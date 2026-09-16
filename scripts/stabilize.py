@@ -22,7 +22,8 @@ ANALYSIS_LONG_SIDE = 960
 GRID = 4
 FEATURES_PER_CELL = 40
 MIN_INLIERS = 12
-SETTING_DEFAULTS = {"amount": 100, "smoothness": 50, "cropMode": 0, "zoom": 10, "tripod": 0, "maxShift": 15, "maxAngle": 5}
+SETTING_DEFAULTS = {"amount": 100, "smoothness": 50, "cropMode": 0, "zoom": 0, "tripod": 0, "maxShift": 15, "maxAngle": 5}
+MAX_AUTO_ZOOM = 3.0
 
 
 def emit(**message):
@@ -258,7 +259,8 @@ def output_matrices(path, raw_settings):
     elif mode == 1:
         zoom = 1.0 + max(0.0, settings["zoom"]) / 100.0
     else:
-        zoom = auto_zoom(matrices, width, height, 1.0 + max(0.0, settings["zoom"]) / 100.0)
+        # Crop exactly to the largest corrected movement, then apply the user's fine adjustment on top.
+        zoom = max(1.0, auto_zoom(matrices, width, height, MAX_AUTO_ZOOM) + settings["zoom"] / 100.0)
     cx, cy = width / 2.0, height / 2.0
     zoom_matrix = np.array([[zoom, 0.0, cx - zoom * cx], [0.0, zoom, cy - zoom * cy], [0.0, 0.0, 1.0]])
     return [(zoom_matrix @ np.vstack([matrix, [0.0, 0.0, 1.0]]))[:2] for matrix in matrices], zoom
@@ -274,7 +276,8 @@ def render(job):
     start, end, preview = float(job["from"]), float(job["to"]), bool(job.get("preview"))
     if not end > start:
         fail("Render range is empty.")
-    matrices, _zoom = output_matrices(path, job.get("settings") or {})
+    matrices, zoom = output_matrices(path, job.get("settings") or {})
+    emit(zoom=round(zoom, 4))
     first = int(round((start - path["from"]) * info["fps"]))
     count = max(1, int(round((end - start) * info["fps"])))
     width, height = info["width"], info["height"]
@@ -359,7 +362,11 @@ def selftest():
     error = float(np.sqrt(np.mean((np.array(motions)[:, :2] - truth[:, :2]) ** 2)))
     assert error < 0.5, f"motion error {error:.2f} px per frame"
     path = {"version": 1, "width": width, "height": height, "fps": 24.0, "from": 0.0, "to": len(frames) / 24.0, "frames": motions, "dropped": []}
-    matrices, zoom = output_matrices(path, {"amount": 100, "smoothness": 70, "cropMode": 0, "zoom": 40, "tripod": 0, "maxShift": 50, "maxAngle": 30})
+    matrices, zoom = output_matrices(path, {"amount": 100, "smoothness": 70, "cropMode": 0, "zoom": 0, "tripod": 0, "maxShift": 50, "maxAngle": 30})
+    assert 1.0 < zoom < MAX_AUTO_ZOOM, f"auto zoom {zoom}"
+    assert all(fits(m, zoom, width, height) for m in matrices), "auto crop leaves a visible border"
+    tighter, _ = output_matrices(path, {"amount": 100, "smoothness": 70, "cropMode": 0, "zoom": 5, "maxShift": 50, "maxAngle": 30})
+    assert abs(np.linalg.norm(tighter[0][:, :2]) / np.linalg.norm(matrices[0][:, :2]) - (zoom + 0.05) / zoom) < 1e-6, "crop adjust must add to the auto crop"
     stabilized = [cv2.warpAffine(frame, matrix, (width, height), flags=cv2.INTER_LINEAR) for frame, matrix in zip(frames, matrices)]
     after, _ = analyze_frames(iter(stabilized), width)
     before_jitter, after_jitter = jitter(recovered), jitter(np.cumsum(np.array(after), axis=0))

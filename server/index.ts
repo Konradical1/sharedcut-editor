@@ -1049,8 +1049,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const file = join(stabilizeDirectory,`${key}.mp4`), result = { from: window.from, duration: window.to-window.from, fps: sourceFps };
           let job = stabilizeJobs.get(key);
           if (existsSync(file)) {
-            if (!job) stabilizeJobs.set(key,{status:'ready',key,progress:100,...result,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()});
-            send(res,200,{status:'ready',key,url:`/api/stabilize/${key}/video?projectId=${project.id}`,progress:100,...result}); return;
+            const zoom = job?.zoom ?? await renderStabilized({input,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true}).then(r=>r.zoom).catch(()=>undefined);
+            if (!job) stabilizeJobs.set(key,{status:'ready',key,progress:100,zoom,...result,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()});
+            send(res,200,{status:'ready',key,url:`/api/stabilize/${key}/video?projectId=${project.id}`,progress:100,zoom,...result}); return;
           }
           if (!job || job.controller.signal.aborted) {
             for (const old of stabilizeJobs.values()) if (old.clipId === clip.id && old.status === 'preparing' && old.key !== key && old.generation !== generation) old.controller.abort();
@@ -1060,8 +1061,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             stabilizeQueue = stabilizeQueue.then(async () => {
               if (closed || current.controller.signal.aborted) return;
               try {
-                await renderStabilized({input,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
-                current.status='ready'; current.url=`/api/stabilize/${key}/video?projectId=${project.id}`;
+                const rendered = await renderStabilized({input,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
+                current.zoom=rendered.zoom; current.status='ready'; current.url=`/api/stabilize/${key}/video?projectId=${project.id}`;
                 await trimStabilizeCache(stabilizeDirectory,new Set([key]));
               } catch(error) { current.status='failed';current.error=(error as Error).message; }
             });

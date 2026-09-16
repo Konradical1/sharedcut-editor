@@ -6,7 +6,7 @@ import { flowFrames } from './opticalFlow.ts';
 export const stabilizeChunkSeconds = 4;
 export const stabilizeKeys = ['amount', 'smoothness', 'cropMode', 'zoom', 'tripod', 'maxShift', 'maxAngle'] as const;
 export type StabilizeSettings = Record<typeof stabilizeKeys[number], number>;
-export type StabilizePreview = { status: 'preparing' | 'ready' | 'failed'; key: string; url?: string; error?: string; progress: number; from: number; duration: number; fps: number };
+export type StabilizePreview = { status: 'preparing' | 'ready' | 'failed'; key: string; url?: string; error?: string; progress: number; from: number; duration: number; fps: number; /** Final zoom factor the render used, e.g. 1.083 for an 8.3 % crop. */ zoom?: number };
 export type StabilizeRange = { from: number; to: number };
 export const stabilizeCropModes = ['Auto zoom', 'Fixed zoom', 'Borders'];
 

@@ -19,7 +19,7 @@ test('Stabilize is offered on plain video only', () => {
 
 test('settings come from the registry defaults and clamp', () => {
   const c = clip({ effects: [stabilize] });
-  assert.deepEqual(stabilizeSettings(c, stabilize), { amount: 100, smoothness: 50, cropMode: 0, zoom: 10, tripod: 0, maxShift: 15, maxAngle: 5 });
+  assert.deepEqual(stabilizeSettings(c, stabilize), { amount: 100, smoothness: 50, cropMode: 0, zoom: 0, tripod: 0, maxShift: 15, maxAngle: 5 });
   assert.equal(stabilizeSettings(c, { ...stabilize, parameters: { smoothness: 500 } }).smoothness, 100);
   assert.equal(stabilizeEffect(c), stabilize);
   assert.equal(stabilizeEffect(clip({ effects: [{ ...stabilize, enabled: false }] })), undefined);

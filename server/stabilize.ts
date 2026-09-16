@@ -46,7 +46,7 @@ async function checkCapabilities() {
 
 const round = (value: number) => Math.round(value * 1e6) / 1e6;
 export function normalizeSettings(raw: Partial<StabilizeSettings> | undefined): StabilizeSettings {
-  const defaults: StabilizeSettings = { amount: 100, smoothness: 50, cropMode: 0, zoom: 10, tripod: 0, maxShift: 15, maxAngle: 5 };
+  const defaults: StabilizeSettings = { amount: 100, smoothness: 50, cropMode: 0, zoom: 0, tripod: 0, maxShift: 15, maxAngle: 5 };
   return Object.fromEntries(stabilizeKeys.map(key => { const value = Number(raw?.[key]); return [key, Number.isFinite(value) ? round(value) : defaults[key]]; })) as StabilizeSettings;
 }
 
@@ -68,9 +68,9 @@ async function runStage(job: Record<string, unknown>, directory: string, prefix:
     await writeFile(file, JSON.stringify(job));
     const task = workerQueue.then(() => runStabilizeProcess(stabilizePython(), [worker, file], signal, onProgress));
     workerQueue = task.then(() => {}, () => {});
-    await task;
+    const output = await task;
     if (signal?.aborted) throw new Error('Stabilize cancelled.');
-    return temporary;
+    return { temporary, output };
   } catch (error) { await rm(temporary, { recursive: true, force: true }); throw error; }
 }
 
@@ -81,7 +81,7 @@ export async function stabilizeAnalysis(options: { input: string; directory: str
   const key = await stabilizeAnalysisIdentity(input, from, to), output = join(directory, `${key}.path.json`);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   if (existsSync(output)) { onProgress?.(100); return { key, output }; }
-  const temporary = await runStage({ stage: 'analyze', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, from, to, output: join(directory, `.analysis-${key}.tmp`) }, directory, '.stabilize-analyze-', signal, onProgress);
+  const { temporary } = await runStage({ stage: 'analyze', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, from, to, output: join(directory, `.analysis-${key}.tmp`) }, directory, '.stabilize-analyze-', signal, onProgress);
   try { await rename(join(directory, `.analysis-${key}.tmp`), output); onProgress?.(100); return { key, output }; }
   finally { await rm(temporary, { recursive: true, force: true }); await rm(join(directory, `.analysis-${key}.tmp`), { force: true }); }
 }
@@ -92,10 +92,15 @@ export async function renderStabilized(options: { input: string; directory: stri
   if (!(to > from) || from < range.from - 1e-6 || to > range.to + 1e-6) throw new Error('Stabilize render range must lie inside the analysed range.');
   const analysis = await stabilizeAnalysis({ input, directory: analysisDirectory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(value * .3) });
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const key = await stabilizeIdentity(analysis.key, settings, from, to, preview), output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`);
-  if (existsSync(output)) { onProgress?.(100); return { key, output }; }
-  const temporary = await runStage({ stage: 'render', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, path: analysis.output, from, to, preview, settings, output: join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`) }, directory, '.stabilize-render-', signal, value => onProgress?.(30 + value * .7));
-  try { await rename(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), output); onProgress?.(100); return { key, output }; }
+  const key = await stabilizeIdentity(analysis.key, settings, from, to, preview), output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`), sidecar = join(directory, `${key}.json`);
+  const zoomOf = async () => { try { const value = Number(JSON.parse(await readFile(sidecar, 'utf8')).zoom); return Number.isFinite(value) ? value : undefined; } catch { return undefined; } };
+  if (existsSync(output)) { onProgress?.(100); return { key, output, zoom: await zoomOf() }; }
+  const { temporary, output: log } = await runStage({ stage: 'render', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, path: analysis.output, from, to, preview, settings, output: join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`) }, directory, '.stabilize-render-', signal, value => onProgress?.(30 + value * .7));
+  try {
+    const zoom = log.split('\n').map(line => { try { return Number(JSON.parse(line).zoom); } catch { return Number.NaN; } }).find(Number.isFinite);
+    if (zoom !== undefined) await writeFile(sidecar, JSON.stringify({ zoom }));
+    await rename(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), output); onProgress?.(100); return { key, output, zoom };
+  }
   finally { await rm(temporary, { recursive: true, force: true }); await rm(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), { force: true }); }
 }
 
