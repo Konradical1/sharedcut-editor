@@ -11,6 +11,10 @@ import sys
 
 os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')
 os.environ.setdefault('PYANNOTE_METRICS_ENABLED', '0')
+# Every model this downloads is public, so do not attach whatever token happens to be cached on the
+# host. A stale one makes the Hub answer 401 on a public repo, which reads as "model not found" and
+# takes captions down for a credential they never needed. Override to '0' for a gated model.
+os.environ.setdefault('HF_HUB_DISABLE_IMPLICIT_TOKEN', '1')
 # MLX is Apple silicon only. Everywhere else faster-whisper runs the same model through
 # CTranslate2, which carries its own CUDA and does not need a GPU build of torch.
 MLX = sys.platform == 'darwin' and platform.machine() == 'arm64'
@@ -27,10 +31,12 @@ def main():
     from whisperx.audio import load_audio
 
     torch.set_num_threads(4)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Alignment is torch, so it can only use the card if this is a CUDA build of torch. whisperx
+    # pins a torch version that has no CUDA wheel, so off Apple silicon this is usually 'cpu'.
+    align_device = 'cuda' if torch.cuda.is_available() else 'cpu'
     emit('Loading local models', 10)
     vad = load_silero_vad()
-    alignment, metadata = load_align_model(language_code='en', device=device)
+    alignment, metadata = load_align_model(language_code='en', device=align_device)
 
     # Both backends return the same shape: a list of segments carrying the text and the two
     # confidence fields the filter below reads.
@@ -44,10 +50,39 @@ def main():
         def release():
             mx.clear_cache()
     else:
+        # The nvidia-* wheels drop their DLLs in site-packages/nvidia/*/bin, a directory Windows
+        # does not search. Without this CTranslate2 reports a missing cublas64_12.dll while the
+        # card sits there working, and captions fall back to the CPU for a path problem.
+        # CTranslate2 resolves these lazily with a plain LoadLibrary, which consults PATH and
+        # ignores add_dll_directory, so both are needed: the directory list for the extension
+        # module's own dependencies, and PATH for the lazy CUDA loads.
+        if os.name == 'nt':
+            import glob
+            import sysconfig
+            folders = glob.glob(os.path.join(sysconfig.get_paths()['purelib'], 'nvidia', '*', 'bin'))
+            for folder in folders:
+                with contextlib.suppress(OSError):
+                    os.add_dll_directory(folder)
+            if folders:
+                os.environ['PATH'] = os.pathsep.join(folders) + os.pathsep + os.environ.get('PATH', '')
+
+        import ctranslate2
         from faster_whisper import WhisperModel
 
-        # CTranslate2 carries its own CUDA, so this needs no GPU build of torch.
-        model = WhisperModel(MODEL, device=device, compute_type='float16' if device == 'cuda' else 'int8')
+        # CTranslate2 ships its own CUDA and is independent of whichever torch whisperx dragged in,
+        # so ask it directly. Asking torch instead would strand transcription on the CPU next to an
+        # idle card, which is exactly what a CPU-only torch build looks like from here.
+        # Seeing a card is not the same as being able to drive it, so both the probe and the load
+        # are guarded. Captions on the CPU are slow, not broken; say what happened and carry on
+        # rather than failing the job.
+        model = None
+        try:
+            if ctranslate2.get_cuda_device_count() > 0:
+                model = WhisperModel(MODEL, device='cuda', compute_type='float16')
+        except Exception as error:
+            print(f'CUDA unavailable to CTranslate2 ({error}); transcribing on the CPU.', file=sys.stderr)
+        if model is None:
+            model = WhisperModel(MODEL, device='cpu', compute_type='int8')
 
         def transcribe(samples):
             segments, _ = model.transcribe(samples, language='en', word_timestamps=True, temperature=0, condition_on_previous_text=False)
@@ -72,7 +107,7 @@ def main():
         segments = [s for s in result if s.get('no_speech_prob', 0) < .7 or s.get('avg_logprob', -2) > -.8]
         emit(f'Aligning words · {i+1} / {len(regions)} passages', 16+78*(i+.65)/max(1,len(regions)))
         alignment_segments = [{'start': 0, 'end': len(segment_audio)/16000, 'text': ' '.join(s['text'].strip() for s in segments)}] if segments else []
-        aligned = align(alignment_segments, alignment, metadata, segment_audio, device, return_char_alignments=False)
+        aligned = align(alignment_segments, alignment, metadata, segment_audio, align_device, return_char_alignments=False)
         for seg in aligned['segments']:
             items = seg.get('words', [])
             for n, item in enumerate(items):
