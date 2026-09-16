@@ -292,3 +292,10 @@
 .motion-blur-control { min-width: 0; margin: 10px 0 0; padding: 10px 0 0; border: 0; border-top: 1px solid var(--border, #ffffff12); }
 .motion-blur-control > .inspector-checks { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .motion-blur-control .inspector-note { margin-bottom: 0; }
+
+.clip-preparing{position:absolute;left:0;right:0;bottom:0;height:11px;z-index:6;pointer-events:none;border-radius:0 0 3px 3px;overflow:hidden;background:#0b141aee;font-size:7px;color:#dbe9ee;display:flex;align-items:center;padding:0 6px;white-space:nowrap}
+.clip-preparing:before{content:"";position:absolute;inset:0;width:var(--progress);background:linear-gradient(90deg,#3f8f7a,#6fd0b0);opacity:.75;transition:width .4s}
+.clip-preparing:after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(-45deg,#ffffff18 0 6px,transparent 6px 12px);animation:clip-preparing-stripes 1s linear infinite}
+.clip-preparing.failed:before{background:#b04a4a;width:100%}.clip-preparing.failed:after{animation:none}
+.clip-preparing>span{position:relative;z-index:1;text-shadow:0 1px 2px #000a}
+@keyframes clip-preparing-stripes{to{background-position:12px 0}}

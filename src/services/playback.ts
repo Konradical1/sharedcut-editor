@@ -11,7 +11,8 @@ import { gradeValues } from './grade.ts';
 import { createColorPreview, ColorPending } from './colorPreview.ts';
 import { createFlowPreview } from './flowPreview.ts';
 import { createStabilizePreview } from './stabilizePreview.ts';
-import { stabilizeChunk, stabilizeChunkCount, stabilizeEffect, stabilizeRange, stabilizeSettings, type StabilizePreview, type StabilizeRange } from './stabilize.ts';
+import { stabilizeChunk, stabilizeChunkCount, stabilizeEffect, stabilizeRange, stabilizeSettings, stabilizeZoom, type StabilizePreview, type StabilizeRange } from './stabilize.ts';
+import './clipStatus.ts';
 import { flowChunkSeconds, type FlowPreview } from './opticalFlow.ts';
 
 export function sourceTime(clip: Clip, playhead: number, fps = 24, duration = Infinity) {
@@ -474,9 +475,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         try { stabilizedRange = stabilizeRange(original, sourceFps, asset.duration || Infinity); } catch { stabilizedRange = undefined; }
         if (stabilizedRange) {
           const settings = stabilizeSettings(original, stabilizeFx), quality = options.original ? 'Original' : options.quality;
-          const chunk = stabilizeChunk(sourceTime(original, time, sourceFps, asset.duration || Infinity), stabilizedRange);
+          const chunk = stabilizeChunk(sourceTime(original, time, sourceFps, asset.duration || Infinity), stabilizedRange, sourceFps);
           stabilized = stabilizePreview.get(original, chunk, stabilizedRange, settings, sourceFps, quality);
-          if (chunk + 1 < stabilizeChunkCount(stabilizedRange)) { const warm = flowDecoder(stabilizePreview.get(original, chunk + 1, stabilizedRange, settings, sourceFps, quality), 'stabilize'); if (warm) (warm.element as HTMLVideoElement).pause(); }
+          if (chunk + 1 < stabilizeChunkCount(stabilizedRange, sourceFps)) { const warm = flowDecoder(stabilizePreview.get(original, chunk + 1, stabilizedRange, settings, sourceFps, quality), 'stabilize'); if (warm) (warm.element as HTMLVideoElement).pause(); }
         }
         warning = stabilized?.status === 'ready' ? 'Stabilize · Ready' : stabilized?.status === 'failed' ? `Stabilize unavailable · ${stabilized.error}` : `Stabilize · Preparing ${stabilized?.progress ?? 0}%`;
         const detail={clipId:clip.id,...stabilized,status:stabilized?.status??'preparing'},signature=`${Math.floor(performance.now()/1000)}:${JSON.stringify(detail)}`;
@@ -556,7 +557,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       const fit = Math.min(width / sourceWidth, height / sourceHeight);
       layerContext.drawImage(element, (width - sourceWidth * fit) / 2, (height - sourceHeight * fit) / 2, sourceWidth * fit, sourceHeight * fit);
       if (options.compare) draw(referenceTarget, clip, width, height, projectWidth, projectHeight,time);
-      beginSide();finishLayer(clip,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined);
+      // While a stabilized section is still preparing, show the original at the same crop so the framing never jumps.
+      const framed = stabilizeFx && !flowReady ? {...clip, properties:{...clip.properties, zoom: Number(clip.properties.zoom ?? 100) * stabilizeZoom(stabilizeSettings(original, stabilizeFx))}} : clip;
+      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined);
     }
     flush(Infinity);
     };

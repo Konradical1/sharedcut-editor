@@ -94,13 +94,14 @@ export async function renderStabilized(options: { input: string; analysisInput?:
   const analysis = await stabilizeAnalysis({ input: analysisInput, directory: analysisDirectory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(value * .3) });
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const key = await stabilizeIdentity(analysis.key, settings, from, to, preview, input), output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`), sidecar = join(directory, `${key}.json`);
-  const zoomOf = async () => { try { const value = Number(JSON.parse(await readFile(sidecar, 'utf8')).zoom); return Number.isFinite(value) ? value : undefined; } catch { return undefined; } };
-  if (existsSync(output)) { onProgress?.(100); return { key, output, zoom: await zoomOf() }; }
+  const zoomOf = async () => { try { const value = JSON.parse(await readFile(sidecar, 'utf8')); return { zoom: Number.isFinite(Number(value.zoom)) ? Number(value.zoom) : undefined, zoomMin: Number.isFinite(Number(value.zoomMin)) ? Number(value.zoomMin) : undefined }; } catch { return { zoom: undefined, zoomMin: undefined }; } };
+  if (existsSync(output)) { onProgress?.(100); return { key, output, ...await zoomOf() }; }
   const { temporary, output: log } = await runStage({ stage: 'render', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, path: analysis.output, from, to, preview, settings, output: join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`) }, directory, '.stabilize-render-', signal, value => onProgress?.(30 + value * .7));
   try {
-    const zoom = log.split('\n').map(line => { try { return Number(JSON.parse(line).zoom); } catch { return Number.NaN; } }).find(Number.isFinite);
-    if (zoom !== undefined) await writeFile(sidecar, JSON.stringify({ zoom }));
-    await rename(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), output); onProgress?.(100); return { key, output, zoom };
+    const report = log.split('\n').map(line => { try { return JSON.parse(line) as { zoom?: number; zoomMin?: number }; } catch { return undefined; } }).find(value => value && Number.isFinite(Number(value.zoom)));
+    const zoom = report ? Number(report.zoom) : undefined, zoomMin = report && Number.isFinite(Number(report.zoomMin)) ? Number(report.zoomMin) : zoom;
+    if (zoom !== undefined) await writeFile(sidecar, JSON.stringify({ zoom, zoomMin }));
+    await rename(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), output); onProgress?.(100); return { key, output, zoom, zoomMin };
   }
   finally { await rm(temporary, { recursive: true, force: true }); await rm(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), { force: true }); }
 }

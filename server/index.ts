@@ -1037,9 +1037,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const records = timelineTransitions(state.clips.filter(c=>c.projectId===project.id),clip.timelineId,state.media);
           const span = clipSpan(clip,records), geometry = extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
           const sourceFps = asset!.fps || numberField(body.fps,1,120), range = stabilizeRange(geometry,sourceFps,asset!.duration);
-          const chunk = numberField(body.chunk,0,stabilizeChunkCount(range)-1);
+          const chunk = numberField(body.chunk,0,stabilizeChunkCount(range,sourceFps)-1);
           if (!Number.isInteger(chunk)) fail(400,'Invalid preview chunk.');
-          const window = stabilizeChunkRange(chunk,range);
+          const window = stabilizeChunkRange(chunk,range,sourceFps);
           const previewName = quality === 'Color' || quality === 'Full' && asset!.colorProxyUrl ? 'color-v1.mp4' : quality === '1/4' ? 'proxy-quarter-v1.mp4' : quality === '1/2' || quality === 'Stream' ? 'proxy-half-v1.mp4' : 'proxy.mp4';
           const proxy = join(mediaDir(asset!.id),'prepared',previewName);
           const input = quality==='Original'||quality==='Color'&&!existsSync(proxy)?originalPath(asset!.id):existsSync(proxy) ? proxy : join(mediaDir(asset!.id),'prepared','proxy.mp4');
@@ -1051,9 +1051,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const file = join(stabilizeDirectory,`${key}.mp4`), result = { from: window.from, duration: window.to-window.from, fps: sourceFps };
           let job = stabilizeJobs.get(key);
           if (existsSync(file)) {
-            const zoom = job?.zoom ?? await renderStabilized({input,analysisInput:original,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true}).then(r=>r.zoom).catch(()=>undefined);
-            if (!job) stabilizeJobs.set(key,{status:'ready',key,progress:100,zoom,...result,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()});
-            send(res,200,{status:'ready',key,url:`/api/stabilize/${key}/video?projectId=${project.id}`,progress:100,zoom,...result}); return;
+            const zooms = job ? {zoom:job.zoom,zoomMin:job.zoomMin} : await renderStabilized({input,analysisInput:original,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true}).then(r=>({zoom:r.zoom,zoomMin:r.zoomMin})).catch(()=>({}));
+            if (!job) stabilizeJobs.set(key,{status:'ready',key,progress:100,...zooms,...result,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()});
+            send(res,200,{status:'ready',key,url:`/api/stabilize/${key}/video?projectId=${project.id}`,progress:100,...zooms,...result}); return;
           }
           if (!job || job.controller.signal.aborted) {
             for (const old of stabilizeJobs.values()) if (old.clipId === clip.id && old.status === 'preparing' && old.key !== key && old.generation !== generation) old.controller.abort();
@@ -1064,7 +1064,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
               if (closed || current.controller.signal.aborted) return;
               try {
                 const rendered = await renderStabilized({input,analysisInput:original,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
-                current.zoom=rendered.zoom; current.status='ready'; current.url=`/api/stabilize/${key}/video?projectId=${project.id}`;
+                current.zoom=rendered.zoom; current.zoomMin=rendered.zoomMin; current.status='ready'; current.url=`/api/stabilize/${key}/video?projectId=${project.id}`;
                 await trimStabilizeCache(stabilizeDirectory,new Set([key]));
               } catch(error) { current.status='failed';current.error=(error as Error).message; }
             });

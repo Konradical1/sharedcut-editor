@@ -23,7 +23,7 @@ export function createStabilizePreview(changed: () => void) {
       let entry = entries.get(id);
       if (!entry) {
         entry = {controller:new AbortController(),projectId:clip.projectId}; entries.set(id,entry);
-        const current = entry, window = stabilizeChunkRange(chunk,range);
+        const current = entry, window = stabilizeChunkRange(chunk,range,fps);
         const request = async () => {
           if (disposed || current.controller.signal.aborted) return;
           try {

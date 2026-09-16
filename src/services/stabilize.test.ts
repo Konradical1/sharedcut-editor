@@ -38,8 +38,11 @@ test('the analysed range follows the source frames the clip reads', () => {
 
 test('chunks index source time inside the range', () => {
   const range = { from: 10, to: 19 };
-  assert.equal(stabilizeChunkCount(range), 3);
-  assert.equal(stabilizeChunk(10, range), 0); assert.equal(stabilizeChunk(14.5, range), 1); assert.equal(stabilizeChunk(18.9, range), 2);
-  assert.equal(stabilizeChunk(50, range), 2); assert.equal(stabilizeChunk(-5, range), 0);
-  assert.deepEqual(stabilizeChunkRange(2, range), { from: 18, to: 19 });
+  assert.equal(stabilizeChunkCount(range, 24), 3);
+  assert.equal(stabilizeChunk(10, range, 24), 0); assert.equal(stabilizeChunk(14.5, range, 24), 1); assert.equal(stabilizeChunk(18.9, range, 24), 2);
+  assert.equal(stabilizeChunk(50, range, 24), 2); assert.equal(stabilizeChunk(-5, range, 24), 0);
+  assert.deepEqual(stabilizeChunkRange(2, range, 24), { from: 18, to: 19 });
+  // 59.94 fps: 4 s is 239.76 frames, so chunk edges move to whole frames (240 frames).
+  const edge = stabilizeChunkRange(1, { from: 0, to: 20 }, 60000 / 1001);
+  assert.ok(Math.abs(edge.from * 60000 / 1001 - 240) < 1e-6);
 });

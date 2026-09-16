@@ -11,6 +11,7 @@ external tool, reached through the path the server passes in the job.
 """
 import json
 import math
+import os
 import subprocess
 import sys
 
@@ -64,10 +65,35 @@ def matrix_name(value):
     return {"bt709": "bt709", "bt470bg": "bt601", "smpte170m": "bt601", "bt601": "bt601", "bt2020nc": "bt2020", "bt2020": "bt2020", "bt2020c": "bt2020"}.get(value, "bt709")
 
 
+_hwaccel_cache = {}
+
+
+def hardware_decode_args(job):
+    """Detected, never assumed: try the platform decoder on this very file and fall back to software if it cannot."""
+    if os.environ.get("FRAME_LINE_HWACCEL", "").lower() in ("off", "0", "false"):
+        return []
+    key = (job["ffmpeg"], job["input"])
+    if key in _hwaccel_cache:
+        return _hwaccel_cache[key]
+    args = []
+    try:
+        listed = subprocess.run([job["ffmpeg"], "-hide_banner", "-hwaccels"], capture_output=True, text=True, timeout=20).stdout
+        candidates = [name for name in ("videotoolbox", "cuda", "d3d11va", "vaapi") if name in listed.split()]
+        for name in candidates:
+            trial = [job["ffmpeg"], "-v", "error", "-nostdin", "-hwaccel", name, "-i", job["input"], "-frames:v", "2", "-f", "null", "-"]
+            if subprocess.run(trial, capture_output=True, timeout=60).returncode == 0:
+                args = ["-hwaccel", name]
+                break
+    except (OSError, subprocess.SubprocessError):
+        args = []
+    _hwaccel_cache[key] = args
+    return args
+
+
 def decoder(job, info, start, duration, pix_fmt, scale=None):
     """Constant-frame-rate rawvideo pipe over [start, start+duration) of the source."""
     filters = [f"scale=in_color_matrix={matrix_name(info['matrix'])}:in_range={info['range']}" + (f":w={scale[0]}:h={scale[1]}:flags=area" if scale else "")]
-    command = [job["ffmpeg"], "-v", "error", "-nostdin", "-protocol_whitelist", "file,pipe", "-format_whitelist", FORMATS,
+    command = [job["ffmpeg"], "-v", "error", "-nostdin", "-protocol_whitelist", "file,pipe", "-format_whitelist", FORMATS, *hardware_decode_args(job),
                "-ss", f"{start:.6f}", "-i", job["input"], "-t", f"{duration:.6f}", "-an", "-sn",
                "-vf", ",".join(filters), "-r", f"{info['fps']:.6f}", "-fps_mode", "cfr",
                "-f", "rawvideo", "-pix_fmt", pix_fmt, "-"]
@@ -148,7 +174,7 @@ def analyze_frames(frames, full_width, progress=None, total=None):
         previous = frame
         if progress and total and index % 4 == 0:
             progress(index / total)
-    return fill_dropped(motions, dropped), dropped
+    return motions, dropped
 
 
 def fill_dropped(motions, dropped):
@@ -169,20 +195,55 @@ def fill_dropped(motions, dropped):
     return filled
 
 
+def analysis_size(info):
+    ratio = min(1.0, ANALYSIS_LONG_SIDE / max(info["width"], info["height"]))
+    return max(32, int(round(info["width"] * ratio)) // 2 * 2), max(32, int(round(info["height"] * ratio)) // 2 * 2)
+
+
+def analyze_segment(task):
+    """One decode + track pass over [start, end); starts one frame early so the first motion is real, not identity."""
+    job, info, start, end, lead = task
+    width, height = analysis_size(info)
+    process = decoder(job, info, max(0.0, start - lead), end - max(0.0, start - lead), "gray", (width, height))
+    motions, dropped = analyze_frames(frames_from(process, width, height, 1, np.uint8), info["width"])
+    finish(process, "Source decode")
+    if lead > 0 and start - lead >= 0 and motions:
+        motions, dropped = motions[1:], [d - 1 for d in dropped if d >= 1]
+    return motions, dropped
+
+
 def analyze(job):
     info = probe(job)
     start, end = float(job["from"]), float(job["to"])
     if not end > start:
         fail("Analysis range is empty.")
-    ratio = min(1.0, ANALYSIS_LONG_SIDE / max(info["width"], info["height"]))
-    width, height = max(32, int(round(info["width"] * ratio)) // 2 * 2), max(32, int(round(info["height"] * ratio)) // 2 * 2)
-    total = max(1, int(round((end - start) * info["fps"])))
-    process = decoder(job, info, start, end - start, "gray", (width, height))
-    motions, dropped = analyze_frames(frames_from(process, width, height, 1, np.uint8), info["width"], lambda p: emit(progress=round(p * 98, 1)), total)
-    finish(process, "Source decode")
+    fps = info["fps"]
+    total = max(1, int(round((end - start) * fps)))
+    # Decode and tracking both run near real time on 4K; segments in parallel processes share the load.
+    # ponytail: fixed 2 s segments and up to 4 workers; tune from the machine's core count if it shows up.
+    segment_frames = max(1, int(round(2.0 * fps)))
+    starts = list(range(0, total, segment_frames))
+    tasks = [(job, info, start + first / fps, start + min(total, first + segment_frames) / fps, 1.0 / fps) for first in starts]
+    workers = max(1, min(4, len(tasks), (os.cpu_count() or 2) // 2))
+    motions, dropped, done = [], [], 0
+    if workers == 1:
+        results = map(analyze_segment, tasks)
+    else:
+        import concurrent.futures
+        pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
+        results = pool.map(analyze_segment, tasks)
+    for segment_motions, segment_dropped in results:
+        offset = len(motions)
+        motions.extend(segment_motions)
+        dropped.extend(d + offset for d in segment_dropped)
+        done += 1
+        emit(progress=round(done / len(tasks) * 98, 1))
+    if workers > 1:
+        pool.shutdown()
     if len(motions) < 2:
         fail("The clip is too short to stabilize.")
-    path = {"version": 1, "width": info["width"], "height": info["height"], "fps": info["fps"], "from": start, "to": end,
+    motions = fill_dropped(motions, dropped)
+    path = {"version": 1, "width": info["width"], "height": info["height"], "fps": fps, "from": start, "to": end,
             "matrix": info["matrix"], "range": info["range"], "primaries": info["primaries"], "transfer": info["transfer"],
             "frames": [[round(v, 5) for v in m] for m in motions], "dropped": dropped}
     with open(job["output"], "w", encoding="utf-8") as stream:
@@ -203,9 +264,14 @@ def settings_of(raw):
     return settings
 
 
+SLACK_WEIGHT = 30.0  # cost per pixel of leaving the crop budget; a hard wall would pass the camera's own jerk straight through
+
+
 def l1_path(trajectory, budget, smoothness):
     """Grundmann et al. (CVPR 2011): the path of constant, linear and parabolic segments that stays within
     `budget` of the measured trajectory while minimising the L1 norm of its first three derivatives.
+    The budget is soft: a slack variable per frame lets the path overshoot where staying inside would mean
+    following a whip pan frame for frame; the render then zooms smoothly to cover it.
     Solved as one linear program with HiGHS. ponytail: one LP over the whole clip; window it if minutes-long clips get slow."""
     n = len(trajectory)
     if n < 4 or budget <= 0:
@@ -213,11 +279,13 @@ def l1_path(trajectory, budget, smoothness):
     weights = (10.0, 1.0 + 4.0 * smoothness, 100.0 + 400.0 * smoothness)
     counts = (n - 1, n - 2, n - 3)
     offsets = (n, n + counts[0], n + counts[0] + counts[1])
-    total = n + sum(counts)
+    slack = n + sum(counts)
+    total = slack + n
     cost = np.zeros(total)
     for weight, count, offset in zip(weights, counts, offsets):
         cost[offset:offset + count] = weight
-    rows, cols, values = [], [], []
+    cost[slack:] = SLACK_WEIGHT
+    rows, cols, values, rhs = [], [], [], []
     row = 0
     stencils = ((-1, 1), (1, -2, 1), (-1, 3, -3, 1))
     for stencil, count, offset in zip(stencils, counts, offsets):
@@ -226,10 +294,17 @@ def l1_path(trajectory, budget, smoothness):
                 for k, coefficient in enumerate(stencil):
                     rows.append(row); cols.append(i + k); values.append(sign * coefficient)
                 rows.append(row); cols.append(offset + i); values.append(-1.0)
+                rhs.append(0.0)
                 row += 1
+    for i in range(n):  # |p_i - t_i| <= budget + s_i
+        for sign in (1, -1):
+            rows.append(row); cols.append(i); values.append(sign)
+            rows.append(row); cols.append(slack + i); values.append(-1.0)
+            rhs.append(sign * float(trajectory[i]) + budget)
+            row += 1
     matrix = sparse.csr_matrix((values, (rows, cols)), shape=(row, total))
-    bounds = [(float(t - budget), float(t + budget)) for t in trajectory] + [(0, None)] * (total - n)
-    result = linprog(cost, A_ub=matrix, b_ub=np.zeros(row), bounds=bounds, method="highs")
+    bounds = [(None, None)] * n + [(0, None)] * (total - n)
+    result = linprog(cost, A_ub=matrix, b_ub=np.array(rhs), bounds=bounds, method="highs")
     if not result.success:
         return trajectory.copy()
     return result.x[:n]
@@ -295,19 +370,68 @@ def auto_zoom(matrices, width, height, cap):
     return high
 
 
+def required_zoom(matrix, width, height, floor, cap):
+    """Smallest zoom in [floor, cap] that hides this frame's edges."""
+    if fits(matrix, floor, width, height):
+        return floor
+    low, high = floor, cap
+    if not fits(matrix, high, width, height):
+        return high
+    for _ in range(20):
+        middle = (low + high) / 2
+        if fits(matrix, middle, width, height):
+            high = middle
+        else:
+            low = middle
+    return high
+
+
+def smooth_zoom_curve(required, fps, floor):
+    """A zoom that never shows an edge yet only ever glides. Each frame's need is held for 2.5 s either side, the
+    plateau is blurred over 1 s, and the two steps repeat until no frame is short. Holding wider than the blur keeps
+    the blur from eating the peak, so the final safety max() has almost nothing left to add and no step to make.
+    The eye reads a slow push-in as camera work, not a jump."""
+    values = np.maximum(np.asarray(required, dtype=np.float64), floor)
+    if len(values) < 3:
+        return values
+    sigma = max(1.0, fps * 1.0)
+    hold = max(1, int(round(2.5 * sigma)))
+    curve = values.copy()
+    for _ in range(4):
+        padded = np.pad(np.maximum(curve, values), hold, mode="edge")
+        held = np.max(np.lib.stride_tricks.sliding_window_view(padded, 2 * hold + 1), axis=1)
+        curve = gaussian_smooth(held[:, None], sigma)[:, 0]
+        if (values - curve).max() <= 1e-4:
+            break
+    return np.maximum(curve, values)
+
+
+def gaussian_smooth(values, sigma):
+    if sigma <= 0.01:
+        return values.copy()
+    radius = int(math.ceil(sigma * 3))
+    kernel = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma) ** 2)
+    kernel /= kernel.sum()
+    padded = np.pad(values, ((radius, radius), (0, 0)), mode="edge")
+    return np.stack([np.convolve(padded[:, column], kernel, mode="valid") for column in range(values.shape[1])], axis=1)
+
+
 def output_matrices(path, raw_settings):
+    """Per-frame output matrices (correction then zoom about the centre) and the per-frame zoom curve."""
     delta, settings, crop = corrections(path, raw_settings)
     matrices = frame_matrices(path, delta)
     width, height = path["width"], path["height"]
-    if settings["lock"] >= 0.5:
-        zoom = auto_zoom(matrices, width, height, MAX_LOCK_ZOOM)
-    else:
-        # The budget fixes the zoom. Only where rotation and translation combine past it does the zoom creep up a little.
-        budget_zoom = 1.0 / (1.0 - 2.0 * crop)
-        zoom = budget_zoom if all(fits(m, budget_zoom, width, height) for m in matrices) else max(budget_zoom, auto_zoom(matrices, width, height, budget_zoom * 1.06))
+    locked = settings["lock"] >= 0.5
+    floor = 1.0 if locked else 1.0 / (1.0 - 2.0 * crop)
+    cap = MAX_LOCK_ZOOM if locked else floor * 1.35
+    required = [required_zoom(m, width, height, floor, cap) for m in matrices]
+    zooms = smooth_zoom_curve(required, path["fps"], floor)
     cx, cy = width / 2.0, height / 2.0
-    zoom_matrix = np.array([[zoom, 0.0, cx - zoom * cx], [0.0, zoom, cy - zoom * cy], [0.0, 0.0, 1.0]])
-    return [(zoom_matrix @ np.vstack([matrix, [0.0, 0.0, 1.0]]))[:2] for matrix in matrices], zoom
+    combined = []
+    for matrix, zoom in zip(matrices, zooms):
+        zoom_matrix = np.array([[zoom, 0.0, cx - zoom * cx], [0.0, zoom, cy - zoom * cy], [0.0, 0.0, 1.0]])
+        combined.append((zoom_matrix @ np.vstack([matrix, [0.0, 0.0, 1.0]]))[:2])
+    return combined, zooms
 
 
 def scaled_matrices(matrices, path, width, height):
@@ -330,8 +454,8 @@ def render(job):
     start, end, preview = float(job["from"]), float(job["to"]), bool(job.get("preview"))
     if not end > start:
         fail("Render range is empty.")
-    matrices, zoom = output_matrices(path, job.get("settings") or {})
-    emit(zoom=round(zoom, 4))
+    matrices, zooms = output_matrices(path, job.get("settings") or {})
+    emit(zoom=round(float(np.max(zooms)), 4), zoomMin=round(float(np.min(zooms)), 4))
     matrices = scaled_matrices(matrices, path, info["width"], info["height"])
     first = int(round((start - path["from"]) * info["fps"]))
     count = max(1, int(round((end - start) * info["fps"])))
@@ -342,7 +466,7 @@ def render(job):
               "-vf", f"scale=out_color_matrix={matrix}:out_range=tv", "-colorspace", "smpte170m" if matrix == "bt601" else matrix,
               "-color_primaries", info["primaries"], "-color_trc", info["transfer"], "-color_range", "tv"]
     if preview:
-        encode += ["-c:v", "libx264", "-threads", "2", "-preset", "veryfast", "-qp", "0", "-g", str(max(1, round(info["fps"] / 2))), "-pix_fmt", "yuv422p10le", "-movflags", "+faststart"]
+        encode += ["-c:v", "libx264", "-threads", "4", "-preset", "veryfast", "-crf", "12", "-g", str(max(1, round(info["fps"] / 2))), "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
     else:
         encode += ["-c:v", "prores_ks", "-profile:v", "3", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
     encode += ["-y", job["output"]]
@@ -417,12 +541,16 @@ def selftest():
     error = float(np.sqrt(np.mean((np.array(motions)[:, :2] - truth[:, :2]) ** 2)))
     assert error < 0.5, f"motion error {error:.2f} px per frame"
     path = {"version": 1, "width": width, "height": height, "fps": 24.0, "from": 0.0, "to": len(frames) / 24.0, "frames": motions, "dropped": []}
-    matrices, zoom = output_matrices(path, {"amount": 100, "smoothness": 50, "crop": 6, "lock": 0})
-    assert abs(zoom - 1 / (1 - 0.12)) < 0.02, f"crop 6% must give ~1.136x zoom, got {zoom}"
-    assert all(fits(m, zoom, width, height) for m in matrices), "crop budget leaves a visible border"
-    matrices2, zoom2 = output_matrices(path, {"amount": 100, "smoothness": 50, "crop": 2, "lock": 0})
-    assert zoom2 < zoom and all(fits(m, zoom2, width, height) for m in matrices2), "a smaller budget must zoom less and still fit"
-    interpolated, dropped_marks = analyze_frames(iter(frames[:10] + [np.zeros_like(frames[0])] + frames[11:14]), width)
+    matrices, zooms = output_matrices(path, {"amount": 100, "smoothness": 50, "crop": 6, "lock": 0})
+    zoom = float(np.max(zooms))
+    assert abs(float(np.min(zooms)) - 1 / (1 - 0.12)) < 0.006 and zoom < 1 / (1 - 0.12) * 1.1, f"crop 6% must sit at ~1.136x zoom, got {np.min(zooms)}..{zoom}"
+    assert np.abs(np.diff(zooms)).max() < 0.004, f"zoom must glide, max step {np.abs(np.diff(zooms)).max():.4f}"
+    plain = frame_matrices(path, corrections(path, {"amount": 100, "smoothness": 50, "crop": 6, "lock": 0})[0])
+    assert all(fits(m, z, width, height) for m, z in zip(plain, zooms)), "zoom curve leaves a visible border"
+    matrices2, zooms2 = output_matrices(path, {"amount": 100, "smoothness": 50, "crop": 2, "lock": 0})
+    assert float(np.max(zooms2)) < zoom, "a smaller budget must zoom less"
+    raw, dropped_marks = analyze_frames(iter(frames[:10] + [np.zeros_like(frames[0])] + frames[11:14]), width)
+    interpolated = fill_dropped(raw, dropped_marks)
     assert dropped_marks and any(abs(v) > 0 for v in interpolated[dropped_marks[0]][:2]), "dropped frames are interpolated, not zeroed"
     stabilized = [cv2.warpAffine(frame, matrix, (width, height), flags=cv2.INTER_LINEAR) for frame, matrix in zip(frames, matrices)]
     after, _ = analyze_frames(iter(stabilized), width)
@@ -433,7 +561,7 @@ def selftest():
     locked_motion, _ = analyze_frames(iter(locked), width)
     locked_jitter = jitter(np.cumsum(np.array(locked_motion), axis=0))
     assert locked_jitter < 0.6, f"tripod mode still moves {locked_jitter:.2f}"
-    print(json.dumps({"ok": True, "pathErrorPx": round(error, 3), "jitterBefore": round(before_jitter, 3), "jitterAfter": round(after_jitter, 3), "lockJitter": round(locked_jitter, 3), "zoomAt6pct": round(zoom, 4)}))
+    print(json.dumps({"ok": True, "pathErrorPx": round(error, 3), "jitterBefore": round(before_jitter, 3), "jitterAfter": round(after_jitter, 3), "lockJitter": round(locked_jitter, 3), "zoomAt6pct": [round(float(np.min(zooms)), 4), round(zoom, 4)]}))
 
 
 def main(argv):

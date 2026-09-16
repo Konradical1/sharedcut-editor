@@ -183,3 +183,17 @@ the Gaussian smoother lagging the pan by up to 59 % of the frame and zooming 2.0
 - Measured on the clip: perceived shake (rms frame-to-frame acceleration) down 62 % at 5 % crop, 72 % at 8 %.
   Analysis 12.5 s for 25 s of 4K; export 62 s; L1 solve 1.5 s.
 - Still open (phase two): rolling-shutter shear correction on whip pans, content-preserving mesh warp for parallax.
+
+## Revision 2026-09-16 (night): framing, speed, timeline status
+
+- **Framing never jumps.** The crop budget is soft in the LP (per-frame slack, weight 30 px⁻¹) so the path keeps its
+  smoothness through whip pans; the render then uses a per-frame zoom curve: each frame's required zoom is held
+  2.5 s either side, blurred over 1 s, repeated until nothing is short. On the soccer clip the zoom moves at most
+  2.2 % per second at a 5 % budget. While a preview chunk is still preparing, the player draws the original at the
+  budget zoom so the picture stays framed the same. Chunk edges sit on whole source frames.
+- **Speed.** ffmpeg hardware decode is detected and verified on the actual file (`videotoolbox`, `cuda`, `d3d11va`,
+  `vaapi`; `FRAME_LINE_HWACCEL=off` disables). Analysis runs 2 s segments across up to four processes. Preview
+  chunks encode 8-bit 4:2:0 at CRF 12. 25 s of 4K: analysis 12.5 s → 7.3 s, a 4 s preview chunk 3.5 s → 2.1 s.
+- **Timeline status.** `src/services/clipStatus.ts` collects Stabilize, optical flow and Smart Mask progress per clip
+  (from the playback events and the mask store); `Timeline.tsx` shows a striped progress bar on the clip while
+  anything is preparing and a red bar when it failed.

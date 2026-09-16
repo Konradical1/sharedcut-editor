@@ -6,7 +6,7 @@ import { flowFrames } from './opticalFlow.ts';
 export const stabilizeChunkSeconds = 4;
 export const stabilizeKeys = ['amount', 'crop', 'smoothness', 'lock'] as const;
 export type StabilizeSettings = Record<typeof stabilizeKeys[number], number>;
-export type StabilizePreview = { status: 'preparing' | 'ready' | 'failed'; key: string; url?: string; error?: string; progress: number; from: number; duration: number; fps: number; /** Final zoom factor the render used, e.g. 1.083 for an 8.3 % crop. */ zoom?: number };
+export type StabilizePreview = { status: 'preparing' | 'ready' | 'failed'; key: string; url?: string; error?: string; progress: number; from: number; duration: number; fps: number; /** Largest and smallest zoom the render used, e.g. 1.083 for an 8.3 % crop. */ zoom?: number; zoomMin?: number };
 export type StabilizeRange = { from: number; to: number };
 
 /** The enabled Stabilize effect that actually changes the picture, if any. */
@@ -22,6 +22,10 @@ export function stabilizeRange(clip: Clip, sourceFps: number, sourceDuration: nu
   if (!(to > from)) throw new Error('The clip reads no source frames to stabilize.');
   return { from, to };
 }
-export const stabilizeChunkCount = (range: StabilizeRange) => Math.max(1, Math.ceil((range.to - range.from) / stabilizeChunkSeconds - 1e-6));
-export const stabilizeChunk = (sourceTime: number, range: StabilizeRange) => Math.max(0, Math.min(stabilizeChunkCount(range) - 1, Math.floor((sourceTime - range.from) / stabilizeChunkSeconds)));
-export const stabilizeChunkRange = (chunk: number, range: StabilizeRange): StabilizeRange => ({ from: range.from + chunk * stabilizeChunkSeconds, to: Math.min(range.to, range.from + (chunk + 1) * stabilizeChunkSeconds) });
+/** Chunk edges land on whole source frames so consecutive sections never repeat or skip a frame. */
+const chunkLength = (fps: number) => Math.max(1, Math.round(stabilizeChunkSeconds * Math.max(1, fps || 24))) / Math.max(1, fps || 24);
+export const stabilizeChunkCount = (range: StabilizeRange, fps: number) => Math.max(1, Math.ceil((range.to - range.from) / chunkLength(fps) - 1e-6));
+export const stabilizeChunk = (sourceTime: number, range: StabilizeRange, fps: number) => Math.max(0, Math.min(stabilizeChunkCount(range, fps) - 1, Math.floor((sourceTime - range.from) / chunkLength(fps))));
+export const stabilizeChunkRange = (chunk: number, range: StabilizeRange, fps: number): StabilizeRange => ({ from: range.from + chunk * chunkLength(fps), to: Math.min(range.to, range.from + (chunk + 1) * chunkLength(fps)) });
+/** Zoom the crop budget implies, before any smooth extra zoom the worker adds around whip pans. */
+export const stabilizeZoom = (settings: StabilizeSettings) => 1 / (1 - 2 * Math.min(.45, Math.max(0, settings.crop / 100)));
