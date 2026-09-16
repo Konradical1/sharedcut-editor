@@ -22,6 +22,10 @@ export function clipActivity(clipId: string): ClipActivity | undefined {
   const list = [...current.values()];
   return list.find(a => a.status === 'preparing') ?? list.find(a => a.status === 'failed');
 }
+/** Re-renders whenever any clip's background work changes; the ruler bar reads every clip at once. */
+export function useActivityVersion() {
+  return useSyncExternalStore(listener => { listeners.add(listener); return () => { listeners.delete(listener); }; }, () => version, () => 0);
+}
 export function useClipActivity(clipId: string) {
   return useSyncExternalStore(listener => { listeners.add(listener); return () => { listeners.delete(listener); }; }, () => { void version; return clipActivity(clipId); }, () => undefined);
 }

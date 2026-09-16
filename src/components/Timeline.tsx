@@ -22,7 +22,9 @@ import { companionAudioTrack, edgeScrollVelocity, rulerStep, timelineZoom, uncov
 import { snapTime, SNAP_PIXELS } from '../services/snapping';
 import { RemotePlayhead } from './Collaboration';
 import { acceptsEffect } from '../services/effects';
-import { useClipActivity, watchSmartMaskJobs } from '../services/clipStatus';
+import { useClipActivity, watchSmartMaskJobs, clipActivity, useActivityVersion } from '../services/clipStatus';
+import { clipCached, useFootageVersion } from '../services/footageCache';
+import { barSegments, type BarState } from '../services/renderBar';
 import { useMaskEditor } from '../services/smartMaskClient';
 import type { Clip, MediaAsset } from '../state/models';
 
@@ -72,6 +74,18 @@ function TimelinePlayheads({ pixels, color, scrub, scrubMove }: { pixels: number
 }
 
 watchSmartMaskJobs(useMaskEditor);
+
+/** Premiere's ruler bar: green = cached on this machine, yellow = streaming from the server, red = the server is still working on it. */
+function RenderBar({pixels}:{pixels:number}){
+  useFootageVersion();useActivityVersion();
+  const clips=useEditorStore(s=>s.clips),media=useEditorStore(s=>s.media),timelineId=useEditorStore(s=>s.timelineId),projectId=useEditorStore(s=>s.projectId);
+  const segments=barSegments(clips.filter(c=>c.timelineId===timelineId&&c.projectId===projectId&&!c.disabled).map(clip=>{
+    const asset=media.find(m=>m.id===clip.mediaId);
+    const state:BarState=clipActivity(clip.id)||(asset&&asset.status!=='ready')?'red':clipCached(clip.id)?'green':'yellow';
+    return {start:clip.start,end:clip.start+clip.duration,state};
+  }));
+  return <div className="render-bar" aria-hidden="true">{segments.map((seg,i)=><i key={i} className={seg.state} style={{left:seg.start*pixels,width:Math.max(1,(seg.end-seg.start)*pixels)}}/>)}</div>;
+}
 
 function ClipActivityBar({clipId}:{clipId:string}) {
   const activity=useClipActivity(clipId);
@@ -301,6 +315,7 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
       <div className="timeline-content" style={{minWidth:width+164}}>
         <div className="timeline-ruler-row"><div className="timeline-track-heading"><span>TRACKS</span><ChevronDown size={12}/></div><div className="timeline-ruler" data-cursor-anchor="ruler" data-time-span={width/pixels} style={{width}} onPointerDown={scrub} onPointerMove={scrubMove}>
           <div className="timeline-range" title="Marked export range" style={{left:rangeIn*pixels,width:(rangeOut-rangeIn)*pixels}}/>
+          <RenderBar pixels={pixels}/>
           {Array.from({length:Math.max(0,lastTick-firstTick+1)},(_,index)=>{const i=index+firstTick;return <div key={i} className="ruler-tick major" style={{left:i*step*pixels}}><span className="mono">{timecode(i*step,fps)}</span></div>;})}
           {markers.map((m,i)=><button key={i} className="timeline-marker" style={{left:m.time*pixels,color:m.color}} title={m.name} aria-label={`Go to marker: ${m.name}`} onClick={e=>{e.stopPropagation();actions().setPlayhead(m.time);}}><Flag size={12} fill="currentColor"/></button>)}
         </div></div>

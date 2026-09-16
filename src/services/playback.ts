@@ -13,6 +13,7 @@ import { createFlowPreview } from './flowPreview.ts';
 import { createStabilizePreview } from './stabilizePreview.ts';
 import { stabilizeChunk, stabilizeChunkCount, stabilizeEffect, stabilizeRange, stabilizeSettings, stabilizeZoom, type StabilizePreview, type StabilizeRange } from './stabilize.ts';
 import './clipStatus.ts';
+import * as footageCache from './footageCache.ts';
 import { flowChunkSeconds, type FlowPreview } from './opticalFlow.ts';
 
 export function sourceTime(clip: Clip, playhead: number, fps = 24, duration = Infinity) {
@@ -307,6 +308,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     const dependencies = [state.timelineId, state.timelines, state.playhead, state.playing, state.clips, state.tracks, state.media, state.leaks, state.nodes, state.settings, project, options.original, options.quality, options.volume, options.compare, options.fontsRevision];
     if (!dirty && !stalled && dependencies.every((value, i) => value === previous[i])) return;
     previous = dependencies; dirty = false; renderSlot = slot;
+    footageCache.update(state, options, (asset, visual) => playbackUrl(asset, options, visual));
     const [projectWidth, projectHeight] = projectSize(project?.resolution ?? '1920 × 1080');
     flowPreview.retain(new Set(state.clips.filter(c=>c.properties.opticalFlow&&!c.disabled).map(c=>c.id)));
     stabilizePreview.retain(new Set(state.clips.filter(c=>stabilizeEffect(c)&&!c.disabled).map(c=>c.id)));

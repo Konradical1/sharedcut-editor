@@ -299,3 +299,5 @@
 .clip-preparing.failed:before{background:#b04a4a;width:100%}.clip-preparing.failed:after{animation:none}
 .clip-preparing>span{position:relative;z-index:1;text-shadow:0 1px 2px #000a}
 @keyframes clip-preparing-stripes{to{background-position:12px 0}}
+
+.render-bar{position:absolute;left:0;right:0;bottom:0;height:3px;pointer-events:none;z-index:1}.render-bar>i{position:absolute;top:0;bottom:0;display:block}.render-bar>i.green{background:#4cc26a}.render-bar>i.yellow{background:#e0b93f}.render-bar>i.red{background:#e0524a}
