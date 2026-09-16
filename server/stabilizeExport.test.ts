@@ -22,7 +22,7 @@ test('Stabilize export bakes a shaky clip and rejects conflicting effects', { ti
     const asset: MediaAsset = { id: 'asset', projectId: 'project', name: 'shaky.mp4', kind: 'video', binId: 'all', duration: 3, fps: 24, resolution: '280 × 160', size: '10 KB', status: 'ready', progress: 100, thumbnail: '', hasAudio: false };
     const project = { id: 'project', resolution: '280 × 160', fps: 24 } as Project;
     const track: Track = { id: 'v1', timelineId: 'timeline', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
-    const stabilize = { id: 'fx', name: 'Stabilize', enabled: true, amount: 100, parameters: { smoothness: 60 } };
+    const stabilize = { id: 'fx', name: 'Stabilize', enabled: true, amount: 100, parameters: { crop: 6 } };
     const clip: Clip = { id: 'clip', projectId: 'project', timelineId: 'timeline', mediaId: 'asset', name: 'Shaky', trackId: 'v1', start: 0, duration: 2, sourceIn: .5, color: 'red', disabled: false, properties: { ...defaultProperties }, effects: [stabilize] };
     const request: RenderRequest = { project, timeline: { id: 'timeline', projectId: 'project', name: 'test', duration: 2 }, tracks: [track], clips: [clip], nodes: [], assets: [{ asset, path: source }], settings: { resolution: '280 × 160', fps: '24', rangeIn: '0', rangeOut: '2', audio: 'Disabled' }, outputPath: path.join(dir, 'out.mp4'), stabilizeDir: path.join(dir, 'cache') };
     await assert.rejects(renderTimeline({ ...request, clips: [{ ...clip, properties: { ...clip.properties, opticalFlow: true } }] }), /optical flow/);

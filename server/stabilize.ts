@@ -46,7 +46,7 @@ async function checkCapabilities() {
 
 const round = (value: number) => Math.round(value * 1e6) / 1e6;
 export function normalizeSettings(raw: Partial<StabilizeSettings> | undefined): StabilizeSettings {
-  const defaults: StabilizeSettings = { amount: 100, smoothness: 50, cropMode: 0, zoom: 0, tripod: 0, maxShift: 15, maxAngle: 5 };
+  const defaults: StabilizeSettings = { amount: 100, crop: 5, smoothness: 50, lock: 0 };
   return Object.fromEntries(stabilizeKeys.map(key => { const value = Number(raw?.[key]); return [key, Number.isFinite(value) ? round(value) : defaults[key]]; })) as StabilizeSettings;
 }
 
@@ -57,8 +57,8 @@ async function inputIdentity(input: string) { const file = await stat(input); re
 export async function stabilizeAnalysisIdentity(input: string, from: number, to: number) {
   return hash(['stabilize-analysis-v1', await workerIdentity(), await inputIdentity(input), round(from), round(to)]);
 }
-export async function stabilizeIdentity(analysisKey: string, settings: StabilizeSettings, from: number, to: number, preview: boolean) {
-  return hash(['stabilize-render-v1', analysisKey, normalizeSettings(settings), round(from), round(to), preview]);
+export async function stabilizeIdentity(analysisKey: string, settings: StabilizeSettings, from: number, to: number, preview: boolean, input?: string) {
+  return hash(['stabilize-render-v2', analysisKey, normalizeSettings(settings), round(from), round(to), preview, input ? await inputIdentity(input) : null]);
 }
 
 async function runStage(job: Record<string, unknown>, directory: string, prefix: string, signal: AbortSignal | undefined, onProgress: ((value: number) => void) | undefined) {
@@ -87,12 +87,13 @@ export async function stabilizeAnalysis(options: { input: string; directory: str
 }
 
 /** Stabilized picture for [from,to) of the source in source time. Preview: x264 mp4. Export: ProRes mov. */
-export async function renderStabilized(options: { input: string; directory: string; analysisDirectory?: string; range: { from: number; to: number }; from: number; to: number; settings: StabilizeSettings; preview: boolean; signal?: AbortSignal; onProgress?: (value: number) => void }) {
-  const { input, directory, analysisDirectory = directory, range, from, to, preview, signal, onProgress } = options, settings = normalizeSettings(options.settings);
+/** `analysisInput` is the camera original: proxies lose tracking and invent rotation. `input` may be a proxy of the same aspect for previews. */
+export async function renderStabilized(options: { input: string; analysisInput?: string; directory: string; analysisDirectory?: string; range: { from: number; to: number }; from: number; to: number; settings: StabilizeSettings; preview: boolean; signal?: AbortSignal; onProgress?: (value: number) => void }) {
+  const { input, analysisInput = input, directory, analysisDirectory = directory, range, from, to, preview, signal, onProgress } = options, settings = normalizeSettings(options.settings);
   if (!(to > from) || from < range.from - 1e-6 || to > range.to + 1e-6) throw new Error('Stabilize render range must lie inside the analysed range.');
-  const analysis = await stabilizeAnalysis({ input, directory: analysisDirectory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(value * .3) });
+  const analysis = await stabilizeAnalysis({ input: analysisInput, directory: analysisDirectory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(value * .3) });
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const key = await stabilizeIdentity(analysis.key, settings, from, to, preview), output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`), sidecar = join(directory, `${key}.json`);
+  const key = await stabilizeIdentity(analysis.key, settings, from, to, preview, input), output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`), sidecar = join(directory, `${key}.json`);
   const zoomOf = async () => { try { const value = Number(JSON.parse(await readFile(sidecar, 'utf8')).zoom); return Number.isFinite(value) ? value : undefined; } catch { return undefined; } };
   if (existsSync(output)) { onProgress?.(100); return { key, output, zoom: await zoomOf() }; }
   const { temporary, output: log } = await runStage({ stage: 'render', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, path: analysis.output, from, to, preview, settings, output: join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`) }, directory, '.stabilize-render-', signal, value => onProgress?.(30 + value * .7));

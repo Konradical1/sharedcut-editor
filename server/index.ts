@@ -1045,11 +1045,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const input = quality==='Original'||quality==='Color'&&!existsSync(proxy)?originalPath(asset!.id):existsSync(proxy) ? proxy : join(mediaDir(asset!.id),'prepared','proxy.mp4');
           if (!existsSync(input)) fail(409,'The source preview is still being prepared.');
           const generation=JSON.stringify([settings,range,quality]);
-          const key = await stabilizeIdentity(await stabilizeAnalysisIdentity(input,range.from,range.to),settings,window.from,window.to,true);
+          const original = originalPath(asset!.id);
+          if (!existsSync(original)) fail(409,'Original media is missing.');
+          const key = await stabilizeIdentity(await stabilizeAnalysisIdentity(original,range.from,range.to),settings,window.from,window.to,true,input);
           const file = join(stabilizeDirectory,`${key}.mp4`), result = { from: window.from, duration: window.to-window.from, fps: sourceFps };
           let job = stabilizeJobs.get(key);
           if (existsSync(file)) {
-            const zoom = job?.zoom ?? await renderStabilized({input,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true}).then(r=>r.zoom).catch(()=>undefined);
+            const zoom = job?.zoom ?? await renderStabilized({input,analysisInput:original,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true}).then(r=>r.zoom).catch(()=>undefined);
             if (!job) stabilizeJobs.set(key,{status:'ready',key,progress:100,zoom,...result,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()});
             send(res,200,{status:'ready',key,url:`/api/stabilize/${key}/video?projectId=${project.id}`,progress:100,zoom,...result}); return;
           }
@@ -1061,7 +1063,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             stabilizeQueue = stabilizeQueue.then(async () => {
               if (closed || current.controller.signal.aborted) return;
               try {
-                const rendered = await renderStabilized({input,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
+                const rendered = await renderStabilized({input,analysisInput:original,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
                 current.zoom=rendered.zoom; current.status='ready'; current.url=`/api/stabilize/${key}/video?projectId=${project.id}`;
                 await trimStabilizeCache(stabilizeDirectory,new Set([key]));
               } catch(error) { current.status='failed';current.error=(error as Error).message; }

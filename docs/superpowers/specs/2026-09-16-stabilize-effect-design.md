@@ -162,3 +162,24 @@ and pre-warm the next chunk. Status text: `Stabilize · Preparing n%`, `Stabiliz
 Rolling-shutter correction, per-frame mesh warps (MeshFlow), gyro data, GPU analysis, keyframing
 the stabilize parameters (they are registry parameters and will show as keyframable; the renderer
 uses the value at the clip start and this is noted in the Inspector).
+
+## Revision 2026-09-16 (evening): crop-budget L1 path
+
+Testing on the Girls Soccer clip 4B4A7032 (4K 59.94, pans up to 480 % of the frame width per second) showed
+the Gaussian smoother lagging the pan by up to 59 % of the frame and zooming 2.07×. Replaced:
+
+- **Path**: Grundmann et al. L1-optimal camera path (CVPR 2011), one linear program per axis (x, y, angle) solved with
+  SciPy HiGHS. The user sets **Crop** (budget per side, default 5 % → 1.11× zoom); the path follows pans with
+  constant, linear and parabolic segments and never leaves the budget. Zoom is `1/(1-2·crop)`, creeping up at most 6 %
+  where rotation and translation combine past it. **Smoothness** scales the second/third-derivative weights.
+  **Lock** keeps the first frame with auto zoom (tripod). Scale drift is never corrected.
+- **Parameters** are now `amount` (Strength), `crop`, `smoothness`, `lock`. `cropMode`, `zoom`, `tripod`, `maxShift`
+  and `maxAngle` are gone.
+- **Analysis always runs on the camera original**, cached once per source range. The half-resolution proxy lost tracking
+  on 8 % of frames and invented a 42°/s rotation; the original lost none. Previews render from the proxy of the
+  requested quality with the matrices rescaled; the render cache key includes the render input.
+- **Tracking**: per-frame fits with more than 1.5° rotation or 4 % scale are rejected as foreground/whip-pan artefacts and,
+  like lost frames, interpolated from their neighbours instead of being treated as no motion.
+- Measured on the clip: perceived shake (rms frame-to-frame acceleration) down 62 % at 5 % crop, 72 % at 8 %.
+  Analysis 12.5 s for 25 s of 4K; export 62 s; L1 solve 1.5 s.
+- Still open (phase two): rolling-shutter shear correction on whip pans, content-preserving mesh warp for parallax.

@@ -17,14 +17,14 @@ import { effectDefinitions, effectValue, effectEnabled, acceptsEffect } from '..
 import { IconButton, EmptyState, NumberInput, durationLabel, fpsLabel } from './ui';
 import { api } from '../services/api';
 import type { FlowPreview } from '../services/opticalFlow';
-import { stabilizeCropModes, type StabilizePreview } from '../services/stabilize';
+import type { StabilizePreview } from '../services/stabilize';
 
-function StabilizeStatus({clipId,cropMode,tripod}:{clipId:string;cropMode:number;tripod:number}) {
+function StabilizeStatus({clipId,lock}:{clipId:string;lock:number}) {
   const [capability,setCapability]=useState<{available:boolean;reason?:string}>();
   const [status,setStatus]=useState<StabilizePreview>();
   useEffect(()=>{let active=true;void api<{available:boolean;reason?:string}>('/stabilize/capabilities').then(value=>{if(active)setCapability(value);}).catch(error=>{if(active)setCapability({available:false,reason:error.message});});return()=>{active=false;};},[]);
   useEffect(()=>{setStatus(undefined);const changed=(event:Event)=>{const detail=(event as CustomEvent).detail;if(detail.clipId===clipId)setStatus(previous=>JSON.stringify(previous)===JSON.stringify(detail)?previous:detail);};window.addEventListener('frameline:stabilize',changed);return()=>window.removeEventListener('frameline:stabilize',changed);},[clipId]);
-  return <p className="inspector-note" role="status">{capability?.available===false?capability.reason:!capability?'Checking stabilizer…':status?.status==='ready'?'Ready · stabilized preview':status?.status==='failed'?status.error:`Preparing stabilization${status?.progress?` · ${status.progress}%`:''}. Playback updates as sections finish.`}<br/>Crop: {stabilizeCropModes[Math.round(cropMode)]??'Auto zoom'}{status?.zoom?` · picture zoomed ${((status.zoom-1)*100).toFixed(1)}%`:''}{tripod>=.5?' · Tripod locked to the first frame':''}. Auto crop fits the largest movement; Crop adjust adds or removes margin on top. Values are read at the clip start; keyframes do not animate them.</p>;
+  return <p className="inspector-note" role="status">{capability?.available===false?capability.reason:!capability?'Checking stabilizer…':status?.status==='ready'?'Ready · stabilized preview':status?.status==='failed'?status.error:`Preparing stabilization${status?.progress?` · ${status.progress}%`:''}. Playback updates as sections finish.`}<br/>{status?.zoom?`Picture zoomed ${((status.zoom-1)*100).toFixed(1)}%. `:''}{lock>=.5?'Locked to the first frame; the zoom grows with the drift. ':'Crop is the budget per side; pans are followed, shake inside the budget is removed. '}Analysis runs once on the original and is cached. Values are read at the clip start; keyframes do not animate them.</p>;
 }
 
 function OpticalFlowControl({clipId,enabled}:{clipId:string;enabled:boolean}) {
@@ -172,7 +172,7 @@ export default function Inspector() {
             <IconButton label={`Delete ${effect.name}`} onClick={()=>s().updateEffect(selected.id,effect.id,null)}><Trash2 size={12}/></IconButton>
           </div><p className="inspector-note">{effectDefinitions[effect.name]?.description}</p>
           {effect.name==='Smart Mask'&&<SmartMaskInspector clip={selected} maskId={effect.maskId} targetId={effect.id}/>}
-          {effect.name==='Stabilize'&&<StabilizeStatus clipId={selected.id} cropMode={effect.parameters?.cropMode??0} tripod={effect.parameters?.tripod??0}/>}
+          {effect.name==='Stabilize'&&<StabilizeStatus clipId={selected.id} lock={effect.parameters?.lock??0}/>}
           {(effectDefinitions[effect.name]?.parameters??[]).map(p=><Property key={p.key} effectId={effect.id} name={p.key} label={p.label} initial={p.initial} min={p.min} max={p.max} step={p.step} suffix={p.suffix}/>)}
           {effect.name==='Noise Reduction'&&<p className="inspector-note">Temporal picture smoothing is applied during export. Audio preview uses a noise gate.</p>}
         </details>)}<label className="form-field effect-add"><span>Add an effect</span><select data-cursor-anchor="add-effect" aria-label="Add clip effect" defaultValue="" onChange={e=>{if(e.target.value)s().addEffect(selected.id,e.target.value);e.target.value='';}}><option value="">Choose effect…</option>{Object.keys(effectDefinitions).filter(name=>acceptsEffect(selected,asset?.kind,name)).map(name=><option key={name}>{name}</option>)}</select></label></>}

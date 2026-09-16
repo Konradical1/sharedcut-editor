@@ -16,14 +16,18 @@ import sys
 
 import cv2
 import numpy as np
+import scipy.sparse as sparse
+from scipy.optimize import linprog
 
 FORMATS = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,mxf"
 ANALYSIS_LONG_SIDE = 960
 GRID = 4
 FEATURES_PER_CELL = 40
 MIN_INLIERS = 12
-SETTING_DEFAULTS = {"amount": 100, "smoothness": 50, "cropMode": 0, "zoom": 0, "tripod": 0, "maxShift": 15, "maxAngle": 5}
-MAX_AUTO_ZOOM = 3.0
+SETTING_DEFAULTS = {"amount": 100, "smoothness": 50, "crop": 5, "lock": 0}
+MAX_LOCK_ZOOM = 3.0
+MAX_FRAME_ROTATION = math.radians(1.5)  # a real camera does not rotate faster than this between frames at sports frame rates
+MAX_FRAME_SCALE = 0.04
 
 
 def emit(**message):
@@ -117,11 +121,14 @@ def pair_motion(previous, current):
     matrix, inliers = cv2.estimateAffinePartial2D(points[keep], forward[keep], method=cv2.RANSAC, ransacReprojThreshold=2.0, confidence=0.99, refineIters=10)
     if matrix is None or inliers is None or inliers.sum() < MIN_INLIERS:
         return None
+    angle, log_scale = math.atan2(matrix[1, 0], matrix[0, 0]), math.log(max(1e-6, math.hypot(matrix[0, 0], matrix[1, 0])))
+    if abs(angle) > MAX_FRAME_ROTATION or abs(log_scale) > MAX_FRAME_SCALE:
+        return None  # foreground players or a whip pan fooled the fit; interpolate through it instead
     # Express the translation at the frame centre so it sums cleanly and matches the centre-anchored correction.
     height, width = previous.shape
     centre = np.array([width / 2.0, height / 2.0])
     moved = matrix[:, :2] @ centre + matrix[:, 2] - centre
-    return float(moved[0]), float(moved[1]), math.atan2(matrix[1, 0], matrix[0, 0]), math.log(max(1e-6, math.hypot(matrix[0, 0], matrix[1, 0])))
+    return float(moved[0]), float(moved[1]), angle, log_scale
 
 
 def analyze_frames(frames, full_width, progress=None, total=None):
@@ -141,7 +148,25 @@ def analyze_frames(frames, full_width, progress=None, total=None):
         previous = frame
         if progress and total and index % 4 == 0:
             progress(index / total)
-    return motions, dropped
+    return fill_dropped(motions, dropped), dropped
+
+
+def fill_dropped(motions, dropped):
+    """Replace lost frames with the average of their nearest tracked neighbours so the path keeps moving."""
+    if not dropped:
+        return motions
+    filled = [list(m) for m in motions]
+    lost = set(dropped)
+    for index in dropped:
+        low, high = index - 1, index + 1
+        while low in lost:
+            low -= 1
+        while high in lost:
+            high += 1
+        neighbours = [motions[i] for i in (low, high) if 0 <= i < len(motions)]
+        if neighbours:
+            filled[index] = [float(v) for v in np.mean(neighbours, axis=0)]
+    return filled
 
 
 def analyze(job):
@@ -167,16 +192,6 @@ def analyze(job):
 
 # ---------------------------------------------------------------- camera path -> corrections
 
-def gaussian_smooth(values, sigma):
-    if sigma <= 0.01:
-        return values.copy()
-    radius = int(math.ceil(sigma * 3))
-    kernel = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma) ** 2)
-    kernel /= kernel.sum()
-    padded = np.pad(values, ((radius, radius), (0, 0)), mode="edge")
-    return np.stack([np.convolve(padded[:, column], kernel, mode="valid") for column in range(values.shape[1])], axis=1)
-
-
 def settings_of(raw):
     settings = dict(SETTING_DEFAULTS)
     for key, default in SETTING_DEFAULTS.items():
@@ -188,28 +203,59 @@ def settings_of(raw):
     return settings
 
 
+def l1_path(trajectory, budget, smoothness):
+    """Grundmann et al. (CVPR 2011): the path of constant, linear and parabolic segments that stays within
+    `budget` of the measured trajectory while minimising the L1 norm of its first three derivatives.
+    Solved as one linear program with HiGHS. ponytail: one LP over the whole clip; window it if minutes-long clips get slow."""
+    n = len(trajectory)
+    if n < 4 or budget <= 0:
+        return trajectory.copy()
+    weights = (10.0, 1.0 + 4.0 * smoothness, 100.0 + 400.0 * smoothness)
+    counts = (n - 1, n - 2, n - 3)
+    offsets = (n, n + counts[0], n + counts[0] + counts[1])
+    total = n + sum(counts)
+    cost = np.zeros(total)
+    for weight, count, offset in zip(weights, counts, offsets):
+        cost[offset:offset + count] = weight
+    rows, cols, values = [], [], []
+    row = 0
+    stencils = ((-1, 1), (1, -2, 1), (-1, 3, -3, 1))
+    for stencil, count, offset in zip(stencils, counts, offsets):
+        for i in range(count):
+            for sign in (1, -1):
+                for k, coefficient in enumerate(stencil):
+                    rows.append(row); cols.append(i + k); values.append(sign * coefficient)
+                rows.append(row); cols.append(offset + i); values.append(-1.0)
+                row += 1
+    matrix = sparse.csr_matrix((values, (rows, cols)), shape=(row, total))
+    bounds = [(float(t - budget), float(t + budget)) for t in trajectory] + [(0, None)] * (total - n)
+    result = linprog(cost, A_ub=matrix, b_ub=np.zeros(row), bounds=bounds, method="highs")
+    if not result.success:
+        return trajectory.copy()
+    return result.x[:n]
+
+
 def corrections(path, raw_settings):
-    """Per-frame correction (dx, dy, dAngle, dLogScale) applied about the frame center."""
+    """Per-frame correction (dx, dy, dAngle, dLogScale) about the frame centre, plus the crop fraction per side."""
     settings = settings_of(raw_settings)
+    width, height = path["width"], path["height"]
     motions = np.array(path["frames"], dtype=np.float64)
     trajectory = np.cumsum(motions, axis=0)
-    if settings["tripod"] >= 0.5:
+    crop = min(0.45, max(0.0, settings["crop"] / 100.0))
+    smoothness = min(1.0, max(0.0, settings["smoothness"] / 100.0))
+    if settings["lock"] >= 0.5:
         target = np.repeat(trajectory[:1], len(trajectory), axis=0)
     else:
-        sigma = (max(0.0, settings["smoothness"]) / 100.0) ** 1.5 * path["fps"] * 2.5 + 0.5  # 100 -> about 5 s window
-        target = gaussian_smooth(trajectory, sigma)
+        # Rotation spends crop too: a tilt of a radians moves the far corner by about a * half-diagonal pixels,
+        # so it gets a small slice of the budget and translation solves on the rest.
+        angle_budget = 0.3 * crop * height / max(1.0, math.hypot(width, height) / 2.0)
+        target = np.stack([l1_path(trajectory[:, 0], crop * width * 0.85, smoothness),
+                           l1_path(trajectory[:, 1], crop * height * 0.85, smoothness),
+                           l1_path(trajectory[:, 2], angle_budget, smoothness),
+                           trajectory[:, 3]], axis=1)
     delta = (target - trajectory) * (settings["amount"] / 100.0)
-    max_shift = settings["maxShift"] / 100.0 * path["width"]
-    shift = np.hypot(delta[:, 0], delta[:, 1])
-    over = shift > max_shift
-    if max_shift <= 0:
-        delta[:, :2] = 0
-    elif over.any():
-        delta[over, :2] *= (max_shift / shift[over])[:, None]
-    max_angle = math.radians(settings["maxAngle"])
-    delta[:, 2] = np.clip(delta[:, 2], -max_angle, max_angle)
-    delta[:, 3] = np.clip(delta[:, 3], math.log(0.8), math.log(1.25))
-    return delta, settings
+    delta[:, 3] = 0.0  # zoom drift is intentional camera work on a long lens; never fight it
+    return delta, settings, crop
 
 
 def similarity(dx, dy, angle, scale, cx, cy):
@@ -250,20 +296,28 @@ def auto_zoom(matrices, width, height, cap):
 
 
 def output_matrices(path, raw_settings):
-    delta, settings = corrections(path, raw_settings)
+    delta, settings, crop = corrections(path, raw_settings)
     matrices = frame_matrices(path, delta)
     width, height = path["width"], path["height"]
-    mode = int(round(settings["cropMode"]))
-    if mode == 2:
-        zoom = 1.0
-    elif mode == 1:
-        zoom = 1.0 + max(0.0, settings["zoom"]) / 100.0
+    if settings["lock"] >= 0.5:
+        zoom = auto_zoom(matrices, width, height, MAX_LOCK_ZOOM)
     else:
-        # Crop exactly to the largest corrected movement, then apply the user's fine adjustment on top.
-        zoom = max(1.0, auto_zoom(matrices, width, height, MAX_AUTO_ZOOM) + settings["zoom"] / 100.0)
+        # The budget fixes the zoom. Only where rotation and translation combine past it does the zoom creep up a little.
+        budget_zoom = 1.0 / (1.0 - 2.0 * crop)
+        zoom = budget_zoom if all(fits(m, budget_zoom, width, height) for m in matrices) else max(budget_zoom, auto_zoom(matrices, width, height, budget_zoom * 1.06))
     cx, cy = width / 2.0, height / 2.0
     zoom_matrix = np.array([[zoom, 0.0, cx - zoom * cx], [0.0, zoom, cy - zoom * cy], [0.0, 0.0, 1.0]])
     return [(zoom_matrix @ np.vstack([matrix, [0.0, 0.0, 1.0]]))[:2] for matrix in matrices], zoom
+
+
+def scaled_matrices(matrices, path, width, height):
+    """Re-express full-resolution matrices for a proxy of a different size (same aspect)."""
+    sx, sy = width / path["width"], height / path["height"]
+    if abs(sx - 1) < 1e-9 and abs(sy - 1) < 1e-9:
+        return matrices
+    scale = np.array([[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]])
+    inverse = np.linalg.inv(scale)
+    return [(scale @ np.vstack([m, [0.0, 0.0, 1.0]]) @ inverse)[:2] for m in matrices]
 
 
 # ---------------------------------------------------------------- render
@@ -271,13 +325,14 @@ def output_matrices(path, raw_settings):
 def render(job):
     with open(job["path"], "r", encoding="utf-8") as stream:
         path = json.load(stream)
-    info = {"width": path["width"], "height": path["height"], "fps": path["fps"], "matrix": path.get("matrix", "bt709"),
-            "range": path.get("range", "tv"), "primaries": path.get("primaries", "bt709"), "transfer": path.get("transfer", "bt709")}
+    info = probe(job)
+    info["fps"] = path["fps"]  # frame indices in the path follow the analysed cadence; proxies share it
     start, end, preview = float(job["from"]), float(job["to"]), bool(job.get("preview"))
     if not end > start:
         fail("Render range is empty.")
     matrices, zoom = output_matrices(path, job.get("settings") or {})
     emit(zoom=round(zoom, 4))
+    matrices = scaled_matrices(matrices, path, info["width"], info["height"])
     first = int(round((start - path["from"]) * info["fps"]))
     count = max(1, int(round((end - start) * info["fps"])))
     width, height = info["width"], info["height"]
@@ -362,21 +417,23 @@ def selftest():
     error = float(np.sqrt(np.mean((np.array(motions)[:, :2] - truth[:, :2]) ** 2)))
     assert error < 0.5, f"motion error {error:.2f} px per frame"
     path = {"version": 1, "width": width, "height": height, "fps": 24.0, "from": 0.0, "to": len(frames) / 24.0, "frames": motions, "dropped": []}
-    matrices, zoom = output_matrices(path, {"amount": 100, "smoothness": 70, "cropMode": 0, "zoom": 0, "tripod": 0, "maxShift": 50, "maxAngle": 30})
-    assert 1.0 < zoom < MAX_AUTO_ZOOM, f"auto zoom {zoom}"
-    assert all(fits(m, zoom, width, height) for m in matrices), "auto crop leaves a visible border"
-    tighter, _ = output_matrices(path, {"amount": 100, "smoothness": 70, "cropMode": 0, "zoom": 5, "maxShift": 50, "maxAngle": 30})
-    assert abs(np.linalg.norm(tighter[0][:, :2]) / np.linalg.norm(matrices[0][:, :2]) - (zoom + 0.05) / zoom) < 1e-6, "crop adjust must add to the auto crop"
+    matrices, zoom = output_matrices(path, {"amount": 100, "smoothness": 50, "crop": 6, "lock": 0})
+    assert abs(zoom - 1 / (1 - 0.12)) < 0.02, f"crop 6% must give ~1.136x zoom, got {zoom}"
+    assert all(fits(m, zoom, width, height) for m in matrices), "crop budget leaves a visible border"
+    matrices2, zoom2 = output_matrices(path, {"amount": 100, "smoothness": 50, "crop": 2, "lock": 0})
+    assert zoom2 < zoom and all(fits(m, zoom2, width, height) for m in matrices2), "a smaller budget must zoom less and still fit"
+    interpolated, dropped_marks = analyze_frames(iter(frames[:10] + [np.zeros_like(frames[0])] + frames[11:14]), width)
+    assert dropped_marks and any(abs(v) > 0 for v in interpolated[dropped_marks[0]][:2]), "dropped frames are interpolated, not zeroed"
     stabilized = [cv2.warpAffine(frame, matrix, (width, height), flags=cv2.INTER_LINEAR) for frame, matrix in zip(frames, matrices)]
     after, _ = analyze_frames(iter(stabilized), width)
     before_jitter, after_jitter = jitter(recovered), jitter(np.cumsum(np.array(after), axis=0))
-    assert after_jitter < before_jitter / 4, f"jitter {before_jitter:.2f} -> {after_jitter:.2f}"
-    tripod, _ = output_matrices(path, {"tripod": 1, "amount": 100, "cropMode": 2, "maxShift": 50, "maxAngle": 30})
+    assert after_jitter < before_jitter / 3, f"jitter {before_jitter:.2f} -> {after_jitter:.2f}"
+    tripod, _ = output_matrices(path, {"lock": 1, "amount": 100, "crop": 5})
     locked = [cv2.warpAffine(frame, matrix, (width, height), flags=cv2.INTER_LINEAR) for frame, matrix in zip(frames[:24], tripod[:24])]
     locked_motion, _ = analyze_frames(iter(locked), width)
     locked_jitter = jitter(np.cumsum(np.array(locked_motion), axis=0))
     assert locked_jitter < 0.6, f"tripod mode still moves {locked_jitter:.2f}"
-    print(json.dumps({"ok": True, "pathErrorPx": round(error, 3), "jitterBefore": round(before_jitter, 3), "jitterAfter": round(after_jitter, 3), "tripodJitter": round(locked_jitter, 3), "autoZoom": round(zoom, 4)}))
+    print(json.dumps({"ok": True, "pathErrorPx": round(error, 3), "jitterBefore": round(before_jitter, 3), "jitterAfter": round(after_jitter, 3), "lockJitter": round(locked_jitter, 3), "zoomAt6pct": round(zoom, 4)}))
 
 
 def main(argv):

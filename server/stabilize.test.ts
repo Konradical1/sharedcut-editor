@@ -17,9 +17,10 @@ test('stabilize identities follow input, range and settings', async () => {
   assert.notEqual(a, await stabilizeAnalysisIdentity(input, 0, 4));
   const render = await stabilizeIdentity(a, settings, 0, 4, true);
   assert.equal(render, await stabilizeIdentity(a, { ...settings, smoothness: 50.0000001 }, 0, 4, true));
+  assert.notEqual(render, await stabilizeIdentity(a, settings, 0, 4, true, input), 'a proxy render input changes the key');
   assert.notEqual(render, await stabilizeIdentity(a, { ...settings, smoothness: 80 }, 0, 4, true));
   assert.notEqual(render, await stabilizeIdentity(a, settings, 0, 4, false));
-  assert.deepEqual(normalizeSettings({ smoothness: Number.NaN, zoom: 12 } as never), { ...settings, zoom: 12 });
+  assert.deepEqual(normalizeSettings({ smoothness: Number.NaN, crop: 3.2 } as never), { ...settings, crop: 3.2 });
   await rm(directory, { recursive: true, force: true });
 });
 
@@ -35,7 +36,7 @@ test('cached results skip the worker and the interpreter honours the env overrid
     const progress: number[] = [];
     assert.deepEqual(await stabilizeAnalysis({ input, directory, from: 0, to: 2, onProgress: p => progress.push(p) }), { key, output: join(directory, `${key}.path.json`) });
     assert.deepEqual(progress, [100]);
-    const renderKey = await stabilizeIdentity(key, settings, 0, 2, true);
+    const renderKey = await stabilizeIdentity(key, settings, 0, 2, true, input);
     await writeFile(join(directory, `${renderKey}.mp4`), 'mp4');
     const rendered = await renderStabilized({ input, directory, range: { from: 0, to: 2 }, from: 0, to: 2, settings, preview: true });
     assert.equal(rendered.output, join(directory, `${renderKey}.mp4`));
