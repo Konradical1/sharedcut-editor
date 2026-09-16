@@ -18,31 +18,33 @@ test('link validation only accepts canonical single-video and single-track desti
   assert.throws(() => parseImportLink('https://youtu.be/jNQXAC9IVRw', 'video', 999));
 });
 
-// The importer under test is cross-platform; this test's stand-in for it is not. It fakes the
-// interpreter with a `#!` script, and Windows has no shebang, so `spawn` cannot start it. Replacing
-// it needs a shim Windows can execute directly — a `.cmd` would need `shell: true` in linkImport.ts,
-// which is not worth opening up to a user-supplied URL.
-test('project link imports prepare real media, retain sources, retry failures, cancel and enforce access', { skip: process.platform === 'win32', timeout: 60_000 }, async () => {
+test('project link imports prepare real media, retain sources, retry failures, cancel and enforce access', { timeout: 60_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sharedcut-links-'));
-  const interpreter = join(directory, 'importer'), control = join(directory, 'control'), fixture = join(directory, 'source.mp4');
+  const interpreter = join(directory, 'importer.cjs'), control = join(directory, 'control'), fixture = join(directory, 'source.mp4');
   await promisify(execFile)(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=160x90:r=24:d=1', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', fixture]);
   await promisify(execFile)(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-y', '-i', fixture, '-vn', '-c:a', 'copy', join(directory, 'source.m4a')]);
   await writeFile(control, 'success');
-  await writeFile(interpreter, `#!${process.execPath}
-const fs = require('node:fs'), path = require('node:path');
+  // Stand in for the Python importer without a `#!` line, which Windows cannot spawn. Node is the
+  // interpreter and this module is preloaded through NODE_OPTIONS, so it runs and exits before node
+  // ever tries to read the .py path it was handed. The importer's own arguments are counted from
+  // the end of argv, which is the same under a preload as it was under a shebang.
+  await writeFile(interpreter, `const fs = require('node:fs'), path = require('node:path');
+const [, , mode, , temporary] = process.argv.slice(-7);
 const control = fs.readFileSync(${JSON.stringify(control)}, 'utf8');
 if (control === 'fail') { console.log(JSON.stringify({type:'error',message:'Source temporarily unavailable'})); process.exit(1); }
-if (control === 'wait') setInterval(()=>{},1000);
+if (control === 'wait') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 else {
- const extension = process.argv[4] === 'audio' ? 'm4a' : 'mp4';
- fs.copyFileSync(path.join(${JSON.stringify(directory)}, 'source.'+extension), path.join(process.argv[6], 'media.'+extension));
+ const extension = mode === 'audio' ? 'm4a' : 'mp4';
+ fs.copyFileSync(path.join(${JSON.stringify(directory)}, 'source.'+extension), path.join(temporary, 'media.'+extension));
  console.log(JSON.stringify({type:'source',title:'Imported sample',url:'https://www.youtube.com/watch?v=jNQXAC9IVRw',matchedTitle:'Actual recording'}));
  console.log(JSON.stringify({type:'progress',percent:50}));
  console.log(JSON.stringify({type:'complete',filename:'media.'+extension,title:'Imported sample'}));
+ process.exit(0);
 }
-`, { mode: 0o700 });
-  const previous = process.env.FRAME_LINE_IMPORT_PYTHON;
-  process.env.FRAME_LINE_IMPORT_PYTHON = interpreter;
+`);
+  const previous = process.env.FRAME_LINE_IMPORT_PYTHON, previousOptions = process.env.NODE_OPTIONS;
+  process.env.FRAME_LINE_IMPORT_PYTHON = process.execPath;
+  process.env.NODE_OPTIONS = `${previousOptions ? previousOptions + ' ' : ''}--require ${JSON.stringify(interpreter)}`;
   const app = createFrameLineServer({ dataDir: join(directory, 'data') });
   await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
@@ -97,6 +99,7 @@ else {
   } finally {
     await app.close();
     if (previous === undefined) delete process.env.FRAME_LINE_IMPORT_PYTHON; else process.env.FRAME_LINE_IMPORT_PYTHON = previous;
+    if (previousOptions === undefined) delete process.env.NODE_OPTIONS; else process.env.NODE_OPTIONS = previousOptions;
     await rm(directory, { recursive: true, force: true });
   }
 });

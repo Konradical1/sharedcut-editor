@@ -1,3 +1,7 @@
+# torch on PyPI is the CPU build on Windows and Linux. The cu130 index carries the matching
+# +cu130 wheels for these exact pins, and a local version sorts above the plain one, so pip
+# prefers CUDA wherever it exists and falls back to PyPI on macOS, which has no cu130 wheels.
+--extra-index-url https://download.pytorch.org/whl/cu130
 torch==2.14.0
 torchvision==0.29.0
 numpy==2.5.3

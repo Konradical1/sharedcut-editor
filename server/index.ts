@@ -255,6 +255,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   };
   const lockChanged = () => { lockRevision++; broadcast(); };
   const persist = () => { const nextRevision = revision + 1; db.prepare('INSERT INTO workspace(id,revision,state) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,state=excluded.state').run(nextRevision, JSON.stringify(state)); revision = nextRevision; broadcast(); };
+  // A fresh install has no workspace row until something is edited, so `project-bundle.mjs import`
+  // found nothing to merge into and told you to start the server first — which by itself never
+  // created one. Writing the empty state once at boot makes that instruction true, and it is the
+  // first step of moving a project onto a new machine.
+  if (!saved) persist();
   const sounds = soundLibrary(dataDir); sounds.recover();
   const library = projectLibrary(db, () => state.projects, () => accounts().map(a => a.user), () => revision, persist);
   const roleFor = library.projectRole;
