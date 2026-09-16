@@ -75,6 +75,10 @@ Passwords are salted and hashed with scrypt. Sessions use an HttpOnly, SameSite=
 - Add review comments and replies, use personal undo, and save or restore snapshots. Restore first preserves the current edit. Referenced media cannot be deleted while a timeline, snapshot, or pending export needs it.
 - Render selected timeline ranges from the originals with H.264, H.265/HEVC, or ProRes presets and download the resulting MP4 or MOV. Jobs keep running when the browser closes, provided the server stays running.
 
+## Stabilize
+
+Run `npm run setup:stabilize` once on the server (any Python 3.10+; it creates `.venv-stabilize` with OpenCV and NumPy, no GPU needed). Drag **Stabilize** from the Effects tab onto a video clip. The server tracks the camera path once per clip and caches it; Smoothness, Strength, Crop mode, Zoom, Tripod and the shift/rotation clamps re-render only the cheap warp stage. Preview arrives in four-second sections; export bakes the stabilized picture to ProRes and composites it like any other clip, so speed, reverse and freeze keep working. `FRAME_LINE_STABILIZE_PYTHON` overrides the interpreter. Stabilize cannot share a clip with Smart Mask or optical flow. `npm run test:stabilize` covers the identity/cache logic; `.venv-stabilize/bin/python scripts/stabilize.py --selftest` checks the tracker on synthetic shake.
+
 ## Current limits
 
 Preview processing is SDR, uses browser decoders and 8-bit canvas samples, and is capped at **1920 pixels wide**. Final exports use originals at the selected resolution. Browser and FFmpeg effects are separate implementations, so preview is not a calibrated, pixel-identical mastering monitor. Reverse video can be previewed, but reversed audio is heard in the export; extreme playback speeds may also mute browser audio. Preview noise reduction uses a gate; exports use spectral denoising.

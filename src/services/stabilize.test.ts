@@ -30,7 +30,7 @@ test('the analysed range follows the source frames the clip reads', () => {
   const plain = stabilizeRange(clip(), 24, 100);
   assert.equal(plain.from, 1); assert.ok(Math.abs(plain.to - 3) < 1e-6);
   const fast = stabilizeRange(clip({ properties: { speed: 200 } }), 24, 100);
-  assert.ok(fast.to - fast.from >= 4 && fast.to - fast.from < 4 + 1);
+  assert.ok(Math.abs(fast.to - fast.from - 4) < .1, `speed 200 reads ${fast.to - fast.from}s`);
   const reversed = stabilizeRange(clip({ properties: { reverse: true } }), 24, 100);
   assert.equal(reversed.from, 1); assert.ok(Math.abs(reversed.to - 3) < 1e-6);
   assert.ok(stabilizeRange(clip({ sourceIn: 99.5 }), 24, 100).to <= 100);

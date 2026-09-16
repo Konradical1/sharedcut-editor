@@ -10,6 +10,8 @@ import type { Clip, GradeNode, MediaAsset, Project, Settings, Timeline, Track } 
 import { gradeValues } from './grade.ts';
 import { createColorPreview, ColorPending } from './colorPreview.ts';
 import { createFlowPreview } from './flowPreview.ts';
+import { createStabilizePreview } from './stabilizePreview.ts';
+import { stabilizeChunk, stabilizeChunkCount, stabilizeEffect, stabilizeRange, stabilizeSettings, type StabilizePreview, type StabilizeRange } from './stabilize.ts';
 import { flowChunkSeconds, type FlowPreview } from './opticalFlow.ts';
 
 export function sourceTime(clip: Clip, playhead: number, fps = 24, duration = Infinity) {
@@ -188,6 +190,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   const flowPreview = createFlowPreview(() => { dirty = true; });
   const maskPreview=createSmartMaskPreview(()=>{dirty=true;}),fittedMasks=new Map<string,SmartMaskPixels>();
   const flowStatuses = new Map<string,string>();
+  const stabilizePreview = createStabilizePreview(() => { dirty = true; });
+  const stabilizeStatuses = new Map<string,string>();
   let loadingSince: number | undefined, stalled = false;
   let renderSlot = -1;
   let frameRevision=0;
@@ -304,6 +308,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     previous = dependencies; dirty = false; renderSlot = slot;
     const [projectWidth, projectHeight] = projectSize(project?.resolution ?? '1920 × 1080');
     flowPreview.retain(new Set(state.clips.filter(c=>c.properties.opticalFlow&&!c.disabled).map(c=>c.id)));
+    stabilizePreview.retain(new Set(state.clips.filter(c=>stabilizeEffect(c)&&!c.disabled).map(c=>c.id)));
     const divisor = options.quality === '1/4' ? 4 : options.quality === '1/2' || options.quality === 'Stream' ? 2 : 1;
     // Browser proxy preview is capped at 1920px; original-media exports retain the chosen resolution.
     const ratio = Math.min(1 / divisor, 1920 / projectWidth);
@@ -453,15 +458,31 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         const detail={clipId:clip.id,...flow,status:flow?.status??'preparing'},signature=`${Math.floor(performance.now()/1000)}:${JSON.stringify(detail)}`;
         if(flowStatuses.get(clip.id)!==signature){flowStatuses.set(clip.id,signature);window.dispatchEvent(new CustomEvent('frameline:optical-flow',{detail}));}
       }
-      const flowDecoder = (record: FlowPreview | undefined) => {
+      const flowDecoder = (record: FlowPreview | StabilizePreview | undefined, kind = 'flow') => {
         if(record?.status!=='ready'||!record.url)return undefined;
-        const id=`${clip.id}:flow:${record.key}`;
+        const id=`${clip.id}:${kind}:${record.key}`;
         const synthetic={...asset,hasAudio:false,colorProxyUrl:record.url,sourceUrl:record.url,proxyUrl:record.url,proxyVariants:{},duration:record.duration,fps:record.fps};
         const decoder=decoderFor({...clip,id},synthetic,true,{...options,original:false});
         if(decoder)activeIds.add(id);
         return decoder;
       };
-      const interpolated = flowDecoder(flow);
+      // Stabilized proxies stay in source time, so speed, reverse and freeze still drive the seek below.
+      const stabilizeFx = visual && asset.kind === 'video' && !original.properties.opticalFlow ? stabilizeEffect(original) : undefined;
+      const sourceFps = asset.fps || project?.fps || 24;
+      let stabilized: StabilizePreview | undefined, stabilizedRange: StabilizeRange | undefined;
+      if (stabilizeFx) {
+        try { stabilizedRange = stabilizeRange(original, sourceFps, asset.duration || Infinity); } catch { stabilizedRange = undefined; }
+        if (stabilizedRange) {
+          const settings = stabilizeSettings(original, stabilizeFx), quality = options.original ? 'Original' : options.quality;
+          const chunk = stabilizeChunk(sourceTime(original, time, sourceFps, asset.duration || Infinity), stabilizedRange);
+          stabilized = stabilizePreview.get(original, chunk, stabilizedRange, settings, sourceFps, quality);
+          if (chunk + 1 < stabilizeChunkCount(stabilizedRange)) { const warm = flowDecoder(stabilizePreview.get(original, chunk + 1, stabilizedRange, settings, sourceFps, quality), 'stabilize'); if (warm) (warm.element as HTMLVideoElement).pause(); }
+        }
+        warning = stabilized?.status === 'ready' ? 'Stabilize · Ready' : stabilized?.status === 'failed' ? `Stabilize unavailable · ${stabilized.error}` : `Stabilize · Preparing ${stabilized?.progress ?? 0}%`;
+        const detail={clipId:clip.id,...stabilized,status:stabilized?.status??'preparing'},signature=`${Math.floor(performance.now()/1000)}:${JSON.stringify(detail)}`;
+        if(stabilizeStatuses.get(clip.id)!==signature){stabilizeStatuses.set(clip.id,signature);window.dispatchEvent(new CustomEvent('frameline:stabilize',{detail}));}
+      }
+      const interpolated = flowDecoder(flow) ?? flowDecoder(stabilized, 'stabilize');
       if(original.properties.opticalFlow&&visual&&time-original.start+flowChunkSeconds<original.duration) {
         const next=flowPreview.get(original,time+flowChunkSeconds,project?.fps||24,options.original?'Original':options.quality);
         const warm=flowDecoder(next); if(warm)(warm.element as HTMLVideoElement).pause();
@@ -516,6 +537,14 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         media.muted=true;media.playbackRate=Math.max(.0625,Math.min(8,Math.abs(rate)));
         if(playing)play(interpolated);else media.pause();
         if(!media.seeking&&Math.abs(drift)>(playing?.12:.5/flow.fps))seeks.push([media,target]);
+        if(media.seeking){loading=true;continue;}
+      } else if(flowReady&&stabilized) {
+        const media=element as HTMLVideoElement,target=Math.max(0,Math.min(stabilized.duration-1/stabilized.fps,sourceTime(original,time,sourceFps,asset.duration||Infinity)-stabilized.from));
+        const speed=Math.abs(rate)*Number(clip.properties.speed??100)/100;
+        const playing=state.playing&&rate>0&&!clip.properties.reverse&&!clip.properties.freeze&&speed>=.0625&&speed<=8;
+        media.muted=true;media.playbackRate=Math.max(.0625,Math.min(8,speed||1));
+        if(playing)play(interpolated);else media.pause();
+        if(!media.seeking&&Math.abs(media.currentTime-target)>(playing?.12:.5/stabilized.fps))seeks.push([media,target]);
         if(media.seeking){loading=true;continue;}
       }
       sourceClip = clip.id;
@@ -655,6 +684,6 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       for (const decoder of decoders.values()) { decoder.blocked = false; decoder.error = undefined; }
       dirty = true;
     },
-    dispose() { disposed = true; maskPreview.dispose();fittedMasks.clear();motion?.dispose(); flowPreview.dispose(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',fontsChanged); color?.dispose(); cancelAnimationFrame(frame); for (const decoder of decoders.values()) cleanup(decoder); decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
+    dispose() { disposed = true; maskPreview.dispose();fittedMasks.clear();motion?.dispose(); flowPreview.dispose(); stabilizePreview.dispose(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',fontsChanged); color?.dispose(); cancelAnimationFrame(frame); for (const decoder of decoders.values()) cleanup(decoder); decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
   };
 }
