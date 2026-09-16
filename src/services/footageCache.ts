@@ -8,10 +8,12 @@ import { useSyncExternalStore } from 'react';
 import { byteRange, moovExtent, parseMp4Index, type Mp4Index } from './mp4Index.ts';
 import type { Clip, MediaAsset, Settings, Track } from '../state/models.ts';
 
-const CHUNK = 1 << 20, HANDLE = 2, CONCURRENCY = 2, UPDATE_MS = 400;
+const CHUNK = 1 << 20, HANDLE = 2, UPDATE_MS = 400;
+// One prefetch at a time while playing, so it never competes with the clip on screen for the link.
+let concurrency = 2;
 // ponytail: fixed 2 GiB ceiling, make it a setting if someone fills a disk.
 const CAP_BYTES = 2 * 1024 ** 3;
-const CACHE = 'footage-v1';
+const CACHE = 'footage-v2';
 
 type Wanted = { url: string; chunks: number[]; order: number };
 type UrlFor = (asset: MediaAsset, visual: boolean) => string | undefined;
@@ -26,7 +28,8 @@ let version = 0, lastUpdate = 0, registered = false, controlled = false, disable
 const notify = () => { version++; for (const listener of listeners) listener(); };
 
 const supported = () => typeof window !== 'undefined' && 'serviceWorker' in navigator && 'caches' in window;
-const keyOf = (request: Request) => { const url = new URL(request.url); return decodeURIComponent(url.pathname + url.search + url.hash); };
+/** Splits a cache key back into the footage URL and its `fc` marker (a chunk index or 'meta'). */
+const keyOf = (request: Request) => { const url = new URL(request.url); const marker = url.searchParams.get('fc'); url.searchParams.delete('fc'); return { url: decodeURIComponent(url.pathname + url.search), marker }; };
 
 async function register() {
   if (registered || !supported()) return;
@@ -43,7 +46,7 @@ async function register() {
     void registration.update().catch(() => {});
     void navigator.storage?.persist?.().catch(() => {});
     const cache = await caches.open(CACHE);
-    for (const request of await cache.keys()) { const match = /^(.*)#c=(\d+)$/.exec(keyOf(request)); if (match) remember(match[1], Number(match[2]), false); }
+    for (const request of await cache.keys()) { const { url, marker } = keyOf(request); if (marker && marker !== 'meta') remember(url, Number(marker), false); }
     notify(); pump();
   } catch { /* No worker: playback streams as before and the bar stays yellow. */ }
 }
@@ -88,12 +91,13 @@ export function sourceSpan(clip: Clip) {
  * Rebuilds the wanted set from the active timeline. Called from the playback tick; cheap enough to
  * throttle rather than diff. `urlFor` is the player's own URL choice so cache and decoder agree.
  */
-export function update(state: { clips: Clip[]; tracks: Track[]; media: MediaAsset[]; timelineId: string; projectId: string; playhead: number; settings: Settings }, options: { original: boolean }, urlFor: UrlFor) {
+export function update(state: { clips: Clip[]; tracks: Track[]; media: MediaAsset[]; timelineId: string; projectId: string; playhead: number; playing?: boolean; settings: Settings }, options: { original: boolean }, urlFor: UrlFor) {
   disabled = state.settings.footageCache === false;
   if (disabled) { if (registered) void disable(); wanted.clear(); return; }
   if (!supported()) return;
   void register();
   const now = performance.now();
+  concurrency = state.playing ? 1 : 2;
   if (now - lastUpdate < UPDATE_MS) return;
   lastUpdate = now;
   const next = new Map<string, Wanted>();
@@ -132,7 +136,7 @@ export function useFootageVersion() {
 
 function pump() {
   if (disabled || !controlled) return;
-  while (active < CONCURRENCY) {
+  while (active < concurrency) {
     let best: { url: string; index: number; order: number } | null = null;
     for (const entry of wanted.values()) {
       const set = stored.get(entry.url);
@@ -160,13 +164,13 @@ async function evict() {
     if (!estimate?.usage || estimate.usage < CAP_BYTES) return;
     const cache = await caches.open(CACHE), keys = await cache.keys();
     const metas: { url: string; used: number }[] = [];
-    for (const request of keys) { const path = keyOf(request); if (path.endsWith('#meta')) { const meta = await (await cache.match(request))?.json().catch(() => null); metas.push({ url: path.slice(0, -5), used: meta?.used ?? 0 }); } }
+    for (const request of keys) { const { url, marker } = keyOf(request); if (marker === 'meta') { const meta = await (await cache.match(request))?.json().catch(() => null); metas.push({ url, used: meta?.used ?? 0 }); } }
     const keep = new Set([...wanted.values()].map(entry => entry.url));
     let excess = estimate.usage - CAP_BYTES * .8;
     for (const { url } of metas.sort((a, b) => a.used - b.used)) {
       if (excess <= 0) break;
       if (keep.has(url)) continue;
-      for (const request of keys) if (keyOf(request).startsWith(`${url}#`)) { await cache.delete(request); excess -= CHUNK; }
+      for (const request of keys) if (keyOf(request).url === url) { await cache.delete(request); excess -= CHUNK; }
       stored.delete(url);
     }
     notify();
@@ -175,7 +179,7 @@ async function evict() {
 
 export async function footageUsage() {
   if (!supported()) return 0;
-  try { const cache = await caches.open(CACHE); return (await cache.keys()).filter(request => /#c=\d+$/.test(request.url)).length * CHUNK; } catch { return 0; }
+  try { const cache = await caches.open(CACHE); return (await cache.keys()).filter(request => /^\d+$/.test(keyOf(request).marker ?? '')).length * CHUNK; } catch { return 0; }
 }
 
 export async function clearFootageCache() {
