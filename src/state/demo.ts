@@ -21,7 +21,7 @@ export const projects: Project[] = [
   { id: 'last-stop', name: 'Last Stop', description: 'A portrait of the city at the end of the line.', shared: true, thumbnail: '/media/train.jpg', modifiedAt: now - 4 * 86_400_000, duration: 180, resolution: '3840 × 2160', fps: 24, status: 'In progress', members: [{ userId: 'kyle', role: 'Owner' }, { userId: 'jacob', role: 'Editor' }] },
 ];
 
-export const defaultProperties: Clip['properties'] = { x: 0, y: 0, zoom: 100, rotation: 0, anchorX: 0, anchorY: 0, cropLeft: 0, cropRight: 0, cropTop: 0, cropBottom: 0, opacity: 100, blendMode: 'Normal', speed: 100, reverse: false, freeze: false, stabilization: false, gain: 0, pan: 0 };
+export const defaultProperties: Clip['properties'] = { x: 0, y: 0, zoom: 100, rotation: 0, anchorX: 0, anchorY: 0, cropLeft: 0, cropRight: 0, cropTop: 0, cropBottom: 0, opacity: 100, blendMode: 'Normal', speed: 100, reverse: false, freeze: false, gain: 0, pan: 0 };
 
 export function createDemoProject(projectId = 'city-after-dark') {
   const isCity = projectId === 'city-after-dark';
