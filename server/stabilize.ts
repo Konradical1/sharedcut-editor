@@ -87,10 +87,11 @@ export async function stabilizeAnalysis(options: { input: string; directory: str
 }
 
 /** Stabilized picture for [from,to) of the source in source time. Preview: x264 mp4. Export: ProRes mov. */
-export async function renderStabilized(options: { input: string; directory: string; range: { from: number; to: number }; from: number; to: number; settings: StabilizeSettings; preview: boolean; signal?: AbortSignal; onProgress?: (value: number) => void }) {
-  const { input, directory, range, from, to, preview, signal, onProgress } = options, settings = normalizeSettings(options.settings);
+export async function renderStabilized(options: { input: string; directory: string; analysisDirectory?: string; range: { from: number; to: number }; from: number; to: number; settings: StabilizeSettings; preview: boolean; signal?: AbortSignal; onProgress?: (value: number) => void }) {
+  const { input, directory, analysisDirectory = directory, range, from, to, preview, signal, onProgress } = options, settings = normalizeSettings(options.settings);
   if (!(to > from) || from < range.from - 1e-6 || to > range.to + 1e-6) throw new Error('Stabilize render range must lie inside the analysed range.');
-  const analysis = await stabilizeAnalysis({ input, directory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(value * .3) });
+  const analysis = await stabilizeAnalysis({ input, directory: analysisDirectory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(value * .3) });
+  await mkdir(directory, { recursive: true, mode: 0o700 });
   const key = await stabilizeIdentity(analysis.key, settings, from, to, preview), output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`);
   if (existsSync(output)) { onProgress?.(100); return { key, output }; }
   const temporary = await runStage({ stage: 'render', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, path: analysis.output, from, to, preview, settings, output: join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`) }, directory, '.stabilize-render-', signal, value => onProgress?.(30 + value * .7));

@@ -12,6 +12,8 @@ import { validateKeyframes } from '../src/services/animation.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
 import { flowChunkSeconds, flowTiming, type FlowPreview } from '../src/services/opticalFlow.ts';
 import { flowWorker, flowIdentity, renderOpticalFlow, trimFlowCache } from './opticalFlow.ts';
+import { normalizeSettings, renderStabilized, stabilizeAnalysisIdentity, stabilizeCapabilities, stabilizeIdentity, trimStabilizeCache } from './stabilize.ts';
+import { stabilizeChunkCount, stabilizeChunkRange, stabilizeEffect, stabilizeRange, stabilizeSettings, type StabilizePreview } from '../src/services/stabilize.ts';
 import { presenceCursor } from '../src/services/presence.ts';
 import { fontLibrary } from './fonts.ts';
 import { transitionLibrary } from './transitions.ts';
@@ -175,6 +177,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const masks = smartMaskService(join(dataDir, 'smart-masks'));
   const flowJobs = new Map<string, FlowPreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
   let flowQueue = Promise.resolve();
+  const stabilizeDirectory = join(dataDir, 'stabilize');
+  const stabilizeJobs = new Map<string, StabilizePreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
+  let stabilizeQueue = Promise.resolve();
   const accounts = () => (db.prepare('SELECT data FROM accounts').all() as { data: string }[]).map(row => JSON.parse(row.data) as Account);
   const accountById = (id: string) => { const row = db.prepare('SELECT data FROM accounts WHERE id=?').get(id) as { data: string } | undefined; return row ? JSON.parse(row.data) as Account : undefined; };
   const saveAccount = (account: Account) => db.prepare('INSERT INTO accounts(id,email,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,data=excluded.data').run(account.user.id, account.user.email, JSON.stringify(account));
@@ -302,7 +307,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
               const eta = progressValue > 0 && progressValue < 100 ? ` · ~${Math.ceil(elapsed * (100 - progressValue) / progressValue)}s remaining` : '';
               updateJob(job.id, { progress: progressValue, remaining: `${progressValue === 0 ? 'Preparing export' : progressValue >= 100 ? 'Finalizing file' : 'Rendering'} · ${elapsed}s elapsed${eta}` }); };
             const heartbeat = setInterval(report, 1000);
-            try { let previous = -1; await renderTimeline({ ...snapshot, smartMaskDir:join(dataDir, 'smart-masks'), resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onProgress: progress => { const next = Math.floor(progress); if (next !== previous) { previous = next; progressValue = Math.max(progressValue, Math.min(100, next)); report(); } } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
+            try { let previous = -1; await renderTimeline({ ...snapshot, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onProgress: progress => { const next = Math.floor(progress); if (next !== previous) { previous = next; progressValue = Math.max(progressValue, Math.min(100, next)); report(); } } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
             catch (error) { rmSync(outputPath, { force: true }); if (!closed) updateJob(job.id, { status: 'failed', remaining: signal.aborted ? 'Cancelled' : 'Export failed', error: signal.aborted ? 'Cancelled by user.' : error instanceof Error ? error.message : 'Export failed.' }); }
             finally { clearInterval(heartbeat); if (!closed) db.prepare('DELETE FROM render_snapshots WHERE id=?').run(job.id); }
     }, true);
@@ -1017,6 +1022,61 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (!job || job.projectId !== projectId) fail(404,'Optical-flow preview not found. Prepare it again.');
           if (method==='DELETE'&&!flowRoute[2]) { job!.controller.abort(); flowJobs.delete(flowRoute[1]); send(res,200,{ok:true});return; }
           if (['GET','HEAD'].includes(method)&&flowRoute[2]) { streamFile(req,res,join(flowDirectory,`${flowRoute[1]}.mp4`),'video/mp4',undefined,true);return; }
+        }
+        if (path === '/api/stabilize/capabilities' && method === 'GET') { send(res,200,await stabilizeCapabilities()); return; }
+        if (path === '/api/stabilize' && method === 'POST') {
+          const body = await jsonBody(req), clip = state.clips.find(c => c.id === textField(body.clipId,160,true)) ?? fail(404,'Clip not found.');
+          const project = requireProject(clip.projectId,userId);
+          const asset = state.media.find(a => a.id === clip.mediaId && a.projectId === project.id);
+          const effect = stabilizeEffect(clip);
+          if (!asset || asset.kind !== 'video' || !effect) fail(400,'Add Stabilize to a video clip first.');
+          const quality = textField(body.quality,20,true);
+          if (!['Full','1/2','1/4','Stream','Original','Color'].includes(quality)) fail(400,'Invalid preview quality.');
+          const settings = stabilizeSettings(clip,effect!);
+          if (!same(normalizeSettings(body.settings),normalizeSettings(settings))) fail(409,'The Stabilize settings are still saving. Retry shortly.');
+          const records = timelineTransitions(state.clips.filter(c=>c.projectId===project.id),clip.timelineId,state.media);
+          const span = clipSpan(clip,records), geometry = extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
+          const sourceFps = asset!.fps || numberField(body.fps,1,120), range = stabilizeRange(geometry,sourceFps,asset!.duration);
+          const chunk = numberField(body.chunk,0,stabilizeChunkCount(range)-1);
+          if (!Number.isInteger(chunk)) fail(400,'Invalid preview chunk.');
+          const window = stabilizeChunkRange(chunk,range);
+          const previewName = quality === 'Color' || quality === 'Full' && asset!.colorProxyUrl ? 'color-v1.mp4' : quality === '1/4' ? 'proxy-quarter-v1.mp4' : quality === '1/2' || quality === 'Stream' ? 'proxy-half-v1.mp4' : 'proxy.mp4';
+          const proxy = join(mediaDir(asset!.id),'prepared',previewName);
+          const input = quality==='Original'||quality==='Color'&&!existsSync(proxy)?originalPath(asset!.id):existsSync(proxy) ? proxy : join(mediaDir(asset!.id),'prepared','proxy.mp4');
+          if (!existsSync(input)) fail(409,'The source preview is still being prepared.');
+          const generation=JSON.stringify([settings,range,quality]);
+          const key = await stabilizeIdentity(await stabilizeAnalysisIdentity(input,range.from,range.to),settings,window.from,window.to,true);
+          const file = join(stabilizeDirectory,`${key}.mp4`), result = { from: window.from, duration: window.to-window.from, fps: sourceFps };
+          let job = stabilizeJobs.get(key);
+          if (existsSync(file)) {
+            if (!job) stabilizeJobs.set(key,{status:'ready',key,progress:100,...result,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()});
+            send(res,200,{status:'ready',key,url:`/api/stabilize/${key}/video?projectId=${project.id}`,progress:100,...result}); return;
+          }
+          if (!job || job.controller.signal.aborted) {
+            for (const old of stabilizeJobs.values()) if (old.clipId === clip.id && old.status === 'preparing' && old.key !== key && old.generation !== generation) old.controller.abort();
+            if ([...stabilizeJobs.values()].filter(j=>j.status==='preparing'&&!j.controller.signal.aborted).length >= 8) fail(429,'Stabilize preview queue is full.');
+            job = {status:'preparing',key,progress:0,...result,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()};
+            stabilizeJobs.set(key,job); const current = job;
+            stabilizeQueue = stabilizeQueue.then(async () => {
+              if (closed || current.controller.signal.aborted) return;
+              try {
+                await renderStabilized({input,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
+                current.status='ready'; current.url=`/api/stabilize/${key}/video?projectId=${project.id}`;
+                await trimStabilizeCache(stabilizeDirectory,new Set([key]));
+              } catch(error) { current.status='failed';current.error=(error as Error).message; }
+            });
+          }
+          const {controller,projectId,clipId,generation:jobGeneration,...view}=job;
+          send(res,200,view); return;
+        }
+        const stabilizeRoute = /^\/api\/stabilize\/([a-f0-9]{64})(?:\/(video))?$/.exec(path);
+        if (stabilizeRoute) {
+          const projectId = textField(url.searchParams.get('projectId'),160,true); requireProject(projectId,userId);
+          const job = stabilizeJobs.get(stabilizeRoute[1]);
+          // The project binding is retained for downloads; never authorize a cache hash on its own.
+          if (!job || job.projectId !== projectId) fail(404,'Stabilize preview not found. Prepare it again.');
+          if (method==='DELETE'&&!stabilizeRoute[2]) { job!.controller.abort(); stabilizeJobs.delete(stabilizeRoute[1]); send(res,200,{ok:true});return; }
+          if (['GET','HEAD'].includes(method)&&stabilizeRoute[2]) { streamFile(req,res,join(stabilizeDirectory,`${stabilizeRoute[1]}.mp4`),'video/mp4',undefined,true);return; }
         }
         if (path === '/api/renders' && method === 'GET') { send(res, 200, { jobs: view(account).state.renderJobs }); return; }
         if (path === '/api/renders' && method === 'POST') {

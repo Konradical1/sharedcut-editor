@@ -20,6 +20,8 @@ import type { Clip, GradeNode, MediaAsset, Project, Timeline, Track } from '../s
 import { colorTransform, cubeText, makeCube, parseCube, hasACES, interpretation, processingStages } from '../src/services/color.ts';
 import { tmpdir, cpus, setPriority } from 'node:os';
 import { renderOpticalFlow } from './opticalFlow.ts';
+import { renderStabilized } from './stabilize.ts';
+import { stabilizeEffect, stabilizeRange, stabilizeSettings } from '../src/services/stabilize.ts';
 import { timingPaths } from '../src/services/opticalFlow.ts';
 
 type ProcessOptions = { signal?: AbortSignal; onProgress?: (percent: number) => void; duration?: number; binary?: boolean; maxBytes?: number; jsonProgress?: boolean };
@@ -302,6 +304,7 @@ function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset
       const alpha=effect.parameters?.invert?'(1-B/65535)':'B/65535';
       filters.push(`format=gbrap16le,split=2[${label}rgb][${label}a];[${label}a]extractplanes=a[${label}old];[${mask.index}:v:0]${mask.timing.join(',')},format=gray16le[${label}mask];[${label}old][${label}mask]blend=all_expr='A*(1-${q}+${q}*${alpha})'[${label}new];[${label}rgb][${label}new]mergeplanes=0x00010210:gbrap16le`);
     }
+    else if (effect.name === 'Stabilize') { /* Baked into replacement media before compositing; see renderStabilizedTimeline. */ }
     else if (effect.name === 'Film grain') filters.push(`noise=alls=${Math.round(amount / 3)}:allf=t+u:all_seed=${Math.round(effectValue(clip,effect,'seed'))}`);
     else if (effect.name === 'Bloom') {
       const cut = Math.round(effectValue(clip,effect,'threshold') / 100 * 255), gain = (1 / Math.max(.05, 1 - effectValue(clip,effect,'threshold') / 100)).toFixed(3);
@@ -320,7 +323,7 @@ function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset
 export interface RenderRequest {
   project: Project; timeline: Timeline; timelines?: Timeline[]; clips: Clip[]; tracks: Track[]; nodes: GradeNode[];
   assets: { asset: MediaAsset; path: string }[]; settings: Record<string, string>; outputPath: string;
-  signal?: AbortSignal; onProgress?: (percent: number) => void; resolveDir?: string; smartMaskDir?: string;
+  signal?: AbortSignal; onProgress?: (percent: number) => void; resolveDir?: string; smartMaskDir?: string; stabilizeDir?: string;
   /** Internal composition renders keep alpha and defer the master limiter to the outer timeline. */
   transparent?: boolean; compositionPath?: string[]; sampledFrame?: boolean;
   transformSamples?: Record<string, MotionPose[]>;
@@ -331,6 +334,7 @@ export interface RenderRequest {
 export async function renderTimeline(request: RenderRequest): Promise<void> {
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&isCaption(c)))return renderCaptionTimeline(request);
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&c.mediaId==='frameline-composition'&&!c.disabled))return renderCompositions(request);
+  if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c)))return renderStabilizedTimeline(request);
   if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&c.properties.opticalFlow))return renderFlowTimeline(request);
   if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&(Object.keys(c.keyframes??{}).length||isTitle(c)&&getText(c).typingEnabled))) {
     // Animated export bakes the timeline down to one flattened clip, which a transition spanning
@@ -505,7 +509,6 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     const explicitAudio = clips.some(other => other.id !== clip.id && tracks.find(t => t.id === other.trackId)?.kind === 'audio' && other.mediaId === clip.mediaId && other.start === clip.start && other.sourceIn === clip.sourceIn && other.duration === clip.duration);
     const audible = audio !== 'Disabled' && source.asset.hasAudio && !p.freeze && !track.muted && (!solo || track.solo) && !(track.kind === 'video' && (clip.properties.audioDetached || explicitAudio));
     if (!visual && !audible) continue;
-    if (p.stabilization) throw new Error(`${clip.name}: stabilization is not available. Disable stabilization before exporting.`);
     if (p.blendMode && p.blendMode !== 'Normal') throw new Error(`${clip.name}: ${p.blendMode} blending is not available. Choose Normal.`);
 
     const speed = property('speed', 100, 1, 800) / 100;
@@ -723,6 +726,37 @@ async function renderFlattenedTransitions(request: RenderRequest) {
     if (clips.some(clip => clip.timelineId === request.timeline.id && (Object.keys(clip.keyframes ?? {}).length || isTitle(clip) && getText(clip).typingEnabled))) return await renderAnimatedTimeline(flattened);
     return await renderTimeline(flattened);
   } finally { await rm(directory, { recursive: true, force: true }); }
+}
+
+/** Bake stabilized picture as source-time replacement media, then composite normally. Timing edits stay on the clip. */
+async function renderStabilizedTimeline(request: RenderRequest) {
+  const directory=await mkdtemp(path.join(tmpdir(),'frameline-stabilize-export-'));
+  try {
+  const clips=[...request.clips],assets=[...request.assets],tracks=[...request.tracks];
+  const records=timelineTransitions(clips.filter(c=>c.projectId===request.project.id),request.timeline.id,assets.map(a=>a.asset));
+  const candidates=clips.filter(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c));
+  for(const [index,clip] of candidates.entries()) {
+    if(activeSmartMasks(clip,request.nodes).length)throw Error(`${clip.name}: Smart Mask tracks the original frame, which Stabilize moves. Remove one of them from this clip.`);
+    if(clip.properties.opticalFlow)throw Error(`${clip.name}: Stabilize and optical flow cannot share a clip yet. Disable optical flow or remove Stabilize.`);
+    const source=assets.find(a=>a.asset.id===clip.mediaId),track=tracks.find(t=>t.id===clip.trackId);
+    if(!source||source.asset.kind!=='video'||!track)throw new Error(`${clip.name}: Stabilize requires a video source.`);
+    const span=clipSpan(clip,records),geo=extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
+    const sourceFps=source.asset.fps||finite(request.settings.fps||request.project.fps,'Frame rate',1,120);
+    const range=stabilizeRange(geo,sourceFps,source.asset.duration);
+    const baked=await renderStabilized({input:source.path,directory,analysisDirectory:request.stabilizeDir,range,from:range.from,to:range.to,settings:stabilizeSettings(clip,stabilizeEffect(clip)!),preview:false,signal:request.signal,onProgress:p=>request.onProgress?.((index+p/100)/candidates.length*45)});
+    const mediaId=`stabilize-${clip.id}`,metadata=await probeMedia(baked.output,request.signal);
+    assets.push({path:baked.output,asset:{...source.asset,id:mediaId,duration:range.to-range.from,fps:metadata.fps||sourceFps,hasAudio:false,colorRange:metadata.colorRange,colorMatrix:metadata.colorMatrix}});
+    clips[clips.indexOf(clip)]={...clip,mediaId,sourceIn:clip.sourceIn-range.from,effects:clip.effects.filter(e=>e.name!=='Stabilize'),properties:{...clip.properties,audioDetached:true}};
+    const explicitAudio=request.clips.some(other=>other.id!==clip.id&&tracks.find(t=>t.id===other.trackId)?.kind==='audio'&&other.mediaId===clip.mediaId&&other.start===clip.start&&other.sourceIn===clip.sourceIn&&other.duration===clip.duration);
+    if(source.asset.hasAudio&&!clip.properties.audioDetached&&!explicitAudio&&request.settings.audio!=='Disabled') {
+      const audioId=`stabilize-audio-${clip.id}`;
+      tracks.push({...track,id:audioId,kind:'audio'});
+      // The original carries the sound; the bake is picture only.
+      clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name))});
+    }
+  }
+  await renderTimeline({...request,clips,assets,tracks,onProgress:p=>request.onProgress?.(45+p*.55)});
+  } finally {await rm(directory,{recursive:true,force:true});}
 }
 
 /** Bake optical flow before compositing; all subsequent frame reads use the same retimed footage. */
