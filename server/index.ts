@@ -11,7 +11,7 @@ import { isComposition, validateCompositions } from '../src/services/composition
 import { validateKeyframes } from '../src/services/animation.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
 import { flowChunkSeconds, flowTiming, type FlowPreview } from '../src/services/opticalFlow.ts';
-import { flowWorker, flowIdentity, renderOpticalFlow, trimFlowCache } from './opticalFlow.ts';
+import { flowWorker, flowEngineLabel, flowIdentity, renderOpticalFlow, trimFlowCache } from './opticalFlow.ts';
 import { presenceCursor } from '../src/services/presence.ts';
 import { fontLibrary } from './fonts.ts';
 import { transitionLibrary } from './transitions.ts';
@@ -963,7 +963,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           }
         }
         if (path === '/api/optical-flow/capabilities' && method === 'GET') {
-          try { await flowWorker(); send(res,200,{available:true,engine:'Apple VideoToolbox · quality priority'}); }
+          try { await flowWorker(); send(res,200,{available:true,engine:flowEngineLabel()}); }
           catch(error) { send(res,200,{available:false,error:(error as Error).message}); } return;
         }
         if (path === '/api/optical-flow' && method === 'POST') {

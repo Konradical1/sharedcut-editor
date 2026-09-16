@@ -1,3 +1,4 @@
+import { venvPython, quotedFilterPath } from './platform.ts';
 import { resolveSmartMaskArtifact } from './smartMask.ts';
 import { activeSmartMasks } from '../src/services/smartMaskPreview.ts';
 import { transformMotion, motionArtwork, type MotionPose } from '../src/services/motionBlur.ts';
@@ -70,7 +71,7 @@ export function run(command: string, args: string[], options: ProcessOptions = {
 export async function getMediaCapabilities() {
   try {
     await Promise.all([run(ffmpeg(), ['-version']), run(ffprobe(), ['-version'])]);
-    return { available: true, ffmpeg: ffmpeg(), ffprobe: ffprobe() };
+    return { available: true, ffmpeg: ffmpeg(), ffprobe: ffprobe(), hwaccel: await decodeAccelName() };
   } catch (error) { return { available: false, ffmpeg: ffmpeg(), ffprobe: ffprobe(), error: (error as Error).message }; }
 }
 
@@ -117,13 +118,38 @@ export async function probeMedia(inputPath: string, signal?: AbortSignal) {
  * and concurrency multiply, and oversubscribing them thrashes worse than the old serial pass.
  */
 /**
- * Hardware decode is the half of VideoToolbox worth taking: it cut a full-rate 4K pass from 56s of
+ * Hardware decode is the half worth taking: it cut a full-rate 4K pass from 56s of
  * CPU to 7s, which is what lets several jobs share the machine. Encoding stays on libx264 — the
- * VideoToolbox encoders have no CRF mode, and these proxies are quality-critical.
+ * platform encoders have no CRF mode, and these proxies are quality-critical.
  */
+/**
+ * Never assume an accelerator: probe what this FFmpeg build actually offers and take the first name
+ * this platform prefers. `-hwaccel` is best-effort by design, so a stream the device cannot handle
+ * (Ada NVDEC has no 4:2:2 HEVC; Blackwell does) decodes in software instead of failing the job.
+ * `FRAME_LINE_HWACCEL` forces one by name, or `off` disables the probe entirely.
+ */
+const ACCEL_PREFERENCE: Record<string, string[]> = {
+  darwin: ['videotoolbox'],
+  win32: ['cuda', 'd3d11va', 'qsv'],
+  linux: ['cuda', 'vaapi', 'qsv'],
+};
 let accel: Promise<string[]> | undefined;
-const decodeAccel = () => accel ??= process.env.FRAME_LINE_HWACCEL === 'off' ? Promise.resolve([])
-  : run(ffmpeg(), ['-hide_banner', '-hwaccels']).then(out => /videotoolbox/.test(out.toString()) ? ['-hwaccel', 'videotoolbox'] : []).catch(() => []);
+export const decodeAccel = () => accel ??= (async () => {
+  const forced = process.env.FRAME_LINE_HWACCEL;
+  if (forced === 'off') return [];
+  try {
+    const offered = new Set((await run(ffmpeg(), ['-hide_banner', '-hwaccels'])).toString().split('\n').slice(1).map(line => line.trim()).filter(Boolean));
+    if (forced) {
+      if (offered.has(forced)) return ['-hwaccel', forced];
+      console.warn(`FRAME_LINE_HWACCEL=${forced} is not offered by this FFmpeg build (${[...offered].join(', ') || 'none'}). Decoding in software.`);
+      return [];
+    }
+    const chosen = (ACCEL_PREFERENCE[process.platform] ?? []).find(name => offered.has(name));
+    return chosen ? ['-hwaccel', chosen] : [];
+  } catch { return []; }
+})();
+/** The accelerator actually in use, for the capabilities endpoint and the migration checks. */
+export const decodeAccelName = async () => (await decodeAccel())[1] ?? 'software';
 
 const cores = Math.max(2, cpus().length);
 export const MEDIA_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.FRAME_LINE_MEDIA_JOBS) || Math.max(1, Math.floor(cores / 4))));
@@ -292,7 +318,7 @@ function audioFilters(clip: Clip): string[] {
 function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset, masks:Map<string,{index:number;timing:string[]}>=new Map()): string[] {
   const matrix=String(clip.properties.yuvMatrix||asset.colorMatrix||(asset.inputProfile?.startsWith('S-Log')?'bt709':'auto')).replace('bt2020-ncl','bt2020nc');
   const range=clip.properties.dataLevels==='Full'?'pc':clip.properties.dataLevels==='Video'?'tv':'auto';
-  const filters = lutPath ? [`scale=in_color_matrix=${["bt709","bt470bg","smpte170m","bt2020nc"].includes(matrix)?matrix:"auto"}:in_range=${range}` ,'format=gbrapf32le', `lut3d=file='${lutPath.replaceAll("'", "'\\''")}':interp=trilinear`] : [];
+  const filters = lutPath ? [`scale=in_color_matrix=${["bt709","bt470bg","smpte170m","bt2020nc"].includes(matrix)?matrix:"auto"}:in_range=${range}` ,'format=gbrapf32le', `lut3d=file=${quotedFilterPath(lutPath)}:interp=trilinear`] : [];
   for (const effect of clip.effects.filter(effect => effectEnabled(clip,effect))) {
     const amount = finite(effect.amount, `${effect.name} amount`, 0, 100);
     if (!amount) continue;
@@ -557,7 +583,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         const frameTimes=times?.filter(t=>t>=renderSeek-1e-7&&t<renderSeek+decoded-1e-7);
         const inputCube=clip.properties.colorPipeline!=='nodes-v2'?makeCube(colorTransform(clip,source.asset,[],base),65):undefined;
         await writeFile(jobPath,JSON.stringify({input:source.path,output,ffmpeg:ffmpeg(),image:source.asset.kind==='image',seek:renderSeek,duration:decoded,width:metadata.width,height:metadata.height,fps:source.asset.kind==='image'?fps:metadata.frameRate||metadata.fps,numericFps:metadata.fps||fps,frames:frameTimes?.length??Math.ceil(decoded*(metadata.fps||fps)),frameTimes,masks,alpha:masks.length>0,managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)}));
-        const python=process.env.FRAME_LINE_COLOR_PYTHON||path.resolve('.venv-color/bin/python');
+        const python=process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color');
         if(!existsSync(python))throw Error('OpenColorIO export is not installed. Run npm run setup:color on the server.');
         await run(python,[path.resolve('scripts/color-render.py'),jobPath],{signal:request.signal});
         args.push('-i',output);videoIndex=inputIndex++;

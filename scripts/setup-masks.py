@@ -17,11 +17,16 @@ def run(*args, **kwargs):
     subprocess.run(list(map(str, args)), check=True, **kwargs)
 
 
+def venv_python(environment):
+    # .venv-x/bin/python on macOS and Linux, .venv-x\Scripts\python.exe on Windows.
+    return environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
 def setup():
     environment = ROOT / ".venv-mask"
-    if not (environment / "bin/python").exists():
+    if not venv_python(environment).exists():
         venv.create(environment, with_pip=True)
-    python = environment / "bin/python"
+    python = venv_python(environment)
     run(python, "-m", "pip", "install", "-r", ROOT / "scripts/mask-requirements.txt")
     if not REPO.exists():
         REPO.parent.mkdir(parents=True, exist_ok=True)

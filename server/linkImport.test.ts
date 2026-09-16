@@ -18,7 +18,11 @@ test('link validation only accepts canonical single-video and single-track desti
   assert.throws(() => parseImportLink('https://youtu.be/jNQXAC9IVRw', 'video', 999));
 });
 
-test('project link imports prepare real media, retain sources, retry failures, cancel and enforce access', { timeout: 60_000 }, async () => {
+// The importer under test is cross-platform; this test's stand-in for it is not. It fakes the
+// interpreter with a `#!` script, and Windows has no shebang, so `spawn` cannot start it. Replacing
+// it needs a shim Windows can execute directly — a `.cmd` would need `shell: true` in linkImport.ts,
+// which is not worth opening up to a user-supplied URL.
+test('project link imports prepare real media, retain sources, retry failures, cancel and enforce access', { skip: process.platform === 'win32', timeout: 60_000 }, async () => {
   const directory = await mkdtemp(join(tmpdir(), 'sharedcut-links-'));
   const interpreter = join(directory, 'importer'), control = join(directory, 'control'), fixture = join(directory, 'source.mp4');
   await promisify(execFile)(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=red:s=160x90:r=24:d=1', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', fixture]);

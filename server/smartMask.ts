@@ -1,3 +1,4 @@
+import { venvPython, filterPath } from './platform.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, lstatSync, openSync, readSync, closeSync } from 'node:fs';
@@ -10,7 +11,7 @@ import type { Clip, MediaAsset } from '../src/state/models.ts';
 import { colorTransform, cubeText, interpretation, makeCube } from '../src/services/color.ts';
 
 const worker = fileURLToPath(new URL('../scripts/smart-mask.py', import.meta.url));
-const python = () => process.env.FRAME_LINE_MASK_PYTHON || fileURLToPath(new URL('../.venv-mask/bin/python', import.meta.url));
+const python = () => process.env.FRAME_LINE_MASK_PYTHON || venvPython('.venv-mask');
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const validKey = (key: string) => /^[a-f0-9]{64}$/.test(key);
 export class SmartMaskError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status; } }
@@ -175,7 +176,7 @@ export function smartMaskService(directory: string) {
         const temporary = join(root, `.source-${randomUUID()}`); mkdirSync(temporary, { mode: 0o700 });
         try {
           const lut = join(temporary, 'analysis.cube'), jpeg = join(temporary, 'frame.jpg'); writeFileSync(lut, analysis.text, { mode: 0o600 });
-          const escaped = lut.replace(/\\/g, '\\\\').replace(/'/g, "'\\''").replace(/:/g, '\\:');
+          const escaped = filterPath(lut);
           const scale: string[] = [], range = clip.properties.dataLevels, matrix = inputMatrix(clip, asset);
           if (range === 'Full' || range === 'Video') scale.push(`in_range=${range === 'Full' ? 'pc' : 'tv'}`);
           if (matrix !== 'auto') scale.push(`in_color_matrix=${matrix}`);

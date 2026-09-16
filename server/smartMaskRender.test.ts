@@ -1,3 +1,4 @@
+import { venvPython } from './platform.ts';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
@@ -32,7 +33,7 @@ test('authored alpha survives clip and node export, source trims, reverse and st
     await writeFile(path.join(cache,'manifest.json'),JSON.stringify(manifest));await writeFile(path.join(cache,'binding.json'),JSON.stringify({projectId:clip.projectId,clipId:clip.id,maskId:mask.id,signature:mask.result.signature,sourceFingerprint:maskSourceFingerprint(source),analysisIdentity:maskAnalysis(clip,asset).identity,workerIdentity:'fixture'}));
     const workerJob=path.join(dir,'worker.json'),alphaMovie=path.join(dir,'alpha.mkv');
     await writeFile(workerJob,JSON.stringify({input:source,output:path.join(dir,'float.mkv'),ffmpeg:ff,width:64,height:32,fps:4,numericFps:4,seek:0,duration:2,frames:8,frameTimes:manifest.sourceTimes,matrix:'bt709',range:'auto',alpha:true,stages:[],masks:[{document:mask,sourceTimes:manifest.sourceTimes,files:Object.fromEntries(manifest.frames.map(f=>[f.index,path.join(cache,f.file)])),output:alphaMovie}]}));
-    await run(process.env.FRAME_LINE_COLOR_PYTHON||path.resolve('.venv-color/bin/python'),[path.resolve('scripts/color-render.py'),workerJob]);
+    await run(process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color'),[path.resolve('scripts/color-render.py'),workerJob]);
     const recovered=await run(ff,['-v','error','-i',alphaMovie,'-f','rawvideo','-pix_fmt','gray16le','-'],{binary:true});assert.deepEqual(recovered,raw,'Every 16-bit alpha value must survive the float worker without 8-bit quantization.');
     const track={id:'video',timelineId:'timeline',number:1,kind:'video',name:'Video',muted:false,solo:false,hidden:false,locked:false,gain:0,pan:0} as Track;
     const request:RenderRequest={project:{id:'project',fps:4,resolution:'64 × 32'} as Project,timeline:{id:'timeline',projectId:'project',name:'Test',duration:2},clips:[clip],tracks:[track],nodes:[],assets:[{asset,path:source}],settings:{fps:'4',resolution:'64 × 32',codec:'Apple ProRes 422 HQ',audio:'Disabled',rangeIn:'0',rangeOut:'2'},outputPath:path.join(dir,'out.mov'),smartMaskDir:dir};

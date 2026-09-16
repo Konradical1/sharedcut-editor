@@ -1,3 +1,4 @@
+import { venvPython } from './platform.ts';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,7 +7,7 @@ import { existsSync } from 'node:fs';
 import { renderTimeline, type RenderRequest } from './media.ts';
 import { validateWords, type CaptionWord } from '../src/services/captions.ts';
 
-export const captionPython=()=>process.env.FRAME_LINE_CAPTION_PYTHON||resolve('.venv-captions/bin/python');
+export const captionPython=()=>process.env.FRAME_LINE_CAPTION_PYTHON||venvPython('.venv-captions');
 export const captionAvailable=()=>existsSync(captionPython());
 function processFile(command:string,args:string[],signal:AbortSignal,progress?:(stage:string,progress:number)=>void) {
   return new Promise<void>((resolve,reject)=>{

@@ -1,3 +1,4 @@
+import { venvPython } from './platform.ts';
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import { mkdtemp, rename, rm } from 'node:fs/promises';
@@ -36,7 +37,7 @@ export async function downloadLink(link: ImportLink, directory: string, maxBytes
   for (const name of readdirSync(directory).filter(name => name.startsWith('download-'))) await rm(join(directory, name), { recursive: true, force: true });
   const temporary = await mkdtemp(join(directory, 'download-'));
   try {
-    const python = process.env.FRAME_LINE_IMPORT_PYTHON || join(root, '.venv-import', 'bin', 'python');
+    const python = process.env.FRAME_LINE_IMPORT_PYTHON || venvPython('.venv-import');
     if (!existsSync(python)) throw new Error('Link importing needs setup on the server: run npm run setup:imports, then retry.');
     const result = await new Promise<{ filename: string; title: string }>((accept, reject) => {
       const child = spawn(python, [join(root, 'scripts/import-link.py'), link.url, link.mode, String(link.quality), temporary, String(maxBytes), process.execPath], { detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUNBUFFERED: '1' } });

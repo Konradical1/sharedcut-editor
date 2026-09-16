@@ -27,6 +27,12 @@ Rules, in order of how often they bite:
    on Windows too, or it does not ship.
 2. **Build paths with `node:path`.** `join()` and `resolve()`, never string concatenation with
    `/`. Never hardcode `/Users/...`, `/opt/homebrew`, or `/tmp` — use `os.tmpdir()`.
+
+2b. **Never interpolate a raw path into an FFmpeg filtergraph.** Argv paths are fine; a filter
+   argument is not. The filtergraph parser reads `\` as an escape and `:` as an option separator,
+   so `lut3d=file='C:\Users\...'` silently becomes garbage and fails the render. Use
+   `filterPath`/`quotedFilterPath` from `server/platform.ts`. This broke every graded export on
+   Windows and is the single easiest way to reintroduce the bug.
 3. **Reach external binaries through an env var with a sane default**, the way the Python hooks
    already do: `FRAME_LINE_COLOR_PYTHON`, `FRAME_LINE_IMPORT_PYTHON`,
    `FRAME_LINE_CAPTION_PYTHON`, `FRAME_LINE_MASK_PYTHON`, `FFMPEG_PATH`. A venv interpreter is
@@ -45,9 +51,11 @@ Rules, in order of how often they bite:
    run on the editor's machine, not the server. That code is already portable — keep new visual
    work there rather than adding server-side GPU dependencies.
 
-**The one known violation** is `server/opticalFlow.ts`: it compiles an Objective-C worker with
-`xcrun clang` and throws on non-Darwin. It is a tracked blocker with a planned replacement
-(RIFE via ONNX/TensorRT), not a pattern to copy. Do not add a second one.
+**`server/opticalFlow.ts` is no longer Darwin-only.** It dispatches on `process.platform`: the
+VideoToolbox worker on the Mac, FFmpeg `minterpolate` everywhere else. Freezes, deep slow motion
+and direction-reversing curves raise a clear error on the FFmpeg engine rather than dropping
+frames; RIFE via ONNX/TensorRT is the planned quality upgrade. There is no known Mac-only path
+left in the server. Do not add one.
 
 If a feature genuinely cannot be done cross-platform, say so and ask before writing it
 Mac-only.
