@@ -1,0 +1,98 @@
+/**
+ * Move one project between machines. `data/` is 125 GB and gitignored, so a project travels as a
+ * folder you copy by USB or cloud drive, not through git.
+ *
+ *   node scripts/project-bundle.mjs export "Newspaper" ~/Desktop/newspaper-bundle
+ *   node scripts/project-bundle.mjs import ~/Desktop/newspaper-bundle
+ *
+ * Stop the server on BOTH ends first — this reads and writes the SQLite workspace row directly,
+ * and a running server holds the whole state in memory and will overwrite an import on its next save.
+ *
+ * ponytail: copies whole media directories including generated proxies, so a bundle is bigger than
+ * the originals but imports with nothing to re-encode. Delete `prepared/` from the bundle if transfer
+ * size matters more than import time — the server's startup upgrade pass rebuilds it.
+ */
+import { DatabaseSync } from 'node:sqlite';
+import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+
+const DATA = resolve(process.env.FRAME_LINE_DATA ?? 'data');
+// Per-project slices of the workspace state. `operations` is machine-local undo history and
+// `renderJobs` are finished exports pointing at files that do not travel; neither is worth carrying.
+const BY_PROJECT = ['media', 'clips', 'nodes', 'comments', 'snapshots'];
+
+const open = () => {
+  const file = join(DATA, 'frameline.sqlite');
+  if (!existsSync(file)) throw new Error(`No database at ${file}. Set FRAME_LINE_DATA or run from the repo root.`);
+  const db = new DatabaseSync(file);
+  const row = db.prepare('SELECT revision,state FROM workspace WHERE id=1').get();
+  if (!row) throw new Error('The workspace is empty — start the server once before bundling.');
+  return { db, revision: Number(row.revision), state: JSON.parse(String(row.state)) };
+};
+
+function exportProject(needle, outDir) {
+  const { state } = open();
+  const project = state.projects.find(item => item.id === needle)
+    ?? state.projects.find(item => item.name.toLowerCase() === needle.toLowerCase())
+    ?? (() => { throw new Error(`No project matched ${JSON.stringify(needle)}. Available: ${state.projects.map(item => item.name).join(', ')}`); })();
+
+  const timelines = state.timelines.filter(item => item.projectId === project.id);
+  const timelineIds = new Set(timelines.map(item => item.id));
+  const slice = Object.fromEntries(BY_PROJECT.map(key => [key, state[key].filter(item => item.projectId === project.id)]));
+  const bundle = { version: 1, exportedAt: Date.now(), project, timelines, tracks: state.tracks.filter(item => timelineIds.has(item.timelineId)), ...slice };
+
+  mkdirSync(outDir, { recursive: true });
+  for (const asset of bundle.media) {
+    const from = join(DATA, 'media', asset.id);
+    if (!existsSync(from)) { console.warn(`  ! missing media on disk, skipping: ${asset.name}`); continue; }
+    cpSync(from, join(outDir, 'media', asset.id), { recursive: true });
+  }
+  // DaVinci provenance for imported projects; harmless when absent.
+  const resolveDir = join(DATA, 'resolve', project.id);
+  if (existsSync(resolveDir)) cpSync(resolveDir, join(outDir, 'resolve'), { recursive: true });
+
+  writeFileSync(join(outDir, 'project.json'), JSON.stringify(bundle, null, 1));
+  console.log(`Exported ${JSON.stringify(project.name)} to ${outDir}`);
+  console.log(`  ${bundle.media.length} assets, ${bundle.clips.length} clips, ${bundle.timelines.length} timeline(s), ${bundle.tracks.length} tracks`);
+}
+
+function importProject(inDir) {
+  const bundle = JSON.parse(readFileSync(join(inDir, 'project.json'), 'utf8'));
+  if (bundle.version !== 1) throw new Error(`Unsupported bundle version ${bundle.version}.`);
+  const { db, revision, state } = open();
+
+  // The owner's account id is per-install. Without a remap the project imports invisible: every
+  // membership points at a user that does not exist on this machine.
+  const owner = db.prepare('SELECT data FROM accounts ORDER BY rowid LIMIT 1').get();
+  if (!owner) throw new Error('Create an account on this machine first — sign up in the browser, then import.');
+  const ownerId = JSON.parse(String(owner.data)).user.id;
+
+  if (state.projects.some(item => item.id === bundle.project.id)) throw new Error(`Project ${bundle.project.id} already exists here. Delete it in the app first.`);
+
+  for (const asset of bundle.media) {
+    const from = join(inDir, 'media', asset.id);
+    if (!existsSync(from)) { console.warn(`  ! bundle is missing files for ${asset.name}, skipping`); continue; }
+    cpSync(from, join(DATA, 'media', asset.id), { recursive: true });
+  }
+  if (existsSync(join(inDir, 'resolve'))) cpSync(join(inDir, 'resolve'), join(DATA, 'resolve', bundle.project.id), { recursive: true });
+
+  const next = {
+    ...state,
+    projects: [...state.projects, { ...bundle.project, members: [{ userId: ownerId, role: 'Owner' }] }],
+    timelines: [...state.timelines, ...bundle.timelines],
+    tracks: [...state.tracks, ...bundle.tracks],
+    ...Object.fromEntries(BY_PROJECT.map(key => [key, [...state[key], ...bundle[key]]])),
+  };
+  db.prepare('UPDATE workspace SET revision=?,state=? WHERE id=1').run(revision + 1, JSON.stringify(next));
+
+  console.log(`Imported ${JSON.stringify(bundle.project.name)} — ${bundle.media.length} assets, ${bundle.clips.length} clips.`);
+  console.log("Start the server and sign in; the project belongs to this machine's first account.");
+}
+
+const [mode, target, out] = process.argv.slice(2);
+if (mode === 'export' && target) exportProject(target, resolve(out ?? `${target.toLowerCase().replace(/\W+/g, '-')}-bundle`));
+else if (mode === 'import' && target) importProject(resolve(target));
+else {
+  console.error('Usage:\n  node scripts/project-bundle.mjs export <project name or id> [outDir]\n  node scripts/project-bundle.mjs import <bundleDir>\n\nStop the server on both ends first.');
+  process.exit(1);
+}
