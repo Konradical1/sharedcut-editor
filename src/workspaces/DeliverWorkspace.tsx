@@ -1,0 +1,91 @@
+import { useState } from 'react';
+import { motion } from 'motion/react';
+import { ArrowDownToLine, ArrowRight, Check, ChevronRight, CircleCheck, Clock3, Cpu, Download, Film, Folder, HardDrive, ListVideo, MonitorPlay, Plus, RotateCcw, Send, Server, Settings2, ShieldCheck, Sparkles, Subtitles, Volume2, X } from 'lucide-react';
+import { useEditorStore } from '../state/store';
+import type { RenderJob } from '../state/models';
+import { Badge, Button, Field, IconButton, Modal, NumberInput, timecode } from '../components/ui';
+import Viewer from '../components/Viewer';
+import './workspaces.css';
+
+const presets = [
+  { name: 'Quick Export', detail: 'Ready to share', icon: Send, codec: 'H.264', resolution: '1920 × 1080', quality: 'High · 20 Mb/s' },
+  { name: 'YouTube', detail: 'Made for the big screen', icon: MonitorPlay, codec: 'H.264', resolution: '3840 × 2160', quality: 'Maximum · 50 Mb/s' },
+  { name: 'High Quality Master', detail: 'Every little detail', icon: Film, codec: 'Apple ProRes 422 HQ', resolution: '3840 × 2160', quality: 'Visually lossless' },
+  { name: 'Custom', detail: 'Your finishing touches', icon: Settings2, codec: 'H.264', resolution: '1920 × 1080', quality: 'High · 20 Mb/s' },
+];
+
+function QueueItem({ job, onDetails }: { job: RenderJob; onDetails: () => void }) {
+  const s = useEditorStore();
+  return <motion.div layout="position" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className={`render-job ${job.status}`}><div className="render-job-top"><div className="render-job-icon">{job.status === 'complete' ? <CircleCheck size={17}/> : job.status === 'rendering' ? <Film size={17}/> : job.status === 'failed' ? <X size={17}/> : <Clock3 size={17}/>}</div><button onClick={onDetails}><strong>{job.name}</strong><span>{job.preset} · {job.settings.resolution || '1920 × 1080'}</span></button>{job.status === 'rendering' || job.status === 'waiting' ? <IconButton label={`Cancel ${job.name}`} onClick={() => { s.updateRender(job.id, { status: 'failed', remaining: 'Canceled by you' }); s.notify('Render canceled', 'info', job.name); }}><X size={13}/></IconButton> : <IconButton label={`View details for ${job.name}`} onClick={onDetails}><ChevronRight size={14}/></IconButton>}</div>
+    {job.status === 'rendering' && <><div className="render-progress"><motion.span animate={{ scaleX: job.progress / 100 }} initial={false} transition={{ duration: .6, ease: 'linear' }}/></div><div className="render-job-meta"><span><span className="tiny-dot"/> Rendering on the server</span><strong className="mono">{Math.round(job.progress)}%</strong></div><div className="render-job-footer"><span>{job.remaining || 'Estimating…'}</span><span>{job.settings.codec || 'H.264'}</span></div></>}
+    {job.status === 'waiting' && <div className="render-job-meta"><span><Clock3 size={11}/> {s.renderJobs.some(item => item.status === 'rendering') ? 'Queued behind another export' : 'Starting export…'}</span></div>}
+    {job.status === 'complete' && <div className="render-job-meta"><span><Check size={11}/> Export complete</span><button onClick={onDetails}>View details <ArrowRight size={10}/></button></div>}
+    {job.status === 'failed' && <div className="render-job-meta"><span>{job.error || job.remaining || 'Export failed'}</span><button onClick={() => s.updateRender(job.id, { status: 'waiting', progress: 0, remaining: 'Queued' })}><RotateCcw size={10}/> Retry</button></div>}
+  </motion.div>;
+}
+
+export default function DeliverWorkspace() {
+  const s = useEditorStore();
+  const project = s.projects.find(p => p.id === s.projectId);
+  const timeline = s.timelines.find(t => t.id === s.timelineId);
+  const [preset, setPreset] = useState('Quick Export');
+  const [filename, setFilename] = useState((project?.name || 'Untitled').replace(/[^a-zA-Z0-9_-]+/g, '_') + '_Final');
+  const destination = 'Server exports';
+  const [resolution, setResolution] = useState('1920 × 1080');
+  const [fps, setFps] = useState(String(project?.fps || 24));
+  const [codec, setCodec] = useState('H.264');
+  const [quality, setQuality] = useState('High · 20 Mb/s');
+  const [range, setRenderRange] = useState('Entire timeline');
+  const [tab, setTab] = useState('Video');
+  const [includeAudio, setIncludeAudio] = useState(true);
+  const [audioCodec, setAudioCodec] = useState('AAC');
+  const [audioRate, setAudioRate] = useState('320 kb/s');
+  const [subtitles, setSubtitles] = useState('None');
+  const [selectedJob, setSelectedJob] = useState<string | null>(null);
+  const [serverExpanded, setServerExpanded] = useState(false);
+  const [renderError, setRenderError] = useState('');
+  const jobs = s.renderJobs.filter(j => j.projectId === s.projectId);
+  const job = jobs.find(j => j.id === selectedJob);
+  const sourceTimeline = s.timelines.find(t => t.id === job?.settings.timelineId && t.projectId === s.projectId);
+  const sourceStart = Number(job?.settings.rangeIn);
+  const sourceEnd = Number(job?.settings.rangeOut);
+  const canViewSource = Boolean(sourceTimeline && Number.isFinite(sourceStart) && Number.isFinite(sourceEnd) && sourceEnd > sourceStart);
+  const selectedClip = s.clips.find(c => c.id === s.selectedClipId && c.timelineId === s.timelineId);
+  const timelineFps = project?.fps || 24;
+  const renderStart = range === 'In / Out range' ? s.rangeIn : range === 'Selected clip' ? selectedClip?.start || 0 : 0;
+  const renderEnd = range === 'In / Out range' ? s.rangeOut : range === 'Selected clip' ? (selectedClip?.start || 0) + (selectedClip?.duration || 0) : Math.max(0,...s.clips.filter(c=>c.timelineId===s.timelineId).map(c=>c.start+c.duration));
+  const renderDuration = Math.max(0, renderEnd - renderStart);
+  const rendering = s.renderJobs.filter(j => j.status === 'rendering').length;
+  const waiting = jobs.filter(j => j.status === 'waiting').length;
+  const extension = codec.includes('ProRes') ? 'mov' : 'mp4';
+  // ponytail: duration-scaled preview estimate; the server encoder will report the real size.
+  const estimatedMB = (codec.includes('ProRes') ? 220 : quality.includes('50') ? 50 : 20) * renderDuration / 8;
+  const estimatedSize = estimatedMB >= 1000 ? `${(estimatedMB / 1000).toFixed(1)} GB` : `${Math.round(estimatedMB)} MB`;
+  const changePreset = (name: string) => { const value = presets.find(p => p.name === name)!; setPreset(name); if (name !== 'Custom') { setCodec(value.codec); setResolution(value.resolution); setQuality(value.quality); } };
+  const changeRange = (value: string) => { setRenderRange(value); s.setPlayhead(value === 'In / Out range' ? s.rangeIn : value === 'Selected clip' ? selectedClip?.start || 0 : 0); };
+  const viewSource = () => { if (!canViewSource || !sourceTimeline) return; s.setTimeline(sourceTimeline.id); s.setRange(sourceStart, sourceEnd); s.setPlayhead(sourceStart); s.setWorkspace('edit'); setSelectedJob(null); };
+  const addToQueue = () => {
+    if (!filename.trim() || /[/\\\u0000-\u001f]/.test(filename)) { setRenderError('Give your export a filename without slashes.'); return; }
+    if (!destination.trim()) { setRenderError('Choose a destination on the server.'); return; }
+    if (!Number.isFinite(renderDuration) || renderDuration < 1 / timelineFps - 1e-9) { setRenderError('Choose a render range with at least one frame.'); return; }
+    setRenderError('');
+    s.enqueueRender(filename.trim() + '.' + extension, preset, { destination, resolution, fps, codec, quality, masterGain: String(s.settings.masterGain??0), masterMuted: String(s.settings.masterMuted??false), range, rangeIn: String(renderStart), rangeOut: String(renderEnd), duration: String(renderDuration), timecodeIn: timecode(renderStart, timelineFps), timecodeOut: timecode(renderEnd, timelineFps), sourceFrameRate: String(timelineFps), audio: includeAudio ? `${audioCodec} · ${audioRate} · 48 kHz` : 'Disabled', subtitles, timeline: timeline?.name || 'Main timeline', timelineId: s.timelineId });
+  };
+
+
+  return <div className="deliver-workspace special-workspace">
+    <div className="deliver-heading"><div><h1>Export</h1></div><div className="deliver-heading-meta"><ShieldCheck size={16}/><span>Render from originals<small>Server rendering</small></span></div></div>
+    <div className="export-presets">{presets.map(p => <button key={p.name} onClick={() => changePreset(p.name)} className={`export-preset ${preset === p.name ? 'selected' : ''}`}><div className="preset-icon"><p.icon size={20} strokeWidth={1.5}/></div><div><strong>{p.name}</strong><span>{p.detail}</span></div>{preset === p.name && <Check size={14}/>}</button>)}</div>
+    <div className="deliver-main"><section className="panel export-settings"><div className="panel-header"><Settings2 size={14}/><span>Export settings</span><span className="spacer"/><Badge>{preset === 'Custom' ? 'Custom' : 'Preset'}</Badge></div><div className="export-form"><Field label="Filename"><div className="filename-input"><input className="input" value={filename} onChange={e => setFilename(e.target.value)} aria-label="Export filename"/><span className="mono">.{extension}</span></div></Field><Field label="Destination on server"><div className="destination-input"><Folder size={13}/><input className="input" value={destination} readOnly aria-label="Export destination"/></div></Field><div className="export-setting-tabs">{[{ name: 'Video', icon: Film }, { name: 'Audio', icon: Volume2 }, { name: 'Subtitles', icon: Subtitles }].map(t => <button key={t.name} onClick={() => setTab(t.name)} className={tab === t.name ? 'active' : ''}><t.icon size={12}/>{t.name}</button>)}</div>
+      {tab === 'Video' && <div className="export-tab-fields"><Field label="Resolution"><select className="select" aria-label="Export resolution" value={resolution} onChange={e => { setResolution(e.target.value); setPreset('Custom'); }}><option>1920 × 1080</option><option>3840 × 2160</option><option>2560 × 1440</option><option>1080 × 1920</option><option>1280 × 720</option></select></Field><div className="export-form-row"><Field label="Frame rate"><select className="select" aria-label="Export frame rate" value={fps} onChange={e => setFps(e.target.value)}>{['23.976', '24', '25', '29.97', '30', '50', '59.94', '60'].map(value => <option key={value} value={value}>{value} fps</option>)}</select></Field><Field label="Codec"><select className="select" aria-label="Export codec" value={codec} onChange={e => { setCodec(e.target.value); setPreset('Custom'); }}><option>H.264</option><option>H.265 / HEVC</option><option>Apple ProRes 422 HQ</option><option>Apple ProRes 4444</option></select></Field></div><Field label="Quality"><select className="select" aria-label="Export quality" value={quality} onChange={e => setQuality(e.target.value)}><option>Automatic</option><option>High · 20 Mb/s</option><option>Maximum · 50 Mb/s</option><option>Visually lossless</option></select></Field></div>}
+      {tab === 'Audio' && <div className="export-tab-fields"><label className="export-checkbox"><input type="checkbox" checked={includeAudio} onChange={e => setIncludeAudio(e.target.checked)}/><span>Include audio</span></label><Field label="Audio codec"><select className="select" aria-label="Audio export codec" disabled={!includeAudio} value={audioCodec} onChange={e => setAudioCodec(e.target.value)}><option>AAC</option><option disabled={!codec.includes('ProRes')}>Linear PCM</option></select></Field><Field label="Bit rate / depth"><select className="select" aria-label="Audio bit rate" disabled={!includeAudio} value={audioRate} onChange={e => setAudioRate(e.target.value)}><option>320 kb/s</option><option>192 kb/s</option><option>24-bit</option><option>16-bit</option></select></Field><div className="export-info-line"><Volume2 size={13}/><span>Stereo · 48,000 Hz · Master bus</span></div></div>}
+      {tab === 'Subtitles' && <div className="export-tab-fields"><p className="muted">{s.clips.some(c=>c.timelineId===s.timelineId&&c.properties.captionSet)?'Visible captions are included in the exported video. Hide the Captions track to exclude them.':'Generate captions in the Captions library to include them in your video.'} Separate subtitle-file export is not available.</p></div>}
+      <Field label="Render range"><select className="select" aria-label="Render range" value={range} onChange={e => changeRange(e.target.value)}><option>Entire timeline</option><option>In / Out range</option><option disabled={!selectedClip}>Selected clip</option></select></Field>{range === 'In / Out range' && <div className="export-form-row export-range-inputs"><Field label="In point · seconds"><NumberInput className="input mono" aria-label="Render in point seconds" min={0} max={timeline?.duration || 0} step={1 / timelineFps} decimals={2} value={s.rangeIn} onCommit={value => s.setRange(value, s.rangeOut)}/></Field><Field label="Out point · seconds"><NumberInput className="input mono" aria-label="Render out point seconds" min={0} max={timeline?.duration || 0} step={1 / timelineFps} decimals={2} value={s.rangeOut} onCommit={value => s.setRange(s.rangeIn, value)}/></Field></div>}<div className="export-range-time mono"><button aria-label="Preview render first frame" onClick={() => s.setPlayhead(renderStart)}>{timecode(renderStart, timelineFps)}</button><ArrowRight size={12}/><button aria-label="Preview render last frame" onClick={() => s.setPlayhead(Math.max(renderStart, renderEnd - 1 / timelineFps))}>{timecode(renderEnd, timelineFps)}</button></div><div className="export-duration"><span>Duration</span><span className="mono">{timecode(renderDuration, timelineFps)}</span></div>{renderError && <p className="export-error" role="alert">{renderError}</p>}<Button variant="primary" className="queue-submit" onClick={addToQueue}><Plus size={15}/>Add to render queue</Button><p className="export-local-note"><Server size={11}/>Rendered from originals on your server</p></div></section>
+
+      <div className="export-preview"><section className="panel export-viewer-panel"><div className="panel-header"><MonitorPlay size={14}/><span>Output preview</span><span className="spacer"/><span className="muted">{resolution.split(' × ')[0] === '3840' ? 'UHD' : 'HD'} · {fps} fps</span></div><Viewer compact/></section><div className="export-summary panel"><div className="panel-header"><ListVideo size={14}/><span>{timeline?.name || 'Main timeline'}</span><span className="spacer"/><Badge>Original media</Badge></div><div className="export-summary-grid"><div><span>VIDEO</span><strong>{codec}</strong><small>{resolution} · {fps} fps</small></div><div><span>AUDIO</span><strong>{includeAudio ? `${audioCodec} Stereo` : 'No audio'}</strong><small>{includeAudio ? `48 kHz · ${audioRate}` : 'Video only'}</small></div><div><span>ESTIMATED SIZE</span><strong>{estimatedSize}</strong><small>Preview estimate</small></div></div><div className="original-media-flow"><span><Film size={12}/>Camera originals</span><ChevronRight size={12}/><span><Cpu size={12}/>Server render</span><ChevronRight size={12}/><span><ArrowDownToLine size={12}/>Your export</span></div></div><div className="deliver-note"><Sparkles size={15}/><p><strong>Keep creating while we do the heavy lifting.</strong><span>Exports continue on your server after you close the browser. Download the finished file from the queue.</span></p></div></div>
+
+      <aside className="panel render-queue"><div className="panel-header"><ListVideo size={14}/><span>Render queue</span><Badge>{jobs.length}</Badge><span className="spacer"/><span className="tiny-dot"/></div><div className="render-worker-status" role="status" aria-live="polite"><span className="worker-pulse"/><div><strong>{!s.serverOnline ? 'Reconnecting to server…' : rendering ? 'Rendering your export' : waiting ? 'Starting queued export…' : 'Ready to export'}</strong><span>{rendering} active · {waiting} waiting</span></div><Cpu size={20}/></div><div className="render-jobs">{jobs.map(renderJob => <QueueItem key={renderJob.id} job={renderJob} onDetails={() => setSelectedJob(renderJob.id)}/>)}{!jobs.length && <div className="queue-empty"><Film size={25}/><strong>Your next great export starts here.</strong><span>Choose a preset, then add your timeline to the queue.</span></div>}</div><div className="render-server"><button className="render-server-toggle" onClick={() => setServerExpanded(!serverExpanded)}><Server size={15}/><span>SharedCut render server<small><span className="tiny-dot"/> {s.serverOnline?'Connected':'Reconnecting'}</small></span><ChevronRight size={14} style={{ transform: serverExpanded ? 'rotate(90deg)' : undefined }}/></button>{serverExpanded && <div className="render-server-details"><div><span>Proxy jobs</span><strong>{s.media.filter(m=>!['ready','failed'].includes(m.status)).length}</strong></div><div><span>Connected users</span><strong>{s.presence.filter(p => p.online).length + 1}</strong></div></div>}</div></aside>
+    </div>
+    {job && <Modal title="Render details" onClose={() => setSelectedJob(null)}><div className="render-details"><div className="render-detail-title"><Film size={25}/><div><strong>{job.name}</strong><span>{job.preset} · {job.status}</span></div></div>{canViewSource && <div className="render-detail-range"><span>In<strong className="mono">{job.settings.timecodeIn}</strong></span><span>Out<strong className="mono">{job.settings.timecodeOut}</strong></span><span>Duration<strong className="mono">{timecode(sourceEnd - sourceStart, Number(job.settings.sourceFrameRate) || 24)}</strong></span></div>}{Object.entries(job.settings).filter(([key]) => !['rangeIn', 'rangeOut', 'duration', 'timecodeIn', 'timecodeOut', 'timelineId', 'sourceFrameRate'].includes(key)).map(([key, value]) => <div className="render-detail-row" key={key}><span>{key}</span><strong>{value}</strong></div>)}<div className="render-simulation-note"><Server size={18}/><p>{job.error||job.remaining||'The server is processing this export.'}</p></div><div className="render-detail-actions">{canViewSource && <Button variant="secondary" onClick={viewSource}><Film size={14}/>View source range</Button>}<Button variant="primary" disabled={job.status!=='complete'||!job.outputUrl} onClick={() => {const link=document.createElement('a');link.href=job.outputUrl!;link.download=job.name;link.click();}}><Download size={14}/>Download video</Button></div></div></Modal>}
+  </div>;
+}

@@ -1,0 +1,52 @@
+import { useEffect, type Dispatch, type SetStateAction } from 'react';
+import { useEditorStore } from './state/store';
+export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['I / O','Mark In / Out'], ['V / B','Selection / blade tool'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['Delete','Delete selected clip'] ];
+export function useEditorShortcuts(enabled: boolean) {
+  useEffect(()=>{
+    if(!enabled)return;
+    const keydown=(e:KeyboardEvent)=>{
+      const target=e.target as HTMLElement;
+      if(e.defaultPrevented)return;
+      if(target.closest('input,textarea,select,[contenteditable="true"],dialog[open]'))return;
+      const s=useEditorStore.getState();const command=e.metaKey||e.ctrlKey;
+      if(s.workspace==='color'&&command&&['c','v'].includes(e.key.toLowerCase())){e.preventDefault();if(s.selectedClipId){if(e.key.toLowerCase()==='c')s.copyGrade(s.selectedClipId);else s.pasteGrade(s.selectedClipId);}return;}
+      if(s.workspace==='color'&&((command&&e.key.toLowerCase()==='d')||e.key==='Backspace'||e.key==='Delete')){e.preventDefault();const node=s.nodes.find(n=>n.id===s.selectedNodeId&&n.clipId===s.selectedClipId);if(node){if(command)s.updateNode(node.id,{enabled:!node.enabled});else s.removeNode(node.id);}return;}
+      if(command&&e.key.toLowerCase()==='s'){e.preventDefault();s.setModal('snapshot');}
+      else if(command&&e.key.toLowerCase()==='z'){e.preventDefault();s.undo();}
+      else if(command&&e.key.toLowerCase()==='b'&&s.selectedClipId){e.preventDefault();s.splitClip(s.selectedClipId);}
+      else if(command&&e.key.toLowerCase()==='c'&&s.selectedClipId){e.preventDefault();s.copyClip(s.selectedClipId);}
+      else if(command&&e.key.toLowerCase()==='v'){e.preventDefault();s.pasteClip();}
+      else if(command&&e.key.toLowerCase()==='d'&&s.selectedClipId){e.preventDefault();s.duplicateClip(s.selectedClipId);}
+      else if(command&&e.key.toLowerCase()==='t'){e.preventDefault();s.applyTransitionAtPlayhead();}
+      else if(e.code==='Space'){e.preventDefault();if(s.liveMode!=='following')s.setPlaying(!s.playing);}
+      else if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&s.liveMode!=='following'){e.preventDefault();s.setPlayhead(s.playhead+(e.key==='ArrowRight'?1:-1)/(s.projects.find(p=>p.id===s.projectId)?.fps||24));}
+      else if((e.key==='Delete'||e.key==='Backspace')&&s.selectedTransition){e.preventDefault();s.removeTransition(s.selectedTransition.clipId,s.selectedTransition.side);}
+      else if((e.key==='Delete'||e.key==='Backspace')&&s.selectedClipId){e.preventDefault();s.deleteClip(s.selectedClipId);}
+    };
+    const releaseField=(event:PointerEvent)=>{
+      const active=document.activeElement;
+      if(active instanceof HTMLElement&&active.closest('.inspector')&&!(event.target as HTMLElement).closest('.inspector'))active.blur();
+    };
+    document.addEventListener('pointerdown',releaseField,true);
+    document.addEventListener('keydown',keydown);return()=>{document.removeEventListener('keydown',keydown);document.removeEventListener('pointerdown',releaseField,true);};
+  },[enabled]);
+}
+
+export function useTimelineShortcuts(setTool: Dispatch<SetStateAction<string>>, setSnapping: Dispatch<SetStateAction<boolean>>) {
+  useEffect(() => {
+    const key = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey || (e.target as HTMLElement).closest('input,textarea,select,[contenteditable],dialog[open]')) return;
+      const s = useEditorStore.getState();
+      const k = e.key.toLowerCase();
+      if (k === 'v') { setTool('select'); useEditorStore.setState({textTool:false,shapeTool:null}); }
+      if (k === 't') { useEditorStore.setState({textTool:!s.textTool,shapeTool:null,playing:false}); }
+      if (k === 'b') {setTool('blade');useEditorStore.setState({textTool:false,shapeTool:null});}
+      if (k === 's' || k === 'p') {setTool('select');useEditorStore.setState({shapeTool:k==='p'?'pen':'rectangle',textTool:false,playing:false});}
+      if (k === 'n') setSnapping(value => !value);
+      if (k === 'i') s.setRange(s.playhead, s.rangeOut);
+      if (k === 'o') s.setRange(s.rangeIn, s.playhead);
+    };
+    window.addEventListener('keydown', key);
+    return () => window.removeEventListener('keydown', key);
+  }, [setTool, setSnapping]);
+}

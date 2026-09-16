@@ -1,0 +1,48 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, rm, mkdir, cp } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createFrameLineServer } from '../server/index.ts';
+const { chromium }=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
+delete process.env.FRAME_LINE_SIGNUP_CODE;
+const temp=await mkdtemp(join(tmpdir(),'frameline-shapes-'));
+await cp(resolve('dist'),join(temp,'dist'),{recursive:true});
+const app=createFrameLineServer({dataDir:join(temp,'data'),distDir:join(temp,'dist')});
+await new Promise(r=>app.server.listen(0,'127.0.0.1',r));
+const url=`http://127.0.0.1:${app.server.address().port}`,browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_CHROME_PATH}),context=await browser.newContext({viewport:{width:1600,height:1100}}),page=await context.newPage(),errors=[];
+page.on('pageerror',e=>errors.push(e.message));
+const out=resolve('artifacts/qa');await mkdir(out,{recursive:true});
+const state=async()=>(await(await context.request.get(url+'/api/state')).json()).state;
+const saved=async()=>page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
+const drag=async(locator,dx,dy)=>{const r=await locator.boundingBox();await page.mouse.move(r.x+r.width/2,r.y+r.height/2);await page.mouse.down();await page.mouse.move(r.x+r.width/2+dx,r.y+r.height/2+dy,{steps:6});await page.mouse.up();await saved();};
+try{
+  await page.goto(url);await page.getByRole('button',{name:'Create account',exact:true}).click();await page.getByRole('textbox',{name:'Your name'}).fill('Shape Designer');await page.getByRole('textbox',{name:'Email address'}).fill('shapes@example.test');await page.locator('input[type=password]').fill('Shapes-test-password-2026');await page.getByRole('button',{name:'Create account',exact:true}).last().click();
+  await page.getByRole('button',{name:'New project',exact:true}).click();await page.getByRole('textbox',{name:'Project name'}).fill('Shapes Studio');await page.getByRole('button',{name:'Create project',exact:true}).click();
+  await page.getByRole('button',{name:'Shapes',exact:true}).click();assert.equal(await page.locator('.shape-preset').count(),9);
+  await page.getByRole('button',{name:'Add Rounded rectangle shape',exact:true}).click();await saved();
+  let first=(await state()).clips[0],doc=JSON.parse(first.properties.shapeDocument);assert.equal(doc.kind,'rounded');
+  await page.waitForFunction(()=>document.querySelector('.viewer-frame canvas')?.dataset.hasPicture==='true');
+  await page.getByRole('combobox',{name:'Shape fill style'}).selectOption('linear');await page.getByRole('spinbutton',{name:'Shape Shadow opacity',exact:true}).fill('40');await page.getByRole('spinbutton',{name:'Shape Outline width',exact:true}).fill('4');await page.getByRole('spinbutton',{name:'Rotation',exact:true}).fill('30');await page.getByRole('spinbutton',{name:'Rotation',exact:true}).blur();await saved();
+  const prior=JSON.parse((await state()).clips[0].properties.shapeDocument);
+  await drag(page.locator('.shape-bounds'),35,20);doc=JSON.parse((await state()).clips[0].properties.shapeDocument);assert.ok(doc.x>prior.x&&doc.y>prior.y,'Rotated shape moves with mouse');
+  const nw=await page.getByRole('button',{name:'Resize shape nw',exact:true}).boundingBox();
+  await drag(page.getByRole('button',{name:'Resize shape se',exact:true}),30,25);const nwAfter=await page.getByRole('button',{name:'Resize shape nw',exact:true}).boundingBox();assert.ok(Math.hypot(nwAfter.x-nw.x,nwAfter.y-nw.y)<2,'Rotated resize keeps opposite corner fixed');
+  await page.getByRole('button',{name:'Add shape Position X keyframe',exact:true}).click();
+  const ruler=page.locator('.timeline-ruler'),r=await ruler.boundingBox(),px=await ruler.evaluate(e=>e.getBoundingClientRect().width/Number(e.dataset.timeSpan));await page.mouse.click(r.x+px*2,r.y+20);
+  await page.getByRole('spinbutton',{name:'Shape Position X',exact:true}).fill('50');await page.getByRole('spinbutton',{name:'Shape Position X',exact:true}).blur();await saved();assert.equal((await state()).clips[0].keyframes['shape.x'].length,2);
+  await page.mouse.click(r.x+px,r.y+20);const animatedX=Number(await page.getByRole('spinbutton',{name:'Shape Position X',exact:true}).inputValue()),handleX=await page.locator('.shape-bounds').getAttribute('x');assert.ok(Math.abs(Number(handleX)/1920*100-animatedX)<.001,'Animated inspector and selection bounds agree');
+  await page.getByRole('button',{name:'Pen tool',exact:true}).click();const frame=await page.locator('.shape-overlay').boundingBox();
+  const p=(x,y)=>({x:frame.x+frame.width*x,y:frame.y+frame.height*y});
+  const a=p(.1,.2),b=p(.35,.15),c=p(.4,.45),d=p(.12,.5);
+  await page.mouse.click(a.x,a.y);await page.mouse.move(b.x,b.y);await page.mouse.down();await page.mouse.move(b.x+35,b.y+15,{steps:5});await page.mouse.up();await page.mouse.click(c.x,c.y);await page.mouse.click(d.x,d.y);await page.mouse.click(a.x,a.y);await saved();
+  const penClip=(await state()).clips.find(c=>c.name==='Custom shape');assert.ok(penClip);let pen=JSON.parse(penClip.properties.shapeDocument);assert.equal(pen.points.length,4);assert.ok(pen.points[1].outX!==undefined);assert.equal(pen.closed,true);
+  await page.getByRole('spinbutton',{name:'Shape Width',exact:true}).fill('45');await page.getByRole('spinbutton',{name:'Shape Height',exact:true}).fill('50');await page.getByRole('spinbutton',{name:'Rotation',exact:true}).fill('25');await page.getByRole('spinbutton',{name:'Rotation',exact:true}).blur();await page.locator('.shape-bounds').dblclick();await page.getByRole('button',{name:'Shape point 1',exact:true}).waitFor();
+  await drag(page.getByRole('button',{name:'Shape point 1',exact:true}),20,10);pen=JSON.parse((await state()).clips.find(c=>c.id===penClip.id).properties.shapeDocument);assert.ok(pen.points[0].x!==0||pen.points[0].y!==0);
+  const oldOut=pen.points[0].outX;
+  await drag(page.getByRole('button',{name:'Point 1 outgoing curve',exact:true}),15,-25);pen=JSON.parse((await state()).clips.find(c=>c.id===penClip.id).properties.shapeDocument);assert.notEqual(pen.points[0].outX,oldOut);
+  await page.getByRole('button',{name:'Shape point 2',exact:true}).focus();await page.keyboard.press('Delete');await saved();pen=JSON.parse((await state()).clips.find(c=>c.id===penClip.id).properties.shapeDocument);assert.equal(pen.points.length,3);
+  await page.getByRole('button',{name:'Done',exact:true}).click();await page.screenshot({path:join(out,'shapes-studio.png')});
+  await page.reload();await page.getByRole('button',{name:'Shapes',exact:true}).click();assert.equal((await state()).clips.length,2);assert.deepEqual(errors,[]);
+  console.log('PASS shape library, drawing, appearance, rotated transform, keyframed bounds, pen curves and point editing, persistence');
+}catch(error){console.log(await page.locator('body').innerText());await page.screenshot({path:join(out,'shapes-failure.png')});throw error;}
+finally{await browser.close();await app.close();await rm(temp,{recursive:true,force:true});}

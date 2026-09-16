@@ -1,0 +1,644 @@
+One-shot Astra prompt
+And this is the version I would actually paste into Astra.
+
+Build the first UI/architecture prototype for a browser-based multiplayer professional video editor.
+Read this entire request before writing code. Do not prematurely simplify the scope. This first pass is intentionally UI-heavy.
+The product can best be described as a simplified professional editor inspired by the workflow of DaVinci Resolve combined with the real-time collaboration experience of Google Docs/Figma. Do not visually clone DaVinci Resolve or use its branding/trade dress. Create an original, extremely polished modern interface while retaining the familiar workflow of a professional nonlinear video editor.
+IMPORTANT: I do not want you to build the actual professional video-processing engine in this pass.
+I want the near-complete UI shell, application architecture, panels, component hierarchy, fake data, interactions, state model, and visual language for the product we will ultimately build. Many controls can be mocked, but essentially every major piece of the eventual product should have somewhere to live in the UI now.
+This should not look like a wireframe. It should look like a polished product.
+
+TECHNOLOGY
+Create this as a desktop-first browser application using React and TypeScript with a clean component architecture.
+If starting from scratch, use:
+React
+TypeScript
+Vite
+a modern utility-based CSS solution
+a high-quality icon library
+a modern animation library
+a lightweight centralized client state store
+Keep dependencies reasonable.
+No production backend is required in this pass.
+Use mock/local state but architect networking, media, project state, collaboration, locks, history, and rendering as replaceable services.
+Do not create one giant component.
+
+PRODUCT ARCHITECTURE
+This will eventually run from one central self-hosted Mac server rather than relying heavily on paid cloud infrastructure.
+The central Mac will eventually host:
+the web application
+authentication
+project state
+multiplayer synchronization
+original video storage
+uploads
+proxy generation
+thumbnails
+audio waveform generation
+history
+snapshots
+final renders
+Collaborators access everything through a normal browser.
+Some collaborators will use approximately ten-year-old MacBooks, so the browser experience must be performant.
+Original high-quality footage will eventually be uploaded once to the server. The server generates lightweight proxies. Browsers edit the proxies while final rendering references the original footage.
+Media must eventually use permanent internal media IDs rather than filenames as project references.
+Build UI states for:
+uploading
+upload progress
+processing
+proxy generation
+waveform generation
+thumbnail generation
+ready
+failed
+Fake all processing for now.
+
+AUTHENTICATION AND PEOPLE
+Build polished login/sign-up screens and account controls.
+Every user has:
+name
+email
+avatar/initials
+collaboration color
+Collaboration color is extremely important.
+Generate several demo collaborators:
+Kyle — red
+Ashley — purple
+Jacob — blue
+Maya — yellow
+Make these colors consistently identify users throughout the entire editor.
+Include the user account in the top-right corner.
+Allow changing collaboration color through a profile popover.
+There is essentially one "Class" group. Projects can be private or shared with the Class group.
+When creating a project, include:
+Project Name
+Description
+Share with Class
+Support conceptual roles:
+Owner
+Editor
+Commenter
+Viewer
+Do not build enterprise administration.
+
+PROJECT DASHBOARD
+The root application should be a polished project dashboard.
+Include:
+New Project
+project cards
+thumbnails
+collaborator avatars
+modified date
+duration
+resolution
+project status
+search
+sorting
+Create several realistic demo projects.
+Project navigation should conceptually use routes similar to:
+/project/documentary-project
+
+MAIN EDITOR
+Use four primary workspaces:
+Edit
+Color
+Audio
+Deliver
+Do not reproduce every workspace from DaVinci Resolve.
+The interface should feel professional but simpler.
+The Edit workspace should contain:
+top application/project toolbar
+media/effects panel on the left
+professional viewer in the center
+inspector on the right
+large timeline across the bottom
+Panels should visually support resizing, collapsing, and hiding. Implement resizable panels if practical.
+
+MEDIA PANEL
+Include tabs:
+Media
+Effects
+Transitions
+Titles
+Media should support UI for:
+bins/folders
+grid/list view
+thumbnails
+search
+filtering
+sorting
+metadata
+duration
+resolution
+frame rate
+proxy state
+Populate it with realistic fake footage.
+
+VIEWER
+Do not use a generic-looking browser video player.
+Build a professional viewer containing:
+video frame
+timecode
+play
+pause
+frame forward/back
+previous/next edit
+volume
+fullscreen
+preview quality
+proxy/original indicator
+zoom
+safe-area options
+viewer settings
+Playback may simply advance a fake playhead.
+
+TIMELINE
+This is the visual centerpiece.
+Populate it from the beginning with a realistic demo edit.
+Include:
+multiple video tracks
+multiple audio tracks
+clip thumbnails
+audio waveforms
+transitions
+markers
+timeline ruler
+playhead
+track controls
+mute
+solo
+visibility
+lock
+zoom
+snapping controls
+Familiar editing interaction is desirable:
+click a clip
+select
+drag
+trim
+split
+move
+For this prototype, selecting and moving some fake clips locally would be useful.
+
+MULTIPLAYER VISUAL LANGUAGE
+Collaboration must feel native to the editor, not bolted on.
+Every collaborator's personal color appears throughout the application.
+If Kyle is red:
+Kyle's cursor is red
+Kyle's playhead is red
+clips Kyle selects get a subtle red border
+properties Kyle is actively editing get a subtle red glow
+clips Kyle manipulates get a tasteful red activity indicator
+Ashley's equivalents are purple, etc.
+Keep this elegant rather than overwhelming.
+
+REMOTE CURSORS
+Implement fake multiplayer cursors similar to collaborative design tools.
+Each cursor should have:
+collaborator color
+smooth movement
+name badge
+subtle inactivity behavior
+Animate demo users periodically so the UI visibly feels multiplayer.
+
+MULTIPLAYER PLAYHEADS
+Each user normally navigates independently.
+My playhead should be prominent.
+Remote users should have lower-opacity colored playheads with names.
+A viewer should immediately understand that another collaborator is currently looking at another point in the timeline.
+
+LIVE PLAYBACK
+Add a significant collaboration feature called:
+Join Live Playback
+Normally each collaborator controls playback independently.
+One person can become the presenter/playback leader.
+Others can join synchronized playback.
+Show UI states such as:
+LIVE — Following Ashley
+and:
+You're presenting to 6 people
+Users can leave Live Playback at any time.
+Fake synchronization is sufficient for now.
+Include a classroom-friendly:
+Present Project
+/ Follow Presenter
+experience.
+
+COLLABORATOR PANEL
+Build a People/Collaboration sidebar with something like:
+Kyle — Editing — 01:22:14
+Ashley — Viewing — 02:08:03
+Jacob — Color — Shot 18
+Maya — Following Presenter
+Clicking a collaborator should offer future actions such as:
+Follow Playhead
+View Selection
+
+INSPECTOR
+Build a serious professional inspector.
+Sections should include:
+Transform
+X
+Y
+Zoom
+Rotation
+Anchor
+Crop
+Left
+Right
+Top
+Bottom
+Composite
+Opacity
+Blend Mode
+Speed
+Percentage
+Reverse
+Freeze
+Stabilization
+placeholder controls
+Audio
+Gain
+Pan
+Effects
+applied effects stack
+Changing selected clips should change the inspector.
+
+COLLABORATIVE LOCKS
+Do not lock an entire clip simply because somebody selected it.
+Multiple people can select and inspect the same clip.
+But active manipulation is exclusive.
+If Kyle focuses the Speed field, everyone else should see something like:
+Kyle editing
+and the field should temporarily appear owned by Kyle.
+When Kyle leaves the field, release the lock.
+If Kyle starts dragging or trimming a clip, Kyle owns that manipulation until mouse-up.
+Other people may still inspect the clip but cannot simultaneously move/trim it.
+Design visual states for locks now.
+The future architecture should allow locks to release on:
+completion
+mouse-up
+timeout
+disconnect
+crash
+
+REAL-TIME STATE MODEL
+Architect project changes as small operations rather than passing entire project files around.
+Conceptually support operations such as:
+ClipMoved
+ClipTrimmed
+ClipDeleted
+PropertyChanged
+EffectAdded
+GradeNodeAdded
+TrackCreated
+CommentAdded
+An operation should conceptually contain:
+OperationId
+ProjectId
+UserId
+Timestamp
+TargetId
+Type
+OldState
+NewState
+Fake this locally for now.
+Separate persistent project state from temporary presence state.
+Persistent examples:
+clip position
+speed
+volume
+effects
+color nodes
+Presence examples:
+cursor
+remote playhead
+currently selected item
+focused inspector field
+drag ownership
+presenter
+online status
+Never treat cursor movement as project history.
+
+UNDO
+Undo must eventually be per-user.
+Kyle pressing Undo should undo Kyle's eligible action, not Ashley's simply because hers happened last.
+Structure the client state with this future requirement in mind.
+
+AUTOSAVE
+Normal editing should continuously autosave.
+Add a subtle toolbar status such as:
+Saving…
+followed by:
+Saved
+There should not be a normal manual-save workflow.
+
+HISTORY
+Create a beautiful History panel.
+Do not present raw technical operations.
+Show human-readable activity such as:
+Kyle trimmed Interview 04
+Ashley changed speed from 100% to 85%
+Maya moved B-Roll 12
+Jacob added a color correction
+Allow visual filtering by:
+user
+action type
+date
+Populate the mock history.
+
+SNAPSHOTS
+Add a major feature:
+Save Snapshot
+Clicking it opens a polished dialog with:
+Snapshot Name
+Optional Note
+Example:
+Before Sound Design
+Picture lock from Thursday review
+Snapshots should appear inside History but visually carry much more importance than ordinary activity.
+Populate examples:
+Rough Cut
+Picture Lock
+Before Color
+Before Sound Design
+Each snapshot should have:
+creator
+timestamp
+note
+Preview
+Restore
+Restoring should show confirmation and explain that the current state will first be preserved.
+
+COLOR WORKSPACE
+Color is critically important to this product.
+Create a serious but approachable Color workspace.
+Include:
+clip/shot browser
+viewer
+scopes area
+grading node graph
+grading controls
+AI Color Assistant
+Do not implement fake "professional color science" and claim it is correct.
+The real product will eventually use a proper mathematically rigorous color-management pipeline that understands log footage, camera input spaces, a wide-gamut working space, and proper display/output transforms.
+For now build the interfaces and abstract service boundaries where the real color engine will later connect.
+
+COLOR NODES
+Preserve the editable node concept because it is both powerful and educational.
+Start with understandable default nodes:
+Input → Balance → Contrast → Skin → Look → Output Trim
+Display these as a beautiful interactive node graph.
+Allow selecting nodes.
+Allow adding fake nodes.
+Show editable parameters.
+Make it feel professional without overwhelming beginners.
+
+AI COLOR ASSISTANT
+This future feature is extremely important.
+Create the complete UI now.
+A user should eventually be able to type:
+Make this warmer and more cinematic but keep the skin natural.
+The AI should eventually create actual editable grade nodes instead of applying a mysterious hidden preset.
+The UI might then show:
+Grade Created
+✓ Balance
+✓ Contrast
+✓ Skin Protection
+✓ Look
+Include controls:
+Explain Grade
+Apply
+Undo
+Include suggestion chips:
+Balance this shot
+Match previous shot
+Protect skin tones
+Create cinematic look
+For now simulate the results.
+
+COLOR SCOPES
+Reserve real layout space for:
+Waveform
+RGB Parade
+Vectorscope
+Histogram
+Render believable placeholder graphics if needed.
+Do not omit them because the real scope engine has not been built yet.
+
+AUDIO WORKSPACE
+Build a simplified professional audio workspace.
+Include:
+audio timeline
+audio tracks
+waveforms
+mixer
+level meters
+mute
+solo
+pan
+gain
+master output
+effect stack
+Include placeholder panels for:
+EQ
+Compressor
+Limiter
+Noise Reduction
+Make the page look complete even if DSP is fake.
+
+DELIVER WORKSPACE
+Final rendering will eventually happen on the central Mac.
+Create export presets:
+Quick Export
+YouTube
+High Quality Master
+Custom
+Provide controls for:
+filename
+destination
+resolution
+frame rate
+codec
+quality
+audio
+range
+Include:
+Add to Render Queue
+
+RENDER QUEUE
+Create a convincing queue such as:
+Documentary Final — 74% — 2:13 remaining
+Teacher Review — Waiting
+Social Cut — Complete
+Animate progress tastefully.
+Rendering should visually reinforce that processing happens on the central server.
+
+SERVER STATUS
+Add a subtle server indicator:
+● Server Online
+Clicking it should expose a small server-health panel showing mocked values:
+storage
+proxy workers
+active renders
+connected users
+This product is self-hosted, and that should subtly become part of its personality.
+
+COMMENTS / REVIEW
+Create the foundation for timestamped comments.
+Comments should eventually attach to:
+timestamp
+clip
+timeline range
+Example:
+Ashley — 01:23:14
+Could we hold this shot about half a second longer?
+Include replies and resolve controls in the UI.
+
+NOTIFICATIONS
+Build animated notifications for events such as:
+collaborator joined
+footage uploaded
+proxy ready
+snapshot saved
+render completed
+Keep them tasteful.
+
+SETTINGS
+Build a complete-looking settings screen with:
+General
+Appearance
+Playback
+Editing
+Color
+Audio
+Storage
+Server
+Accounts
+Shortcuts
+About
+Include future appearance settings for:
+UI scale
+timeline density
+reduced motion
+
+CONTEXT MENUS
+Build polished context menus.
+Timeline clip menu:
+Cut
+Copy
+Duplicate
+Split at Playhead
+Change Speed
+Disable Clip
+Color
+Audio
+Reveal in Media
+Clip Properties
+Delete
+Media menu:
+Add to Timeline
+Rename
+Create Proxy
+Metadata
+Remove from Project
+
+MOTION / VISUAL DESIGN
+Spend substantial effort here.
+I want the interface to immediately communicate:
+This is modern software.
+Use:
+dark cinematic surfaces
+excellent typography
+subtle depth
+tasteful rounded corners
+thin separators
+clean icons
+restrained translucency
+extremely polished hover/focus states
+subtle glow for collaborative ownership
+Animation should communicate state, not simply decorate.
+Animate:
+panel transitions
+remote cursors
+remote playheads
+selection borders
+inspector ownership
+notifications
+live-playback state
+snapshot creation
+render progress
+menus/dialogs
+Because some clients will be older computers, prioritize transform/opacity animations and avoid enormous expensive blur/backdrop effects.
+Target a smooth high-frame-rate experience on modest hardware.
+Respect Reduced Motion.
+
+DATA TYPES / APPLICATION STRUCTURE
+Even though the project is using mock data, create coherent types/models for at least:
+User
+Group
+Project
+ProjectMember
+MediaAsset
+Bin
+Timeline
+Track
+Clip
+Effect
+GradeNode
+Comment
+Presence
+CollaborativeLock
+Operation
+Snapshot
+RenderJob
+Notification
+Keep UI components separate from eventual backend services.
+Create service interfaces or clean seams for future:
+ProjectService
+MediaService
+CollaborationService
+RenderService
+ColorService
+AuthenticationService
+Mock those services for now.
+
+DEMONSTRATION STATE
+Do not present me with an empty timeline.
+Create an attractive built-in project called:
+City After Dark
+It should appear to be a short documentary.
+Populate it with:
+interviews
+B-roll
+drone footage
+music
+ambience
+multiple video/audio tracks
+comments
+color nodes
+history
+snapshots
+collaborators
+Fake collaborators should periodically move their cursors/playheads so I can immediately see the multiplayer concept.
+
+PRIORITY
+In this pass, prioritize:
+visual polish
+layout
+component architecture
+completeness of UI
+multiplayer visual language
+smooth interaction
+realistic demo state
+over sophisticated video implementation.
+Do not spend most of the development time attempting to build a codec/rendering engine.
+
+SUCCESS TEST
+When I launch this, I should first think:
+"This looks like a real professional video editor."
+A few seconds later I should notice another user's colored cursor, playhead, clip selection, or inspector activity and think:
+"Oh shit. It's multiplayer."
+That emotional response is the goal of this prototype.
+Build the application now. Do not stop after producing a plan or describing the architecture. Create the working UI prototype and make sensible design decisions where small details are unspecified.
+

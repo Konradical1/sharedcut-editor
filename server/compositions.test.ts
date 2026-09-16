@@ -1,0 +1,65 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createFrameLineServer } from './index.ts';
+import { defaultShape } from '../src/services/shapes.ts';
+import type { PersistedState } from '../src/services/index.ts';
+import type { Clip, Project, ProjectState, Track, Timeline } from '../src/state/models.ts';
+
+const exec=promisify(execFile);
+test('HTTP composition graphs, history, snapshots, persistence and nested rendering preserve editable shapes',async()=>{
+ const dataDir=await mkdtemp(join(tmpdir(),'frameline-compositions-http-'));
+ let app=createFrameLineServer({dataDir}),base='',cookie='';
+ const listen=async()=>{await new Promise<void>(resolve=>app.server.listen(0,'127.0.0.1',resolve));base=`http://127.0.0.1:${(app.server.address() as {port:number}).port}`;};
+ const request=async(path:string,method='GET',body?:unknown)=>{const response=await fetch(`${base}/api${path}`,{method,headers:{cookie,...(body===undefined?{}:{'content-type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body)});return {response,data:await response.json()};};
+ const read=async()=>(await request('/state')).data as {revision:number;state:PersistedState};
+ const save=async(value:Awaited<ReturnType<typeof read>>)=>{const result=await request('/state','PUT',value);assert.equal(result.response.status,200,JSON.stringify(result.data));};
+ const graph=(s:PersistedState):ProjectState=>structuredClone({timelines:s.timelines.filter(t=>t.projectId==='film'),tracks:s.tracks.filter(t=>s.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId==='film')),clips:s.clips.filter(c=>c.projectId==='film'),nodes:s.nodes.filter(n=>n.projectId==='film'),comments:[]});
+ const track=(id:string,timelineId:string):Track=>({id,timelineId,name:id,kind:'video',number:1,muted:false,hidden:false,solo:false,locked:false,gain:0,pan:0});
+ try {
+  await listen();
+  const signup=await request('/auth/signup','POST',{name:'Composition Editor',email:'compositions@example.com',password:'composition regression password'});
+  assert.equal(signup.response.status,201);cookie=signup.response.headers.get('set-cookie')!.split(';')[0];const userId=signup.data.user.id;
+  let value=await read();
+  const project=(id:string):Project=>({id,name:id,description:'',shared:false,thumbnail:'',modifiedAt:Date.now(),duration:.25,resolution:'64 × 64',fps:24,status:'In progress',members:[{userId,role:'Owner'}]});
+  const main:Timeline={id:'main',projectId:'film',name:'Main',duration:.25};
+  const shape:Clip={id:'shape',projectId:'film',timelineId:main.id,trackId:'main-v',mediaId:'frameline-shape',name:'Cyan card',start:0,duration:.25,sourceIn:0,disabled:false,color:'#00ffff',properties:{shapeDocument:JSON.stringify({...defaultShape(),x:.25,y:.25,width:.5,height:.5,fill:'#00ffff'})},effects:[]};
+  value.state.projects.push(project('film'),project('other'));
+  value.state.timelines.push(main,{id:'other-composition',projectId:'other',name:'Other',duration:.25,composition:true});
+  value.state.tracks.push(track('main-v','main'));value.state.clips.push(shape);await save(value);
+  value=await read();const before=graph(value.state);
+  const inner:Timeline={...main,id:'inner',name:'Inner',composition:true},middle:Timeline={...inner,id:'middle',name:'Card composition'};
+  value.state.timelines.push(middle,inner);value.state.tracks.push(track('middle-v','middle'),track('inner-v','inner'));
+  value.state.clips=[{...shape,timelineId:'inner',trackId:'inner-v'},{...shape,id:'middle-parent',mediaId:'frameline-composition',timelineId:'middle',trackId:'middle-v',properties:{compositionId:'inner'}},{...shape,id:'parent',mediaId:'frameline-composition',properties:{compositionId:'middle'}}];
+  value.state.operations.push({id:'group-operation',projectId:'film',userId,timestamp:Date.now(),targetId:'parent',type:'SnapshotRestored',description:'Create composition',oldState:[{collection:'timelines',id:'middle',value:null},{collection:'timelines',id:'inner',value:null},{collection:'clips',id:'shape',value:shape}],newState:[{collection:'timelines',id:'middle',value:middle},{collection:'timelines',id:'inner',value:inner},{collection:'clips',id:'shape',value:value.state.clips[0]}]});
+  value.state.snapshots.push({id:'before-group',projectId:'film',name:'Before grouping',note:'',userId,timestamp:Date.now(),state:before},{id:'after-group',projectId:'film',name:'Editable card',note:'',userId,timestamp:Date.now(),state:graph(value.state)});
+  await save(value);
+  await app.close();app=createFrameLineServer({dataDir});await listen();value=await read();
+  assert.equal(value.state.timelines.filter(t=>t.composition&&t.projectId==='film').length,2);
+  assert.equal(value.state.operations[0].newState instanceof Array,true);
+  assert.equal((value.state.operations[0].newState as {collection:string}[]).filter(c=>c.collection==='timelines').length,2);
+  assert.equal(value.state.snapshots.find(s=>s.id==='after-group')!.state.timelines!.length,3);
+  const reject=async(mutate:(s:PersistedState)=>void,pattern:RegExp)=>{const invalid=structuredClone(value);mutate(invalid.state);const result=await request('/state','PUT',invalid);assert.equal(result.response.status,400,JSON.stringify(result.data));assert.match(JSON.stringify(result.data),pattern);};
+  await reject(s=>{s.clips.find(c=>c.id==='parent')!.properties.compositionId='missing';},/missing|inaccessible/i);
+  await reject(s=>{s.clips.find(c=>c.id==='parent')!.properties.compositionId='other-composition';},/missing|inaccessible/i);
+  await reject(s=>{const c=s.clips.find(c=>c.id==='shape')!;c.mediaId='frameline-composition';c.properties={compositionId:'middle'};},/itself|cycle/i);
+  await reject(s=>{s.clips.find(c=>c.id==='shape')!.properties.shapeDocument=JSON.stringify({...defaultShape(),width:9});},/shape/i);
+  await reject(s=>{s.clips.find(c=>c.id==='shape')!.properties.shapeDocument='{broken';},/shape/i);
+  await reject(s=>{const snapshot=structuredClone(s.snapshots.find(s=>s.id==='after-group')!);snapshot.id='invalid-snapshot';const c=snapshot.state.clips.find(c=>c.id==='shape')!;c.mediaId='frameline-composition';c.properties={compositionId:'middle'};s.snapshots.push(snapshot);},/itself|cycle/i);
+  const rendered=await request('/renders','POST',{projectId:'film',name:'Nested card',preset:'Quick Export',settings:{timelineId:'main',codec:'H.264',audio:'Disabled'}});
+  assert.equal(rendered.response.status,202,JSON.stringify(rendered.data));
+  let job=rendered.data.job;
+  for(let attempt=0;attempt<100&&!['complete','failed'].includes(job.status);attempt++){await new Promise(resolve=>setTimeout(resolve,50));job=(await read()).state.renderJobs.find(j=>j.id===job.id);}
+  assert.equal(job.status,'complete',job.error);
+  const download=await fetch(`${base}${job.outputUrl}`,{headers:{cookie}});assert.equal(download.status,200);
+  const file=join(dataDir,'verified-output.mp4');await writeFile(file,Buffer.from(await download.arrayBuffer()));
+  const pixels=(await exec(process.env.FFMPEG_PATH||'ffmpeg',['-v','error','-i',file,'-frames:v','1','-pix_fmt','rgb24','-f','rawvideo','pipe:1'],{encoding:'buffer',maxBuffer:1e6})).stdout;
+  assert.ok(pixels[(32*64+32)*3+1]>235&&pixels[(32*64+32)*3+2]>235,'The export endpoint includes the nested timeline shape.');
+  assert.ok([...pixels.subarray(0,3)].every(v=>v<10),'The transparent card keeps the empty outer canvas.');
+  assert.equal((await fetch(`${base}${job.outputUrl}`)).status,401,'Nested exports still require authentication.');
+ } finally {await app.close();await rm(dataDir,{recursive:true,force:true});}
+});

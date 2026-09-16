@@ -1,0 +1,69 @@
+// Isolated copy of a real project; the live database and camera originals are never edited.
+import assert from 'node:assert/strict';
+import {mkdtemp,mkdir,symlink,readFile,writeFile,rm} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join,resolve} from 'node:path';
+import {DatabaseSync} from 'node:sqlite';
+import {createFrameLineServer} from '../server/index.ts';
+const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
+const temp=await mkdtemp(join(tmpdir(),'frameline-overhaul-')),out=resolve('artifacts/qa/color-layout');await mkdir(out,{recursive:true});
+delete process.env.FRAME_LINE_SIGNUP_CODE;
+const source=new DatabaseSync('data/frameline.sqlite',{readOnly:true}),live=JSON.parse(source.prepare('select state from workspace where id=1').get().state);source.close();
+const asset=live.media.find(m=>m.name==='C0965.MP4');assert.ok(asset,'Test needs Newspaper C0965.MP4');
+const original=live.clips.find(c=>c.mediaId===asset.id),project=structuredClone(live.projects.find(p=>p.id===asset.projectId));
+let app=createFrameLineServer({dataDir:temp,distDir:resolve('dist')}),url='';
+const listen=async()=>{await new Promise(r=>app.server.listen(0,'127.0.0.1',r));url=`http://127.0.0.1:${app.server.address().port}`;};await listen();
+const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH});
+const context=await browser.newContext({viewport:{width:1600,height:1000}}),page=await context.newPage();
+const errors=[];page.on('pageerror',e=>errors.push(e.message));
+await page.addInitScript(()=>{const NativeAudio=window.AudioContext;window.AudioContext=class extends NativeAudio{constructor(options={}){super({...options,sinkId:{type:'none'}});}};});
+try{
+ const signup=await context.request.post(url+'/api/auth/signup',{data:{name:'Color QA',email:'color-overhaul@example.test',password:'FrameLine-Color-Test-2026'}});assert.equal(signup.status(),201);const {user}=await signup.json();await app.close();
+ const db=new DatabaseSync(join(temp,'frameline.sqlite'));const row=db.prepare('select state from workspace where id=1').get();const state=row?JSON.parse(row.state):{projects:[],media:[],clips:[],tracks:[],nodes:[],timelines:[],comments:[],operations:[],snapshots:[],renderJobs:[],users:[],currentUserId:'',settings:{}};
+ project.members=[{userId:user.id,role:'Owner'}];project.shared=false;
+ const clip={...structuredClone(original),start:0,duration:3,keyframes:{},properties:{...original.properties,zoom:100,x:0,y:0,opacity:100}};
+ Object.assign(state,{projects:[project],media:[asset],clips:[clip],tracks:live.tracks.filter(t=>t.timelineId===clip.timelineId),timelines:live.timelines.filter(t=>t.id===clip.timelineId).map(t=>({...t,duration:3})),nodes:live.nodes.filter(n=>n.clipId===clip.id),comments:[],operations:[],snapshots:[],renderJobs:[],settings:{...state.settings,performanceMode:'On'}});
+ db.prepare('insert into workspace(id,revision,state) values(1,1,?) on conflict(id) do update set state=excluded.state').run(JSON.stringify(state));db.close();
+ await mkdir(join(temp,'media'));await symlink(resolve('data/media',asset.id),join(temp,'media',asset.id));await mkdir(join(temp,'resolve'));await symlink(resolve('data/resolve',project.id),join(temp,'resolve',project.id));
+ app=createFrameLineServer({dataDir:temp,distDir:resolve('dist')});await listen();
+ const saved=async()=> (await(await context.request.get(url+'/api/state')).json()).state;
+ const settled=()=>page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
+ await page.goto(url+'/project/'+project.id);await page.getByRole('navigation',{name:'Editor workspaces'}).getByRole('button',{name:'Color',exact:true}).click();
+ await page.waitForFunction(()=>document.querySelector('.viewer-frame canvas')?.dataset.hasPicture==='true');
+ await page.getByRole('button',{name:'Start wide-gamut grade',exact:true}).click();await settled();
+ await page.getByRole('button',{name:'Node 2: Balance',exact:true}).click();
+ assert.equal(await page.locator('.color-page-header').count(),0);
+ assert.equal(await page.getByRole('separator',{name:'Resize tools'}).count(),0);
+ for(const size of [{width:1600,height:1000},{width:1512,height:756},{width:1280,height:720},{width:960,height:640},{width:390,height:844}]){
+  await page.setViewportSize(size);
+  const layout=await page.evaluate(()=>{const root=document.querySelector('.color-workspace'),frame=document.querySelector('.viewer-frame');return {height:root.clientHeight,scrollHeight:root.scrollHeight,width:root.clientWidth,scrollWidth:root.scrollWidth,frameHeight:frame.getBoundingClientRect().height,body:document.documentElement.scrollHeight,window:innerHeight};});
+  assert.ok(layout.scrollHeight<=layout.height+1,JSON.stringify({size,layout}));assert.ok(layout.scrollWidth<=layout.width+1,JSON.stringify({size,layout}));assert.ok(layout.body<=layout.window);assert.ok(layout.frameHeight>90);
+  await page.screenshot({path:join(out,`layout-${size.width}.png`)});
+ }
+ await page.setViewportSize({width:1512,height:850});
+ await page.getByRole('button',{name:'Show effects panel'}).click();assert.ok(await page.getByRole('button',{name:'Library',exact:true}).isVisible());await page.getByRole('button',{name:'Hide effects panel'}).click();await page.setViewportSize({width:960,height:640});await page.getByRole('button',{name:'Show effects panel'}).click();await page.getByRole('button',{name:'Close effects panel'}).click();assert.equal(await page.locator('.color-effects-panel').count(),0);await page.setViewportSize({width:1512,height:850});
+ const scrub=page.getByRole('slider',{name:'Scrub color footage'});await scrub.focus();await scrub.press('Home');await scrub.press('ArrowRight');
+ await page.waitForFunction(()=>Math.abs(Number(document.querySelector('[aria-label="Scrub color footage"]').value)-1/24)<.001);
+ const bounds=await scrub.boundingBox();await page.mouse.click(bounds.x+bounds.width*.7,bounds.y+bounds.height/2);
+ assert.ok(Number(await scrub.inputValue())>1.5);assert.ok(Number(await scrub.inputValue())<3);
+ await page.waitForFunction(()=>document.querySelector('.viewer-frame canvas')?.dataset.hasPicture==='true');
+ await page.getByRole('button',{name:'Fit Nodes'}).click();
+ const canvas=page.getByRole('group',{name:'Color node canvas'}),box=await canvas.boundingBox();
+ const transform=()=>page.locator('.node-world').evaluate(el=>{const m=new DOMMatrix(getComputedStyle(el).transform);return {z:m.a,x:m.e,y:m.f};});
+ const scale=await canvas.evaluate(el=>el.clientWidth/el.getBoundingClientRect().width);const before=await transform(),anchor={x:box.width*.7,y:box.height*.6};
+ await canvas.evaluate(el=>el.addEventListener('wheel',e=>{window.zoomAnchor={x:e.clientX-el.getBoundingClientRect().left,y:e.clientY-el.getBoundingClientRect().top};},{once:true}));await page.mouse.move(box.x+anchor.x,box.y+anchor.y);await page.mouse.wheel(0,100);await page.waitForTimeout(100);Object.assign(anchor,await page.evaluate(()=>window.zoomAnchor));
+ const after=await transform();assert.ok(after.z<before.z);assert.ok(Math.abs((anchor.x*scale-before.x)/before.z-(anchor.x*scale-after.x)/after.z)<.01);assert.ok(Math.abs((anchor.y*scale-before.y)/before.z-(anchor.y*scale-after.y)/after.z)<.01);
+ const gridBefore=await canvas.evaluate(el=>getComputedStyle(el).backgroundPosition);
+ await page.mouse.move(box.x+20,box.y+20);await page.mouse.down();await page.mouse.move(box.x+60,box.y+50);await page.mouse.up();
+ assert.notEqual(await canvas.evaluate(el=>getComputedStyle(el).backgroundPosition),gridBefore);
+ for(let i=0;i<8;i++){await page.mouse.move(box.x+anchor.x,box.y+anchor.y);await page.mouse.wheel(0,100);}
+ await page.waitForTimeout(100);const spacing=await canvas.evaluate(el=>parseFloat(getComputedStyle(el).backgroundSize));assert.ok(spacing>=12&&spacing<=48,String(spacing));
+ const wheel=page.getByRole('group',{name:'Lift color balance; use RGB fields for keyboard control'}),w=await wheel.boundingBox();
+ await wheel.dblclick();const read=async()=>Number(await page.getByLabel('Lift R',{exact:true}).inputValue());
+ await page.mouse.move(w.x+w.width/2,w.y+w.height/2);await page.mouse.down();await page.mouse.move(w.x+w.width/2+20,w.y+w.height/2);const normal=await read();assert.ok(normal>0);
+ await page.keyboard.down('Shift');await page.mouse.move(w.x+w.width/2+21,w.y+w.height/2);const fine=await read();assert.ok(Math.abs(fine-normal)<.002);
+ await page.keyboard.up('Shift');await page.mouse.move(w.x+w.width/2+22,w.y+w.height/2);assert.ok(Math.abs(await read()-fine)<.003);await page.mouse.up();
+ await page.keyboard.press('Control+z');assert.equal(await read(),0);
+ await wheel.focus();await wheel.press('ArrowRight');assert.equal(await read(),.001);await wheel.press('Home');assert.equal(await read(),0);
+ await page.screenshot({path:join(out,'final.png')});assert.deepEqual(errors,[]);console.log('PASS fixed viewport, inspector, frame scrub, anchored zoom, adaptive panning grid, precise wheels and undo');
+}finally{await browser.close();await app.close();await rm(temp,{recursive:true,force:true});}

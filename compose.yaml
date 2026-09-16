@@ -1,0 +1,25 @@
+services:
+  frameline:
+    build: .
+    expose:
+      - "4310"
+    environment:
+      FRAME_LINE_SIGNUP_CODE: ${FRAME_LINE_SIGNUP_CODE:?Set an installation signup code}
+      FRAME_LINE_TRUST_PROXY: "1"
+    volumes:
+      - frameline-data:/data
+    restart: unless-stopped
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+volumes:
+  frameline-data:
+  caddy-data:
+  caddy-config:

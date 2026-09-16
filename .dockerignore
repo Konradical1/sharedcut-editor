@@ -1,0 +1,11 @@
+node_modules
+dist
+data
+artifacts
+.git
+*.log
+.env*
+
+.venv-import/
+
+.venv-color/

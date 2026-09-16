@@ -1,0 +1,7 @@
+sharedcut.com, www.sharedcut.com {
+	reverse_proxy frameline:4310
+	request_body {
+		# 10 GiB, matching FRAME_LINE_MAX_UPLOAD_BYTES
+		max_size 10GiB
+	}
+}

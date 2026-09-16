@@ -1,0 +1,75 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createFrameLineServer } from './index.ts';
+
+test('folders persist, inherit and revoke access, protect moves and reject stale confirmations', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'sharedcut-library-'));
+  let app = createFrameLineServer({ dataDir: dir });
+  const listen = async () => { await new Promise<void>(r => app.server.listen(0, '127.0.0.1', r)); return `http://127.0.0.1:${(app.server.address() as { port: number }).port}`; };
+  let base = await listen();
+  const request = async (path: string, cookie: string, body?: unknown, method = body ? 'POST' : 'GET') => { const res = await fetch(`${base}/api${path}`, { method, headers: { cookie, 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }); return { status: res.status, data: await res.json(), cookie: res.headers.get('set-cookie')?.split(';')[0] ?? '' }; };
+  const signup = (name: string) => request('/auth/signup', '', { name, email: `${name}@test.example`, password: 'library test password' });
+  try {
+    const alice = await signup('Alice'), bob = await signup('Bob'), carol = await signup('Carol');
+    const a = alice.cookie, b = bob.cookie, c = carol.cookie;
+    const initial = (await request('/state', a)).data;
+    initial.state.projects.push({ id: 'film', name: 'Film', description: '', shared: false, thumbnail: '', modifiedAt: 1, duration: 0, resolution: '1920 × 1080', fps: 24, status: 'In progress', members: [{ userId: alice.data.user.id, role: 'Owner' }] });
+    assert.equal((await request('/state', a, initial, 'PUT')).status, 200);
+    const change = async (body: unknown, cookie = a) => {
+      const preview = await request('/library', cookie, { ...body as object, preview: true }); assert.equal(preview.status, 200, JSON.stringify(preview.data));
+      const result = await request('/library', cookie, { ...body as object, revision: preview.data.preview.revision }); assert.equal(result.status, 200, JSON.stringify(result.data)); return result.data;
+    };
+    const parent = await change({ action: 'create', parentId: null, name: 'Class films', shared: true, classRole: 'Viewer', members: [] });
+    const child = await change({ action: 'create', parentId: parent.id, name: 'Documentaries', shared: false, classRole: 'Editor', members: [] });
+    const move = { action: 'move', kind: 'project', id: 'film', parentId: child.id };
+    const warning = await request('/library', a, { ...move, preview: true }); assert.deepEqual(warning.data.preview.changes[0].added.sort(), ['Bob', 'Carol']);
+    assert.equal((await request('/state', b)).data.state.projects.length, 0, 'preview does not grant access');
+    await change(move);
+    const bobState = (await request('/state', b)).data; assert.equal(bobState.state.projects[0].members.find((m: any) => m.userId === bob.data.user.id).role, 'Viewer');
+    bobState.state.projects[0].name = 'Not allowed'; assert.equal((await request('/state', b, bobState, 'PUT')).status, 403);
+    assert.equal((await request('/library', b, { ...move, parentId: null, preview: true })).status, 403);
+    assert.equal((await request('/library', b, { action: 'create', parentId: parent.id, name: 'No', shared: false, classRole: 'Editor', members: [], preview: true })).status, 403);
+    assert.equal((await request('/library', a, { action: 'move', kind: 'folder', id: parent.id, parentId: child.id, preview: true })).status, 400);
+    assert.equal((await request('/library', a, { action: 'delete', id: child.id, preview: true })).status, 409);
+    await change({ action: 'update', id: parent.id, name: 'Class films', shared: true, classRole: 'Editor', members: [] });
+    const editable = (await request('/state', b)).data; editable.state.projects[0].description = 'Inherited edit'; assert.equal((await request('/state', b, editable, 'PUT')).status, 200);
+    // Saving expanded inherited members must never turn them into permanent direct shares.
+    await change({ action: 'move', kind: 'project', id: 'film', parentId: null });
+    assert.equal((await request('/state', b)).data.state.projects.length, 0);
+    assert.equal((await request('/state', c)).data.state.projects.length, 0);
+    await request('/projects/film', a, { name: 'Film', description: '', status: 'In progress', resolution: '1920 × 1080', fps: 24, access: 'people', memberIds: [carol.data.user.id] }, 'PATCH');
+    await change(move); await change({ action: 'move', kind: 'project', id: 'film', parentId: null });
+    assert.equal((await request('/state', c)).data.state.projects.length, 1, 'direct shares survive moves');
+    assert.equal((await request('/state', b)).data.state.projects.length, 0);
+    const stale = (await request('/library', a, { ...move, preview: true })).data.preview;
+    await change({ action: 'update', id: parent.id, name: 'Renamed class', shared: false, classRole: 'Editor', members: [] });
+    assert.equal((await request('/library', a, { ...move, revision: stale.revision })).status, 409);
+    await change(move);
+    assert.equal((await request('/library', b)).data.folders.length, 0);
+    const beforeDelete = (await request('/state', a)).data.state.projects[0];
+    assert.equal((await request('/projects/film', a, undefined, 'DELETE')).status, 200);
+    const forged = (await request('/state', b)).data; forged.state.projects.push({ ...beforeDelete, members: [{ userId: bob.data.user.id, role: 'Owner' }] });
+    assert.equal((await request('/state', b, forged, 'PUT')).status, 400, 'a deleted project ID cannot bypass destination access');
+    assert.equal((await request('/projects/film/restore', a, {})).status, 200);
+    await app.close(); app = createFrameLineServer({ dataDir: dir }); base = await listen();
+    assert.equal((await request('/library', a)).data.locations.film, child.id);
+    assert.equal((await request('/library', a)).data.folders.find((f: any) => f.id === parent.id).name, 'Renamed class');
+    assert.equal((await request('/state', b)).data.state.projects.length, 0);
+    assert.equal((await request('/projects/film', a, { access: 'people', members: [{ userId: bob.data.user.id, role: 'Viewer' }], classRole: 'Viewer' }, 'PATCH')).status, 200);
+    assert.equal((await request('/projects/film', a, { name: 'Renamed without changing access' }, 'PATCH')).status, 200);
+    const viewer = (await request('/state', b)).data;
+    assert.equal(viewer.state.projects[0].members.find((m: any) => m.userId === bob.data.user.id).role, 'Viewer');
+    viewer.state.projects[0].description = 'Forbidden';
+    assert.equal((await request('/state', b, viewer, 'PUT')).status, 403);
+    assert.equal((await request('/projects/film', a, { access: 'class', members: [], classRole: 'Viewer' }, 'PATCH')).status, 200);
+    const joined = await signup('NewStudent');
+    assert.equal((await request('/state', joined.cookie)).data.state.projects[0].members.find((m: any) => m.userId === joined.data.user.id).role, 'Viewer');
+    const forgedClass = (await request('/state', b)).data; forgedClass.state.projects[0].classRole = 'Editor';
+    assert.equal((await request('/state', b, forgedClass, 'PUT')).status, 403);
+    assert.equal((await request('/projects/film', b, { classRole: 'Editor' }, 'PATCH')).status, 403);
+    assert.equal((await request('/projects/film', a, { members: [{ userId: bob.data.user.id, role: 'Owner' }] }, 'PATCH')).status, 400);
+  } finally { await app.close(); await rm(dir, { recursive: true, force: true }); }
+});
