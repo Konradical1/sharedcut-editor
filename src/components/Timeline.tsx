@@ -109,6 +109,10 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
   const tracks = savedTracks.map(track => { const preview = heightDraft?.id === track.id ? heightDraft : livePreviews.flatMap(p => p.preview?.tracks ?? []).find(t => t.id === track.id); return preview ? { ...track, height: preview.height } : track; });
   const clips = useEditorStore(s=>s.clips);
   const draggingMediaId = useEditorStore(s=>s.draggingMediaId);
+  // A multi-select drag from the bin carries its ids newline-joined; everything downstream of the
+  // first id only cares about how much time the drop will take up.
+  const draggingIds = draggingMediaId?.split('\n') ?? [];
+  const draggingFirst = draggingIds[0] ?? null;
   const media = useEditorStore(s=>s.media);
   const textTool = useEditorStore(s=>s.textTool);
   const selectedIds = useEditorStore(s=>s.selectedClipIds);
@@ -172,7 +176,7 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
   const length = timeline?.duration ?? 180;
   const width = Math.max(length, ...clips.filter(c=>c.timelineId===timelineId).map(c=>c.start+c.duration)) * pixels + viewport.width/2;
   const ownColor = users.find(u=>u.id===currentUserId)?.color ?? '#ec7b77';
-  const audioPreview=dropDraft&&media.find(m=>m.id===draggingMediaId)?.hasAudio&&media.find(m=>m.id===draggingMediaId)?.kind==='video'?companionAudioTrack(tracks,tracks.find(t=>t.id===dropDraft.trackId)!):null;
+  const audioPreview=dropDraft&&draggingIds.some(id=>{const m=media.find(a=>a.id===id);return m?.hasAudio&&m.kind==='video';})?companionAudioTrack(tracks,tracks.find(t=>t.id===dropDraft.trackId)!):null;
   const visibleTracks = [...tracks,...(audioPreview?.id==='pending-audio'?[audioPreview]:[])].filter(t=>t.timelineId===timelineId&&(!audioOnly||t.kind==='audio')).sort((a,b)=>Number(Boolean(b.captionSets))-Number(Boolean(a.captionSets))||(a.kind!==b.kind?(a.kind==='video'?-1:1):a.kind==='video'?b.number-a.number:a.number-b.number));
   const staleCaptions=new Set(tracks.filter(t=>t.timelineId===timelineId).flatMap(t=>t.captionSets??[]).filter(meta=>meta.signature!==captionSignature(clips,tracks,timelineId,meta.start,meta.end,meta.trackIds)).map(s=>s.id));
   const actions = useEditorStore.getState;
@@ -291,15 +295,17 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
     }
   }
   function mediaPlacement(e:DragEvent<HTMLDivElement>,trackId:string) {
-    const titleIndex=draggingMediaId?.startsWith('title:')?Number(draggingMediaId.split(':')[1]):-1,shapeKind=draggingMediaId?.startsWith('shape:')?draggingMediaId.slice(6):null;
-    const asset=titleTemplates[titleIndex]?{kind:'image',status:'ready',duration:createTitleTemplate(titleIndex,!draggingMediaId?.endsWith(':static'),fps).duration,name:titleTemplates[titleIndex].name}:shapeKind?{kind:'image',status:'ready',duration:5,name:shapeKind}:draggingSound && draggingSound.id===draggingMediaId?{...draggingSound,kind:'audio'}:media.find(m=>m.id===draggingMediaId),track=tracks.find(t=>t.id===trackId);
+    const titleIndex=draggingFirst?.startsWith('title:')?Number(draggingFirst.split(':')[1]):-1,shapeKind=draggingFirst?.startsWith('shape:')?draggingFirst.slice(6):null;
+    const asset=titleTemplates[titleIndex]?{kind:'image',status:'ready',duration:createTitleTemplate(titleIndex,!draggingFirst?.endsWith(':static'),fps).duration,name:titleTemplates[titleIndex].name}:shapeKind?{kind:'image',status:'ready',duration:5,name:shapeKind}:draggingSound && draggingSound.id===draggingFirst?{...draggingSound,kind:'audio'}:media.find(m=>m.id===draggingFirst),track=tracks.find(t=>t.id===trackId);
     if(!asset||asset.status!=='ready'||track?.locked||track?.kind!==(asset.kind==='audio'?'audio':'video'))return null;
-    const duration=titleIndex>=0||shapeKind?asset.duration:asset.kind==='image'?parseFloat(String(actions().settings.stillDuration))||5:asset.duration;
+    const still=parseFloat(String(actions().settings.stillDuration))||5;
+    const lengthOf=(a:{kind?:string;duration:number})=>a.kind==='image'?still:a.duration;
+    const duration=titleIndex>=0||shapeKind?asset.duration:draggingIds.reduce((total,id)=>{const m=media.find(a=>a.id===id);return total+(m?lengthOf(m):0);},0)||lengthOf(asset);
     let start=Math.max(0,(e.clientX-e.currentTarget.getBoundingClientRect().left)/screenPixels());
     let snapped:number|undefined;
     if(snapping){const boundaries=[0,actions().playhead,...markers.map(m=>m.time),...clips.filter(c=>c.timelineId===timelineId).flatMap(c=>[c.start,c.start+c.duration])];const hit=snapTime([start,start+duration],boundaries,SNAP_PIXELS/screenPixels());if(hit&&start+hit.shift>=0){start+=hit.shift;snapped=hit.at;}}
     start=Math.round(start*(project?.fps||24))/(project?.fps||24);
-    return {trackId,start,duration,name:asset.name,snap:snapped};
+    return {trackId,start,duration,name:draggingIds.length>1?`${draggingIds.length} clips`:asset.name,snap:snapped};
   }
   const moved=clips.find(c=>c.id===draft?.id);
   const movePlacements=draft&&moved&&drag.current?.mode==='move'?clips.filter(c=>drag.current!.ids.includes(c.id)).map(c=>{const source=tracks.find(t=>t.id===moved.trackId)!,target=tracks.find(t=>t.id===(draft.trackId??moved.trackId))!,original=tracks.find(t=>t.id===c.trackId)!;return {...c,start:c.start+draft.start-moved.start,trackId:original.kind===source.kind?tracks.find(t=>t.timelineId===timelineId&&t.kind===original.kind&&t.number===original.number+target.number-source.number)?.id??c.trackId:c.trackId};}):[];
@@ -377,7 +383,7 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
                 } catch { actions().notify('That transition could not be read','error'); }
                 return;
               }
-              const id=e.dataTransfer.getData('application/x-frameline-media');if(!id)return;e.preventDefault();e.stopPropagation();const preview=mediaPlacement(e,track.id);setDropDraft(null);if(preview){if(id.startsWith('title:'))actions().addTitle(Number(id.split(':')[1]),{},preview,!id.endsWith(':static'));else if(id.startsWith('shape:'))actions().addShape(id.slice(6),{},preview);else if(id.startsWith('sfx-')){const pending={...preview,id:crypto.randomUUID()};setPendingSounds(items=>[...items,pending]);void insertSound(id,preview.start,track.id).finally(()=>setPendingSounds(items=>items.filter(item=>item.id!==pending.id)));}else actions().addMediaToTimeline(id,preview.start,track.id);}useEditorStore.setState({draggingMediaId:null});}}>
+              const id=e.dataTransfer.getData('application/x-frameline-media');if(!id)return;e.preventDefault();e.stopPropagation();const preview=mediaPlacement(e,track.id);setDropDraft(null);if(preview){if(id.startsWith('title:'))actions().addTitle(Number(id.split(':')[1]),{},preview,!id.endsWith(':static'));else if(id.startsWith('shape:'))actions().addShape(id.slice(6),{},preview);else if(id.startsWith('sfx-')){const pending={...preview,id:crypto.randomUUID()};setPendingSounds(items=>[...items,pending]);void insertSound(id,preview.start,track.id).finally(()=>setPendingSounds(items=>items.filter(item=>item.id!==pending.id)));}else actions().addMediaToTimeline(id.split('\n'),preview.start,track.id);}useEditorStore.setState({draggingMediaId:null});}}>
               {livePreviews.flatMap(person => (person.preview?.clips ?? []).filter(c => c.trackId === track.id).map(c => <div key={`remote-${person.userId}-${c.id}`} className="timeline-drop-ghost" data-remote-preview={c.id} style={{left:c.start*pixels,width:Math.max(12,c.duration*pixels),pointerEvents:'none'}}><span>{users.find(u=>u.id===person.userId)?.name} · {clips.find(clip=>clip.id===c.id)?.name}</span></div>))}
               {pendingSounds.filter(item=>item.trackId===track.id).map(item=><div key={item.id} className="timeline-drop-ghost" role="status" style={{left:item.start*pixels,width:Math.max(12,item.duration*pixels)}}><AudioLines size={12}/><span>{item.name}<small>Adding sound…</small></span></div>)}
               {gap?.trackId===track.id&&<div className="timeline-gap" aria-label="Selected gap; Delete to close" style={{left:gap.start*pixels,width:(gap.end-gap.start)*pixels}}/>}

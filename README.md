@@ -4,6 +4,9 @@ SharedCut v0.2 is a self-hosted collaborative video editor for a local studio or
 
 ## Run
 
+Moving to the Lenovo? See the [pull and cutover checklist](docs/LENOVO_SETUP.md)
+for Docker setup, the separate private data transfer, and Mac-only worker limitations.
+
 Install **Node.js 22.18 or newer**, npm, and **FFmpeg with ffprobe**. Both media executables must be on `PATH`, or configured with `FFMPEG_PATH` and `FFPROBE_PATH`. The FFmpeg build needs the encoders used by your chosen export, including libx264 for proxies.
 
 ```sh

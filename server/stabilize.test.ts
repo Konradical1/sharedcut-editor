@@ -3,7 +3,7 @@ import test from 'node:test';
 import { mkdtemp, writeFile, readdir, utimes, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { normalizeSettings, renderStabilized, stabilizeAnalysis, stabilizeAnalysisIdentity, stabilizeIdentity, stabilizePython, trimStabilizeCache } from './stabilize.ts';
+import { normalizeSettings, pickStabilizeJob, renderStabilized, stabilizeAnalysis, stabilizeAnalysisIdentity, stabilizeIdentity, stabilizePython, trimStabilizeCache } from './stabilize.ts';
 
 const settings = normalizeSettings(undefined);
 
@@ -51,7 +51,18 @@ test('trimming evicts the oldest finished previews only', async () => {
   const names = ['a'.repeat(64), 'b'.repeat(64), 'c'.repeat(64)];
   for (const [index, name] of names.entries()) { await writeFile(join(directory, `${name}.mp4`), Buffer.alloc(100)); await utimes(join(directory, `${name}.mp4`), 1000 + index, 1000 + index); }
   await writeFile(join(directory, `${names[0]}.path.json`), '{}'); await writeFile(join(directory, `${names[0]}.mov`), Buffer.alloc(100));
+  await writeFile(join(directory, '.render-dead.tmp.mp4'), 'x'); await utimes(join(directory, '.render-dead.tmp.mp4'), 1000, 1000);
+  await writeFile(join(directory, '.analysis-live.tmp'), 'x');
   await trimStabilizeCache(directory, new Set([names[0]]), 250);
-  assert.deepEqual((await readdir(directory)).sort(), [`${names[0]}.mov`, `${names[0]}.mp4`, `${names[0]}.path.json`, `${names[2]}.mp4`]);
+  assert.deepEqual((await readdir(directory)).sort(), ['.analysis-live.tmp', `${names[0]}.mov`, `${names[0]}.mp4`, `${names[0]}.path.json`, `${names[2]}.mp4`], 'stale leftovers go, a live temp file stays');
   await rm(directory, { recursive: true, force: true });
+});
+
+test('the section being watched renders first, then the rest in request order', () => {
+  const job = (created: number, polled: number) => ({ created, polled });
+  const scrubbedPast = job(1, 1000), current = job(2, 9500), warm = job(3, 9600), oldest = job(0, 500);
+  assert.equal(pickStabilizeJob([scrubbedPast, current, warm, oldest], 10_000), current);
+  assert.equal(pickStabilizeJob([warm, current], 10_000), current, 'the current section was requested before its warm-up neighbour');
+  assert.equal(pickStabilizeJob([scrubbedPast, oldest], 10_000), oldest, 'nothing watched: plain request order');
+  assert.equal(pickStabilizeJob([], 10_000), undefined);
 });

@@ -12,8 +12,8 @@ import { validateKeyframes } from '../src/services/animation.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
 import { flowChunkSeconds, flowTiming, type FlowPreview } from '../src/services/opticalFlow.ts';
 import { flowWorker, flowIdentity, renderOpticalFlow, trimFlowCache } from './opticalFlow.ts';
-import { normalizeSettings, renderStabilized, stabilizeAnalysisIdentity, stabilizeCapabilities, stabilizeIdentity, trimStabilizeCache } from './stabilize.ts';
-import { stabilizeChunkCount, stabilizeChunkRange, stabilizeEffect, stabilizeRange, stabilizeSettings, type StabilizePreview } from '../src/services/stabilize.ts';
+import { normalizeSettings, pickStabilizeJob, stabilizeCapabilities, stabilizeSolve, trimStabilizeCache } from './stabilize.ts';
+import { stabilizeEffect, stabilizeRange, stabilizeSettings, type StabilizePreview } from '../src/services/stabilize.ts';
 import { presenceCursor } from '../src/services/presence.ts';
 import { fontLibrary } from './fonts.ts';
 import { transitionLibrary } from './transitions.ts';
@@ -34,8 +34,8 @@ import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock 
 import { exportResolveTimeline, importResolve } from './resolve.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
-import { validateSmartMaskBindings } from '../src/services/smartMask.ts';
-import { FILMSTRIP_VERSION, MEDIA_CONCURRENCY, SKIP_COLOR_PROXY, getMediaCapabilities, prepareColorProxy, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, preparePreviewVariants, prepareWaveform, renderTimeline, renderSoundEffect } from './media.ts';
+import { validateSmartMask, validateSmartMaskBindings } from '../src/services/smartMask.ts';
+import { FILMSTRIP_VERSION, MEDIA_CONCURRENCY, SKIP_COLOR_PROXY, STREAM_VARIANT, getMediaCapabilities, prepareColorProxy, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, preparePreviewVariants, prepareWaveform, renderTimeline, renderSoundEffect } from './media.ts';
 
 const scrypt = promisify(scryptCallback);
 const DEFAULT_SETTINGS = { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false, snapping: true, mediaWidth: 278, inspectorWidth: 292, timelineHeight: 294 };
@@ -178,8 +178,17 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const flowJobs = new Map<string, FlowPreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
   let flowQueue = Promise.resolve();
   const stabilizeDirectory = join(dataDir, 'stabilize');
-  const stabilizeJobs = new Map<string, StabilizePreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
-  let stabilizeQueue = Promise.resolve();
+  type StabilizeJob = StabilizePreview & { projectId: string; clipId: string; generation: string; controller: AbortController; created: number; polled: number; started: boolean; run: () => Promise<void> };
+  const stabilizeJobs = new Map<string, StabilizeJob>();
+  let stabilizeBusy = false;
+  // One analysis at a time; it saturates every core on its own. The clip asked about most recently goes first.
+  const pumpStabilize = () => {
+    if (stabilizeBusy || closed) return;
+    const next = pickStabilizeJob([...stabilizeJobs.values()].filter(j => j.status === 'preparing' && !j.started && !j.controller.signal.aborted));
+    if (!next) return;
+    next.started = true; stabilizeBusy = true;
+    void next.run().finally(() => { stabilizeBusy = false; pumpStabilize(); });
+  };
   const accounts = () => (db.prepare('SELECT data FROM accounts').all() as { data: string }[]).map(row => JSON.parse(row.data) as Account);
   const accountById = (id: string) => { const row = db.prepare('SELECT data FROM accounts WHERE id=?').get(id) as { data: string } | undefined; return row ? JSON.parse(row.data) as Account : undefined; };
   const saveAccount = (account: Account) => db.prepare('INSERT INTO accounts(id,email,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,data=excluded.data').run(account.user.id, account.user.email, JSON.stringify(account));
@@ -325,9 +334,23 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       if (signal.aborted) throw new Error('Import cancelled.');
       updateAsset(id, { status: 'processing', progress: 0, error: undefined });
       let previous = -1;
-      const result = await prepareMedia({ inputPath: originalPath(id), outputDir: join(mediaDir(id), 'prepared'), baseUrl: `/api/media/${id}/files`, signal, onThumbnail: thumbnail => { if (!asset.importLink) updateAsset(id, { thumbnail }); }, onProgress: progress => { const next = Math.floor(progress); if (next !== previous && Date.now() - (progressAt.get(id) ?? 0) >= 10000) { previous = next; progressAt.set(id, Date.now()); updateAsset(id, { progress: next }); } } });
-      if (!signal.aborted) { const { size, ...metadata } = result; updateAsset(id, { ...metadata, ...(asset.importLink ? { thumbnail: state.media.find(item => item.id === id)?.thumbnail || metadata.thumbnail } : {}), size: size >= 1e9 ? `${(size / 1e9).toFixed(1)} GB` : `${(size / 1e6).toFixed(1)} MB`, sourceUrl: `/api/media/${id}/original`, status: 'ready', progress: 100 }); }
-    } catch (error) { if (!closed) updateAsset(id, { status: 'failed', error: signal.aborted ? 'Processing cancelled.' : error instanceof Error ? error.message : 'Media processing failed.', progress: 0 }); }
+      const publish = (result: Awaited<ReturnType<typeof probeMedia>> & Partial<Omit<Asset, 'size'>>) => {
+        const { size, ...metadata } = result;
+        updateAsset(id, { ...metadata, ...(asset.importLink ? { thumbnail: state.media.find(item => item.id === id)?.thumbnail || metadata.thumbnail } : {}), size: size >= 1e9 ? `${(size / 1e9).toFixed(1)} GB` : `${(size / 1e6).toFixed(1)} MB`, sourceUrl: `/api/media/${id}/original`, status: 'ready', progress: 100 });
+      };
+      const result = await prepareMedia({ inputPath: originalPath(id), outputDir: join(mediaDir(id), 'prepared'), baseUrl: `/api/media/${id}/files`, signal,
+        onStage: preparationStage => { if (!signal.aborted) updateAsset(id, { preparationStage }); },
+        onPlayable: result => { if (!signal.aborted) publish(result); },
+        onThumbnail: thumbnail => { if (!asset.importLink) updateAsset(id, { thumbnail }); },
+        onProgress: progress => { const next = Math.floor(progress); if (state.media.find(item => item.id === id)?.status !== 'ready' && next !== previous && Date.now() - (progressAt.get(id) ?? 0) >= 5000) { previous = next; progressAt.set(id, Date.now()); updateAsset(id, { progress: next }); } }
+      });
+      if (!signal.aborted) { publish(result); updateAsset(id, { preparationStage: undefined, error: undefined }); }
+    } catch (error) {
+      if (!closed) {
+        const playable = state.media.find(asset => asset.id === id)?.status === 'ready';
+        updateAsset(id, { status: playable ? 'ready' : 'failed', preparationStage: playable ? 'Additional previews failed · original and playable preview are safe' : undefined, error: signal.aborted ? 'Processing cancelled.' : error instanceof Error ? error.message : 'Media processing failed.', progress: playable ? 100 : 0 });
+      }
+    }
   });
 
   const schemas: Record<string, Record<string, string>> = {
@@ -464,6 +487,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (req.headers.origin) { let origin: URL; try { origin = new URL(req.headers.origin); } catch { fail(403, 'Invalid request origin.'); } if (origin!.host !== req.headers.host) fail(403, 'Cross-site requests are not allowed.'); }
       }
       if (path === '/api/health' && method === 'GET') { const capabilities = await getMediaCapabilities(); send(res, 200, { status: 'ok', ffmpeg: capabilities.available, captions: captionAvailable() }); return; }
+      if (path === '/api/uploads/info' && method === 'GET') { requireAccount(req); const address = server.address(); send(res, 200, { localUrl: `http://localhost:${typeof address === 'object' && address ? address.port : 4310}`, maxUploadBytes }); return; }
       if (path === '/api/auth/me' && method === 'GET') { send(res, 200, { user: authenticated(req)?.user ?? null, registrationRequiresCode: Boolean(process.env.FRAME_LINE_SIGNUP_CODE) }); return; }
       if (['/api/auth/signup', '/api/auth/login'].includes(path) && method === 'POST') {
         const body = await jsonBody(req); const email = textField(body.email, 254, true).trim().toLowerCase(); const password = textField(body.password, 1024, true);
@@ -852,9 +876,12 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
                 const digest=createHash('sha256').update(chunk).digest('hex');if(req.headers['upload-checksum']!==digest)fail(400,'Chunk checksum mismatch.');
                 if(offset+chunk.length>metadata.size)fail(400,'Upload exceeds its declared size.');
                 appendFileSync(partial,chunk,{mode:0o600,flush:true});const complete=offset+chunk.length===metadata.size;
-                if(complete){progressAt.delete(id);renameSync(partial,originalPath(id));updateAsset(id,{status:'processing',progress:0});if(!DEFER_PREP)processAsset(id);}
-                // No progress write per chunk: persist() serialises the whole workspace, and a
-                // percentage is not worth that. The terminal importer reports progress instead.
+                if(complete){progressAt.delete(id);renameSync(partial,originalPath(id));updateAsset(id,{status:'processing',progress:0,preparationStage:'Queued for media processing'});if(!DEFER_PREP)processAsset(id);}
+                // Keep collaborators informed without persisting the workspace for every chunk.
+                else if (Date.now() - (progressAt.get(id) ?? 0) >= 5000) {
+                  progressAt.set(id, Date.now());
+                  updateAsset(id, { progress: Math.min(99, Math.floor((offset + chunk.length) / metadata.size * 100)) });
+                }
                 send(res,complete?202:200,{offset:offset+chunk.length,complete});return;
               } finally {uploadLocks.delete(id);}
             }
@@ -940,6 +967,24 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const image = await masks.source(clip, asset, originalPath(asset.id), frame);
           streamFile(req, res, image, 'image/jpeg'); return;
         }
+        if (path === '/api/smart-masks/preview' && method === 'POST') {
+          const body = await jsonBody(req), clip = state.clips.find(item => item.id === textField(body.clipId, 160, true)) ?? fail(404, 'Clip not found.');
+          requireProject(clip.projectId, userId, true);
+          const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId) ?? fail(404, 'Media not found.');
+          if (asset.kind !== 'video' || !existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
+          const mask = clip.smartMasks?.find(item => item.id === textField(body.maskId, 160, true)) ?? fail(404, 'Mask not found.');
+          // Guides come from the request so a click previews before the workspace save lands.
+          const candidate = { ...structuredClone(mask), prompts: body.prompts, repairs: [] }; validateSmartMask(candidate);
+          if (!candidate.prompts.length || candidate.prompts.length > 64) fail(400, 'Preview one frame of guides at a time.');
+          const frame = Number(body.frame); if (!Number.isSafeInteger(frame) || frame < 0) fail(400, 'Invalid source frame.');
+          const image = await masks.preview(structuredClone(clip), asset, originalPath(asset.id), candidate, frame, candidate.prompts);
+          send(res, 200, { url: `/api/smart-masks/preview/${basename(image, '.png')}.png?projectId=${encodeURIComponent(clip.projectId)}` }); return;
+        }
+        const previewRoute = /^\/api\/smart-masks\/preview\/([a-f0-9]{64})\.png$/.exec(path);
+        if (previewRoute && ['GET', 'HEAD'].includes(method)) {
+          requireProject(textField(url.searchParams.get('projectId'), 160, true), userId);
+          streamFile(req, res, masks.previewFile(previewRoute[1]), 'image/png', undefined, true); return;
+        }
         if (path === '/api/smart-masks' && method === 'POST') {
           const body = await jsonBody(req), clip = state.clips.find(item => item.id === textField(body.clipId, 160, true)) ?? fail(404, 'Clip not found.');
           requireProject(clip.projectId, userId, true);
@@ -949,13 +994,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const job = await masks.enqueue({ clip: structuredClone(clip), asset, mask: structuredClone(mask), sourcePath: originalPath(asset.id), signature: textField(body.signature, 8_000_000, true), direction: body.direction, anchorTime: body.anchorTime });
           send(res, job.status === 'ready' ? 200 : 202, job); return;
         }
-        const maskRoute = /^\/api\/smart-masks\/([a-f0-9]{64})(?:\/(manifest|frames|source)(?:\/(\d+)\.(png|jpg))?)?$/.exec(path);
+        const maskRoute = /^\/api\/smart-masks\/([a-f0-9]{64})(?:\/(manifest|frames|preview|source)(?:\/(\d+)\.(png|jpg))?)?$/.exec(path);
         if (maskRoute) {
           const projectId = textField(url.searchParams.get('projectId'), 160, true); requireProject(projectId, userId, method === 'DELETE');
           const [_, key, kind, frame, extension] = maskRoute;
           if (!kind && method === 'GET') { send(res, 200, masks.get(projectId, key)); return; }
           if (!kind && method === 'DELETE') { masks.cancel(projectId, key); send(res, 200, { ok: true }); return; }
-          if (['GET', 'HEAD'].includes(method) && (kind === 'manifest' && !frame || kind === 'frames' && extension === 'png' || kind === 'source' && extension === 'jpg')) {
+          if (['GET', 'HEAD'].includes(method) && (kind === 'manifest' && !frame || (kind === 'frames' || kind === 'preview') && extension === 'png' || kind === 'source' && extension === 'jpg')) {
             const currentClip = kind === 'manifest' && url.searchParams.has('clipId');
             if (currentClip) {
               const clip = state.clips.find(item => item.id === url.searchParams.get('clipId') && item.projectId === projectId) ?? fail(404, 'Clip not found.');
@@ -964,7 +1009,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
               if (!existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
               resolveSmartMaskArtifact(join(dataDir, 'smart-masks'), clip, mask, originalPath(asset.id), asset);
             }
-            streamFile(req, res, masks.file(projectId, key, kind as 'manifest' | 'frames' | 'source', frame === undefined ? undefined : Number(frame)), undefined, undefined, !currentClip); return;
+            streamFile(req, res, masks.file(projectId, key, kind as 'manifest' | 'frames' | 'preview' | 'source', frame === undefined ? undefined : Number(frame)), undefined, undefined, !currentClip); return;
           }
         }
         if (path === '/api/optical-flow/capabilities' && method === 'GET') {
@@ -1030,56 +1075,40 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const asset = state.media.find(a => a.id === clip.mediaId && a.projectId === project.id);
           const effect = stabilizeEffect(clip);
           if (!asset || asset.kind !== 'video' || !effect) fail(400,'Add Stabilize to a video clip first.');
-          const quality = textField(body.quality,20,true);
-          if (!['Full','1/2','1/4','Stream','Original','Color'].includes(quality)) fail(400,'Invalid preview quality.');
           const settings = stabilizeSettings(clip,effect!);
           if (!same(normalizeSettings(body.settings),normalizeSettings(settings))) fail(409,'The Stabilize settings are still saving. Retry shortly.');
           const records = timelineTransitions(state.clips.filter(c=>c.projectId===project.id),clip.timelineId,state.media);
           const span = clipSpan(clip,records), geometry = extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
           const sourceFps = asset!.fps || numberField(body.fps,1,120), range = stabilizeRange(geometry,sourceFps,asset!.duration);
-          const chunk = numberField(body.chunk,0,stabilizeChunkCount(range,sourceFps)-1);
-          if (!Number.isInteger(chunk)) fail(400,'Invalid preview chunk.');
-          const window = stabilizeChunkRange(chunk,range,sourceFps);
-          const previewName = quality === 'Color' || quality === 'Full' && asset!.colorProxyUrl ? 'color-v1.mp4' : quality === '1/4' ? 'proxy-quarter-v1.mp4' : quality === '1/2' || quality === 'Stream' ? 'proxy-half-v1.mp4' : 'proxy.mp4';
-          const proxy = join(mediaDir(asset!.id),'prepared',previewName);
-          const input = quality==='Original'||quality==='Color'&&!existsSync(proxy)?originalPath(asset!.id):existsSync(proxy) ? proxy : join(mediaDir(asset!.id),'prepared','proxy.mp4');
-          if (!existsSync(input)) fail(409,'The source preview is still being prepared.');
-          const generation=JSON.stringify([settings,range,quality]);
           const original = originalPath(asset!.id);
           if (!existsSync(original)) fail(409,'Original media is missing.');
-          const key = await stabilizeIdentity(await stabilizeAnalysisIdentity(original,range.from,range.to),settings,window.from,window.to,true,input);
-          const file = join(stabilizeDirectory,`${key}.mp4`), result = { from: window.from, duration: window.to-window.from, fps: sourceFps };
+          // The editor warps the picture it already decodes, so one solve serves every frame, quality and section.
+          const generation = JSON.stringify([clip.mediaId,settings,range]), key = createHash('sha256').update(`${clip.id}:${generation}`).digest('hex');
           let job = stabilizeJobs.get(key);
-          if (existsSync(file)) {
-            const zooms = job ? {zoom:job.zoom,zoomMin:job.zoomMin} : await renderStabilized({input,analysisInput:original,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true}).then(r=>({zoom:r.zoom,zoomMin:r.zoomMin})).catch(()=>({}));
-            if (!job) stabilizeJobs.set(key,{status:'ready',key,progress:100,...zooms,...result,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()});
-            send(res,200,{status:'ready',key,url:`/api/stabilize/${key}/video?projectId=${project.id}`,progress:100,...zooms,...result}); return;
-          }
-          if (!job || job.controller.signal.aborted) {
-            for (const old of stabilizeJobs.values()) if (old.clipId === clip.id && old.status === 'preparing' && old.key !== key && old.generation !== generation) old.controller.abort();
-            if ([...stabilizeJobs.values()].filter(j=>j.status==='preparing'&&!j.controller.signal.aborted).length >= 8) fail(429,'Stabilize preview queue is full.');
-            job = {status:'preparing',key,progress:0,...result,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()};
-            stabilizeJobs.set(key,job); const current = job;
-            stabilizeQueue = stabilizeQueue.then(async () => {
-              if (closed || current.controller.signal.aborted) return;
+          if (!job || job.controller.signal.aborted || job.status === 'failed' && Date.now() - job.polled > 10_000) {
+            for (const old of stabilizeJobs.values()) if (old.clipId === clip.id && old.key !== key) { old.controller.abort(); stabilizeJobs.delete(old.key); }
+            const pending = [...stabilizeJobs.values()].filter(j=>j.status==='preparing'&&!j.started&&!j.controller.signal.aborted);
+            if (pending.length >= 8) { const stale = pending.sort((a,b)=>a.polled-b.polled)[0]; stale.controller.abort(); stabilizeJobs.delete(stale.key); }
+            const current: StabilizeJob = {status:'preparing',key,progress:0,projectId:project.id,clipId:clip.id,generation,controller:new AbortController(),created:Date.now(),polled:Date.now(),started:false,run:async()=>{
               try {
-                const rendered = await renderStabilized({input,analysisInput:original,directory:stabilizeDirectory,range,from:window.from,to:window.to,settings,preview:true,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
-                current.zoom=rendered.zoom; current.zoomMin=rendered.zoomMin; current.status='ready'; current.url=`/api/stabilize/${key}/video?projectId=${project.id}`;
-                await trimStabilizeCache(stabilizeDirectory,new Set([key]));
+                const solved = await stabilizeSolve({input:original,directory:stabilizeDirectory,range,settings,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
+                current.solve=solved.solve; current.zoom=solved.solve.zoom; current.zoomMin=solved.solve.zoomMin; current.status='ready'; current.progress=100;
+                await trimStabilizeCache(stabilizeDirectory,new Set());
               } catch(error) { current.status='failed';current.error=(error as Error).message; }
-            });
+            }};
+            stabilizeJobs.set(key,current); job = current; pumpStabilize();
           }
-          const {controller,projectId,clipId,generation:jobGeneration,...view}=job;
+          job!.polled = Date.now();
+          const {controller,projectId,clipId,generation:jobGeneration,created,polled,started,run,...view}=job!;
           send(res,200,view); return;
         }
-        const stabilizeRoute = /^\/api\/stabilize\/([a-f0-9]{64})(?:\/(video))?$/.exec(path);
-        if (stabilizeRoute) {
+        const stabilizeRoute = /^\/api\/stabilize\/([a-f0-9]{64})$/.exec(path);
+        if (stabilizeRoute && method === 'DELETE') {
           const projectId = textField(url.searchParams.get('projectId'),160,true); requireProject(projectId,userId);
           const job = stabilizeJobs.get(stabilizeRoute[1]);
-          // The project binding is retained for downloads; never authorize a cache hash on its own.
-          if (!job || job.projectId !== projectId) fail(404,'Stabilize preview not found. Prepare it again.');
-          if (method==='DELETE'&&!stabilizeRoute[2]) { job!.controller.abort(); stabilizeJobs.delete(stabilizeRoute[1]); send(res,200,{ok:true});return; }
-          if (['GET','HEAD'].includes(method)&&stabilizeRoute[2]) { streamFile(req,res,join(stabilizeDirectory,`${stabilizeRoute[1]}.mp4`),'video/mp4',undefined,true);return; }
+          // The project binding is retained; never authorize a cache hash on its own.
+          if (!job || job.projectId !== projectId) fail(404,'Stabilize analysis not found. Prepare it again.');
+          job!.controller.abort(); stabilizeJobs.delete(stabilizeRoute[1]); send(res,200,{ok:true});return;
         }
         if (path === '/api/renders' && method === 'GET') { send(res, 200, { jobs: view(account).state.renderJobs }); return; }
         if (path === '/api/renders' && method === 'POST') {
@@ -1128,9 +1157,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     } else { job.status = 'failed'; job.remaining = 'Interrupted by server restart'; job.error = 'The server restarted. Submit the export again.'; }
   }
   for (const asset of state.media as Asset[]) if (!['ready', 'failed', 'uploading'].includes(asset.status)) { asset.status = 'failed'; asset.error = 'Processing was interrupted. Retry to continue from the saved original.'; }
+  for (const asset of state.media) if (asset.status === 'ready') asset.preparationStage = undefined;
   if (saved) persist();
   // Upgrade existing imports in the same bounded worker queue; their current preview stays usable.
-  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && !asset.proxyVariants?.Stream && asset.proxyUrl) {
+  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && !asset.proxyVariants?.Stream?.endsWith(`/${STREAM_VARIANT}`) && asset.proxyUrl) {
     const filename = asset.proxyUrl.split('/').at(-1)!;
     if (!/^[a-zA-Z0-9_-]+\.mp4$/.test(filename)) continue;
     const inputPath = join(mediaDir(asset.id), 'prepared', filename);

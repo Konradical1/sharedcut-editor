@@ -9,12 +9,13 @@
  * Cache entries: `<url>?fc=<index>` holds chunk bytes, `<url>?fc=meta` holds {size, type, used}.
  * The marker is a query parameter because Cache Storage ignores URL fragments when matching.
  */
-const CACHE = 'footage-v2';
+const CACHE = 'footage-v3';
+const pending = new Map();
 const CHUNK = 1 << 20;
 const MEDIA = /^\/api\/.+\.(mp4|m4a|mov|webm)$/i;
 
 self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', event => event.waitUntil(Promise.all([self.clients.claim(), caches.delete('footage-v1')])));
+self.addEventListener('activate', event => event.waitUntil(Promise.all([self.clients.claim(), caches.delete('footage-v1'), caches.delete('footage-v2')])));
 
 const keyFor = (url, marker) => `${url}${url.includes('?') ? '&' : '?'}fc=${marker}`;
 const chunkKey = (url, index) => keyFor(url, index);
@@ -34,25 +35,42 @@ async function writeMeta(cache, url, meta) {
  * the whole megabyte before answering is what made a seek through the worker slower than none.
  */
 async function chunk(request, url, index, cache) {
-  const hit = await cache.match(chunkKey(url, index));
+  const key = chunkKey(url, index);
+  const hit = await cache.match(key);
   if (hit) return { bytes: await hit.arrayBuffer(), meta: null };
-  const start = index * CHUNK;
-  const response = await fetch(new Request(request.url, { headers: { Range: `bytes=${start}-${start + CHUNK - 1}` }, credentials: 'include', cache: 'no-store' }));
-  if (response.status !== 206) throw response;
-  const total = /\/(\d+)$/.exec(response.headers.get('Content-Range') || '');
-  if (!total) throw response;
-  const meta = { size: Number(total[1]), type: response.headers.get('Content-Type') || 'video/mp4', used: Date.now() };
-  const length = Math.min(CHUNK, meta.size - start);
-  const [toClient, toCache] = response.body.tee();
-  cache.put(chunkKey(url, index), new Response(toCache, { headers: { 'Content-Type': meta.type, 'Content-Length': String(length) } }))
-    .then(() => writeMeta(cache, url, meta))
-    .then(() => notify({ type: 'footage-stored', url, index }))
-    .catch(() => {});
-  return { body: toClient, meta };
+  let job = pending.get(key);
+  if (!job) {
+    job = (async () => {
+      const start = index * CHUNK;
+      const response = await fetch(new Request(request.url, { headers: { Range: `bytes=${start}-${start + CHUNK - 1}` }, credentials: 'include', cache: 'no-store' }));
+      const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') || '');
+      if (response.status !== 206 || !range || Number(range[1]) !== start || Number(range[2]) !== Math.min(start + CHUNK, Number(range[3])) - 1) throw new Error('Invalid media range');
+      const meta = { size: Number(range[3]), type: response.headers.get('Content-Type') || 'video/mp4', used: Date.now() };
+      const length = Math.min(CHUNK, meta.size - start);
+      let received = 0;
+      const checked = new Response(response.body.pipeThrough(new TransformStream({
+        transform(bytes, controller) { received += bytes.byteLength; if (received > length) throw new Error('Oversized media range'); controller.enqueue(bytes); },
+        flush() { if (received !== length) throw new Error('Incomplete media range'); },
+      })), { headers: { 'Content-Type': meta.type, 'Content-Length': String(length) } });
+      // All simultaneous readers share this network request. Keep at most one aligned chunk
+      // buffered for late readers; the first reader still receives bytes as they arrive.
+      const saved = cache.put(key, checked.clone()).then(() => writeMeta(cache, url, meta)).then(() => {
+        notify({ type: 'footage-stored', url, index, size: length });
+        notify({ type: 'footage-transfer', bytes: length });
+      }).catch(error => { notify({ type: 'footage-storage-error', url }); throw error; });
+      saved.catch(() => {});
+      void saved.finally(() => { pending.delete(key); checked.body.cancel().catch(() => {}); }).catch(() => {});
+      return { response: checked, meta, saved };
+    })();
+    pending.set(key, job);
+    job.catch(() => pending.delete(key));
+  }
+  const result = await job;
+  return { body: result.response.clone().body, meta: result.meta, saved: result.saved };
 }
 
 function notify(message) {
-  self.clients.matchAll({ type: 'window' }).then(clients => { for (const client of clients) client.postMessage(message); }).catch(() => {});
+  self.clients.matchAll({ type: 'window' }).then(clients => { for (const client of clients) client.postMessage({ ...message, cache: CACHE }); }).catch(() => {});
 }
 
 async function serveRange(request, url, start, endInclusive) {
@@ -63,6 +81,7 @@ async function serveRange(request, url, start, endInclusive) {
   // network telling us this URL does not answer ranges, in which case the caller passes through.
   const first = await chunk(request, url, firstIndex, cache);
   if (!meta) meta = first.meta;
+  if (request.headers.get('X-Footage-Prefetch') === '1') await first.saved;
   if (!meta) { first.body?.cancel().catch(() => {}); throw new Error('unsized'); }
   const size = meta.size;
   if (start >= size) return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${size}` } });
@@ -86,7 +105,7 @@ async function serveRange(request, url, start, endInclusive) {
         let seen = 0;
         while (seen < to) {
           const { value, done } = await reader.read();
-          if (done) break;
+          if (done) { if (seen < to) throw new Error('Incomplete media range'); break; }
           const sliceFrom = Math.max(0, from - seen), sliceTo = Math.min(value.byteLength, to - seen);
           if (sliceTo > sliceFrom) controller.enqueue(value.subarray(sliceFrom, sliceTo));
           seen += value.byteLength;

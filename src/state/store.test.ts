@@ -805,3 +805,31 @@ test('closing a gap carries the linked audio with the picture', () => {
   state().undo();
   assert.deepEqual([clip('picture').start, clip('sound').start], [40, 40]);
 });
+
+test('a bin multi-drop lays clips end to end and undoes as one action',()=>{
+  const base={...state().media[0],hasAudio:false,duration:4,kind:'video' as const,status:'ready' as const};
+  const assets=Array.from({length:40},(_,i)=>({...base,id:`bulk-${i}`,name:`bulk ${i}`}));
+  store.setState({media:assets,clips:[],nodes:[],comments:[]});
+  const videoTrack=state().tracks.find(t=>t.timelineId===state().timelineId&&t.kind==='video'&&!t.locked)!;
+  state().addMediaToTimeline(assets.map(a=>a.id),6,videoTrack.id);
+  const placed=state().clips.filter(c=>c.trackId===videoTrack.id).sort((a,b)=>a.start-b.start);
+  assert.equal(placed.length,assets.length);
+  placed.forEach((c,i)=>{assert.equal(c.start,6+i*4);assert.equal(c.duration,4);});
+  assert.equal(new Set(placed.map(c=>c.mediaId)).size,assets.length,'Every dropped asset lands once.');
+  state().undo();
+  assert.equal(state().clips.length,0,'One undo takes the whole drop back.');
+});
+
+test('a multi-drop skips media that is not ready and sends audio to its own lane',()=>{
+  const video={...state().media[0],id:'mixed-video',hasAudio:false,kind:'video' as const,duration:3,status:'ready' as const};
+  const pending={...video,id:'mixed-pending',status:'processing' as const};
+  const sound={...video,id:'mixed-audio',kind:'audio' as const,duration:2};
+  store.setState({media:[video,pending,sound],clips:[],nodes:[],comments:[]});
+  const videoTrack=state().tracks.find(t=>t.timelineId===state().timelineId&&t.kind==='video'&&!t.locked)!;
+  state().addMediaToTimeline([video.id,pending.id,sound.id],0,videoTrack.id);
+  assert.equal(state().clips.length,2,'The unready clip is skipped, the rest still land.');
+  const audio=state().clips.find(c=>c.mediaId===sound.id)!;
+  assert.equal(state().tracks.find(t=>t.id===audio.trackId)!.kind,'audio');
+  assert.equal(state().clips.find(c=>c.mediaId===video.id)!.start,0);
+  assert.equal(audio.start,3,'Audio still follows the video in time.');
+});

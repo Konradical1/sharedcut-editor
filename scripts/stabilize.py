@@ -17,8 +17,6 @@ import sys
 
 import cv2
 import numpy as np
-import scipy.sparse as sparse
-from scipy.optimize import linprog
 
 FORMATS = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,mxf"
 ANALYSIS_LONG_SIDE = 960
@@ -111,10 +109,11 @@ def frames_from(process, width, height, channels, dtype):
 
 
 def finish(process, label):
+    """Raises instead of exiting so an analysis worker process reports the ffmpeg error to the parent."""
     process.stdout.close()
     errors = process.stderr.read().decode(errors="replace")
     if process.wait() != 0:
-        fail(f"{label} failed: {errors.strip()[-2000:] or process.returncode}")
+        raise RuntimeError(f"{label} failed: {errors.strip()[-2000:] or process.returncode}")
 
 
 # ---------------------------------------------------------------- analysis
@@ -157,8 +156,8 @@ def pair_motion(previous, current):
     return float(moved[0]), float(moved[1]), angle, log_scale
 
 
-def analyze_frames(frames, full_width, progress=None, total=None):
-    """Consume an iterator of gray frames (already downscaled) and return (motions, dropped)."""
+def analyze_frames(frames, full_width, tick=None):
+    """Consume an iterator of gray frames (already downscaled) and return (motions, dropped). `tick(n)` reports n frames done."""
     motions, dropped, previous = [], [], None
     for index, frame in enumerate(frames):
         if previous is None:
@@ -172,8 +171,8 @@ def analyze_frames(frames, full_width, progress=None, total=None):
                 ratio = full_width / frame.shape[1]
                 motions.append([motion[0] * ratio, motion[1] * ratio, motion[2], motion[3]])
         previous = frame
-        if progress and total and index % 4 == 0:
-            progress(index / total)
+        if tick and index % 4 == 3:
+            tick(4)
     return motions, dropped
 
 
@@ -200,12 +199,27 @@ def analysis_size(info):
     return max(32, int(round(info["width"] * ratio)) // 2 * 2), max(32, int(round(info["height"] * ratio)) // 2 * 2)
 
 
+_progress_counter = None
+
+
+def _init_progress(counter):
+    """Pool initializer: every worker process bumps the same counter so the parent can report frames, not segments."""
+    global _progress_counter
+    _progress_counter = counter
+
+
+def _tick(frames):
+    if _progress_counter is not None:
+        with _progress_counter.get_lock():
+            _progress_counter.value += frames
+
+
 def analyze_segment(task):
     """One decode + track pass over [start, end); starts one frame early so the first motion is real, not identity."""
     job, info, start, end, lead = task
     width, height = analysis_size(info)
     process = decoder(job, info, max(0.0, start - lead), end - max(0.0, start - lead), "gray", (width, height))
-    motions, dropped = analyze_frames(frames_from(process, width, height, 1, np.uint8), info["width"])
+    motions, dropped = analyze_frames(frames_from(process, width, height, 1, np.uint8), info["width"], _tick)
     finish(process, "Source decode")
     if lead > 0 and start - lead >= 0 and motions:
         motions, dropped = motions[1:], [d - 1 for d in dropped if d >= 1]
@@ -220,26 +234,34 @@ def analyze(job):
     fps = info["fps"]
     total = max(1, int(round((end - start) * fps)))
     # Decode and tracking both run near real time on 4K; segments in parallel processes share the load.
-    # ponytail: fixed 2 s segments and up to 4 workers; tune from the machine's core count if it shows up.
+    # ponytail: fixed 2 s segments and up to 8 workers; tune from the machine's core count if it shows up.
     segment_frames = max(1, int(round(2.0 * fps)))
     starts = list(range(0, total, segment_frames))
     tasks = [(job, info, start + first / fps, start + min(total, first + segment_frames) / fps, 1.0 / fps) for first in starts]
-    workers = max(1, min(4, len(tasks), (os.cpu_count() or 2) // 2))
-    motions, dropped, done = [], [], 0
+    workers = max(1, min(8, len(tasks), (os.cpu_count() or 2) // 2))
+    import multiprocessing
+    counter = multiprocessing.Value("i", 0)
+    report = lambda: emit(progress=round(min(98.0, counter.value / total * 98), 1))
     if workers == 1:
-        results = map(analyze_segment, tasks)
+        _init_progress(counter)
+        results = []
+        for task in tasks:
+            results.append(analyze_segment(task))
+            report()
     else:
         import concurrent.futures
-        pool = concurrent.futures.ProcessPoolExecutor(max_workers=workers)
-        results = pool.map(analyze_segment, tasks)
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, initializer=_init_progress, initargs=(counter,)) as pool:
+            futures = [pool.submit(analyze_segment, task) for task in tasks]
+            pending = set(futures)
+            while pending:
+                _, pending = concurrent.futures.wait(pending, timeout=0.25)
+                report()
+            results = [future.result() for future in futures]
+    motions, dropped = [], []
     for segment_motions, segment_dropped in results:
         offset = len(motions)
         motions.extend(segment_motions)
         dropped.extend(d + offset for d in segment_dropped)
-        done += 1
-        emit(progress=round(done / len(tasks) * 98, 1))
-    if workers > 1:
-        pool.shutdown()
     if len(motions) < 2:
         fail("The clip is too short to stabilize.")
     motions = fill_dropped(motions, dropped)
@@ -276,6 +298,8 @@ def l1_path(trajectory, budget, smoothness):
     n = len(trajectory)
     if n < 4 or budget <= 0:
         return trajectory.copy()
+    import scipy.sparse as sparse  # lazy: renders that load a cached solve never pay for SciPy
+    from scipy.optimize import linprog
     weights = (10.0, 1.0 + 4.0 * smoothness, 100.0 + 400.0 * smoothness)
     counts = (n - 1, n - 2, n - 3)
     offsets = (n, n + counts[0], n + counts[0] + counts[1])
@@ -434,6 +458,19 @@ def output_matrices(path, raw_settings):
     return combined, zooms
 
 
+def solved_matrices(path, raw_settings, cache=None):
+    """`output_matrices`, cached on disk per (analysis, settings): every preview chunk of a clip shares one solve."""
+    if cache and os.path.exists(cache):
+        with np.load(cache) as data:
+            return list(data["matrices"]), data["zooms"]
+    matrices, zooms = output_matrices(path, raw_settings)
+    if cache:
+        temporary = f"{cache}.{os.getpid()}.tmp.npz"
+        np.savez(temporary, matrices=np.array(matrices), zooms=np.asarray(zooms, dtype=np.float64))
+        os.replace(temporary, cache)
+    return matrices, zooms
+
+
 def scaled_matrices(matrices, path, width, height):
     """Re-express full-resolution matrices for a proxy of a different size (same aspect)."""
     sx, sy = width / path["width"], height / path["height"]
@@ -442,6 +479,55 @@ def scaled_matrices(matrices, path, width, height):
     scale = np.array([[sx, 0.0, 0.0], [0.0, sy, 0.0], [0.0, 0.0, 1.0]])
     inverse = np.linalg.inv(scale)
     return [(scale @ np.vstack([m, [0.0, 0.0, 1.0]]) @ inverse)[:2] for m in matrices]
+
+
+def matrix_index(path, time):
+    """Position of `time` in the analysed frame list; the render indexes matrices the same way."""
+    return int(round((float(time) - path["from"]) * path["fps"]))
+
+
+# ---------------------------------------------------------------- solve (preview)
+
+def solve(job):
+    """Per-frame output matrices as JSON. The browser warps the picture it already decodes, so a
+    preview needs no decode, no warp and no re-encode here: one small file serves the whole clip."""
+    with open(job["path"], "r", encoding="utf-8") as stream:
+        path = json.load(stream)
+    matrices, zooms = solved_matrices(path, job.get("settings") or {}, job.get("solve"))
+    payload = {"version": 1, "width": path["width"], "height": path["height"], "fps": path["fps"],
+               "from": path["from"], "to": path["to"],
+               "zoom": round(float(np.max(zooms)), 4), "zoomMin": round(float(np.min(zooms)), 4),
+               # Row-major 2x3 per frame, in source pixels, mapping source -> stabilized output.
+               "matrices": [[round(float(v), 5) for v in np.asarray(m).reshape(-1)] for m in matrices]}
+    with open(job["output"], "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, allow_nan=False)
+    emit(progress=100)
+
+
+# ---------------------------------------------------------------- warp an alpha sequence
+
+def warp(job):
+    """Move a Smart Mask matte onto the stabilized picture with that picture's own per-frame matrix.
+    Export bakes the stabilized frames; without this the matte would still sit on the original framing."""
+    with open(job["path"], "r", encoding="utf-8") as stream:
+        path = json.load(stream)
+    matrices, _ = solved_matrices(path, job.get("settings") or {}, job.get("solve"))
+    frames, scaled, size = job["frames"], None, None
+    for n, frame in enumerate(frames):
+        image = cv2.imread(frame["input"], cv2.IMREAD_UNCHANGED)
+        if image is None:
+            fail(f"Smart Mask matte {frame['input']} could not be read.")
+        height, width = image.shape[:2]
+        if size != (width, height):
+            size, scaled = (width, height), scaled_matrices(matrices, path, width, height)
+        matrix = scaled[min(len(scaled) - 1, max(0, matrix_index(path, frame["time"])))]
+        # Outside the warped frame there is no subject: the matte ends at the same black border the picture gets.
+        warped = cv2.warpAffine(image, matrix, (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        if not cv2.imwrite(frame["output"], warped):
+            fail(f"Smart Mask matte {frame['output']} could not be written.")
+        if n % 8 == 0:
+            emit(progress=round(n / max(1, len(frames)) * 98, 1))
+    emit(progress=100)
 
 
 # ---------------------------------------------------------------- render
@@ -454,7 +540,7 @@ def render(job):
     start, end, preview = float(job["from"]), float(job["to"]), bool(job.get("preview"))
     if not end > start:
         fail("Render range is empty.")
-    matrices, zooms = output_matrices(path, job.get("settings") or {})
+    matrices, zooms = solved_matrices(path, job.get("settings") or {}, job.get("solve"))
     emit(zoom=round(float(np.max(zooms)), 4), zoomMin=round(float(np.min(zooms)), 4))
     matrices = scaled_matrices(matrices, path, info["width"], info["height"])
     first = int(round((start - path["from"]) * info["fps"]))
@@ -561,6 +647,37 @@ def selftest():
     locked_motion, _ = analyze_frames(iter(locked), width)
     locked_jitter = jitter(np.cumsum(np.array(locked_motion), axis=0))
     assert locked_jitter < 0.6, f"tripod mode still moves {locked_jitter:.2f}"
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        cache = os.path.join(folder, "solve.npz")
+        first = solved_matrices(path, {"amount": 100, "smoothness": 50, "crop": 6, "lock": 0}, cache)
+        second = solved_matrices(path, {"amount": 100, "smoothness": 50, "crop": 6, "lock": 0}, cache)
+        assert os.path.exists(cache) and np.allclose(np.array(first[0]), np.array(second[0])) and np.allclose(first[1], second[1]), "solve cache round trip"
+        assert np.allclose(np.array(first[0]), np.array(matrices)), "cached solve matches the direct solve"
+        # The browser warps with exactly the matrices the export render bakes in.
+        path_file, solve_file = os.path.join(folder, "path.json"), os.path.join(folder, "solve.json")
+        with open(path_file, "w", encoding="utf-8") as stream:
+            json.dump(path, stream)
+        settings = {"amount": 100, "smoothness": 50, "crop": 6, "lock": 0}
+        solve({"path": path_file, "settings": settings, "solve": cache, "output": solve_file})
+        with open(solve_file, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        assert len(payload["matrices"]) == len(matrices), "solve emits one matrix per analysed frame"
+        assert np.allclose(np.array(payload["matrices"]).reshape(-1, 2, 3), np.array(matrices), atol=2e-5), "solved matrices match the render's"
+        assert payload["fps"] == path["fps"] and payload["from"] == path["from"], "solve carries the analysed cadence"
+        # A matte warps with the picture: the subject lands where the stabilized frame puts it.
+        matte = np.zeros((height, width), dtype=np.uint16)
+        matte[height//2 - 20:height//2 + 20, width//2 - 20:width//2 + 20] = 65535
+        source_png, warped_png = os.path.join(folder, "matte.png"), os.path.join(folder, "warped.png")
+        cv2.imwrite(source_png, matte)
+        moved = int(np.argmax(np.abs(np.array(matrices)[:, :, 2]).sum(axis=1)))
+        warp({"path": path_file, "settings": settings, "solve": cache,
+              "frames": [{"input": source_png, "output": warped_png, "time": path["from"] + moved / path["fps"]}]})
+        expected = cv2.warpAffine(matte, matrices[moved], (width, height), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        got = cv2.imread(warped_png, cv2.IMREAD_UNCHANGED)
+        assert got is not None and got.dtype == np.uint16 and got.shape == matte.shape, "warped matte stays a native 16-bit gray PNG"
+        assert np.abs(got.astype(np.int32) - expected.astype(np.int32)).max() <= 1, "warped matte matches the picture's own warp"
+        assert np.abs(got.astype(np.int32) - matte.astype(np.int32)).max() > 1000, "the test frame actually moves"
     print(json.dumps({"ok": True, "pathErrorPx": round(error, 3), "jitterBefore": round(before_jitter, 3), "jitterAfter": round(after_jitter, 3), "lockJitter": round(locked_jitter, 3), "zoomAt6pct": [round(float(np.min(zooms)), 4), round(zoom, 4)]}))
 
 
@@ -576,12 +693,19 @@ def main(argv):
     with open(argv[1], "r", encoding="utf-8") as stream:
         job = json.load(stream)
     stage = job.get("stage")
-    if stage == "analyze":
-        analyze(job)
-    elif stage == "render":
-        render(job)
-    else:
-        fail(f"Unknown stage {stage!r}.")
+    try:
+        if stage == "analyze":
+            analyze(job)
+        elif stage == "solve":
+            solve(job)
+        elif stage == "warp":
+            warp(job)
+        elif stage == "render":
+            render(job)
+        else:
+            fail(f"Unknown stage {stage!r}.")
+    except RuntimeError as error:
+        fail(str(error))
 
 
 if __name__ == "__main__":

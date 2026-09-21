@@ -34,7 +34,7 @@
     "test:masks": ".venv-mask/bin/python scripts/smart-mask-check.py && node --experimental-strip-types --test src/services/smartMask.test.ts server/smartMask.test.ts",
     "test:masks:browser": "node --experimental-strip-types scripts/smart-mask-browser-check.mjs",
     "setup:stabilize": "python3 scripts/setup-stabilize.py",
-    "test:stabilize": "node --experimental-strip-types --test server/stabilize.test.ts src/services/stabilize.test.ts"
+    "test:stabilize": "node --experimental-strip-types --test server/stabilize.test.ts src/services/stabilize.test.ts src/services/stabilizePreview.test.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

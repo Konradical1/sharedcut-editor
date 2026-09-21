@@ -20,7 +20,7 @@ try {
   const second = await browser.newContext();
   await second.request.post(`${base}/api/auth/signup`, { data: { name: 'Jamie Chen', email: 'jamie@library.test', password: 'library browser password' } });
   const envelope = await (await context.request.get(`${base}/api/state`)).json();
-  envelope.state.projects = ['City after dark', 'A quieter kind of morning', 'The last light', 'New perspectives'].map((name, i) => ({ id: `film-${i}`, name, description: '', shared: false, thumbnail: ['/media/city.jpg','/media/studio.jpg'][i % 2], modifiedAt: Date.now() - i * 86400000, duration: 94 + i * 60, resolution: '1920 × 1080', fps: 24, status: i === 2 ? 'In review' : 'In progress', members: [{ userId: user.id, role: 'Owner' }] }));
+  envelope.state.projects = ['City after dark', 'A quieter kind of morning', 'The last light', 'New perspectives'].map((name, i) => ({ id: `film-${i}`, name, description: '', shared: false, thumbnail: ['/media/city.jpg','/media/ocean.jpg'][i % 2], modifiedAt: Date.now() - i * 86400000, duration: 94 + i * 60, resolution: '1920 × 1080', fps: 24, status: i === 2 ? 'In review' : 'In progress', members: [{ userId: user.id, role: 'Owner' }] }));
   assert.equal((await context.request.put(`${base}/api/state`, { data: envelope })).status(), 200);
   await page.goto(base);
   await page.getByRole('button', { name: 'New folder', exact: true }).click();

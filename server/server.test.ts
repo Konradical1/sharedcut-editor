@@ -177,7 +177,7 @@ test('real upload, authenticated range playback, locks, export download and medi
     assert.equal((await request('/state', 'PUT', data)).status, 200);
     const fixture = join(dataDir, 'fixture.mp4'); execFileSync(process.env.FFMPEG_PATH ?? 'ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24:duration=1', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest', fixture]);
     const bytes = await readFile(fixture); const uploaded = await fetch(`${base}/api/media?projectId=film&id=source&name=fixture.mp4`, { method: 'POST', headers: { cookie }, body: bytes }); assert.equal(uploaded.status, 202);
-    data = await waitFor(state => ['ready', 'failed'].includes(state.media[0]?.status)); const asset = data.state.media[0]; assert.equal(asset.status, 'ready', asset.error); assert.ok(asset.waveform.length > 0); assert.equal(asset.hasAudio, true);
+    data = await waitFor(state => ['ready', 'failed'].includes(state.media[0]?.status) && !state.media[0]?.preparationStage); const asset = data.state.media[0]; assert.equal(asset.status, 'ready', asset.error); assert.ok(asset.waveform.length > 0); assert.equal(asset.hasAudio, true);
     const ranged = await fetch(`${base}${asset.proxyUrl}`, { headers: { cookie, range: 'bytes=0-15' } }); assert.equal(ranged.status, 206); assert.equal((await ranged.arrayBuffer()).byteLength, 16); assert.match(ranged.headers.get('content-range')!, /^bytes 0-15\//);
     assert.equal((await fetch(`${base}${asset.proxyUrl}`)).status, 401);
     const beyond = await fetch(`${base}${asset.proxyUrl}`, { headers: { cookie, range: 'bytes=99999999-' } }); assert.equal(beyond.status, 416);
@@ -274,6 +274,8 @@ test('placeholder media plus resumable chunked upload survives retries, bad offs
     const signup = await fetch(`${base}/auth/signup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Owner', email: 'chunk@example.com', password: 'correct horse battery' }) });
     const cookie = signup.headers.get('set-cookie')!.split(';')[0];
     const ownerId = (await signup.json()).user.id;
+    assert.equal((await fetch(`${base}/uploads/info`)).status, 401);
+    assert.equal((await (await fetch(`${base}/uploads/info`, { headers: { cookie } })).json()).localUrl, base.replace('127.0.0.1', 'localhost').replace('/api', ''));
 
     const state = await (await fetch(`${base}/state`, { headers: { cookie } })).json();
     state.state.projects.push({ id: 'film', name: 'Film', description: '', shared: true, thumbnail: '', modifiedAt: Date.now(), duration: 1, resolution: '320 × 180', fps: 24, status: 'In progress', members: [{ userId: ownerId, role: 'Owner' }] });
@@ -289,6 +291,8 @@ test('placeholder media plus resumable chunked upload survives retries, bad offs
 
     assert.equal((await (await init()).json()).offset, 0);
     assert.equal((await (await put(0, bytes.slice(0, 400))).json()).offset, 400);
+    const uploading = await (await fetch(`${base}/state`, { headers: { cookie } })).json();
+    assert.equal(uploading.state.media.find((asset: { id: string }) => asset.id === 'source').progress, 40, 'chunk progress must reach other editors');
 
     assert.equal((await init()).status, 200);
     assert.equal((await (await init()).json()).offset, 400, 'resume must report the server offset');

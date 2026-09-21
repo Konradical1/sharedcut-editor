@@ -1,3 +1,4 @@
+import { resetUploads, uploadQueue } from './upload.ts';
 import { stateDelta, applyStateDelta, shareState, stateEqual, type StateDelta } from './stateDelta.ts';
 import { useEditorStore, persistentState, persistedKeys, sealHistory } from '../state/store.ts';
 import { createId } from './index.ts';
@@ -73,6 +74,7 @@ function cacheDraft() {
   if (!storageFull) { storageFull = true; useEditorStore.getState().notify('Local recovery storage is full', 'error', 'Keep this window open until the server confirms Saved.'); }
 }
 function resetSession(session: 'loading' | 'signedOut' = 'signedOut') {
+  resetUploads();
   if (baseline && !same(baseline, persistentState(useEditorStore.getState()))) cacheDraft();
   generation++;
   stopped?.(); stopped = undefined; clearTimeout(timer);
@@ -405,6 +407,7 @@ export async function connectSession() {
   // The event stream is the fast path; this only covers frames that arrived while we were busy.
   const catchUp = setInterval(() => { if (session === generation && behind()) drainRefresh(); }, 200);
   const leave = (event: BeforeUnloadEvent) => {
+    if (uploadQueue.getState().jobs.some(job => ['queued', 'uploading'].includes(job.status))) { event.preventDefault(); event.returnValue = ''; }
     if (baseline && !same(baseline, persistentState(useEditorStore.getState()))) {
       cacheDraft(); event.preventDefault(); event.returnValue = '';
     }

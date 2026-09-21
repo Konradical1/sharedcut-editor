@@ -81,7 +81,7 @@ test('scrubbing retains decoded pictures and reuses decoders while coalescing se
     projects: [{ id: 'p', resolution: '320 × 180', fps: 24 }],
     clips: [{ id: 'c', projectId: 'p', timelineId: 't', trackId: 'v', mediaId: 'm', start: 0, duration: 5, sourceIn: 0, properties: {}, effects: [] }],
     tracks: [{ id: 'v', timelineId: 't', kind: 'video', number: 1 }],
-    media: [{ id: 'm', kind: 'video', sourceUrl: '/test.mp4', duration: 5, fps: 24 }], nodes: [], settings: {},
+    media: [{ id: 'm', name: 'Test video', kind: 'video', sourceUrl: '/test.mp4', duration: 5, fps: 24 }], nodes: [], settings: {},
   };
   const statuses: unknown[] = [];
   const playback = attachPlayback(canvas as unknown as HTMLCanvasElement, () => state as unknown as ReturnType<Parameters<typeof attachPlayback>[1]>, () => ({ original: false, quality: 'Full', volume: 0, compare: false }), status => statuses.push(status));
@@ -98,8 +98,8 @@ test('scrubbing retains decoded pictures and reuses decoders while coalescing se
     state.playhead = 2; nextFrame(); state.playhead = 3; nextFrame();
     assert.equal(canvas.paints, painted, 'A seek must leave the last completed picture intact.');
     assert.deepEqual(videos[0].seeks, [1+.5/24], 'A pending decode is not repeatedly canceled.');
-    assert.ok(!statuses.some(status => JSON.stringify(status).includes('Loading media')), 'Idle time before scrubbing is not a slow load.');
-    now += 701; nextFrame(); assert.deepEqual(statuses.at(-1), { title: 'Loading media…' }, 'A genuinely slow decode is reported.');
+    assert.deepEqual(statuses.at(-1), { title: 'Loading picture…', detail: 'Test video · Seeking frame', loading: true }, 'A pending decode reports the blocking clip while retaining its last picture.');
+    now += 701; nextFrame(); assert.deepEqual(statuses.at(-1), { title: 'Loading picture…', detail: 'Test video · Seeking frame', loading: true }, 'A slow decode continues to report the blocking clip.');
     videos[0].finishSeek(); nextFrame();
     assert.equal(canvas.paints, painted + 1, 'Paint the completed frame before seeking again.');
     assert.deepEqual(videos[0].seeks, [1+.5/24, 3+.5/24], 'Skip superseded targets and decode the newest playhead.');

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Clip } from '../state/models.ts';
 import { acceptsEffect, effectDefinitions } from './effects.ts';
-import { stabilizeChunk, stabilizeChunkCount, stabilizeChunkRange, stabilizeEffect, stabilizeRange, stabilizeSettings } from './stabilize.ts';
+import { stabilizeEffect, stabilizeLayerTransform, stabilizeMatrixAt, stabilizeRange, stabilizeSettings, stabilizeTransform, type StabilizeSolve } from './stabilize.ts';
 
 const clip = (overrides: Partial<Clip> = {}): Clip => ({ id: 'c', projectId: 'p', timelineId: 't', trackId: 'v', mediaId: 'm', name: 'Shot', start: 0, duration: 2, sourceIn: 1, color: '', disabled: false, properties: {}, effects: [], ...overrides });
 const stabilize = { id: 'e', name: 'Stabilize', enabled: true, amount: 100 };
@@ -36,13 +36,46 @@ test('the analysed range follows the source frames the clip reads', () => {
   assert.ok(stabilizeRange(clip({ sourceIn: 99.5 }), 24, 100).to <= 100);
 });
 
-test('chunks index source time inside the range', () => {
-  const range = { from: 10, to: 19 };
-  assert.equal(stabilizeChunkCount(range, 24), 3);
-  assert.equal(stabilizeChunk(10, range, 24), 0); assert.equal(stabilizeChunk(14.5, range, 24), 1); assert.equal(stabilizeChunk(18.9, range, 24), 2);
-  assert.equal(stabilizeChunk(50, range, 24), 2); assert.equal(stabilizeChunk(-5, range, 24), 0);
-  assert.deepEqual(stabilizeChunkRange(2, range, 24), { from: 18, to: 19 });
-  // 59.94 fps: 4 s is 239.76 frames, so chunk edges move to whole frames (240 frames).
-  const edge = stabilizeChunkRange(1, { from: 0, to: 20 }, 60000 / 1001);
-  assert.ok(Math.abs(edge.from * 60000 / 1001 - 240) < 1e-6);
+const solve = (matrices: number[][]): StabilizeSolve => ({ version: 1, width: 1920, height: 1080, fps: 24, from: 2, to: 2 + matrices.length / 24, zoom: 1.11, zoomMin: 1.11, matrices });
+
+test('a source time picks the frame the export render would warp', () => {
+  const s = solve([[1, 0, 0, 0, 1, 0], [1, 0, -4, 0, 1, 3], [1, 0, -8, 0, 1, 6]]);
+  assert.deepEqual(stabilizeMatrixAt(s, 2), s.matrices[0]);
+  assert.deepEqual(stabilizeMatrixAt(s, 2 + 1 / 24), s.matrices[1], 'one frame in is the second matrix');
+  assert.deepEqual(stabilizeMatrixAt(s, 2 + 1.4 / 24), s.matrices[1], 'times round to the nearest analysed frame');
+  // Before and after the analysed range the clip holds the nearest solved frame instead of jumping to identity.
+  assert.deepEqual(stabilizeMatrixAt(s, 0), s.matrices[0]);
+  assert.deepEqual(stabilizeMatrixAt(s, 99), s.matrices[2]);
+});
+
+test('the warp is re-expressed for the letterboxed layer it is drawn on', () => {
+  // Source pixels: translate by (-8, 6) about the frame centre.
+  const identity = stabilizeTransform([1, 0, 0, 0, 1, 0], .5, 100, 20);
+  assert.deepEqual(identity, [1, 0, 0, 1, 0, 0], 'an unmoved frame leaves the layer alone at any fit');
+  const [a, b, c, d, e, f] = stabilizeTransform([1, 0, -8, 0, 1, 6], .5, 100, 20);
+  assert.deepEqual([a, b, c, d], [1, 0, 0, 1]);
+  assert.ok(Math.abs(e + 4) < 1e-9 && Math.abs(f - 3) < 1e-9, `a half-scale layer moves half as far, got ${e},${f}`);
+  // A rotation must pivot about the same source point after the change of basis: the layer position of
+  // the source centre is the one point the warp leaves alone when the matrix is a pure rotation about it.
+  const angle = .05, [cx, cy] = [960, 540], cos = Math.cos(angle), sin = Math.sin(angle);
+  const spin = [cos, -sin, cx - cos * cx + sin * cy, sin, cos, cy - sin * cx - cos * cy];
+  const [ra, rb, rc, rd, re, rf] = stabilizeTransform(spin, .5, 100, 20);
+  const [px, py] = [.5 * cx + 100, .5 * cy + 20];
+  assert.ok(Math.abs(ra * px + rc * py + re - px) < 1e-6 && Math.abs(rb * px + rd * py + rf - py) < 1e-6, 'the source centre stays put on the layer');
+});
+
+test('a proxy is measured in the original’s pixels, not its own', () => {
+  // Analysis always runs on the 4K original; playback usually shows a 1080p proxy of it. A 96-pixel
+  // shift at 3840 wide has to arrive as 96/3840 of the letterboxed width whichever proxy is on screen.
+  const s = solve([[1, 0, -96, 0, 1, 48]]);
+  s.width = 3840; s.height = 2160;
+  const layer = 960, high = stabilizeLayerTransform(s, 2, layer, 540, 1920, 1080);
+  const low = stabilizeLayerTransform(s, 2, layer, 540, 960, 540);
+  const full = stabilizeLayerTransform(s, 2, layer, 540, 3840, 2160);
+  assert.ok(Math.abs(high[4] - low[4]) < 1e-9 && Math.abs(high[4] - full[4]) < 1e-9, `every proxy must warp identically, got ${high[4]}, ${low[4]}, ${full[4]}`);
+  assert.ok(Math.abs(high[4] + 96 * layer / 3840) < 1e-9, `96 original pixels is ${96 * layer / 3840} layer pixels, got ${high[4]}`);
+  assert.ok(Math.abs(high[5] - 48 * layer / 3840) < 1e-9);
+  // Letterboxing still comes from what is actually on screen: a 4:3 element is pillarboxed in a 16:9 layer.
+  const narrow = stabilizeLayerTransform(s, 2, layer, 540, 1440, 1080);
+  assert.ok(Math.abs(narrow[4] + 96 * (1440 * (540 / 1080)) / 3840) < 1e-9, 'the fit follows the element that is drawn');
 });

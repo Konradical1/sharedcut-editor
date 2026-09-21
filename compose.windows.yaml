@@ -1,0 +1,12 @@
+# Local Lenovo host. Start with: docker compose -f compose.windows.yaml up -d --build
+services:
+  frameline:
+    build: .
+    ports:
+      - "127.0.0.1:4310:4310"
+    environment:
+      FRAME_LINE_SIGNUP_CODE: ${FRAME_LINE_SIGNUP_CODE:?Set an installation signup code in .env}
+      FRAME_LINE_TRUST_PROXY: ${FRAME_LINE_TRUST_PROXY:-0}
+    volumes:
+      - ./data:/data
+    restart: unless-stopped

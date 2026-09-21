@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, lstatSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,7 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { smartMaskFrame, smartMaskSignature, validateSmartMask } from '../src/services/smartMask.ts';
 import type { SmartMaskDocument, SmartMaskManifest } from '../src/services/smartMask.ts';
 import type { Clip, MediaAsset } from '../src/state/models.ts';
-import { colorTransform, cubeText, interpretation, makeCube } from '../src/services/color.ts';
+import { cubeText, interpretation, logView, makeCube } from '../src/services/color.ts';
 
 const worker = fileURLToPath(new URL('../scripts/smart-mask.py', import.meta.url));
 const python = () => process.env.FRAME_LINE_MASK_PYTHON || fileURLToPath(new URL('../.venv-mask/bin/python', import.meta.url));
@@ -58,8 +58,7 @@ export function maskSourceFingerprint(sourcePath: string) {
 }
 export function maskAnalysis(clip: Clip, asset: MediaAsset) {
   const input = interpretation(clip, asset);
-  const properties = { inputProfile: input.profile, inputGamut: input.gamut };
-  const text = cubeText(makeCube(colorTransform({ ...clip, properties, effects: [] }, asset, []), 33));
+  const text = cubeText(makeCube(logView(input.profile, input.gamut), 33));
   return { text, identity: hash([text, clip.properties.dataLevels || 'auto', clip.properties.yuvMatrix || asset.colorMatrix || 'auto']) };
 }
 function inputMatrix(clip: Clip, asset: MediaAsset) {
@@ -78,20 +77,22 @@ function alphaHeader(path: string, width: number, height: number) {
 export function validateMaskManifest(manifest: Manifest, expected: { key: string; signature: string; mask: SmartMaskDocument; direction?: Direction; anchorTime?: number }, directory: string) {
   const { mask } = expected;
   if (manifest.version !== 1 || manifest.key !== expected.key || manifest.signature !== expected.signature || manifest.width !== mask.source.width || manifest.height !== mask.source.height || manifest.alpha !== 'gray16' || !Array.isArray(manifest.frames) || !manifest.frames.length || manifest.frames.length > 36_000) fail(409, 'Smart Mask worker returned an invalid manifest.');
+  if (!Array.isArray(manifest.sourceTimes) || !manifest.sourceTimes.length || manifest.sourceTimes.some((time, index) => !Number.isFinite(time) || time < 0 || index > 0 && time <= manifest.sourceTimes![index - 1])) fail(409, 'Smart Mask is missing valid source timestamps.');
+  // The range begins with the frame showing at range.start, matching the editor's time-to-frame mapping.
+  const first = smartMaskFrame(mask.range.start, mask.source, manifest.sourceTimes);
   let previousFrame = -1, previousTime = -1;
   for (const entry of manifest.frames) {
-    if (!Number.isSafeInteger(entry.index) || entry.index <= previousFrame || !Number.isFinite(entry.time) || entry.time <= previousTime || entry.time < mask.range.start - 1e-6 || entry.time >= mask.range.end + 1e-6 || entry.file !== `frames/${entry.index}.png` || !regularFile(join(directory, 'frames', `${entry.index}.png`)) || !regularFile(join(directory, 'source', `${entry.index}.jpg`))) fail(409, 'Smart Mask frames are incomplete or out of order.');
+    if (!Number.isSafeInteger(entry.index) || entry.index <= previousFrame || !Number.isFinite(entry.time) || entry.time <= previousTime || entry.index < first || entry.time >= mask.range.end + 1e-6 || entry.file !== `frames/${entry.index}.png` || !regularFile(join(directory, 'frames', `${entry.index}.png`)) || !regularFile(join(directory, 'source', `${entry.index}.jpg`))) fail(409, 'Smart Mask frames are incomplete or out of order.');
     if (!alphaHeader(join(directory, entry.file), manifest.width, manifest.height)) fail(409, 'Smart Mask alpha must be native-resolution 16-bit grayscale PNG.');
     previousFrame = entry.index; previousTime = entry.time;
   }
   if (manifest.frames.some((entry, index) => index > 0 && entry.index !== manifest.frames[index - 1].index + 1)) fail(409, 'Smart Mask frames have gaps.');
-  if (!Array.isArray(manifest.sourceTimes) || !manifest.sourceTimes.length || manifest.sourceTimes.some((time, index) => !Number.isFinite(time) || time < 0 || index > 0 && time <= manifest.sourceTimes![index - 1])) fail(409, 'Smart Mask is missing valid source timestamps.');
   if (!manifest.range || !Number.isFinite(manifest.range.start) || !Number.isFinite(manifest.range.end) || manifest.range.start < mask.range.start - 1e-6 || manifest.range.end > mask.range.end + 1e-6 || manifest.range.end <= manifest.range.start) fail(409, 'Smart Mask returned an invalid analysis range.');
-  const expectedFrames = manifest.sourceTimes!.map((time, index) => ({ time, index })).filter(entry => entry.time >= manifest.range.start - 1e-6 && entry.time < manifest.range.end - 1e-6);
+  const expectedFrames = manifest.sourceTimes!.map((time, index) => ({ time, index })).filter(entry => entry.index >= smartMaskFrame(manifest.range.start, mask.source, manifest.sourceTimes) && entry.time < manifest.range.end - 1e-6);
   if (expectedFrames.length !== manifest.frames.length || expectedFrames.some((entry, index) => entry.index !== manifest.frames[index].index || Math.abs(entry.time - manifest.frames[index].time) > 1e-6)) fail(409, 'Smart Mask coverage does not match source timestamps.');
   if (expected.direction !== undefined && expected.anchorTime !== undefined) {
-    const anchor = smartMaskFrame(expected.anchorTime, mask.source, manifest.sourceTimes);
-    const requestedFrames = manifest.sourceTimes!.map((time, index) => ({ time, index })).filter(entry => entry.time >= mask.range.start - 1e-6 && entry.time < mask.range.end - 1e-6 && (expected.direction !== 'forward' || entry.index >= anchor) && (expected.direction !== 'backward' || entry.index <= anchor));
+    const anchor = Math.max(first, smartMaskFrame(expected.anchorTime, mask.source, manifest.sourceTimes));
+    const requestedFrames = manifest.sourceTimes!.map((time, index) => ({ time, index })).filter(entry => entry.index >= first && entry.time < mask.range.end - 1e-6 && (expected.direction !== 'forward' || entry.index >= anchor) && (expected.direction !== 'backward' || entry.index <= anchor));
     if (requestedFrames.length !== manifest.frames.length || requestedFrames.some((entry, index) => entry.index !== manifest.frames[index].index)) fail(409, 'Smart Mask did not cover the requested direction and range.');
   }
 }
@@ -132,7 +133,47 @@ export function smartMaskService(directory: string) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const jobs = new Map<string, Job>(), controllers = new Map<string, AbortController>();
   const sourceRequests = new Map<string, Promise<string>>();
+  // Scrubbing the frame slider fires a burst of frame requests; queue them instead of rejecting the fifth.
+  let sourceActive = 0; const sourceWaiting: (() => void)[] = [];
+  const sourceSlot = () => new Promise<void>(resolveSlot => { if (sourceActive < 4) { sourceActive++; resolveSlot(); } else if (sourceWaiting.length >= 64) fail(429, 'Source frame requests are busy. Retry shortly.'); else sourceWaiting.push(() => { sourceActive++; resolveSlot(); }); });
+  const releaseSlot = () => { sourceActive--; sourceWaiting.shift()?.(); };
   const timeRequests = new Map<string, Promise<number[]>>();
+  const previewRequests = new Map<string, Promise<string>>();
+  // One resident SAM2 image predictor answers frame previews in about a second instead of reloading
+  // the model per click. It is spawned on demand and retired after ten idle minutes.
+  type PreviewWorker = { child: ChildProcess; ready: Promise<void>; pending: Map<string, { resolve: () => void; reject: (error: Error) => void }>; idle?: ReturnType<typeof setTimeout>; identity: string };
+  let previewWorker: PreviewWorker | undefined;
+  const stopPreviewWorker = (reason: string) => {
+    const current = previewWorker; if (!current) return; previewWorker = undefined;
+    clearTimeout(current.idle);
+    for (const request of current.pending.values()) request.reject(new SmartMaskError(503, reason));
+    current.pending.clear();
+    try { if (process.platform !== 'win32' && current.child.pid) process.kill(-current.child.pid, 'SIGTERM'); else current.child.kill('SIGTERM'); } catch { /* Already gone. */ }
+  };
+  const previewWorkerFor = () => {
+    if (previewWorker) return previewWorker;
+    if (closed) fail(503, 'The server is stopping.');
+    if (!existsSync(python()) || !existsSync(worker)) fail(503, 'Smart Mask models are not installed on this server.');
+    const child = spawn(python(), [worker, '--serve'], { stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true });
+    const current: PreviewWorker = { child, pending: new Map(), identity: hash([readFileSync(worker, 'utf8')]), ready: new Promise<void>((resolveReady, rejectReady) => {
+      let buffered = '', errors = '';
+      child.stdout!.on('data', data => {
+        buffered += data; const lines = buffered.split('\n'); buffered = lines.pop() || '';
+        for (const line of lines) {
+          let message: { ready?: boolean; id?: string; ok?: boolean; error?: string }; try { message = JSON.parse(line); } catch { continue; }
+          if (message.ready) resolveReady();
+          const request = message.id ? current.pending.get(message.id) : undefined; if (!request) continue;
+          current.pending.delete(message.id!);
+          if (message.ok) request.resolve(); else request.reject(new SmartMaskError(422, message.error || 'Preview failed.'));
+        }
+      });
+      child.stderr!.on('data', data => { errors = (errors + data).slice(-2000); });
+      child.on('error', error => rejectReady(error));
+      child.on('close', code => { rejectReady(new SmartMaskError(503, errors.trim().split('\n').at(-1) || `Preview worker exited ${code}.`)); if (previewWorker === current) stopPreviewWorker(errors.trim().split('\n').at(-1) || 'The preview worker stopped.'); });
+    }) };
+    current.ready.catch(() => {});
+    previewWorker = current; return current;
+  };
   let queue = Promise.resolve(), closed = false;
   const save = (job: Job) => { jobs.set(job.key, job); atomicJson(join(directory, `${job.key}.job.json`), job); };
   for (const name of readdirSync(directory)) {
@@ -149,8 +190,10 @@ export function smartMaskService(directory: string) {
     const controller = new AbortController(); controllers.set(`times-${key}`, controller);
     const request = (async () => {
       try {
-        const outputText = await runMaskProcess(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-format_whitelist', 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,mxf', '-select_streams', 'v:0', '-show_entries', 'frame=best_effort_timestamp_time', '-of', 'csv=p=0', sourcePath], AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]));
-        const values = outputText.split('\n').map(line => line.split(',')[0].trim()).filter(value => /^-?\d+(\.\d+)?$/.test(value)).map(Number);
+        // Packet timestamps need no decoding: a 4K HEVC clip probes in milliseconds instead of minutes.
+        // Packets arrive in decode order, so sort into presentation order before deriving frame indices.
+        const outputText = await runMaskProcess(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-format_whitelist', 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,mxf', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', sourcePath], AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]));
+        const values = outputText.split('\n').map(line => line.split(',')[0].trim()).filter(value => /^-?\d+(\.\d+)?$/.test(value)).map(Number).sort((a, b) => a - b);
         const times = values.map(time => time - values[0]);
         if (!times.length || times.some((time, index) => !Number.isFinite(time) || index > 0 && time <= times[index - 1])) fail(409, 'Source video does not have valid ordered frame timestamps.');
         atomicJson(output, times); return times;
@@ -163,14 +206,16 @@ export function smartMaskService(directory: string) {
     sourceTimes,
     async source(clip: Clip, asset: MediaAsset, sourcePath: string, frame: number) {
       if (closed) fail(503, 'The server is stopping.');
-      if (!Number.isSafeInteger(frame) || frame < 0 || frame >= (await sourceTimes(clip, asset, sourcePath)).length) fail(400, 'Invalid source frame.');
+      const times = await sourceTimes(clip, asset, sourcePath);
+      if (!Number.isSafeInteger(frame) || frame < 0 || frame >= times.length) fail(400, 'Invalid source frame.');
       const analysis = maskAnalysis(clip, asset), key = hash([clip.projectId, asset.id, maskSourceFingerprint(sourcePath), analysis.identity, frame]);
       const root = join(directory, 'source'), output = join(root, `${key}.jpg`);
       if (regularFile(output)) return output;
       const pending = sourceRequests.get(key); if (pending) return pending;
-      if (sourceRequests.size >= 4) fail(429, 'Source frame requests are busy. Retry shortly.');
       const controller = new AbortController(); controllers.set(`source-${key}`, controller);
       const request = (async () => {
+        await sourceSlot();
+        try { if (regularFile(output)) return output; } catch { /* Extract below. */ }
         mkdirSync(root, { recursive: true, mode: 0o700 });
         const temporary = join(root, `.source-${randomUUID()}`); mkdirSync(temporary, { mode: 0o700 });
         try {
@@ -179,20 +224,56 @@ export function smartMaskService(directory: string) {
           const scale: string[] = [], range = clip.properties.dataLevels, matrix = inputMatrix(clip, asset);
           if (range === 'Full' || range === 'Video') scale.push(`in_range=${range === 'Full' ? 'pc' : 'tv'}`);
           if (matrix !== 'auto') scale.push(`in_color_matrix=${matrix}`);
-          const filters = [`select=eq(n\\,${frame})`, ...(scale.length ? [`scale=${scale.join(':')}`] : []), `lut3d=file='${escaped}'`];
-          await runMaskProcess(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-format_whitelist', 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,mxf', '-i', sourcePath, '-vf', filters.join(','), '-frames:v', '1', '-q:v', '2', '-threads', '1', jpeg], AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]));
+          const filters = [...(scale.length ? [`scale=${scale.join(':')}`] : []), `lut3d=file='${escaped}'`];
+          // Accurate input seek to the frame's own presentation time decodes from the nearest keyframe only,
+          // instead of every frame from the start; the first output frame is exactly source frame `frame`.
+          await runMaskProcess(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-format_whitelist', 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,mxf', '-ss', times[frame].toFixed(6), '-i', sourcePath, '-vf', filters.join(','), '-frames:v', '1', '-q:v', '2', jpeg], AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]));
           if (!regularFile(jpeg)) fail(404, 'Source frame is unavailable.');
           renameSync(jpeg, output); return output;
-        } finally { rmSync(temporary, { recursive: true, force: true }); sourceRequests.delete(key); controllers.delete(`source-${key}`); }
+        } finally { rmSync(temporary, { recursive: true, force: true }); sourceRequests.delete(key); controllers.delete(`source-${key}`); releaseSlot(); }
       })();
       sourceRequests.set(key, request); return request;
     },
+    /** Alpha for one source frame from the guides on that frame; the same window, candidate choice and cleanup the tracker applies. */
+    async preview(clip: Clip, asset: MediaAsset, sourcePath: string, mask: SmartMaskDocument, frame: number, prompts: SmartMaskDocument['prompts']) {
+      if (closed) fail(503, 'The server is stopping.');
+      const image = await this.source(clip, asset, sourcePath, frame);
+      const active = previewWorkerFor();
+      const key = hash([image.split(/[\\/]/).at(-1), prompts.map(prompt => ({ kind: prompt.kind, points: prompt.points, radius: prompt.radius })), active.identity, 'preview-1']);
+      const root = join(directory, 'preview'), output = join(root, `${key}.png`);
+      if (regularFile(output)) return output;
+      const pending = previewRequests.get(key); if (pending) return pending;
+      if (previewRequests.size >= 6) fail(429, 'Preview requests are busy. Retry shortly.');
+      const request = (async () => {
+        mkdirSync(root, { recursive: true, mode: 0o700 });
+        const temporary = join(root, `.preview-${randomUUID()}.png`);
+        try {
+          await active.ready;
+          clearTimeout(active.idle);
+          const id = randomUUID();
+          await new Promise<void>((resolveRequest, rejectRequest) => {
+            const timer = setTimeout(() => { active.pending.delete(id); stopPreviewWorker('The preview worker stalled.'); rejectRequest(new SmartMaskError(504, 'The frame preview timed out.')); }, 60_000); timer.unref();
+            active.pending.set(id, { resolve: () => { clearTimeout(timer); resolveRequest(); }, reject: error => { clearTimeout(timer); rejectRequest(error); } });
+            active.child.stdin!.write(JSON.stringify({ id, image, width: mask.source.width, height: mask.source.height, prompts, output: temporary }) + '\n');
+          });
+          if (!regularFile(temporary)) fail(500, 'The preview worker returned no image.');
+          renameSync(temporary, output); return output;
+        } finally {
+          rmSync(temporary, { force: true }); previewRequests.delete(key);
+          if (previewWorker === active && !active.pending.size) { active.idle = setTimeout(() => { if (!active.pending.size) stopPreviewWorker('Idle.'); }, 600_000); active.idle.unref(); }
+        }
+      })();
+      previewRequests.set(key, request); return request;
+    },
+    previewFile(key: string) { if (!validKey(key)) fail(404, 'Preview not found.'); const path = join(directory, 'preview', `${key}.png`); if (!regularFile(path)) fail(404, 'Preview not found.'); return path; },
     async enqueue(options: { clip: Clip; asset: MediaAsset; mask: SmartMaskDocument; sourcePath: string; signature: string; direction: Direction; anchorTime: number }) {
       const { clip, asset, mask, sourcePath, signature, direction, anchorTime } = options;
       validateSmartMask(mask);
-      if (!mask.prompts.some(prompt => prompt.kind === 'include' && prompt.time >= mask.range.start && prompt.time < mask.range.end)) fail(400, 'Add an Include point inside the analysis range first.');
+      // Guides carry their frame's exact timestamp, which can sit up to one frame before range.start.
+      const slack = 1 / mask.source.fps;
+      if (!mask.prompts.some(prompt => prompt.kind === 'include' && prompt.time >= mask.range.start - slack && prompt.time < mask.range.end)) fail(400, 'Add an Include point inside the analysis range first.');
       if (signature !== smartMaskSignature(mask)) fail(409, 'Mask edits are still saving. Retry analysis after saving.');
-      if (!['forward', 'backward', 'both'].includes(direction) || !Number.isFinite(anchorTime) || anchorTime < mask.range.start || anchorTime >= mask.range.end) fail(400, 'Choose an anchor frame inside the analysis range.');
+      if (!['forward', 'backward', 'both'].includes(direction) || !Number.isFinite(anchorTime) || anchorTime < mask.range.start - slack || anchorTime >= mask.range.end) fail(400, 'Choose an anchor frame inside the analysis range.');
       if (mask.source.mediaId !== asset.id || mask.source.duration > asset.duration + .1 || mask.range.end > asset.duration + .1) fail(400, 'Mask source metadata does not match the original video.');
       const dimensions = asset.resolution.match(/(\d+)\s*[×x]\s*(\d+)/);
       if (!dimensions || Number(dimensions[1]) !== mask.source.width || Number(dimensions[2]) !== mask.source.height || Math.abs(mask.source.fps - asset.fps) > .001) fail(400, 'Mask dimensions or frame rate do not match the original video.');
@@ -255,15 +336,17 @@ export function smartMaskService(directory: string) {
       return job;
     },
     cancel(projectId: string, key: string) { const job = get(projectId, key); if (job.status === 'ready') return; controllers.get(key)?.abort(); job.status = 'cancelled'; job.error = 'Cancelled by you.'; save(job); },
-    file(projectId: string, key: string, kind: 'manifest' | 'frames' | 'source', frame?: number) {
+    file(projectId: string, key: string, kind: 'manifest' | 'frames' | 'preview' | 'source', frame?: number) {
       const job = get(projectId, key); if (job.status !== 'ready') fail(409, 'Smart Mask is not ready.');
       const root = join(directory, key), binding = json(join(root, 'binding.json')) as Binding;
       if (binding.projectId !== projectId || binding.signature !== job.signature) fail(404, 'Smart Mask asset not found.');
       if (kind === 'manifest') return join(root, 'manifest.json');
       const manifest = json(join(root, 'manifest.json')) as Manifest;
       if (!Number.isSafeInteger(frame) || !manifest.frames.some(entry => entry.index === frame)) fail(404, 'Smart Mask frame not found.');
-      return join(root, kind, `${frame}.${kind === 'frames' ? 'png' : 'jpg'}`);
+      const path = join(root, kind, `${frame}.${kind === 'source' ? 'jpg' : 'png'}`);
+      if (kind === 'preview' && !regularFile(path)) fail(404, 'This mask has no playback-size matte. Analyze it again.');
+      return path;
     },
-    async close() { closed = true; for (const [key, controller] of controllers) { controller.abort(); const job = jobs.get(key); if (job) { job.status = 'cancelled'; job.error = 'Server stopped.'; save(job); } } await Promise.allSettled([queue, ...sourceRequests.values(), ...timeRequests.values()]); },
+    async close() { closed = true; stopPreviewWorker('Server stopped.'); for (const [key, controller] of controllers) { controller.abort(); const job = jobs.get(key); if (job) { job.status = 'cancelled'; job.error = 'Server stopped.'; save(job); } } await Promise.allSettled([queue, ...sourceRequests.values(), ...timeRequests.values()]); },
   };
 }

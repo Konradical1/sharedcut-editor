@@ -15,6 +15,8 @@ export default function SmartMaskInspector({clip,maskId,targetId,node=false}:{cl
   const patch=(value:Parameters<typeof s.updateSmartMask>[2])=>mask&&s.updateSmartMask(clip.id,mask.id,value);
   const nodeMask=s.nodes.find(n=>n.id===targetId)?.mask;
   const current=mask?.result?.signature=== (mask?smartMaskSignature(mask):'');
+  // A never-analyzed mask asking for what this engine cannot do would leave Analyze greyed out for no reason.
+  useEffect(()=>{if(mask&&!mask.result&&capability?.available&&!capability.finalQuality&&(mask.settings.quality==='final'||mask.settings.preserveMotionBlur))patch({settings:{...mask.settings,quality:'preview',preserveMotionBlur:false}});},[mask?.id,capability?.available]);
   const cannotAnalyze=busy||!capability?.available||(mask?.settings.quality==='final'&&!capability.finalQuality)||(mask?.settings.preserveMotionBlur&&!capability.preserveMotionBlur)||!mask?.prompts.some(p=>p.kind==='include');
   const run=async(direction:'forward'|'backward'|'both')=>{if(!mask)return;setLoading(true);await analyzeMask(clip.id,mask.id,direction,editor.maskId===mask.id?editor.time:mask.range.start);setLoading(false);};
   return <fieldset className="smart-mask-inspector" disabled={locked} aria-label="Smart Mask settings">

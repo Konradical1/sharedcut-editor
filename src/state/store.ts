@@ -17,7 +17,7 @@ import { advancePlayhead, playheadMotion, type PlayheadMotion } from '../service
 import { companionAudioTrack, trackGap, trimRoom, uncoveredParts } from '../services/timeline.ts';
 import { getText, isTitle, remapTextRuns, presetDocument, styleText, validateText, type TextDocument, type TextStyle, type TextRange } from '../services/text.ts';
 import { api, connection } from '../services/api.ts';
-import { uploadSource } from '../services/upload.ts';
+import { enqueueUploads } from '../services/upload.ts';
 
 type Collection = 'clips' | 'tracks' | 'nodes' | 'comments' | 'timelines';
 type Change = { collection: Collection; id: string; value: Record<string, unknown> | null; replace?: boolean; unset?: string[] };
@@ -70,7 +70,7 @@ export interface EditorStore extends PersistedState {
   unlinkClip(id: string): void; linkClip(id: string): void;
   moveClip(id: string, start: number, trackId?: string): void; trimClip(id: string, start: number, duration: number): void; fitTrim(id: string, start: number, duration: number): {start:number;duration:number}|null;
   deleteGap(trackId:string,start:number,end:number):void; splitClip(id: string): void; deleteClip(id: string): void; duplicateClip(id: string): void; copyClip(id: string): void; pasteClip(): void;
-  addMediaToTimeline(mediaId: string, start?: number, trackId?: string): void; updateTrack(id: string, patch: Partial<Track>, gesture?: string): void; moveTrack(id: string, direction: 'up' | 'down'): void; deleteTrack(id: string): void; createTrack(kind: 'video' | 'audio'): void; setTimeline(id: string): void;
+  addMediaToTimeline(mediaId: string | string[], start?: number, trackId?: string): void; updateTrack(id: string, patch: Partial<Track>, gesture?: string): void; moveTrack(id: string, direction: 'up' | 'down'): void; deleteTrack(id: string): void; createTrack(kind: 'video' | 'audio'): void; setTimeline(id: string): void;
   addTransition(clipId: string, side: TransitionSide, name: string, patch?: { duration?: number; align?: TransitionAlign; params?: TransitionParams }): void;
   updateTransition(clipId: string, side: TransitionSide, patch: { name?: string; duration?: number; align?: TransitionAlign; curve?: [number, number, number, number]; params?: TransitionParams }, gesture?: string): void;
   removeTransition(clipId: string, side: TransitionSide): void;
@@ -290,7 +290,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     const group=[...new Map(selected.flatMap(linkedClips).map(c=>[c.id,c])).values()];
     return group.every(c=>editableClip(c.id,field))?group:null;
   };
-  const insertClip = (source: Clip, start: number, name = source.name, copied = false) => {
+  const insertClip = (source: Clip, start: number, name = source.name, copied = false, gesture?: string) => {
     const state = get();
     if (!writable()) return;
     const targetTrack = state.tracks.find(track => track.id === source.trackId && track.timelineId === state.timelineId) ?? state.tracks.find(track => track.timelineId === state.timelineId && track.kind === (state.media.find(m => m.id === source.mediaId)?.kind === 'audio' ? 'audio' : 'video') && !track.locked);
@@ -315,8 +315,18 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     const nodes=group.flatMap((c,i)=>copyAnimatedNodes(c,(copied?state.clipboardNodes:state.nodes).filter(n=>n.clipId===sourceGroup[i]?.id),()=>createId('node')));
     const overwritten=overwriteChanges(group[0],group.map(c=>c.id),group);if(!overwritten)return;changes.push(...overwritten);
     for(const placed of group){cloneContents(placed,changes);changes.push({collection:'clips',id:placed.id,value:record(placed),replace:true});}
-    commit('ClipAdded',clip.id,`added ${name}`, [...changes,...nodes.map(node=>({collection:'nodes' as const,id:node.id,value:record(node),replace:true}))]);
+    commit('ClipAdded',clip.id,`added ${name}`, [...changes,...nodes.map(node=>({collection:'nodes' as const,id:node.id,value:record(node),replace:true}))],gesture);
     set({ selectedClipId: clip.id, selectedClipIds:group.map(c=>c.id), selectedTextIds: isTitle(clip) ? [clip.id] : [], textSelection: null, selectedNodeId: nodes[0]?.id ?? null });
+  };
+  // One asset, one clip. Shared by the single add and the bin's multi-drop, which only differs in
+  // laying the next clip down where the last one ended.
+  const assetDuration = (media: MediaAsset) => media.kind === 'image' ? parseFloat(String(get().settings.stillDuration)) || 5 : media.duration;
+  const insertMedia = (media: MediaAsset, start: number, trackId?: string, gesture?: string) => {
+    const state = get(), kind = media.kind === 'audio' ? 'audio' : 'video', fps = state.projects.find(p => p.id === state.projectId)?.fps || 24;
+    const track = trackId ? state.tracks.find(track => track.id === trackId && track.timelineId === state.timelineId && !track.locked && track.kind === kind) : state.tracks.find(track => track.timelineId === state.timelineId && track.kind === kind && !track.locked && !track.captionSets && track.number === 1) ?? state.tracks.find(track => track.timelineId === state.timelineId && track.kind === kind && !track.locked && !track.captionSets);
+    if (!track) { state.notify('Add an unlocked track first', 'info'); return false; }
+    insertClip({ id: '', projectId: state.projectId, timelineId: state.timelineId, trackId: track.id, mediaId: media.id, name: media.name, start: 0, duration: assetDuration(media), sourceIn: 0, color: media.kind === 'audio' ? '#427A68' : '#467879', disabled: false, properties: { ...defaultProperties }, effects: [] }, Math.round(Math.max(0, start) * fps) / fps, media.name, false, gesture);
+    return true;
   };
   return {
     shapeTool:null, compositionTrail:[], selectedClipIds:[], textTool: false, selectedTextIds: [], textSelection: null, textPreview: [],
@@ -546,7 +556,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (!name) { state.notify('Give your project a name', 'error'); return ''; }
       const id = createId(name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'project');
       const template = createDemoProject(id);
-      const project: Project = { id, name, description: input.description.trim().slice(0, 500), shared: input.shared, thumbnail: '/media/city.jpg', modifiedAt: Date.now(), duration: 0, resolution: String(state.settings.timelineResolution || '1920 × 1080'), fps: parseFloat(String(state.settings.timelineFrameRate)) || 24, status: 'In progress', members: [{ userId: state.currentUserId, role: 'Owner' }, ...(!connection.enabled && input.shared ? state.users.filter(user => user.id !== state.currentUserId).map(user => ({ userId: user.id, role: 'Editor' as const })) : [])] };
+      const project: Project = { id, name, description: input.description.trim().slice(0, 500), shared: input.shared, thumbnail: '', modifiedAt: Date.now(), duration: 0, resolution: String(state.settings.timelineResolution || '1920 × 1080'), fps: parseFloat(String(state.settings.timelineFrameRate)) || 24, status: 'In progress', members: [{ userId: state.currentUserId, role: 'Owner' }, ...(!connection.enabled && input.shared ? state.users.filter(user => user.id !== state.currentUserId).map(user => ({ userId: user.id, role: 'Editor' as const })) : [])] };
       set({ projects: [project, ...state.projects], timelines: [...state.timelines, template.timelines[0]], tracks: [...state.tracks, ...template.tracks.filter(t => t.timelineId === template.timelineId)] });
       state.notify(`${name} created`, 'success');
       return id;
@@ -724,14 +734,24 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     duplicateClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) {const group=selectedGroup(clip)??[clip];insertClip(clip,clip.start+Math.max(...group.map(c=>c.start+c.duration))-Math.min(...group.map(c=>c.start)),`${clip.name} copy`);} },
     copyClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) { const group=selectedGroup(clip)??[clip],ids=new Set(group.map(c=>c.id));set({ clipboard: structuredClone(clip),clipboardClips:structuredClone([clip,...group.filter(c=>c.id!==clip.id)]),clipboardNodes:structuredClone(get().nodes.filter(n=>ids.has(n.clipId))) }); get().notify('Clip copied'); } },
     pasteClip() { const state = get(); if (!state.clipboard) return; if (state.clipboard.projectId !== state.projectId || (!isTitle(state.clipboard) && !isShape(state.clipboard) && !isComposition(state.clipboard) && !state.media.some(media => media.id === state.clipboard!.mediaId && media.projectId === state.projectId))) { state.notify('Copy a clip from this project first', 'info'); return; } insertClip(state.clipboard, state.playhead,state.clipboard.name,true); },
+    // A drop can carry the whole bin. Ready clips land end to end from the drop point, sharing one
+    // gesture id so the hundred-clip drop is a single undo.
     addMediaToTimeline(mediaId, start, trackId) {
       const state = get();
-      const media = state.media.find(asset => asset.id === mediaId && asset.projectId === state.projectId);
-      if (!media || media.status !== 'ready') { state.notify('Media is still being prepared', 'info'); return; }
       if (start !== undefined && !Number.isFinite(start)) return;
-      const track = trackId ? state.tracks.find(track => track.id === trackId && track.timelineId === state.timelineId && !track.locked && track.kind === (media.kind === 'audio' ? 'audio' : 'video')) : state.tracks.find(track => track.timelineId === state.timelineId && track.kind === (media.kind === 'audio' ? 'audio' : 'video') && !track.locked && !track.captionSets && track.number === 1) ?? state.tracks.find(track => track.timelineId === state.timelineId && track.kind === (media.kind === 'audio' ? 'audio' : 'video') && !track.locked && !track.captionSets);
-      if (!track) { state.notify('Add an unlocked track first', 'info'); return; }
-      insertClip({ id: '', projectId: state.projectId, timelineId: state.timelineId, trackId: track.id, mediaId, name: media.name, start: 0, duration: media.kind === 'image' ? parseFloat(String(state.settings.stillDuration)) || 5 : media.duration, sourceIn: 0, color: media.kind === 'audio' ? '#427A68' : '#467879', disabled: false, properties: { ...defaultProperties }, effects: [] }, Math.round(Math.max(0, start ?? state.playhead) * (state.projects.find(p => p.id === state.projectId)?.fps || 24)) / (state.projects.find(p => p.id === state.projectId)?.fps || 24));
+      const ids = Array.isArray(mediaId) ? mediaId : [mediaId];
+      const assets = ids.map(id => state.media.find(asset => asset.id === id && asset.projectId === state.projectId)).filter((asset): asset is MediaAsset => asset?.status === 'ready');
+      if (!assets.length) { state.notify('Media is still being prepared', 'info'); return; }
+      if (assets.length < ids.length) state.notify(`Skipped ${ids.length - assets.length} clip${ids.length - assets.length === 1 ? '' : 's'} still being prepared`, 'info');
+      const gesture = assets.length > 1 ? createId('gesture') : undefined;
+      let at = Math.max(0, start ?? state.playhead);
+      for (const asset of assets) {
+        // A single drop on the wrong kind of track still refuses; only a mixed batch sends the odd
+        // ones to their own lane rather than failing the whole drop.
+        const lane = assets.length === 1 || state.tracks.find(track => track.id === trackId)?.kind === (asset.kind === 'audio' ? 'audio' : 'video') ? trackId : undefined;
+        if (!insertMedia(asset, at, lane, gesture)) return;
+        at += assetDuration(asset);
+      }
     },
     updateTrack(id, patch, gesture) {
       const state = get(); const track = state.tracks.find(t => t.id === id && t.timelineId === state.timelineId);
@@ -1231,7 +1251,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     resolveComment(id) { const comment = get().comments.find(c => c.id === id && c.projectId === get().projectId); if (comment && writable(true)) commit('CommentChanged', id, `${comment.resolved ? 'reopened' : 'resolved'} a review comment`, [{ collection: 'comments', id, value: { resolved: !comment.resolved } }]); },
     enqueueRender(name, preset, settings) { const state = get(); if (!writable()) return; if (connection.enabled) { void connection.flush().then(() => api('/renders', { method: 'POST', body: JSON.stringify({ projectId: state.projectId, name, preset, settings }) })).then(() => { state.notify('Render queued on your server', 'success'); return connection.refresh(); }).catch(error => state.notify(error.message, 'error')); return; } const job = renderService.enqueue(state.projectId, name, preset, settings, state.renderJobs.some(job => job.status === 'rendering')); set({ renderJobs: [job, ...state.renderJobs] }); state.notify('Added to the demo render queue', 'success', 'Processing is simulated locally.'); },
     updateRender(id, patch) { const state = get(); if (!writable()) return; if (connection.enabled) { const job = state.renderJobs.find(j => j.id === id); if (!job) return; void (patch.status === 'waiting' ? api('/renders', { method: 'POST', body: JSON.stringify({ projectId: job.projectId, name: job.name, preset: job.preset, settings: job.settings }) }) : api(`/renders/${encodeURIComponent(id)}`, { method: 'DELETE' })).then(() => connection.refresh()).catch(error => state.notify(error.message, 'error')); return; } set({ renderJobs: state.renderJobs.map(job => job.id === id && job.projectId === state.projectId ? { ...job, ...(patch.status && ['rendering', 'waiting', 'complete', 'failed'].includes(patch.status) ? { status: patch.status } : {}), ...(typeof patch.remaining === 'string' ? { remaining: patch.remaining } : {}), ...(Number.isFinite(patch.progress) ? { progress: clamp(patch.progress!, 0, 100) } : {}) } : job) }); },
-    uploadMedia(files) { const state = get(); if (!writable() || !files.length) return; if (connection.enabled) { const projectId = state.projectId; void (async () => { await connection.flush(); for (const file of files) { state.notify(`Uploading ${file.name}`, 'info'); try { const id = createId('media'); await api(`/media?${new URLSearchParams({ projectId, id, name: file.name, placeholder: '1' })}`, { method: 'POST' }); await connection.refresh(); await uploadSource(id, file); await connection.refresh(); } catch (error) { state.notify(`Upload failed: ${file.name}`, 'error', error instanceof Error ? error.message : 'Try again.'); } } })().catch(error => state.notify(error.message, 'error')); return; } const assets = mediaService.importFiles(files, state.projectId); set({ media: [...assets, ...state.media] }); state.notify(`${assets.length} ${assets.length === 1 ? 'file' : 'files'} added to demo upload queue`, 'info', 'File processing is simulated; originals stay on your computer.'); },
+    uploadMedia(files) { const state = get(); if (!writable() || !files.length) return; if (connection.enabled) { enqueueUploads(state.projectId, files, state.media); return; } const assets = mediaService.importFiles(files, state.projectId); set({ media: [...assets, ...state.media] }); state.notify(`${assets.length} files added to demo upload queue`, 'info', 'File processing is simulated; originals stay on your computer.'); },
     renameMedia(id, name) { const state = get(); if (!writable() || !name.trim()) return; if (connection.enabled) { void api(`/media/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name: name.trim() }) }).then(() => connection.refresh()).catch(error => state.notify(error.message,'error')); return; } set({ media: state.media.map(asset => asset.id === id && asset.projectId === state.projectId ? { ...asset, name: name.trim().slice(0, 255) } : asset) }); },
     removeMedia(id) {
       const state = get(); if (!writable()) return;

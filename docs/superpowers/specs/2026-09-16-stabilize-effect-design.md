@@ -41,7 +41,7 @@ Eligibility (`acceptsEffect`): video clips only, not titles, shapes, captions or
 Interactions rejected with a clear message (same pattern as optical flow rejecting Smart Mask):
 
 - Stabilize + Smart Mask on one clip: the matte is in source coordinates and would be wrong after
-  the warp.
+  the warp. *(Superseded 2026-09-17: the matte now takes the same warp as the picture. See the last revision.)*
 - Stabilize + optical flow on one clip.
 
 Speed, reverse and freeze are fine: the stabilized media keeps source timing.
@@ -112,7 +112,7 @@ Smoothing always runs over the whole analysed range, so preview chunks and expor
 
 Routes, copied from the optical-flow block in `server/index.ts`:
 
-- `POST /api/stabilize` `{clipId, chunk, quality, fps, settings}` → `{status, key, url, progress, from, duration, fps}`.
+- `POST /api/stabilize` `{clipId, chunk, tier, fps, settings}` → `{status, key, url, progress, from, duration, fps}`.
   409 if the clip's saved settings no longer match the request.
 - `GET /api/stabilize/:key/video?projectId=…`, `DELETE /api/stabilize/:key`.
 - Serial job chain with the same 8-job cap and generation abort as flow.
@@ -176,8 +176,11 @@ the Gaussian smoother lagging the pan by up to 59 % of the frame and zooming 2.0
 - **Parameters** are now `amount` (Strength), `crop`, `smoothness`, `lock`. `cropMode`, `zoom`, `tripod`, `maxShift`
   and `maxAngle` are gone.
 - **Analysis always runs on the camera original**, cached once per source range. The half-resolution proxy lost tracking
-  on 8 % of frames and invented a 42°/s rotation; the original lost none. Previews render from the proxy of the
-  requested quality with the matrices rescaled; the render cache key includes the render input.
+  on 8 % of frames and invented a 42°/s rotation; the original lost none. Previews render at two tiers shared by every
+  view quality — 960p (half proxy) for Stream/1/2/1/4, 1080p (colour proxy, else the full proxy) for Full/Color/Original —
+  with the matrices rescaled; the 4K original is never a preview input. The render cache key includes the render input,
+  so a quality switch shows whichever tier is ready while the other renders. The camera-path solve is cached per analysis
+  and settings (`<key>.solve.npz`), and the server renders the section being watched before sections scrubbed past.
 - **Tracking**: per-frame fits with more than 1.5° rotation or 4 % scale are rejected as foreground/whip-pan artefacts and,
   like lost frames, interpolated from their neighbours instead of being treated as no motion.
 - Measured on the clip: perceived shake (rms frame-to-frame acceleration) down 62 % at 5 % crop, 72 % at 8 %.
@@ -197,3 +200,54 @@ the Gaussian smoother lagging the pan by up to 59 % of the frame and zooming 2.0
 - **Timeline status.** `src/services/clipStatus.ts` collects Stabilize, optical flow and Smart Mask progress per clip
   (from the playback events and the mask store); `Timeline.tsx` shows a striped progress bar on the clip while
   anything is preparing and a red bar when it failed.
+
+## Revision 2026-09-17: the browser warps, the server only solves
+
+Stabilize + Smart Mask could not play at all, and previews were slow. Both had the same cause: the preview
+substituted a *re-rendered stabilized proxy* for the clip's media. That proxy is cut into 4 s sections in its own
+timebase, so the matte lookup — which indexes the original source's frame table — read section-relative
+timestamps, fell outside the analysed range and stalled on `SmartMaskPending` forever. Rendering those sections
+also cost a decode, a cubic warp and an x264 encode per section, serialized across the whole server, plus the
+download and second decode in the browser.
+
+The warp is a per-frame similarity. Nothing has to be re-encoded to apply one, and per CLAUDE.md rule 8 that GPU
+work belongs on the editor's machine.
+
+- **`stabilize.py` gains a `solve` stage**: analysis + cached solve out to JSON as one row-major 2×3 per analysed
+  frame, in source pixels. A 98 s 4K 59.94 clip is 5 880 matrices in 356 KiB. No decode, no pixels, no encoder.
+- **`POST /api/stabilize`** now takes `{clipId, fps, settings}` for the whole clip and returns
+  `{status, progress, solve, zoom, zoomMin}`. The per-section render, the `chunk`/`tier` parameters and
+  `GET /api/stabilize/<key>/video` are gone, as are `stabilizeChunk*` and `stabilizeTier`.
+- **Playback** keeps decoding the clip's own proxy, so speed, reverse, freeze, the 10-bit YUV colour path, the
+  footage cache and quality switching all behave as they do on any other clip. `finishLayer` warps the layer
+  canvas once with `setTransform` after the colour pass and before the effects, and the Smart Mask cut draws its
+  matte under the same transform. That is the ordering guarantee: **stabilize first, mask on top of the stabilized
+  frame**. Node masks are applied inside the colour pass, i.e. in the frame the camera shot, and are then carried
+  by the same warp — equivalent, and it keeps the grade reading unwarped pixels.
+- **The matrices are in the original's pixels while the element on screen is usually a proxy.** The conjugation
+  scale is the letterboxed width over `solve.width`, never over the element's width; the letterbox rectangle
+  itself comes from the element. `stabilizeLayerTransform` owns this, with a test per proxy tier.
+- **Export** no longer refuses the combination. `renderStabilizedTimeline` resolves each matte against the
+  original, warps it through the new `warp` stage with the same matrices the bake uses, and hands the result to
+  `renderTimeline` via `RenderRequest.maskArtifacts`.
+- **Measured** (M-series Mac, 98 s 4K 59.94 4:2:2 HEVC): analysis 21.8 s + solve 6.7 s, once, cached; then every
+  frame is instant at every quality. Before, the first section needed the same analysis plus a 3.5 s render and a
+  ~20 MB download, and each of the 25 sections repeated that. A 6 s 720p clip is ready 1.6 s after the effect is
+  added, for a 10 KiB payload.
+
+### Smart Mask throughput
+
+Unchanged in behaviour, ~2.1× faster and far lighter on disk. On a 2 s range of the same 4K 59.94 clip
+(121 frames): 113 s → 54 s, and ~3 GB of temporary RGB writes → none.
+
+- **Half precision** (`torch.autocast`, bfloat16 on CUDA, float16 elsewhere) around every SAM 2.1 inference.
+  713 ms → 265 ms per tracked frame. Mattes are unchanged in practice: mean IoU 0.990 against the fp32 run,
+  mean per-pixel alpha difference 0.0003. `FRAME_LINE_MASK_PRECISION=full` forces fp32.
+- **Decode straight to the artifact's own `source/*.jpg`** (4:4:4, `-q:v 2`) instead of a full-resolution PPM dump
+  that was written, read back by the tracker, and then re-encoded to JPEG anyway. At 4K that is ~1.5 MB a frame
+  instead of 25 MB, and two of the five per-frame I/O passes disappear.
+- **PNG compression level 1** for the 16-bit mattes and no `optimize` pass on the 8-bit previews: a matte is flat
+  runs and one soft contour, so the slow filter search buys almost nothing.
+- **`FRAME_LINE_SAM2_MODEL`** selects the checkpoint (`large` default, plus `base_plus`/`small`/`tiny`, all pinned
+  by hash in `setup-masks.py`). `small` roughly doubles tracking throughput again (265 ms → 131 ms) with softer
+  edges on thin limbs; it is a deliberate switch, not the default.

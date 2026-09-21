@@ -38,6 +38,8 @@ test('completed mask resolver rejects cross-project reuse, stale edits/source/co
     assert.throws(() => resolveSmartMaskArtifact(f.directory, clip, { ...f.mask, range: { start: .1, end: 1 } }, f.source, asset), /analyze the current/);
     assert.throws(() => resolveSmartMaskArtifact(f.directory, { ...clip, properties: { inputProfile: 'S-Log3', inputGamut: 'S-Gamut3.Cine' } }, f.mask, f.source, asset), /stale/);
     assert.throws(() => resolveSmartMaskArtifact(f.directory, clip, { ...f.mask, result: { key: '../original', signature: f.signature } }, f.source, asset), /analyze/);
+    // The frame showing at range.start belongs to the range even when its timestamp is a hair earlier.
+    validateMaskManifest({ ...f.manifest, sourceTimes: [0, .5], range: { start: .01, end: 1 } }, { ...f, mask: { ...f.mask, range: { start: .01, end: 1 } } }, f.root);
     const missing = { ...f.manifest, frames: [f.manifest.frames[1]] };
     assert.throws(() => validateMaskManifest(missing, f, f.root), /coverage/);
     assert.throws(() => validateMaskManifest({ ...missing, range: { start: .5, end: 1 } }, { ...f, direction: 'both', anchorTime: 0 }, f.root), /requested direction and range/);

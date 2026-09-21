@@ -18,9 +18,11 @@ def decode(v,p):
         x=(v*1023-64)/876
         return np.where(x>=.030001222851889303,10**((x-.646596)/.432699)-.037584,(x-.030001222851889303)/5)*.9*(219/155 if p=='S-Log2' else 1)
     if p in ['Canon Log','Canon Log 2']:
-        a,b,c=(.529136,.0730597,10.1596) if p=='Canon Log' else (.281863093,.035388128,87.09937546)
-        return np.sign(v-b)*(10**(np.abs(v-b)/a)-1)/c*.9
-    if p=='Canon Log 3': return .9*np.where(v<.04076162,-(10**((.07623209-v)/.42889912)-1)/14.98325,np.where(v<=.105357102,(v-.073059361)/2.3069815,(10**((v-.069886632)/.42889912)-1)/14.98325))
+        a,b,c=(.529136,.0730597,10.1596) if p=='Canon Log' else (.281863093,.035388128,87.09937546);ire=(v*1023-64)/876
+        return np.sign(ire-b)*(10**(np.abs(ire-b)/a)-1)/c*.9
+    if p=='Canon Log 3':
+        ire=(v*1023-64)/876  # Canon IRE curve on code values: black 128/1023, as the ACES IDT
+        return .9*np.where(ire<.04076162,-(10**((.07623209-ire)/.42889912)-1)/14.98325,np.where(ire<=.105357102,(ire-.073059361)/2.3069815,(10**((ire-.069886632)/.42889912)-1)/14.98325))
     raise ValueError('Unsupported gamma: '+p)
 
 def encode(v,p):
@@ -34,10 +36,10 @@ def encode(v,p):
         return (np.where(x>=0,.432699*np.log10(x+.037584)+.646596,x*5+.030001222851889303)*876+64)/1023
     if p in ['Canon Log','Canon Log 2']:
         a,b,c=(.529136,.0730597,10.1596) if p=='Canon Log' else (.281863093,.035388128,87.09937546)
-        return np.sign(v)*a*np.log10(c*np.abs(v)/.9+1)+b
+        return ((np.sign(v)*a*np.log10(c*np.abs(v)/.9+1)+b)*876+64)/1023
     if p=='Canon Log 3':
         x=v/.9
-        return np.where(x<-.014,-.42889912*np.log10(-x*14.98325+1)+.07623209,np.where(x<=.014,2.3069815*x+.073059361,.42889912*np.log10(x*14.98325+1)+.069886632))
+        return (np.where(x<-.014,-.42889912*np.log10(-x*14.98325+1)+.07623209,np.where(x<=.014,2.3069815*x+.073059361,.42889912*np.log10(x*14.98325+1)+.069886632))*876+64)/1023
     raise ValueError('Unsupported gamma: '+p)
 
 def curve(v,c):

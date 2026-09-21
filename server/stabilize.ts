@@ -60,6 +60,8 @@ export async function stabilizeAnalysisIdentity(input: string, from: number, to:
 export async function stabilizeIdentity(analysisKey: string, settings: StabilizeSettings, from: number, to: number, preview: boolean, input?: string) {
   return hash(['stabilize-render-v2', analysisKey, normalizeSettings(settings), round(from), round(to), preview, input ? await inputIdentity(input) : null]);
 }
+/** The solve depends on the analysis and settings only, never on a range or a render size. */
+export const stabilizeSolveIdentity = (analysisKey: string, settings: StabilizeSettings) => hash(['stabilize-solve-v1', analysisKey, normalizeSettings(settings)]);
 
 async function runStage(job: Record<string, unknown>, directory: string, prefix: string, signal: AbortSignal | undefined, onProgress: ((value: number) => void) | undefined) {
   const temporary = await mkdtemp(join(directory, prefix));
@@ -91,12 +93,16 @@ export async function stabilizeAnalysis(options: { input: string; directory: str
 export async function renderStabilized(options: { input: string; analysisInput?: string; directory: string; analysisDirectory?: string; range: { from: number; to: number }; from: number; to: number; settings: StabilizeSettings; preview: boolean; signal?: AbortSignal; onProgress?: (value: number) => void }) {
   const { input, analysisInput = input, directory, analysisDirectory = directory, range, from, to, preview, signal, onProgress } = options, settings = normalizeSettings(options.settings);
   if (!(to > from) || from < range.from - 1e-6 || to > range.to + 1e-6) throw new Error('Stabilize render range must lie inside the analysed range.');
-  const analysis = await stabilizeAnalysis({ input: analysisInput, directory: analysisDirectory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(value * .3) });
+  // Honest progress: a fresh analysis is most of the first section's wait, so it owns 0–70; once cached, the render owns 0–100.
+  const weight = existsSync(join(analysisDirectory, `${await stabilizeAnalysisIdentity(analysisInput, range.from, range.to)}.path.json`)) ? 0 : .7;
+  const analysis = await stabilizeAnalysis({ input: analysisInput, directory: analysisDirectory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(value * weight) });
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const key = await stabilizeIdentity(analysis.key, settings, from, to, preview, input), output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`), sidecar = join(directory, `${key}.json`);
+  // The camera-path solve depends on the analysis and settings only: one file serves every section and both preview tiers.
+  const solve = join(analysisDirectory, `${stabilizeSolveIdentity(analysis.key, settings)}.solve.npz`);
   const zoomOf = async () => { try { const value = JSON.parse(await readFile(sidecar, 'utf8')); return { zoom: Number.isFinite(Number(value.zoom)) ? Number(value.zoom) : undefined, zoomMin: Number.isFinite(Number(value.zoomMin)) ? Number(value.zoomMin) : undefined }; } catch { return { zoom: undefined, zoomMin: undefined }; } };
   if (existsSync(output)) { onProgress?.(100); return { key, output, ...await zoomOf() }; }
-  const { temporary, output: log } = await runStage({ stage: 'render', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, path: analysis.output, from, to, preview, settings, output: join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`) }, directory, '.stabilize-render-', signal, value => onProgress?.(30 + value * .7));
+  const { temporary, output: log } = await runStage({ stage: 'render', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, path: analysis.output, solve, from, to, preview, settings, output: join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`) }, directory, '.stabilize-render-', signal, value => onProgress?.(weight * 100 + value * (1 - weight)));
   try {
     const report = log.split('\n').map(line => { try { return JSON.parse(line) as { zoom?: number; zoomMin?: number }; } catch { return undefined; } }).find(value => value && Number.isFinite(Number(value.zoom)));
     const zoom = report ? Number(report.zoom) : undefined, zoomMin = report && Number.isFinite(Number(report.zoomMin)) ? Number(report.zoomMin) : zoom;
@@ -106,9 +112,49 @@ export async function renderStabilized(options: { input: string; analysisInput?:
   finally { await rm(temporary, { recursive: true, force: true }); await rm(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), { force: true }); }
 }
 
+export type StabilizeSolve = { version: 1; width: number; height: number; fps: number; from: number; to: number; zoom: number; zoomMin: number; matrices: number[][] };
+
+/** Per-frame warp matrices for the whole analysed range. The browser applies them to the picture it already
+ *  decodes, so a preview costs one analysis and one small JSON instead of a decode/warp/encode per section. */
+export async function stabilizeSolve(options: { input: string; directory: string; range: { from: number; to: number }; settings: StabilizeSettings; signal?: AbortSignal; onProgress?: (value: number) => void }): Promise<{ key: string; solve: StabilizeSolve }> {
+  const { input, directory, range, signal, onProgress } = options, settings = normalizeSettings(options.settings);
+  // A fresh analysis is the whole wait; the solve itself is a linear program over a path already in memory.
+  const analysed = existsSync(join(directory, `${await stabilizeAnalysisIdentity(input, range.from, range.to)}.path.json`));
+  const analysis = await stabilizeAnalysis({ input, directory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(analysed ? value : value * .95) });
+  const key = stabilizeSolveIdentity(analysis.key, settings), output = join(directory, `${key}.solve.json`);
+  const read = async () => JSON.parse(await readFile(output, 'utf8')) as StabilizeSolve;
+  if (existsSync(output)) { onProgress?.(100); return { key, solve: await read() }; }
+  const { temporary } = await runStage({ stage: 'solve', path: analysis.output, solve: join(directory, `${key}.solve.npz`), settings, output: join(directory, `.solve-${key}.tmp`) }, directory, '.stabilize-solve-', signal, value => onProgress?.((analysed ? 0 : 95) + value * (analysed ? 1 : .05)));
+  try { await rename(join(directory, `.solve-${key}.tmp`), output); onProgress?.(100); return { key, solve: await read() }; }
+  finally { await rm(temporary, { recursive: true, force: true }); await rm(join(directory, `.solve-${key}.tmp`), { force: true }); }
+}
+
+/** Warp an analysed Smart Mask matte sequence with the picture's own matrices, so the matte follows the
+ *  stabilized frame instead of the original framing. `frames` are absolute PNG paths with their source times. */
+export async function stabilizeWarpMattes(options: { input: string; directory: string; range: { from: number; to: number }; settings: StabilizeSettings; frames: { input: string; output: string; time: number }[]; signal?: AbortSignal; onProgress?: (value: number) => void }) {
+  const { input, directory, range, frames, signal, onProgress } = options, settings = normalizeSettings(options.settings);
+  if (!frames.length) return;
+  const analysis = await stabilizeAnalysis({ input, directory, from: range.from, to: range.to, signal });
+  const { temporary } = await runStage({ stage: 'warp', path: analysis.output, solve: join(directory, `${stabilizeSolveIdentity(analysis.key, settings)}.solve.npz`), settings, frames }, directory, '.stabilize-warp-', signal, onProgress);
+  await rm(temporary, { recursive: true, force: true });
+}
+
+/** Next preview to render: sections someone is polling right now go first, then everything else, each in request order. */
+export function pickStabilizeJob<T extends { created: number; polled: number }>(pending: T[], now = Date.now()): T | undefined {
+  const watched = pending.filter(job => now - job.polled < 2000);
+  return (watched.length ? watched : pending).reduce<T | undefined>((best, job) => !best || job.created < best.created ? job : best, undefined);
+}
+
 // Evict finished previews only; analysis files are tiny and exports are removed by their caller.
-export async function trimStabilizeCache(directory: string, keep: Set<string>, limit = 2 * 1024 ** 3) {
-  const files = await Promise.all((await readdir(directory).catch(() => [])).filter(name => /^[a-f0-9]{64}\.mp4$/.test(name)).map(async name => ({ name, ...await stat(join(directory, name)) })));
+export async function trimStabilizeCache(directory: string, keep: Set<string>, limit = 2 * 1024 ** 3, now = Date.now()) {
+  const names = await readdir(directory).catch(() => []);
+  // Leftovers of a render the server died in the middle of; nothing writes them for longer than an hour.
+  for (const name of names) {
+    if (!/^\.(render|analysis|solve|stabilize)-/.test(name)) continue;
+    const info = await stat(join(directory, name)).catch(() => undefined);
+    if (info && info.mtimeMs < now - 3600_000) await rm(join(directory, name), { recursive: true, force: true });
+  }
+  const files = await Promise.all(names.filter(name => /^[a-f0-9]{64}\.mp4$/.test(name)).map(async name => ({ name, ...await stat(join(directory, name)) })));
   let bytes = files.reduce((sum, file) => sum + file.size, 0);
   for (const file of files.sort((a, b) => a.mtimeMs - b.mtimeMs)) {
     if (bytes <= limit) break;

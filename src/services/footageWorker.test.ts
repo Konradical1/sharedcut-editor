@@ -28,7 +28,7 @@ function worker(file: Buffer) {
   const sandbox: Record<string, unknown> = {
     self: { addEventListener: (type: string, fn: (event: any) => void) => { listeners[type] = fn; }, skipWaiting() {}, clients: { claim: async () => {}, matchAll: async () => [] }, location: { origin: 'https://sharedcut.test' } },
     caches: { open: async () => cache, delete: async () => { store.clear(); return true; } },
-    fetch: origin, Request, Response, Headers, URL, ReadableStream, Uint8Array, Date, Math, Number, JSON, Promise, console, Error, RegExp,
+    fetch: origin, Request, Response, Headers, URL, ReadableStream, TransformStream, Uint8Array, Date, Math, Number, JSON, Promise, console, Error, RegExp,
   };
   vm.createContext(sandbox);
   vm.runInContext(readFileSync(new URL('../../public/footage-worker.js', import.meta.url), 'utf8'), sandbox);
@@ -82,4 +82,12 @@ test('a short range on a miss streams the bytes while the whole chunk still land
   const whole = await sw.request(path, 'bytes=0-1048575');
   assert.ok(Buffer.from(await whole!.arrayBuffer()).equals(file.subarray(0, 1024 * 1024)));
   assert.equal(sw.network(), 1, 'served from the cache');
+});
+
+
+test('simultaneous decoder and prefetch requests share the same network chunks', async () => {
+  const file = randomBytes(2 * 1024 * 1024), sw = worker(file);
+  const responses = await Promise.all(Array.from({length: 4}, () => sw.request('/api/media/shared/files/stream.mp4', 'bytes=0-1048575')));
+  for (const response of responses) assert.deepEqual(Buffer.from(await response!.arrayBuffer()), file.subarray(0, 1048576));
+  assert.equal(sw.network(), 1);
 });

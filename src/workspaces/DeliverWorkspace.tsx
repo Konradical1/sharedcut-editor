@@ -35,7 +35,9 @@ export default function DeliverWorkspace() {
   const [fps, setFps] = useState(String(project?.fps || 24));
   const [codec, setCodec] = useState('H.264');
   const [quality, setQuality] = useState('High · 20 Mb/s');
-  const [range, setRenderRange] = useState('Entire timeline');
+  // Opening Deliver defaults to whatever the edit has marked. With no marks that is still the whole
+  // timeline, so nothing is lost — but a marked range no longer has to be re-chosen on every export.
+  const [range, setRenderRange] = useState('In / Out range');
   const [tab, setTab] = useState('Video');
   const [includeAudio, setIncludeAudio] = useState(true);
   const [audioCodec, setAudioCodec] = useState('AAC');
