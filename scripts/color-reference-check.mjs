@@ -1,3 +1,5 @@
+import {browserExecutable} from './browser-options.mjs';
+import {venvPython} from '../server/platform.ts';
 // Independent OCIO/native reference versus the actual WebGL color renderer.
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
@@ -16,7 +18,7 @@ try{
   const clip={id:'camera',properties:{colorPipeline:'nodes-v2',inputProfile:'S-Log3',inputGamut:'S-Gamut3.Cine'}};let id=0;
   const nodes=starterGrade(clip,undefined,()=>String(++id));Object.assign(nodes.at(-1).effects[0],{toneMapping:'aces2',gamutMapping:'none'});
   const job=join(temp,'camera.json');await writeFile(job,JSON.stringify({stages:processingStages(clip,nodes)}));
-  const check=execFileSync(process.env.FRAME_LINE_COLOR_PYTHON||'.venv-color/bin/python',['-c',`
+  const check=execFileSync(process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color'),['-c',`
 import importlib.util,json,numpy as np,sys
 spec=importlib.util.spec_from_file_location('renderer','scripts/color-render.py');m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
 rng=np.random.default_rng(42);x=np.concatenate([rng.uniform(.1,1,(4096,3)),np.repeat(np.linspace(0,1,1024)[:,None],3,axis=1)]).astype(np.float32)
@@ -33,16 +35,16 @@ e=np.abs(a-b);print(json.dumps({'camera':'S-Log3 S-Gamut3.Cine','samples':len(x)
    nodes[1].curves={RGB:{mode:'smooth',points:[{id:'a',x:0,y:0},{id:'b',x:.3,y:.26},{id:'c',x:.7,y:.74},{id:'d',x:1,y:1}]}};
    if(aces)Object.assign(nodes.at(-1).effects[0],{toneMapping:'aces2',gamutMapping:'none'});
    const job=join(temp,'job.json');await writeFile(job,JSON.stringify({width:256,height:1,stages:processingStages(clip,nodes)}));
-   const bytes=execFileSync(process.env.FRAME_LINE_COLOR_PYTHON||'.venv-color/bin/python',['scripts/color-render.py',job,'--stream'],{input:Buffer.from(planar.buffer),maxBuffer:1e6});
+   const bytes=execFileSync(process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color'),['scripts/color-render.py',job,'--stream'],{input:Buffer.from(planar.buffer),maxBuffer:1e6});
    const data=new Float32Array(bytes.buffer,bytes.byteOffset,bytes.byteLength/4),expected=source.map((_,i)=>[data[512+i],data[i],data[256+i]]);
    if(!aces){const cpu=colorTransform(clip,undefined,nodes);let max=0;for(let i=0;i<source.length;i++){const value=cpu(source[i].map(v=>v/255));for(let c=0;c<3;c++)max=Math.max(max,Math.abs(value[c]-Math.max(0,Math.min(1,expected[i][c]))));}assert.ok(max<.0001,`${profile} native operations differ: ${max}`);}
    cases.push({profile,aces,clip,nodes,expected});
   }
  }
- const server=await createServer({server:{port:0,host:'127.0.0.1'}});await server.listen();
- const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH});
+ const server=await createServer({appType:'custom',server:{port:0,host:'127.0.0.1'}});server.middlewares.use('/__color-check',(_request,response)=>{response.setHeader('Content-Type','text/html');response.end('<!doctype html><title>Color verification</title>');});await server.listen();
+ const browser=await chromium.launch({headless:true,executablePath:browserExecutable()});
  try{
-  const page=await browser.newPage();await page.goto(server.resolvedUrls.local[0]);
+  const page=await browser.newPage();await page.goto(new URL('/__color-check',server.resolvedUrls.local[0]).href);
   const measurements=await page.evaluate(async({cases,source})=>{
    const {createColorPreview}=await import('/src/services/colorPreview.ts');
    const input=document.createElement('canvas'),read=document.createElement('canvas');input.width=read.width=256;input.height=read.height=1;

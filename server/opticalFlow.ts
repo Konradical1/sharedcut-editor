@@ -8,31 +8,25 @@ import { writeFile } from 'node:fs/promises';
 import { flowFrames, flowTiming } from '../src/services/opticalFlow.ts';
 import type { Clip, MediaAsset } from '../src/state/models.ts';
 import { run } from './media.ts';
+import { venvPython } from './platform.ts';
+import { runWorkerProcess } from './processTree.ts';
 
 const source = fileURLToPath(new URL('../scripts/optical-flow.m', import.meta.url));
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const ffmpeg = () => process.env.FFMPEG_PATH || 'ffmpeg';
+const portableSource = fileURLToPath(new URL('../scripts/optical-flow.py', import.meta.url));
+export const flowPython = () => process.env.FRAME_LINE_FLOW_PYTHON || venvPython('.venv-flow');
 let executable: Promise<string> | undefined;
-let ffmpegEngine: Promise<string> | undefined;
+let portableEngine: Promise<string> | undefined;
 let nativeQueue = Promise.resolve();
 
-/**
- * Two engines, one contract. `flowFrames` hands either of them the exact source timestamp of every
- * output frame; the engine's job is to synthesize a frame at each one.
- *
- *   darwin  VideoToolbox frame-rate conversion, quality prioritization. The best available.
- *   other   FFmpeg `minterpolate`: bidirectional motion estimation with adaptive overlapped block
- *           compensation, so intermediate frames are synthesized rather than cross-dissolved.
- *
- * The identity string is folded into the preview cache key, so moving between hosts or FFmpeg
- * builds invalidates cached flow instead of serving one engine's output as though it were the other's.
- */
+/** Exact source timestamps drive both engines; their identity invalidates cached output. */
 export async function flowWorker(): Promise<string> {
-  if (process.platform !== 'darwin') return ffmpegEngine ??= (async () => {
-    const version = (await run(ffmpeg(), ['-hide_banner', '-version'])).toString().split('\n')[0].trim();
-    if (!/\bminterpolate\b/.test((await run(ffmpeg(), ['-hide_banner', '-filters'])).toString())) throw new Error('Optical flow needs an FFmpeg build with the minterpolate filter. Set FFMPEG_PATH to a full build.');
-    return `minterpolate-v1 ${version}`;
-  })().catch(error => { ffmpegEngine = undefined; throw error; });
+  if (process.platform !== 'darwin') return portableEngine ??= (async () => {
+    if (!existsSync(flowPython())) throw new Error('Run npm run setup:flow to install portable optical flow.');
+    const version = await runWorkerProcess(flowPython(), [portableSource, '--check'], AbortSignal.timeout(60000), undefined, 'Optical flow');
+    return `opencv-dis-v1 ${version.trim()} ${hash(await readFile(portableSource, 'utf8'))} ${(await run(ffmpeg(), ['-version'])).toString().split('\n')[0]}`;
+  })().catch(error => { portableEngine = undefined; throw error; });
   return executable ??= (async () => {
     const id = hash([await readFile(source, 'utf8'), release()]);
     const directory = join(tmpdir(), `frameline-optical-${process.getuid?.() ?? 'user'}-${id}`), binary = join(directory, 'worker');
@@ -47,70 +41,16 @@ export async function flowWorker(): Promise<string> {
 }
 
 /** What the inspector shows next to the Optical flow toggle. */
-export const flowEngineLabel = () => process.platform === 'darwin' ? 'Apple VideoToolbox · quality priority' : 'FFmpeg minterpolate · motion compensated';
+export const flowEngineLabel = () => process.platform === 'darwin' ? 'Apple VideoToolbox · quality priority' : 'OpenCV · bidirectional motion compensation';
 
 export async function flowIdentity(clip: Clip, input: string, fps: number, from: number, duration: number, preview: boolean) {
   const file = await stat(input);
   return hash(['color-precision-v2',await flowWorker(), flowTiming(clip), input, file.size, file.mtimeMs, fps, from, duration, preview]);
 }
 
-const MAX_RESAMPLE_FPS = 240;
-/**
- * Resample the needed source span to a constant rate fine enough that every requested timestamp
- * lands on its own synthesized frame, then select those frames in schedule order. One decode and
- * one interpolation pass per section, rather than a process per frame.
- *
- * ponytail: monotonic schedules with distinct timestamps only. A freeze, or slow motion finer than
- * the 240 fps resampling cap resolves, asks for the same synthesized frame twice and `select` can
- * emit each frame only once; a curve that reverses direction mid-section would need them out of
- * order. Both want the engine to stream raw frames through Node between two FFmpeg processes, so a
- * frame can be written more than once and in any order. Until then they raise, rather than quietly
- * dropping frames and shortening the clip.
- */
-async function renderMinterpolate(options: { input: string; output: string; fps: number; sourceFps: number; frames: { time: number; interpolate: boolean }[]; directory: string; signal?: AbortSignal; onProgress?: (value: number) => void }) {
-  const { input, output, fps, sourceFps, frames, directory, signal, onProgress } = options;
-  const times = frames.map(frame => frame.time);
-  const descending = times.length > 1 && times[times.length - 1] < times[0];
-  const ordered = descending ? [...times].reverse() : times;
-  for (let index = 1; index < ordered.length; index++) {
-    if (ordered[index] < ordered[index - 1] - 1e-9) throw new Error('Optical flow on this host cannot follow a speed curve that changes direction inside one section. Split the ramp, or render it on the Mac.');
-  }
-  let smallest = Infinity;
-  for (let index = 1; index < ordered.length; index++) { const gap = ordered[index] - ordered[index - 1]; if (gap > 1e-9 && gap < smallest) smallest = gap; }
-  if (!Number.isFinite(smallest)) smallest = 1 / Math.max(1, sourceFps);
-  const rate = Math.min(MAX_RESAMPLE_FPS, Math.max(Math.ceil(sourceFps), Math.ceil(1 / smallest)));
-  const start = ordered[0], indices = ordered.map(time => Math.round((time - start) * rate));
-  if (new Set(indices).size !== indices.length) throw new Error(`Optical flow on this host cannot hold a frame, or slow further than ${rate} fps resampling resolves. Remove the freeze, raise the speed, or render it on the Mac.`);
-
-  // Two source frames of lead-in, so the first requested timestamp has motion behind it to estimate
-  // from instead of being extrapolated off the front of the section.
-  const lead = Math.min(start, 2 / Math.max(1, sourceFps));
-  const span = ordered[ordered.length - 1] - start + lead + 2 / Math.max(1, sourceFps);
-  const graph = [
-    `[0:v]minterpolate=fps=${rate}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1:scd=fdiff:scd_threshold=10`,
-    `trim=start_frame=${Math.round(lead * rate)}`,
-    'setpts=PTS-STARTPTS',
-    `select='${indices.map(index => `eq(n\\,${index})`).join('+')}'`,
-    ...(descending ? ['reverse'] : []),
-    `setpts=N/${fps}/TB[v]`,
-  ].join(',');
-  // One select term per output frame outgrows a Windows command line, so FFmpeg reads the graph
-  // from a file. That also keeps the expression clear of two layers of shell quoting.
-  const script = join(directory, 'flow.filter');
-  await writeFile(script, graph);
-  await run(ffmpeg(), ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
-    '-ss', (start - lead).toFixed(6), '-t', span.toFixed(6), '-i', input,
-    '-filter_complex_script', script, '-map', '[v]', '-an',
-    // `setpts` above already lays the selected frames on the output grid, so `-r` only stamps the
-    // container rate. Pairing it with a non-CFR `-fps_mode` is a contradiction FFmpeg rejects.
-    '-c:v', 'prores_ks', '-profile:v', '3', '-pix_fmt', 'yuv422p10le',
-    '-r', String(fps), '-progress', 'pipe:1', '-nostats', output],
-    { signal, duration: frames.length / fps, onProgress });
-  onProgress?.(100);
-}
-
 export async function renderOpticalFlow(options: { clip: Clip; asset: MediaAsset; input: string; directory: string; fps: number; from?: number; duration?: number; preview?: boolean; signal?: AbortSignal; onProgress?: (value: number) => void }) {
   const { clip, asset, input, directory, fps, signal, onProgress, preview = false, from = 0, duration = clip.duration } = options;
+  if (signal?.aborted) throw new Error('Optical flow cancelled.');
   const key = await flowIdentity(clip, input, fps, from, duration, preview);
   const output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`);
   await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -134,13 +74,15 @@ export async function renderOpticalFlow(options: { clip: Clip; asset: MediaAsset
       nativeQueue = native.catch(() => {}); await native;
     } else {
       await flowWorker();
-      const job = nativeQueue.then(() => renderMinterpolate({ input, output: movie, fps, sourceFps: asset.fps || fps, frames, directory: temporary, signal, onProgress: progress }));
-      nativeQueue = job.catch(() => {}); await job;
+      const spec = join(temporary, 'job.json');
+      await writeFile(spec, JSON.stringify({ input: resolve(input), output: movie, fps, frames, ffmpeg: ffmpeg(), ffprobe: process.env.FFPROBE_PATH || 'ffprobe' }));
+      const job = nativeQueue.then(() => runWorkerProcess(flowPython(), [portableSource, spec], signal, progress, 'Optical flow'));
+      nativeQueue = job.then(() => {}, () => {}); await job;
     }
     let result = movie;
     if (preview) {
       result = join(temporary, 'preview.mp4');
-      await run(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-i', movie, '-an', '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-qp', '0', '-g', String(Math.max(1, Math.round(fps / 2))), '-pix_fmt', 'yuv422p10le', '-color_range', 'tv', '-movflags', '+faststart', result], { signal });
+      await run(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-i', movie, '-an', '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '16', '-g', String(Math.max(1, Math.round(fps / 2))), '-pix_fmt', 'yuv420p', '-color_range', 'tv', '-movflags', '+faststart', result], { signal });
     }
     if (signal?.aborted) throw new Error('Optical flow cancelled.');
     await rename(result, output); onProgress?.(100);

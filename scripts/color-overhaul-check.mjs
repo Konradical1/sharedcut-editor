@@ -1,6 +1,7 @@
+import {browserExecutable} from './browser-options.mjs';
 // Isolated copy of a real project; the live database and camera originals are never edited.
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,symlink,readFile,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,cp,readFile,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -13,7 +14,7 @@ const asset=live.media.find(m=>m.name==='C0965.MP4');assert.ok(asset,'Test needs
 const original=live.clips.find(c=>c.mediaId===asset.id),project=structuredClone(live.projects.find(p=>p.id===asset.projectId));
 let app=createFrameLineServer({dataDir:temp,distDir:resolve('dist')}),url='';
 const listen=async()=>{await new Promise(r=>app.server.listen(0,'127.0.0.1',r));url=`http://127.0.0.1:${app.server.address().port}`;};await listen();
-const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH});
+const browser=await chromium.launch({headless:true,executablePath:browserExecutable(),args:['--disable-background-timer-throttling','--disable-renderer-backgrounding','--disable-backgrounding-occluded-windows']});
 const context=await browser.newContext({viewport:{width:1600,height:1000}}),page=await context.newPage();
 const errors=[];page.on('pageerror',e=>errors.push(e.message));
 await page.addInitScript(()=>{const NativeAudio=window.AudioContext;window.AudioContext=class extends NativeAudio{constructor(options={}){super({...options,sinkId:{type:'none'}});}};});
@@ -24,7 +25,7 @@ try{
  const clip={...structuredClone(original),start:0,duration:3,keyframes:{},properties:{...original.properties,zoom:100,x:0,y:0,opacity:100}};
  Object.assign(state,{projects:[project],media:[asset],clips:[clip],tracks:live.tracks.filter(t=>t.timelineId===clip.timelineId),timelines:live.timelines.filter(t=>t.id===clip.timelineId).map(t=>({...t,duration:3})),nodes:live.nodes.filter(n=>n.clipId===clip.id),comments:[],operations:[],snapshots:[],renderJobs:[],settings:{...state.settings,performanceMode:'On'}});
  db.prepare('insert into workspace(id,revision,state) values(1,1,?) on conflict(id) do update set state=excluded.state').run(JSON.stringify(state));db.close();
- await mkdir(join(temp,'media'));await symlink(resolve('data/media',asset.id),join(temp,'media',asset.id));await mkdir(join(temp,'resolve'));await symlink(resolve('data/resolve',project.id),join(temp,'resolve',project.id));
+ await mkdir(join(temp,'media'));await cp(resolve('data/media',asset.id),join(temp,'media',asset.id),{recursive:true});await mkdir(join(temp,'resolve'));await cp(resolve('data/resolve',project.id),join(temp,'resolve',project.id),{recursive:true});
  app=createFrameLineServer({dataDir:temp,distDir:resolve('dist')});await listen();
  const saved=async()=> (await(await context.request.get(url+'/api/state')).json()).state;
  const settled=()=>page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
@@ -77,7 +78,7 @@ try{
    const slider=document.querySelector('input[aria-label="Exposure"]'),native=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set;
    const frames=[],mismatch=[];const listener=()=>{const frame=document.querySelector('.viewer-frame canvas'),scope=document.querySelector('.scope-display canvas');frames.push(performance.now());if(frame.dataset.frameRevision!==scope.dataset.frameRevision)mismatch.push([frame.dataset.frameRevision,scope.dataset.frameRevision]);};window.addEventListener('frameline:frame',listener);
    slider.dispatchEvent(new PointerEvent('pointerdown',{bubbles:true,pointerId:42}));
-   await new Promise(resolve=>{let i=0;const tick=()=>{native.call(slider,String((i-45)/100));slider.dispatchEvent(new Event('input',{bubbles:true}));slider.dispatchEvent(new Event('change',{bubbles:true}));if(++i<90)requestAnimationFrame(tick);else requestAnimationFrame(resolve);};requestAnimationFrame(tick);});
+   await new Promise((resolve,reject)=>{const deadline=setTimeout(()=>reject(Error('Scope interaction did not finish within 30 seconds')),30000);let i=0;const tick=()=>{native.call(slider,String((i-45)/100));slider.dispatchEvent(new Event('input',{bubbles:true}));slider.dispatchEvent(new Event('change',{bubbles:true}));if(++i<90)requestAnimationFrame(tick);else requestAnimationFrame(()=>{clearTimeout(deadline);resolve();});};requestAnimationFrame(tick);});
    slider.dispatchEvent(new PointerEvent('pointerup',{bubbles:true,pointerId:42}));window.removeEventListener('frameline:frame',listener);
    return {frames:frames.length,fps:1000*(frames.length-1)/(frames.at(-1)-frames[0]),mismatch};
  });

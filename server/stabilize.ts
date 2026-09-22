@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { runWorkerProcess } from './processTree.ts';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
@@ -14,21 +14,7 @@ const ffmpeg = () => process.env.FFMPEG_PATH || 'ffmpeg', ffprobe = () => proces
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 let workerQueue = Promise.resolve();
 
-// Kill the process group: the worker owns ffmpeg decoder and encoder children.
-export function runStabilizeProcess(command: string, args: string[], signal?: AbortSignal, progress?: (value: number) => void): Promise<string> {
-  if (signal?.aborted) return Promise.reject(new Error('Stabilize cancelled.'));
-  return new Promise((resolveOutput, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true });
-    let output = '', errors = '', pending = '', failure: Error | undefined, timer: ReturnType<typeof setTimeout> | undefined;
-    const kill = (kind: NodeJS.Signals) => { try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, kind); else child.kill(kind); } catch { /* Process already exited. */ } };
-    const abort = () => { failure = new Error('Stabilize cancelled.'); kill('SIGTERM'); timer = setTimeout(() => kill('SIGKILL'), 2000); timer.unref(); };
-    signal?.addEventListener('abort', abort, { once: true });
-    child.stdout.on('data', data => { output += data; pending += data; if (output.length > 4 * 1024 ** 2) { failure = new Error('Stabilize worker output exceeds limit.'); kill('SIGKILL'); } const lines = pending.split('\n'); pending = lines.pop() || ''; for (const line of lines) { try { const value = JSON.parse(line).progress; if (Number.isFinite(value)) progress?.(Math.max(0, Math.min(99, value))); } catch { /* Worker diagnostics. */ } } });
-    child.stderr.on('data', data => { errors = (errors + data).slice(-4000); });
-    child.on('error', error => { failure = error; });
-    child.on('close', code => { if (!signal?.aborted) clearTimeout(timer); signal?.removeEventListener('abort', abort); if (failure) reject(failure); else if (code !== 0) reject(new Error(errors.trim() || `Stabilize worker exited ${code}.`)); else resolveOutput(output); });
-  });
-}
+export const runStabilizeProcess = (command: string, args: string[], signal?: AbortSignal, progress?: (value: number) => void) => runWorkerProcess(command, args, signal, progress, 'Stabilize');
 
 let capabilitiesRequest: Promise<{ available: boolean; reason?: string; opencv?: string }> | undefined, capabilitiesExpiry = 0;
 export function stabilizeCapabilities() {

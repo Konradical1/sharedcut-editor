@@ -1,0 +1,22 @@
+import { execFileSync } from 'node:child_process';
+import { venvPython } from '../server/platform.ts';
+import { flowWorker, flowEngineLabel } from '../server/opticalFlow.ts';
+import { smartMaskCapabilities } from '../server/smartMask.ts';
+import { stabilizeCapabilities } from '../server/stabilize.ts';
+import { captionPython } from '../server/captions.ts';
+import { getMediaCapabilities } from '../server/media.ts';
+
+const checks={};let failed=false;
+async function check(name,work) {
+  try { checks[name]=await work();if(checks[name]?.available===false)failed=true; }
+  catch(error) {checks[name]={available:false,error:error.message};failed=true;}
+}
+const python=(command,code)=>JSON.parse(execFileSync(command,['-c',code],{encoding:'utf8',windowsHide:true,timeout:120000}));
+await check('media',()=>getMediaCapabilities());
+await check('opticalFlow',async()=>({available:!!await flowWorker(),engine:flowEngineLabel()}));
+await check('smartMask',async()=>{const {workerIdentity,...caps}=await smartMaskCapabilities();return caps;});
+await check('stabilize',stabilizeCapabilities);
+await check('captions',()=>python(captionPython(),"import json,torch,ctranslate2; from faster_whisper import WhisperModel; from whisperx.alignment import load_align_model; from silero_vad import load_silero_vad; print(json.dumps(dict(available=True,torch=torch.__version__,alignmentGpu=torch.cuda.is_available(),transcriptionGpus=ctranslate2.get_cuda_device_count())))"));
+await check('color',()=>python(process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color'),"import json,PyOpenColorIO as ocio; print(json.dumps(dict(available=ocio.__version__=='2.5.2',version=ocio.__version__)))"));
+await check('imports',()=>python(process.env.FRAME_LINE_IMPORT_PYTHON||venvPython('.venv-import'),"import json,yt_dlp,spotdl; print(json.dumps(dict(available=True)))"));
+console.log(JSON.stringify(checks,null,2));process.exitCode=failed?1:0;

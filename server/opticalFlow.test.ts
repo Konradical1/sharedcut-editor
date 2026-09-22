@@ -7,7 +7,32 @@ import { renderOpticalFlow, flowWorker } from './opticalFlow.ts';
 import { run, probeMedia, renderTimeline } from './media.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 
-test('Mac optical flow synthesizes motion, caches atomically, preserves duration and exports originals', {skip:process.platform!=='darwin',timeout:120000}, async()=>{
+test('portable flow supports freezes, 1% motion, reverse, direction changes and source-end holds', {timeout:120000}, async()=>{
+  const directory=await mkdtemp(join(tmpdir(),'SharedCut flow schedule '));
+  try {
+    const input=join(directory,'source with spaces.mp4');
+    await run(process.env.FFMPEG_PATH||'ffmpeg',['-v','error','-f','lavfi','-i','testsrc2=size=160x96:rate=24:duration=2','-c:v','libx264','-pix_fmt','yuv420p',input]);
+    const asset={id:'source',projectId:'project',kind:'video',fps:24,duration:2} as MediaAsset;
+    const base={id:'clip',projectId:'project',timelineId:'timeline',trackId:'video',name:'Flow',start:0,color:'red',disabled:false,mediaId:asset.id,sourceIn:0,duration:1,properties:{speed:50},effects:[]} as Clip;
+    for(const [label,changes] of Object.entries({
+      freeze:{sourceIn:.5,properties:{speed:100,freeze:true}},
+      deep:{properties:{speed:1}},
+      reverse:{properties:{speed:50,reverse:true}},
+      direction:{sourceIn:.5,keyframes:{'properties.reverse':[{id:'r0',time:0,value:false,interpolation:'hold'},{id:'r1',time:.5,value:true,interpolation:'hold'}]}},
+      end:{sourceIn:1.8,properties:{speed:100}},
+    })) {
+      const clip={...base,...changes} as Clip;
+      const result=await renderOpticalFlow({clip,asset,input,directory,fps:24,preview:label==='direction'});
+      const raw=await run(process.env.FFMPEG_PATH||'ffmpeg',['-v','error','-i',result.output,'-f','rawvideo','-pix_fmt','gray','-'],{binary:true});
+      const size=160*96;assert.equal(raw.length/size,24,`${label}: preserve every output frame`);
+      if(label==='freeze')assert.deepEqual(raw.subarray(0,size),raw.subarray(23*size,24*size),'A freeze holds the exact source frame');
+      if(label==='deep')assert.notDeepEqual(raw.subarray(0,size),raw.subarray(12*size,13*size),'1% speed still synthesizes subframe motion');
+      if(label==='end')assert.deepEqual(raw.subarray(12*size,13*size),raw.subarray(23*size,24*size),'End holds last frame');
+    }
+  } finally {await rm(directory,{recursive:true,force:true,maxRetries:5});}
+});
+
+test('optical flow synthesizes motion, caches atomically, preserves duration and exports originals', {timeout:120000}, async()=>{
   await flowWorker();
   const directory=await mkdtemp(join(tmpdir(),'frameline-flow-check-'));
   try {

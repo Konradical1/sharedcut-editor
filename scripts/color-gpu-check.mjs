@@ -1,11 +1,12 @@
+import {browserExecutable} from './browser-options.mjs';
 // Real GPU-versus-CPU color math, including Canon inputs and multiple correction stages.
 import assert from 'node:assert/strict';
 import {createServer} from 'vite';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
-const server=await createServer({server:{port:0,host:'127.0.0.1'}});await server.listen();
-const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH,args:JSON.parse(process.env.QA_BROWSER_ARGS||'[]')});
+const server=await createServer({appType:'custom',server:{port:0,host:'127.0.0.1'}});server.middlewares.use('/__color-check',(_request,response)=>{response.setHeader('Content-Type','text/html');response.end('<!doctype html><title>Color verification</title>');});await server.listen();
+const browser=await chromium.launch({headless:true,executablePath:browserExecutable(),args:JSON.parse(process.env.QA_BROWSER_ARGS||'[]')});
 try{
- const page=await browser.newPage();await page.goto(server.resolvedUrls.local[0]);
+ const page=await browser.newPage();await page.goto(new URL('/__color-check',server.resolvedUrls.local[0]).href);
  const results=await page.evaluate(async()=>{
   const {createColorPreview,ColorPending}=await import('/src/services/colorPreview.ts'),{colorTransform,profiles,starterGrade,makeCube}=await import('/src/services/color.ts');
   const source=document.createElement('canvas'),read=document.createElement('canvas');source.width=read.width=64;source.height=read.height=1;

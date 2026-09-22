@@ -1,9 +1,13 @@
 # MLX is Apple silicon only. Everywhere else the whisperx stack below carries faster-whisper,
 # which runs the same model on CUDA through CTranslate2; scripts/transcribe.py picks at runtime.
 mlx-whisper==0.4.3; sys_platform == 'darwin' and platform_machine == 'arm64'
---extra-index-url https://download.pytorch.org/whl/cu130
+--extra-index-url https://download.pytorch.org/whl/cu128
+# Match WhisperX's torch 2.8 pins; explicit local versions upgrade existing CPU installs.
+torch==2.8.0+cu128; sys_platform == 'win32'
+torchaudio==2.8.0+cu128; sys_platform == 'win32'
+torchvision==0.23.0+cu128; sys_platform == 'win32'
 # CTranslate2 needs the CUDA 12 runtime next to it, and nothing else in this file pulls it in:
-# whisperx pins a CPU torch off Apple silicon, so without these faster-whisper loads and then
+# CTranslate2 uses a separate runtime from torch, so without these faster-whisper loads and then
 # fails on a missing cublas64_12.dll. Harmless weight on a CPU-only host, skipped on macOS.
 nvidia-cublas-cu12; sys_platform != 'darwin'
 nvidia-cudnn-cu12; sys_platform != 'darwin'

@@ -1,3 +1,4 @@
+import { killProcessTree } from './processTree.ts';
 import { venvPython } from './platform.ts';
 import { spawn } from 'node:child_process';
 import { existsSync, readdirSync, statSync } from 'node:fs';
@@ -40,9 +41,9 @@ export async function downloadLink(link: ImportLink, directory: string, maxBytes
     const python = process.env.FRAME_LINE_IMPORT_PYTHON || venvPython('.venv-import');
     if (!existsSync(python)) throw new Error('Link importing needs setup on the server: run npm run setup:imports, then retry.');
     const result = await new Promise<{ filename: string; title: string }>((accept, reject) => {
-      const child = spawn(python, [join(root, 'scripts/import-link.py'), link.url, link.mode, String(link.quality), temporary, String(maxBytes), process.execPath], { detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUNBUFFERED: '1' } });
+      const child = spawn(python, [join(root, 'scripts/import-link.py'), link.url, link.mode, String(link.quality), temporary, String(maxBytes), process.execPath], { detached: process.platform !== 'win32', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, PYTHONUNBUFFERED: '1' } });
       let buffer = '', stderr = '', failure: Error | undefined, result: { filename: string; title: string } | undefined, killTimer: ReturnType<typeof setTimeout> | undefined;
-      const kill = (sig: NodeJS.Signals) => { try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, sig); else child.kill(sig); } catch { /* Already exited. */ } };
+      const kill = (sig: NodeJS.Signals) => killProcessTree(child, sig);
       const stop = (message: string) => { if (failure) return; failure = new Error(message); kill('SIGTERM'); killTimer = setTimeout(() => kill('SIGKILL'), 2000); };
       const abort = () => stop('Import cancelled.');
       signal.addEventListener('abort', abort, { once: true }); if (signal.aborted) abort();

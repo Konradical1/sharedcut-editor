@@ -10,6 +10,7 @@ import type { SmartMaskManifest } from '../src/services/smartMask.ts';
 import type { Clip, MediaAsset } from '../src/state/models.ts';
 import { createFrameLineServer } from './index.ts';
 import { defaultShape } from '../src/services/shapes.ts';
+import { run } from './media.ts';
 
 const asset = { id: 'media', projectId: 'project', kind: 'video', duration: 1, fps: 2, resolution: '64 × 32', inputProfile: 'Rec.709' } as MediaAsset;
 const clip = { id: 'clip', projectId: 'project', mediaId: 'media', sourceIn: 0, start: 0, duration: 1, properties: {}, effects: [] } as unknown as Clip;
@@ -103,14 +104,14 @@ test('invalid prompts and node bindings are rejected before a model process is s
   } finally { await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
 });
 
-test('cancelling a running worker kills its decoder child process', async () => {
+for (const engine of ['mask', 'media'] as const) test(`cancelling a running ${engine} worker kills its decoder child process`, async () => {
   const directory = mkdtempSync(join(tmpdir(), 'frameline-mask-cancel-')), marker = join(directory, 'child-finished');
   const controller = new AbortController();
   const childScript = `setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'ran'),1200);setInterval(()=>{},1000)`;
   const parentScript = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(childScript)}],{stdio:'ignore'});console.log(JSON.stringify({progress:1}));setInterval(()=>{},1000)`;
   try {
-    const work = runMaskProcess(process.execPath, ['-e', parentScript], controller.signal, () => controller.abort());
-    await assert.rejects(work, /cancelled/);
+    const work = engine==='mask' ? runMaskProcess(process.execPath, ['-e', parentScript], controller.signal, () => controller.abort()) : run(process.execPath, ['-e', parentScript], {signal:controller.signal,jsonProgress:true,onProgress:()=>controller.abort()});
+    await assert.rejects(work, /cancel(?:led|ed)/i);
     await delay(1400);
     assert.equal(existsSync(marker), false);
     await assert.rejects(runMaskProcess(process.execPath, ['-e', 'process.exit(0)'], AbortSignal.abort()), /cancelled/);

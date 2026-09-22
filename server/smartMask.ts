@@ -1,3 +1,4 @@
+import { killProcessTree, runWorkerProcess } from './processTree.ts';
 import { venvPython, filterPath } from './platform.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -21,21 +22,7 @@ type Job = { key: string; signature: string; projectId: string; clipId: string; 
 type Manifest = SmartMaskManifest;
 type Binding = { projectId: string; clipId: string; maskId: string; signature: string; sourceFingerprint: string; analysisIdentity: string; workerIdentity: string; direction?: Direction; anchorTime?: number };
 
-// Kill the process group: model jobs may have their own FFmpeg decoder children.
-export function runMaskProcess(command: string, args: string[], signal?: AbortSignal, progress?: (value: number) => void): Promise<string> {
-  if (signal?.aborted) return Promise.reject(new Error('Smart Mask cancelled.'));
-  return new Promise((resolveOutput, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32', windowsHide: true });
-    let output = '', errors = '', pending = '', failure: Error | undefined, timer: ReturnType<typeof setTimeout> | undefined;
-    const kill = (kind: NodeJS.Signals) => { try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, kind); else child.kill(kind); } catch { /* Process already exited. */ } };
-    const abort = () => { failure = new Error('Smart Mask cancelled.'); kill('SIGTERM'); timer = setTimeout(() => kill('SIGKILL'), 2000); timer.unref(); };
-    signal?.addEventListener('abort', abort, { once: true });
-    child.stdout.on('data', data => { output += data; pending += data; if (output.length > 4 * 1024 ** 2) { failure = new Error('Smart Mask worker output exceeds limit.'); kill('SIGKILL'); } const lines = pending.split('\n'); pending = lines.pop() || ''; for (const line of lines) { try { const value = JSON.parse(line).progress; if (Number.isFinite(value)) progress?.(Math.max(0, Math.min(99, value))); } catch { /* Worker diagnostics. */ } } });
-    child.stderr.on('data', data => { errors = (errors + data).slice(-4000); });
-    child.on('error', error => { failure = error; });
-    child.on('close', code => { if (!signal?.aborted) clearTimeout(timer); signal?.removeEventListener('abort', abort); if (failure) reject(failure); else if (code !== 0) reject(new Error(errors.trim() || `Smart Mask worker exited ${code}.`)); else resolveOutput(output); });
-  });
-}
+export const runMaskProcess = (command: string, args: string[], signal?: AbortSignal, progress?: (value: number) => void) => runWorkerProcess(command, args, signal, progress, 'Smart Mask');
 
 let capabilitiesRequest: ReturnType<typeof checkCapabilities> | undefined;
 let capabilitiesExpiry = 0;
@@ -149,7 +136,7 @@ export function smartMaskService(directory: string) {
     clearTimeout(current.idle);
     for (const request of current.pending.values()) request.reject(new SmartMaskError(503, reason));
     current.pending.clear();
-    try { if (process.platform !== 'win32' && current.child.pid) process.kill(-current.child.pid, 'SIGTERM'); else current.child.kill('SIGTERM'); } catch { /* Already gone. */ }
+    killProcessTree(current.child, 'SIGTERM');
   };
   const previewWorkerFor = () => {
     if (previewWorker) return previewWorker;

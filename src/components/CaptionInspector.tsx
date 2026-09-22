@@ -60,7 +60,7 @@ export default function CaptionInspector({id}:{id:string}) {
         <p className="caption-hint">Copies the checked properties from this line to every line in this set.</p>
         <label className="caption-apply-all"><input type="checkbox" aria-label="Select all properties" checked={picks.length===setProperties.length} onChange={e=>setPicks(e.target.checked?setProperties.map(p=>p.id):[])}/><span>Select all</span></label>
         {setProperties.map(property=><label className="caption-apply-row" key={property.id}>
-          <input type="checkbox" checked={picks.includes(property.id)} onChange={e=>setPicks(e.target.checked?[...picks,property.id]:picks.filter(key=>key!==property.id))}/>
+          <input type="checkbox" aria-label={property.label} checked={picks.includes(property.id)} onChange={e=>setPicks(e.target.checked?[...picks,property.id]:picks.filter(key=>key!==property.id))}/>
           <span>{property.label}</span><small>{property.value(doc)}</small>
         </label>)}
       </div>

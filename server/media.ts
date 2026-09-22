@@ -1,4 +1,5 @@
 import { venvPython, quotedFilterPath } from './platform.ts';
+import { killProcessTree } from './processTree.ts';
 import { resolveSmartMaskArtifact } from './smartMask.ts';
 import type { SmartMaskManifest } from '../src/services/smartMask.ts';
 import { activeSmartMasks } from '../src/services/smartMaskPreview.ts';
@@ -35,14 +36,14 @@ const safeInput = ['-protocol_whitelist', 'file,pipe', '-format_whitelist', 'mov
 export function run(command: string, args: string[], options: ProcessOptions = {}): Promise<Buffer> {
   if (options.signal?.aborted) return Promise.reject(new Error('Canceled by you'));
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: process.platform !== 'win32' });
     // Preparation is background work and must never outrank the request loop that serves uploads
     // and playback. At equal priority, ffmpeg saturating every core pushed a trivial /api/health
     // from 57ms to 6.5s and dragged a local 64 MB/s import down to 1 MB/s.
     try { setPriority(child.pid!, BACKGROUND_NICE); } catch { /* Not permitted here; thread budget still caps the load. */ }
     const chunks: Buffer[] = [];
     let size = 0, stderr = '', progressBuffer = '', jsonBuffer = '', failure: Error | undefined, killTimer: ReturnType<typeof setTimeout> | undefined;
-    const abort = () => { failure = new Error('Canceled by you'); child.kill('SIGTERM'); killTimer = setTimeout(() => child.kill('SIGKILL'), 2000); killTimer.unref(); };
+    const abort = () => { failure = new Error('Canceled by you'); killProcessTree(child, 'SIGTERM'); killTimer = setTimeout(() => killProcessTree(child), 2000); killTimer.unref(); };
     options.signal?.addEventListener('abort', abort, { once: true });
     const jsonProgress = (chunk: Buffer) => {
       jsonBuffer += chunk.toString();
@@ -54,7 +55,7 @@ export function run(command: string, args: string[], options: ProcessOptions = {
     child.stdout.on('data', (chunk: Buffer) => {
       if (!options.duration || options.binary) {
         size += chunk.length;
-        if (size > (options.maxBytes ?? 8 * 1024 * 1024)) { failure = new Error('Media processor output exceeded its safe limit.'); child.kill('SIGKILL'); return; }
+        if (size > (options.maxBytes ?? 8 * 1024 * 1024)) { failure = new Error('Media processor output exceeded its safe limit.'); killProcessTree(child); return; }
         chunks.push(chunk);
       }
       if (options.onProgress && !options.binary) {
@@ -579,8 +580,11 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     const localStart = Math.max(rangeIn - geo.start, 0), localEnd = Math.min(geo.duration, rangeOut - geo.start), length = localEnd - localStart;
     const offset = Math.max(0, geo.start - rangeIn);
     const sourceIn = finite(geo.sourceIn, `${clip.name} source in`, 0, 86400);
-    const seek = p.freeze || source.asset.kind === 'image' ? sourceIn : sourceIn + (p.reverse ? geo.duration - localEnd : localStart) * speed;
-    const sourceLength = p.freeze ? 1 / Math.max(1, source.asset.fps || fps) : length * speed;
+    const sourceStep = 1 / Math.max(1, source.asset.fps || fps);
+    // Hold the source frame containing the requested time. A fractional seek
+    // followed by a one-frame -t can otherwise decode zero frames in FFmpeg.
+    const seek = source.asset.kind === 'image' ? sourceIn : p.freeze ? Math.floor(sourceIn / sourceStep + 1e-7) * sourceStep : sourceIn + (p.reverse ? geo.duration - localEnd : localStart) * speed;
+    const sourceLength = p.freeze ? sourceStep : length * speed;
     // A transition window reaches past the media when neither clip at the cut has handles left. The
     // preview holds the last frame there (`sourceTime` clamps), so the export clones it too rather
     // than decoding frames that do not exist and coming up short.
@@ -615,7 +619,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
           if(!request.smartMaskDir)throw Error(`${clip.name}: Smart Mask storage is unavailable.`);
           // A baked picture (Stabilize) hands over its own re-warped matte; everything else resolves the stored one.
           const artifact=request.maskArtifacts?.get(`${clip.id}:${document.id}`)??resolveSmartMaskArtifact(request.smartMaskDir,clip,document,source.path,source.asset),manifest=artifact.manifest;
-          if(manifest.quality!=='final')throw Error(`${clip.name}: analyze a final-quality Smart Mask before exporting.`);
+          // A reviewed tracked selection is exportable. Its "preview" identity is
+          // retained: exporting it does not turn segmentation into hair matting.
           if(manifest.width!==metadata.width||manifest.height!==metadata.height)throw Error(`${clip.name}: Smart Mask dimensions differ from the source.`);
           const times=manifest.sourceTimes!,step=1/(metadata.fps||fps);
           if(times.some((t,i)=>i>0&&Math.abs(t-times[i-1]-step)>Math.max(.000003,step*.001)))throw Error(`${clip.name}: Smart Mask export currently requires constant-frame-rate source footage. Convert this source to constant frame rate and reanalyze.`);

@@ -31,12 +31,23 @@ def main():
     from whisperx.audio import load_audio
 
     torch.set_num_threads(4)
-    # Alignment is torch, so it can only use the card if this is a CUDA build of torch. whisperx
-    # pins a torch version that has no CUDA wheel, so off Apple silicon this is usually 'cpu'.
-    align_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Alignment uses the matching CUDA torch wheel installed by setup:captions.
+    requested_device = os.environ.get('FRAME_LINE_CAPTION_DEVICE', 'auto').lower()
+    if requested_device not in ('auto', 'cuda', 'cpu'):
+        raise ValueError('FRAME_LINE_CAPTION_DEVICE must be auto, cuda, or cpu.')
+    align_device = 'cuda' if requested_device != 'cpu' and torch.cuda.is_available() else 'cpu'
+    if requested_device == 'cuda' and align_device != 'cuda':
+        raise RuntimeError('CUDA was requested but the word-alignment GPU is unavailable. Run npm run setup:captions.')
     emit('Loading local models', 10)
     vad = load_silero_vad()
-    alignment, metadata = load_align_model(language_code='en', device=align_device)
+    try:
+        alignment, metadata = load_align_model(language_code='en', device=align_device)
+    except RuntimeError as error:
+        if align_device != 'cuda' or requested_device == 'cuda':
+            raise
+        print(f'GPU alignment unavailable ({error}); aligning on the CPU.', file=sys.stderr)
+        align_device = 'cpu'
+        alignment, metadata = load_align_model(language_code='en', device=align_device)
 
     # Both backends return the same shape: a list of segments carrying the text and the two
     # confidence fields the filter below reads.
@@ -60,9 +71,10 @@ def main():
             import glob
             import sysconfig
             folders = glob.glob(os.path.join(sysconfig.get_paths()['purelib'], 'nvidia', '*', 'bin'))
+            dll_handles = []
             for folder in folders:
                 with contextlib.suppress(OSError):
-                    os.add_dll_directory(folder)
+                    dll_handles.append(os.add_dll_directory(folder))
             if folders:
                 os.environ['PATH'] = os.pathsep.join(folders) + os.pathsep + os.environ.get('PATH', '')
 
@@ -77,16 +89,34 @@ def main():
         # rather than failing the job.
         model = None
         try:
-            if ctranslate2.get_cuda_device_count() > 0:
+            if requested_device != 'cpu' and ctranslate2.get_cuda_device_count() > 0:
                 model = WhisperModel(MODEL, device='cuda', compute_type='float16')
         except Exception as error:
+            if requested_device == 'cuda':
+                raise
             print(f'CUDA unavailable to CTranslate2 ({error}); transcribing on the CPU.', file=sys.stderr)
+        if model is None and requested_device == 'cuda':
+            raise RuntimeError('CUDA was requested but the transcription GPU is unavailable.')
         if model is None:
             model = WhisperModel(MODEL, device='cpu', compute_type='int8')
 
+        print(f'Transcription device: {model.model.device}; alignment device: {align_device}', file=sys.stderr)
+
         def transcribe(samples):
-            segments, _ = model.transcribe(samples, language='en', word_timestamps=True, temperature=0, condition_on_previous_text=False)
-            return [{'text': s.text, 'no_speech_prob': s.no_speech_prob, 'avg_logprob': s.avg_logprob} for s in segments]
+            nonlocal model
+            def infer():
+                segments, _ = model.transcribe(samples, language='en', word_timestamps=True, temperature=0, condition_on_previous_text=False)
+                # CUDA libraries load lazily when iterating, not just in the constructor.
+                return [{'text': s.text, 'no_speech_prob': s.no_speech_prob, 'avg_logprob': s.avg_logprob} for s in segments]
+            try:
+                return infer()
+            except RuntimeError as error:
+                if model.model.device != 'cuda' or requested_device == 'cuda':
+                    raise
+                print(f'GPU transcription failed ({error}); retrying on the CPU.', file=sys.stderr)
+                del model
+                model = WhisperModel(MODEL, device='cpu', compute_type='int8')
+                return infer()
 
         def release():
             pass
@@ -124,7 +154,7 @@ def main():
                     continue
                 words.append({'text': text, 'start': round(start, 4), 'end': round(end, 4), **({'uncertain': True} if uncertain else {})})
         release()
-    Path(sys.argv[2]).write_text(json.dumps({'words': words}, ensure_ascii=False))
+    Path(sys.argv[2]).write_text(json.dumps({'words': words}, ensure_ascii=False), encoding='utf-8')
     emit('Transcript ready', 100)
 
 if __name__ == '__main__':

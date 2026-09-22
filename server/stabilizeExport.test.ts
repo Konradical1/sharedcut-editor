@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -33,7 +33,7 @@ test('Stabilize export bakes a shaky clip and rejects conflicting effects', { ti
     assert.ok(Math.abs(output.duration - 2) < .1, `duration ${output.duration}`);
     assert.equal(output.width, 280);
     assert.ok(progress.some(value => value > 0 && value < 45) && progress.at(-1)! >= 99, 'progress spans bake and composite');
-    assert.ok(existsSync(path.join(dir, 'cache')) && (await exec('ls', [path.join(dir, 'cache')])).stdout.includes('.path.json'), 'analysis is cached in stabilizeDir');
+    assert.ok(existsSync(path.join(dir, 'cache')) && (await readdir(path.join(dir, 'cache'))).some(name=>name.endsWith('.path.json')), 'analysis is cached in stabilizeDir');
     // Speed edits reuse the same analysis and keep working on the baked media.
     await renderTimeline({ ...request, clips: [{ ...clip, duration: 1, properties: { ...clip.properties, speed: 200 } }], settings: { ...request.settings, rangeOut: '1' }, outputPath: path.join(dir, 'fast.mp4') });
     assert.ok(Math.abs((await probeMedia(path.join(dir, 'fast.mp4'))).duration - 1) < .1);

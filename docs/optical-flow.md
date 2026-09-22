@@ -1,6 +1,13 @@
-# Mac optical flow and speed curves
+# Optical flow and speed curves
 
-Enable **Optical flow** immediately below Speed in the video inspector. The FrameLine server must run on a supported Apple silicon Mac with macOS 15.4 or newer and Xcode Command Line Tools. Browser clients use that Mac's processing; a Linux server cannot invoke this native worker.
+Enable **Optical flow** below Speed in the video inspector. On Windows/Linux,
+run `npm run setup:flow` to install the portable OpenCV worker. It supports
+freezes, 1% slow motion, reverse, direction-changing curves and source-end
+holds. The worker uses exact source timestamps, bidirectional motion, and
+16-bit source frames; the final intermediate is 10-bit ProRes. Browser previews
+use H.264 4:2:0 for Windows hardware decoding. Mac hosts retain the existing
+VideoToolbox engine. `FRAME_LINE_FLOW_PYTHON` overrides the portable interpreter.
+
 
 The worker uses Apple's VideoToolbox frame-rate conversion with quality prioritization, its default algorithm revision, 10-bit pixel buffers, and pooled output buffers. It synthesizes at the source timestamps calculated by FrameLine's existing speed-curve integration. Exact source frames and freezes do not require interpolation. A conservative luma-change detector holds through likely hard cuts; this is a heuristic, not a guarantee against motion artifacts. Quality has been functionally checked, not ranked against every competing interpolation model.
 
@@ -19,3 +26,6 @@ PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node --experimental-strip-types 
 ```
 
 The native check measures intermediate motion rather than merely checking that a video file exists. It also checks extensionless originals, cache reuse, cancellation, output duration, and audible ramp exports. Browser checks cover the toggle, authenticated cached video, both ramp scales, and playback across a cache boundary. The synthetic browser run recorded zero dropped frames. A one-second 1280 × 720 segment from the existing speed-ramp footage also rendered successfully; its first full-quality preparation took about eight seconds on this Mac. Preparation is background work, not a real-time guarantee.
+
+The portable checks run with `npm run test:optical-flow` and
+`npm run test:optical-flow:browser`. See [Windows validation](WINDOWS_VALIDATION.md).

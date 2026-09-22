@@ -9,7 +9,7 @@
     "preview": "vite preview --host 0.0.0.0",
     "test": "node --experimental-strip-types --test src/state/store.test.ts src/services/*.test.ts server/*.test.ts",
     "dev:ui": "vite --host 0.0.0.0",
-    "start": "node --experimental-strip-types server/index.ts",
+    "start": "node --env-file-if-exists=.env --experimental-strip-types server/index.ts",
     "test:state": "node --experimental-strip-types --test src/state/store.test.ts",
     "test:browser": "node scripts/browser-check.mjs",
     "test:realtime": "node --experimental-strip-types scripts/realtime-check.mjs",
@@ -35,8 +35,12 @@
     "test:masks:browser": "node --experimental-strip-types scripts/smart-mask-browser-check.mjs",
     "test:optical-flow": "node --experimental-strip-types scripts/optical-flow-ffmpeg-check.mjs",
     "setup:stabilize": "node scripts/setup-venv.mjs .venv-stabilize scripts/stabilize-requirements.txt scripts/stabilize.py --check",
-    "test:stabilize": "node --experimental-strip-types --test server/stabilize.test.ts src/services/stabilize.test.ts src/services/stabilizePreview.test.ts"
-
+    "test:stabilize": "node --experimental-strip-types --test server/stabilize.test.ts src/services/stabilize.test.ts src/services/stabilizePreview.test.ts",
+    "setup:flow": "node scripts/setup-venv.mjs .venv-flow scripts/optical-flow-requirements.txt scripts/optical-flow.py --check",
+    "test:optical-flow:browser": "node --experimental-strip-types scripts/optical-flow-check.mjs",
+    "setup:windows": "node scripts/setup-windows.mjs",
+    "doctor": "node --env-file-if-exists=.env --experimental-strip-types scripts/doctor.mjs",
+    "test:masks:inference": "node --experimental-strip-types scripts/smart-mask-inference-check.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
@@ -55,6 +59,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.0.0",
+    "playwright": "^1.63.0",
     "typescript": "~5.9.0",
     "vite": "^7.0.0"
   },

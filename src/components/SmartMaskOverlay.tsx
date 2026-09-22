@@ -22,6 +22,7 @@ export default function SmartMaskOverlay(){
   const sourceContext=clip?smartMaskPreviewContext(clip,s.media.find(asset=>asset.id===clip.mediaId)):'';
   const canvas=useRef<HTMLCanvasElement>(null),surface=useRef<HTMLDivElement>(null),[manifest,setManifest]=useState<SmartMaskManifest|null>(null),[sourceTimes,setSourceTimes]=useState<number[]>([]),[loaded,setLoaded]=useState(false),[error,setError]=useState(''),[stroke,setStroke]=useState<SmartMaskPoint[]>([]),[cursor,setCursor]=useState({x:.5,y:.5,visible:false}),[size,setSize]=useState({width:1,height:1}),[zoom,setZoom]=useState('Fit');
   const drawing=useRef<{points:SmartMaskPoint[];tool:MaskTool;time:number;radius:number}|null>(null);
+  const loadedSource=useRef('');
   const intent=mask?smartMaskSignature(mask):'',valid=!!mask?.result&&mask.result.signature===intent,key=mask?.result?.key;
   const repairsPreview=mask?pendingMaskRepairPreview(mask):null,canPreview=valid||repairsPreview!==null;
   const [preview,setPreview]=useState<{frame:number;intent:string;url?:string;error?:string}|null>(null);
@@ -55,7 +56,10 @@ export default function SmartMaskOverlay(){
   },[clip?.id,mask?.id,frame,frameIntent,valid,!!times]);
   useEffect(()=>{
     if(!mask||!clip||!canvas.current)return;
-    let live=true;setLoaded(false);setError('');
+    const sourceIdentity=JSON.stringify([clip.id,frame,sourceContext]);
+    // Updating guides or an arriving AI preview must not disable the next stroke.
+    // Only a different source frame needs to block drawing while it loads.
+    let live=true;if(loadedSource.current!==sourceIdentity)setLoaded(false);setError('');
     const picture=new Image(),alpha=new Image();
     const draw=()=>{
       if(!live||!canvas.current)return;
@@ -87,7 +91,7 @@ export default function SmartMaskOverlay(){
           ctx.putImageData(pixels,0,0);
         }
       }
-      setLoaded(true);
+      loadedSource.current=sourceIdentity;setLoaded(true);
     };
     // Scrubbing settles before the frame is fetched, and a transient failure retries before it is reported.
     let attempts=0;const source=`/api/smart-masks/source?clipId=${encodeURIComponent(clip.id)}&frame=${frame}&context=${encodeURIComponent(sourceContext)}`;

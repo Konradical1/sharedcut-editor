@@ -17,6 +17,8 @@ ENV FRAME_LINE_IMPORT_PYTHON=/opt/media-import/bin/python
 COPY scripts/stabilize-requirements.txt ./scripts/stabilize-requirements.txt
 RUN python3 -m venv /opt/stabilize && /opt/stabilize/bin/pip install --no-cache-dir -r scripts/stabilize-requirements.txt
 ENV FRAME_LINE_STABILIZE_PYTHON=/opt/stabilize/bin/python
+# The portable flow worker shares OpenCV/NumPy with stabilization.
+ENV FRAME_LINE_FLOW_PYTHON=/opt/stabilize/bin/python
 COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
@@ -27,6 +29,7 @@ COPY scripts/resolve-export.lua ./scripts/resolve-export.lua
 COPY scripts/import-link.py ./scripts/import-link.py
 COPY scripts/color-render.py ./scripts/color-render.py
 COPY scripts/stabilize.py ./scripts/stabilize.py
+COPY scripts/optical-flow.py ./scripts/optical-flow.py
 RUN mkdir /data && chown node:node /data
 ENV NODE_ENV=production HOST=0.0.0.0 PORT=4310 FRAME_LINE_DATA=/data
 USER node

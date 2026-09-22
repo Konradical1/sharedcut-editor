@@ -18,6 +18,13 @@ npm start
 
 Open [localhost:4310](http://localhost:4310). Create an account, create a project, upload footage, and add it to the timeline. New accounts have no sample projects or fake collaborators. No AI service or API key is needed.
 
+### Native Windows
+
+Run `npm run setup:windows` after `npm ci`, then `npm start`. This installs local
+GPU captions, SAM Smart Mask, portable optical flow, stabilization, color and
+link imports. `npm run doctor` verifies the workers. See [Windows setup and
+Lenovo migration](docs/WINDOWS_NATIVE.md). No Docker or WSL is required.
+
 ### This Mac: startup and tunnel recovery
 
 The installed LaunchAgents `com.frameline.server` and `com.cloudflare.tunnel.frameline` start at login and restart exited processes. `com.sharedcut.tunnel-health` runs `scripts/tunnel-health.mjs` every 60 seconds and at login. It checks Cloudflare's local readiness endpoint at `127.0.0.1:20241` three times before restarting an unresponsive or disconnected tunnel. The fixed metrics address is configured in `~/.cloudflared/config.yml`. This recovers stale connections after network changes without changing the public address, https://sharedcut.com.
@@ -36,7 +43,7 @@ YouTube posters appear as soon as a video link is accepted. Local video/image up
 
 Downloads continue if you close the dialog. Use **Cancel** on a pending import or **Retry** after a failure. Only single public videos/tracks are supported; playlists, albums, private/login-required media, live streams, and videos over six hours are excluded. Import only media you own or have permission to use. These unofficial downloaders depend on platform availability and can need updates when sites change.
 
-`FRAME_LINE_IMPORT_PYTHON` can select an absolute Python executable with the packages in `scripts/import-requirements.txt` installed; otherwise the server uses `.venv-import/bin/python`. FFmpeg uses the existing `FFMPEG_PATH` setting. Imports share the bounded media queue and upload size limit, time out after 30 minutes, and remove temporary files on completion, failure, or cancellation. During merging/conversion, temporary storage may reach twice the configured per-file limit. Run `node --experimental-strip-types --test server/linkImport.test.ts` for the offline integration checks (requires FFmpeg).
+`FRAME_LINE_IMPORT_PYTHON` can select an absolute Python executable with the packages in `scripts/import-requirements.txt` installed; otherwise the server uses the platform-specific `.venv-import` interpreter. FFmpeg uses the existing `FFMPEG_PATH` setting. Imports share the bounded media queue and upload size limit, time out after 30 minutes, and remove temporary files on completion, failure, or cancellation. During merging/conversion, temporary storage may reach twice the configured per-file limit. Run `node --experimental-strip-types --test server/linkImport.test.ts` for the offline integration checks (requires FFmpeg).
 
 For development, run `npm run dev`. It starts the Node API on port 4310 and Vite on [localhost:5173](http://localhost:5173), with `/api` proxied to Node. Vite prints another port if 5173 is occupied. `npm run preview` serves only the built UI; use `npm start` for the complete application.
 
@@ -44,7 +51,7 @@ For development, run `npm run dev`. It starts the Node API on port 4310 and Vite
 
 Run `npm run setup:masks` with Python 3.12 to install the pinned SAM 2.1 Large tracker. It uses the Apple GPU, CUDA, or CPU detected on the server. No external AI service receives footage. Drag **Smart Mask** onto a video clip or grade node, open **Select & refine subject**, and add Include/Exclude points or interior strokes. The source-frame editor has Fit/100%/200% views, frame stepping, and local Restore/Remove/Reset paint. Clip effects and grade nodes can share the same subject document.
 
-The installed engine is explicitly a **selection preview**. Choose **Use selection preview** to analyze with it. It has not qualified for final hair or source motion-blur matting; those controls do not silently fall back to a feathered silhouette. Export requires a qualified final matte. The MatAnyone2 research adapter remains disabled pending permitted use and validation. See [research and model licenses](docs/smart-mask-research.md) and [implementation and measured checks](docs/smart-mask-implementation.md).
+The installed engine produces an **exportable tracked selection**. Choose **Use selection preview** to analyze with it. It has not qualified for final hair or source motion-blur matting; those controls do not silently fall back to a feathered silhouette. Tracked selections can be exported after reviewing their edges. The MatAnyone2 research adapter remains disabled pending permitted use and validation. See [research and model licenses](docs/smart-mask-research.md) and [implementation and measured checks](docs/smart-mask-implementation.md).
 
 Analysis uses the original source's decoded frame timestamps, retains immutable native gray16 masks, and supports whole-clip or source ranges with forward/backward propagation. Editing paint alone reuses unpainted alpha; changing AI guidance requires retracking. Source/model/color-interpretation changes invalidate reuse. Jobs are private to a project and cancellable; originals and previous revisions remain intact. `FRAME_LINE_MASK_PYTHON` can select the worker Python. Run `npm run test:masks` for worker/domain/backend checks and `npm test` for renderer integration checks. Keep `data/smart-masks` with project backups; analysis temporarily needs substantial disk space for native source frames.
 

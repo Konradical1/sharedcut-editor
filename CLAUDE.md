@@ -13,8 +13,7 @@ Say what happened or what to do, then stop. More detail only if asked.
 
 The Lenovo is the production deployment target. Do not plan cloud hosting or cloud
 object-storage migration unless Konrad explicitly changes this decision. Keep
-projects and media on the Lenovo; the Mac is the fallback. Prioritize Windows
-feature parity through the existing Docker Desktop / WSL2 deployment, including
+projects and media on the Lenovo; the Mac is the fallback. Prioritize the native Windows setup in docs/WINDOWS_NATIVE.md, including
 portable captions, optical flow, Smart Mask setup, and NVIDIA acceleration.
 The existing public-access tunnel does not change where the application or media
 is hosted. See `docs/LENOVO_SETUP.md`.
@@ -48,9 +47,9 @@ Rules, in order of how often they bite:
    `FRAME_LINE_CAPTION_PYTHON`, `FRAME_LINE_MASK_PYTHON`, `FFMPEG_PATH`. A venv interpreter is
    `.venv-x/bin/python` on macOS and `.venv-x\Scripts\python.exe` on Windows — the env var is
    what makes that somebody else's problem.
-4. **Kill child processes the way `smartMask.ts` and `linkImport.ts` do.** `process.kill(-pid)`
-   for process groups is POSIX-only; both already branch on `process.platform !== 'win32'`.
-   Copy that pattern, do not invent a new one.
+4. **Use `server/processTree.ts` for worker cancellation.** It terminates the
+   complete decoder/encoder tree using taskkill on Windows and process groups
+   on POSIX. Killing only Python leaves its media processes behind.
 5. **No symlinks.** They need elevated privileges on Windows. Copy or hard-link instead.
 6. **FFmpeg hardware acceleration must be detected, never assumed.** `server/media.ts` probes
    `ffmpeg -hwaccels` and degrades to software. Any new accel path does the same — VideoToolbox
@@ -61,11 +60,12 @@ Rules, in order of how often they bite:
    run on the editor's machine, not the server. That code is already portable — keep new visual
    work there rather than adding server-side GPU dependencies.
 
-**`server/opticalFlow.ts` is no longer Darwin-only.** It dispatches on `process.platform`: the
-VideoToolbox worker on the Mac, FFmpeg `minterpolate` everywhere else. Freezes, deep slow motion
-and direction-reversing curves raise a clear error on the FFmpeg engine rather than dropping
-frames; RIFE via ONNX/TensorRT is the planned quality upgrade. There is no known Mac-only path
-left in the server. Do not add one.
+**`server/opticalFlow.ts` is cross-platform.** Windows/Linux use the OpenCV worker
+installed by `npm run setup:flow`; Mac retains VideoToolbox. Exact timestamp
+schedules support freezes, deep slow motion and direction changes. Worker
+process trees use `server/processTree.ts` for Windows-safe cancellation.
+Tracked Smart Mask selections can be exported; do not advertise SAM as hair
+or source-motion-blur matting.
 
 If a feature genuinely cannot be done cross-platform, say so and ask before writing it
 Mac-only.

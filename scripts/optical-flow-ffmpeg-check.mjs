@@ -2,7 +2,7 @@
 //
 // A white box moves exactly 8 px per source frame. Played at 50% speed the engine must place it at
 // the half steps (4 px apart). Frame duplication would show a 0,8,0,8 stair instead.
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,4 +42,5 @@ const stalled = steps.filter(step => Math.abs(step) < 1).length;
 console.log(`stalled steps ${stalled} of ${steps.length} (any means a frame was duplicated, not synthesized)`);
 const ok = count === 48 && Math.abs(mean - 4) < 0.6 && stalled === 0;
 console.log(ok ? 'PASS  intermediate frames are synthesized' : 'FAIL  motion is not being interpolated');
-process.exit(ok ? 0 : 1);
+await rm(dir, { recursive: true, force: true });
+process.exitCode = ok ? 0 : 1;

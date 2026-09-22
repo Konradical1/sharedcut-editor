@@ -66,8 +66,12 @@ try {
   await page.waitForFunction(()=>!document.querySelector('.smart-mask-source-status'),{},{timeout:60000});
   const canvas=page.locator('.smart-mask-picture svg');const box=await canvas.boundingBox();
   await page.mouse.click(box.x+box.width*.5,box.y+box.height*.5);
+  await page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
   await page.getByRole('button',{name:'Exclude',exact:true}).click();
-  await page.mouse.move(box.x+box.width*.7,box.y+box.height*.4);await page.mouse.down();await page.mouse.move(box.x+box.width*.8,box.y+box.height*.6,{steps:8});await page.mouse.up();
+  const excludeBox=await canvas.boundingBox();
+  await page.mouse.move(excludeBox.x+excludeBox.width*.7,excludeBox.y+excludeBox.height*.4);await page.mouse.down();await page.mouse.move(excludeBox.x+excludeBox.width*.8,excludeBox.y+excludeBox.height*.6,{steps:8});await page.mouse.up();
+  await page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
+  await page.screenshot({path:join(out,'smart-mask-guides.png')});
   await page.getByRole('button',{name:'Next mask frame',exact:true}).click();
   await page.waitForFunction(()=>!document.querySelector('.smart-mask-source-status'));
   await page.getByRole('button',{name:'Restore',exact:true}).click();
@@ -89,7 +93,12 @@ try {
   await page.screenshot({path:join(out,'smart-mask-editor.png')});
   await page.getByRole('button',{name:'Close mask editor',exact:true}).click();
   await page.screenshot({path:join(out,'smart-mask-inspector.png')});
-  assert.equal(await page.getByRole('button',{name:'Analyze range',exact:true}).isDisabled(),true);
+  assert.equal(await page.getByRole('button',{name:'Analyze range',exact:true}).isDisabled(),false);
+  await page.getByRole('button',{name:'Analyze range',exact:true}).click();
+  await page.getByRole('progressbar',{name:'Mask analysis progress',exact:true}).waitFor();
+  await page.getByRole('progressbar',{name:'Mask analysis progress',exact:true}).waitFor({state:'hidden',timeout:180000});
+  await page.waitForFunction(()=>document.querySelector('.smart-mask-status.ready'),{},{timeout:10000});
+  assert.ok((await state()).clips.find(c=>c.id===video.id).smartMasks[0].result?.key);
   assert.deepEqual(errors,[]);
-  console.log('PASS Smart Mask UI source frame drawing, positive/negative strokes, frame-local repair, persistence, unsupported final mode disabled; screenshots artifacts/qa/smart-mask-*.png');
+  console.log('PASS Smart Mask UI drawing, strokes, repairs, persistence and real model analysis; screenshots artifacts/qa/smart-mask-*.png');
 } finally { await browser.close(); await app.close(); await rm(temp,{recursive:true,force:true}); }

@@ -6,15 +6,16 @@ import { join, resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { renderTimeline, type RenderRequest } from './media.ts';
 import { validateWords, type CaptionWord } from '../src/services/captions.ts';
+import { killProcessTree } from './processTree.ts';
 
 export const captionPython=()=>process.env.FRAME_LINE_CAPTION_PYTHON||venvPython('.venv-captions');
 export const captionAvailable=()=>existsSync(captionPython());
 function processFile(command:string,args:string[],signal:AbortSignal,progress?:(stage:string,progress:number)=>void) {
   return new Promise<void>((resolve,reject)=>{
     if(signal.aborted){reject(new Error('Cancelled'));return;}
-    const child=spawn(command,args,{stdio:['ignore','pipe','pipe']});let error='',buffer='';
-    const abort=()=>child.kill('SIGKILL');signal.addEventListener('abort',abort,{once:true});
-    child.stdout.on('data',chunk=>{buffer+=chunk.toString();if(buffer.length>100000){child.kill('SIGKILL');return;}const lines=buffer.split('\n');buffer=lines.pop()||'';for(const line of lines){try{const event=JSON.parse(line);if(typeof event.stage==='string'&&Number.isFinite(event.progress))progress?.(event.stage.slice(0,160),Math.max(0,Math.min(100,event.progress)));}catch{ /* Library diagnostics are not progress. */ }}});
+    const child=spawn(command,args,{stdio:['ignore','pipe','pipe'],windowsHide:true,detached:process.platform!=='win32'});let error='',buffer='';
+    const abort=()=>killProcessTree(child);signal.addEventListener('abort',abort,{once:true});
+    child.stdout.on('data',chunk=>{buffer+=chunk.toString();if(buffer.length>100000){killProcessTree(child);return;}const lines=buffer.split('\n');buffer=lines.pop()||'';for(const line of lines){try{const event=JSON.parse(line);if(typeof event.stage==='string'&&Number.isFinite(event.progress))progress?.(event.stage.slice(0,160),Math.max(0,Math.min(100,event.progress)));}catch{ /* Library diagnostics are not progress. */ }}});
     child.stderr.on('data',chunk=>error=(error+chunk.toString()).slice(-5000));
     child.on('error',reject);child.on('close',code=>{signal.removeEventListener('abort',abort);code===0?resolve():reject(new Error(signal.aborted?'Cancelled':error.trim()||`Speech worker exited (${code}).`));});
   });
@@ -32,7 +33,7 @@ export async function transcribeTimeline(request:RenderRequest,trackIds:string[]
       const outputPath=join(directory,`audio-${files.length}.mov`),to=Math.min(end,from+60);
       progress('Preparing timeline audio',10*(from-start)/(end-start));
       await renderTimeline({...request,project:{...request.project,resolution:'16 × 16'},clips,tracks,nodes:[],outputPath,settings:{...request.settings,resolution:'16 × 16',codec:'Apple ProRes 4444',audio:'Linear PCM · 24-bit · 48 kHz',rangeIn:String(from),rangeOut:String(to)},onProgress:undefined});
-      files.push(`file '${outputPath}'`);
+      files.push(`file '${outputPath.replaceAll('\\','/').replaceAll("'", "'\\''")}'`);
     }
     const list=join(directory,'audio.txt'),audio=join(directory,'audio.wav'),result=join(directory,'words.json');
     await writeFile(list,files.join('\n'));

@@ -13,3 +13,5 @@ artifacts
 .venv-mask/
 .venv-stabilize/
 .playwright-mcp/
+
+.venv-flow/

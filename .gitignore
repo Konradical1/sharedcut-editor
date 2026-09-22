@@ -19,3 +19,5 @@ __pycache__/
 
 .venv-mask/
 .venv-stabilize/
+
+.venv-flow/

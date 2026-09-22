@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createFrameLineServer } from '../server/index.ts';
+import { speechFixture } from './speech-fixture.mjs';
 const { chromium }=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 const exec=promisify(execFile),temp=await mkdtemp(join(tmpdir(),'frameline-caption-qa-'));
 delete process.env.FRAME_LINE_SIGNUP_CODE;
@@ -18,8 +19,7 @@ const saved=async()=>page.waitForFunction(()=>document.querySelector('.save-stat
 try {
   await page.goto(url);await page.getByRole('button',{name:'Create account',exact:true}).click();await page.getByRole('textbox',{name:'Your name'}).fill('Caption Editor');await page.getByRole('textbox',{name:'Email address'}).fill('caption@example.test');await page.locator('input[type=password]').fill('Caption-test-password-2026');await page.getByRole('button',{name:'Create account',exact:true}).last().click();
   await page.getByRole('button',{name:'New project',exact:true}).click();await page.getByRole('textbox',{name:'Project name'}).fill('Caption Studio');await page.getByRole('button',{name:'Create project',exact:true}).click();await saved();
-  await exec('say',['-v','Samantha','-r','165','-o',join(temp,'speech.aiff'),'Make every word feel alive. These captions follow the entire timeline. Five words per line, with natural breaks.']);
-  await exec('ffmpeg',['-v','error','-y','-i',join(temp,'speech.aiff'),'-ar','16000','-ac','1',join(temp,'speech.wav')]);
+  await speechFixture(join(temp,'speech.wav'),'Make every word feel alive. These captions follow the entire timeline. Five words per line, with natural breaks.');
   await page.getByLabel('Upload media files').setInputFiles(join(temp,'speech.wav'));
   await page.getByRole('button',{name:'Add speech.wav to timeline',exact:true}).waitFor();
   for(let i=0;i<100;i++){const state=(await snapshot()).state;if(state.media[0]?.status==='ready')break;await new Promise(r=>setTimeout(r,200));}
@@ -27,7 +27,7 @@ try {
   let snap=await snapshot();let source=snap.state.clips.find(c=>c.mediaId===snap.state.media[0].id);assert.ok(source);
   source.start=2;snap.state.projects[0].resolution='640 × 360';
   let response=await context.request.put(url+'/api/state',{data:snap});assert.equal(response.status(),200,await response.text());
-  await page.reload();await page.getByRole('button',{name:'Captions',exact:true}).click();
+  await page.reload();await page.getByRole('tab',{name:'Captions',exact:true}).click();
   assert.equal(await page.locator('.caption-preset').count(),16);
   const card=page.getByRole('button',{name:'Select Electric pull-in captions',exact:true}),art=card.locator('.caption-art');await art.scrollIntoViewIfNeeded();const box=await art.boundingBox();
   await page.mouse.move(box.x+box.width*.1,box.y+box.height/2);await page.waitForTimeout(100);const first=await art.locator('canvas').evaluate(c=>c.toDataURL());
@@ -93,7 +93,7 @@ try {
   assert.ok((await snapshot()).state.clips.some(c=>oldLines.includes(c.id)),'Keep existing lines while transcribing');
   await page.getByRole('progressbar',{name:'Transcription progress'}).waitFor({state:'hidden',timeout:180000});await saved();
   snap=await snapshot();assert.ok(!snap.state.clips.some(c=>oldLines.includes(c.id)),'Successful overlap replacement removes previous lines');assert.equal(snap.state.tracks.flatMap(t=>t.captionSets??[]).length,1);
-  await page.reload();await page.getByRole('button',{name:'Captions',exact:true}).click();assert.ok((await snapshot()).state.tracks.some(t=>t.captionSets?.length));assert.deepEqual(errors,[]);
+  await page.reload();await page.getByRole('tab',{name:'Captions',exact:true}).click();assert.ok((await snapshot()).state.tracks.some(t=>t.captionSets?.length));assert.deepEqual(errors,[]);
 
   const remaining=(await snapshot()).state.clips.filter(c=>c.properties.captionSet);
   for(let i=0;i<remaining.length;i++){

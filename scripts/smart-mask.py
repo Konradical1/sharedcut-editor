@@ -65,12 +65,12 @@ def capabilities():
         revision["matanyone2"] = digest(MAT_WEIGHT)
     # The adapter below is an evaluation candidate. Existence of weights is not a
     # passing native-frame/temporal test, and must not unlock a finishing promise.
-    return dict(available=True, engine=f"SAM 2.1 {SAM_MODEL.replace('_', ' ').title()} · tracking preview",
+    return dict(available=True, engine=f"SAM 2.1 {SAM_MODEL.replace('_', ' ').title()} · tracked selection",
                 device=device, preserveMotionBlur=False, finalQuality=False,
                 mattingCandidateInstalled=bool(matting),
                 workerIdentity=revision,
                 reason="MatAnyone2 is installed for evaluation; final matting has not passed validation." if matting else
-                "Tracking preview only. Fine hair and source motion blur require a separately installed matting engine.")
+                "Tracked selections are exportable. Fine hair and source motion blur require a separately installed matting engine.")
 
 
 def accelerated(device):
@@ -627,7 +627,9 @@ def main(job):
         with Image.open(rgb / f"{indices[0]}.jpg") as image:
             if image.size != (width, height):
                 raise ValueError("Decoded source dimensions differ from the saved mask.")
-        anchors = track(job, indices, times, rgb, work / "tracking", caps)
+        import torch
+        with torch.inference_mode(), accelerated(caps["device"]):
+            anchors = track(job, indices, times, rgb, work / "tracking", caps)
         alpha_directory = work / "tracking"
         if caps["preserveMotionBlur"]:
             matte(job, indices, anchors, rgb, work / "tracking", work / "alpha", caps)
