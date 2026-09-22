@@ -543,3 +543,4 @@ input.dash-switch[type=checkbox] { appearance: none; padding: 0; cursor: pointer
 @media(max-width:480px) { .library-dialog-body { padding: 18px 20px 20px; } .sharing-person { gap: 8px; } .sharing-person select { max-width: 105px; } }
 
 .sharing-search input:focus-visible { outline: none; box-shadow: none; }
+.drive-thumbnail-empty { position: absolute; inset: 0; margin: auto; color: #4d5b51; }

@@ -227,3 +227,7 @@
   .export-preset { padding-top: 8px; padding-bottom: 8px; }
   .export-presets { margin-bottom: 12px; }
 }
+
+.render-job-footer { gap: 8px; font-size: 10px; line-height: 1.5; }
+.render-job-footer > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.render-job-footer > span:last-child { flex-shrink: 0; }

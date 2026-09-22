@@ -9,3 +9,7 @@ artifacts
 .venv-import/
 
 .venv-color/
+.venv-captions/
+.venv-mask/
+.venv-stabilize/
+.playwright-mcp/

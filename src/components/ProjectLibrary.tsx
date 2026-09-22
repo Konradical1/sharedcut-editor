@@ -2,14 +2,17 @@ import SharingFields, { type SharingValue } from './SharingFields';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ChevronRight, Clock3, Film, Folder, FolderPlus, Grid2X2, List, LockKeyhole, MoreHorizontal, MoveRight, Pencil, Plus, Search, Trash2, Users } from 'lucide-react';
 import type { Project, User } from '../state/models';
+import { projectCover } from '../services/library';
 import type { AccessPreview, LibraryChange, LibraryView, ProjectFolder } from '../services/library';
 import { api } from '../services/api';
+import { useEditorStore } from '../state/store';
 import { flushChanges, refreshState } from '../services/sync';
 import { Button, ContextMenu, durationLabel, Modal } from './ui';
 
 type Item = { kind: 'project' | 'folder'; id: string; name: string };
 const empty: LibraryView = { revision: 0, folders: [], locations: {}, directMembers: {} };
 export default function ProjectLibrary({ projects, users, userId, section, onOpen, onCreate, onSettings }: { projects: Project[]; users: User[]; userId: string; section: string; onOpen: (id: string) => void; onCreate: (folder: LibraryView['folders'][number] | null) => void; onSettings: (project: Project, deleting?: boolean, sharing?: boolean) => void }) {
+  const media = useEditorStore(s => s.media);
   const [library, setLibrary] = useState(empty), [loading, setLoading] = useState(true), [error, setError] = useState('');
   const [folderId, setFolderId] = useState<string | null>(null), [search, setSearch] = useState(''), [sort, setSort] = useState('modified');
   const [view, setView] = useState<'grid' | 'list'>('grid');
@@ -72,8 +75,9 @@ export default function ProjectLibrary({ projects, users, userId, section, onOpe
   const dropProps = (parentId: string | null, enabled = true) => ({ onDragOver: (e: React.DragEvent) => { if (enabled && e.dataTransfer.types.includes('application/x-sharedcut-item')) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; e.currentTarget.classList.add('drop-target'); } }, onDragLeave: (e: React.DragEvent) => e.currentTarget.classList.remove('drop-target'), onDrop: (e: React.DragEvent) => { if (enabled) drop(e, parentId); } });
   const drag = (e: React.DragEvent, item: Item) => { e.dataTransfer.setData('application/x-sharedcut-item', JSON.stringify(item)); e.dataTransfer.effectAllowed = 'move'; };
   const options = (e: React.MouseEvent, item: Item) => { e.preventDefault(); setMenu({ item, x: Math.min(e.clientX, window.innerWidth - 235), y: e.clientY }); };
+  const cover = (p: Project) => projectCover(p, media);
   const card = (p: Project, suggested = false) => <article key={p.id} className="drive-project" draggable={ownProject(p)} onDragStart={e => drag(e, { kind: 'project', id: p.id, name: p.name })} onContextMenu={e => options(e, { kind: 'project', id: p.id, name: p.name })}>
-    <button className="drive-project-open" onClick={() => open(p.id)} aria-label={`${suggested ? 'Resume' : 'Open'} ${p.name}`}><div className="drive-project-title"><Film className="drive-file-icon" size={18}/><strong>{p.name}</strong></div><div className="drive-thumbnail"><img src={p.thumbnail || '/media/studio.jpg'} alt="" loading="lazy"/><span>{durationLabel(p.duration)}</span></div><div className="drive-project-meta"><span>{suggested ? 'Recently opened' : p.status}</span><span>{isClass(p) ? 'Class' : p.members.length > 1 ? 'Shared' : 'Private'}</span></div><span className="drive-list-owner">{users.find(u => p.members.some(m => m.userId === u.id && m.role === 'Owner'))?.name}</span><span className="drive-list-date">{new Date(p.modifiedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span></button>
+    <button className="drive-project-open" onClick={() => open(p.id)} aria-label={`${suggested ? 'Resume' : 'Open'} ${p.name}`}><div className="drive-project-title"><Film className="drive-file-icon" size={18}/><strong>{p.name}</strong></div><div className="drive-thumbnail">{cover(p) ? <img src={cover(p)} alt="" loading="lazy"/> : <Film className="drive-thumbnail-empty" size={26}/>}<span>{durationLabel(p.duration)}</span></div><div className="drive-project-meta"><span>{suggested ? 'Recently opened' : p.status}</span><span>{isClass(p) ? 'Class' : p.members.length > 1 ? 'Shared' : 'Private'}</span></div><span className="drive-list-owner">{users.find(u => p.members.some(m => m.userId === u.id && m.role === 'Owner'))?.name}</span><span className="drive-list-date">{new Date(p.modifiedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span></button>
     <button className="drive-options" aria-label={`Project options for ${p.name}`} onClick={e => options(e, { kind: 'project', id: p.id, name: p.name })}><MoreHorizontal size={18}/></button>
   </article>;
   const menuProject = menu?.item.kind === 'project' ? projects.find(p => p.id === menu.item.id) : undefined;

@@ -1,0 +1,81 @@
+// Run after npm run build; uses the same Playwright environment as browser-check.mjs.
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createFrameLineServer } from '../server/index.ts';
+const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
+delete process.env.FRAME_LINE_SIGNUP_CODE;
+const temp = await mkdtemp(join(tmpdir(), 'frameline-edge-scroll-'));
+const app = createFrameLineServer({ dataDir: join(temp, 'data') });
+await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+const url = `http://127.0.0.1:${app.server.address().port}`;
+const browser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH });
+const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+const errors = [];
+page.on('pageerror', error => errors.push(error.message));
+const scroll = () => page.locator('.timeline-scroll').evaluate(el => el.scrollLeft);
+const saved = () => page.waitForFunction(() => document.querySelector('.save-status')?.textContent === 'Saved');
+try {
+  await page.request.post(url + '/api/auth/signup', { data: { name: 'Edge scroll', email: 'edge@example.test', password: 'Edge-scroll-test-2026' } });
+  await page.goto(url);
+  await page.getByRole('button', { name: 'New project', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Project name' }).fill('Edge scroll');
+  await page.getByRole('button', { name: 'Create project', exact: true }).click();
+  await page.getByRole('tab', { name: 'Titles', exact: true }).click();
+  await page.getByRole('button', { name: 'Add Cinematic title', exact: true }).click();
+  await saved();
+  await page.getByRole('button', { name: 'Selection tool (V)', exact: true }).click();
+  await page.getByRole('button', { name: 'Snapping (N)', exact: true }).click();
+  for (let i = 0; i < 5; i++) await page.getByRole('button', { name: 'Zoom timeline in', exact: true }).click();
+  const clip = page.locator('.timeline-clip').first();
+  for (const scale of [1, 1.25]) {
+    await page.evaluate(scale => document.documentElement.style.setProperty('--ui-scale', String(scale)), scale);
+    await page.locator('.timeline-scroll').evaluate(el => { el.scrollLeft = 0; });
+    const box = await clip.boundingBox(), view = await page.locator('.timeline-scroll').boundingBox();
+    const y = box.y + box.height / 2, grab = 20;
+    await page.mouse.move(box.x + grab, y);
+    await page.mouse.down();
+    await page.mouse.move(view.x + view.width - 12, y, { steps: 8 });
+    const before = await scroll();
+    await page.waitForTimeout(350);
+    assert.ok(await scroll() > before + 50, 'Holding still near the right edge keeps scrolling');
+    const position = await clip.boundingBox();
+    assert.ok(Math.abs(position.x + grab - (view.x + view.width - 12)) < 5, `Clip stays under the pointer at scale ${scale}: ${position.x + grab} vs ${view.x + view.width - 12}`);
+    const left = await page.locator('.timeline-track-heading').evaluate(el => el.getBoundingClientRect().right);
+    await page.mouse.move(left + 12, y, { steps: 8 });
+    const rightmost = await scroll();
+    await page.waitForTimeout(180);
+    assert.ok(await scroll() < rightmost - 30, 'Holding still near the left edge scrolls back');
+    await page.mouse.move(view.x + view.width / 2, y);
+    await page.waitForTimeout(50);
+    const stopped = await scroll();
+    await page.waitForTimeout(100);
+    assert.equal(await scroll(), stopped, 'Scrolling stops away from the edges');
+    await page.mouse.move(view.x + view.width - 12, y);
+    await page.waitForTimeout(100);
+    await page.keyboard.press('Escape');
+    await page.mouse.up();
+    const cancelled = await scroll();
+    await page.waitForTimeout(100);
+    assert.equal(await scroll(), cancelled, 'Escape stops edge scrolling');
+    assert.equal(await clip.evaluate(el => parseFloat(el.style.left)), 0, 'Cancelled drag preserves the original clip');
+  }
+  await page.locator('.timeline-scroll').evaluate(el => { el.scrollLeft = 0; });
+  const box = await clip.boundingBox(), view = await page.locator('.timeline-scroll').boundingBox();
+  await page.mouse.move(box.x + 20, box.y + box.height / 2); await page.mouse.down();
+  await page.mouse.move(view.x + view.width - 12, box.y + box.height / 2, { steps: 8 });
+  await page.waitForTimeout(250);
+  const expected = await clip.evaluate(el => parseFloat(el.style.left));
+  await page.mouse.up(); await saved();
+  assert.ok(Math.abs(await clip.evaluate(el => parseFloat(el.style.left)) - expected) < 5, 'Drop commits the scrolled placement');
+  const released = await scroll(); await page.waitForTimeout(100);
+  assert.equal(await scroll(), released, 'Release stops scrolling');
+  assert.deepEqual(errors, []);
+  console.log('PASS stationary edge scrolling in both directions, pointer alignment at 100%/125%, center stop, cancellation, and drop');
+} catch(error) {
+  console.error(await page.locator('body').innerText());
+  throw error;
+} finally {
+  await browser.close(); await app.close(); await rm(temp, { recursive: true, force: true });
+}

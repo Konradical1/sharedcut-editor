@@ -1,6 +1,6 @@
 import type { SmartMaskPixels } from './smartMaskPreview.ts';
 import { acesShader, acesTextures } from './aces.generated.ts';
-import { processingStages, sampleCurve, identityCurve, luminanceWeights, interpretation, profiles, hasACES, gamutTo709, colorTransform, type Cube } from './color.ts';
+import { processingStages, sampleCurve, identityCurve, luminanceWeights, interpretation, profiles, hasACES, colorTransform, type Cube } from './color.ts';
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 
 export class ColorPending extends Error {}
@@ -19,15 +19,15 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
   in vec2 uv; out vec4 pixel;
   uniform sampler2DArray maskAtlas;
   uniform sampler2D picture, parameters, luma, chromaU, chromaV, curves, lutAtlas; uniform sampler3D grade;
-  uniform float size, stops, warmth; uniform vec3 domainMin, domainMax; uniform int profile, count, yuvMode; uniform vec4 sourceRect, yuvCoefficients, yuvScale; uniform float fullRange; uniform bool nativeView, managed, displaySRGB; uniform mat3 gamut;
+  uniform float size, stops, warmth; uniform vec3 domainMin, domainMax; uniform int profile, count, yuvMode; uniform vec4 sourceRect, yuvCoefficients, yuvScale; uniform float fullRange; uniform bool nativeView, managed, displaySRGB;
   float decode(float v, int profile) {
     if(profile==8)return v;
     if(profile==7)return v>.02740668?exp2(v/.07329248-7.)-.0075:v/10.44426855;
     if(profile==9)return sign(v)*pow(abs(v),2.4);
     if(profile==5||profile==6){float x=(v*1023.-64.)/876.;return (x>=.030001222851889303?pow(10.,(x-.646596)/.432699)-.037584:(x-.030001222851889303)/5.)*.9*(profile==5?219./155.:1.);}
     if(profile==1)return v>=171.2102946929/1023.?pow(10.,(v*1023.-420.)/261.5)*.19-.01:(v*1023.-95.)*.01125/(171.2102946929-95.);
-    if(profile==2||profile==3){float a=profile==2?.529136:.281863093,b=profile==2?.0730597:.035388128,c=profile==2?10.1596:87.09937546;return sign(v-b)*(pow(10.,abs(v-b)/a)-1.)/c*.9;}
-    if(profile==4)return .9*(v<.04076162?-(pow(10.,(.07623209-v)/.42889912)-1.)/14.98325:v<=.105357102?(v-.073059361)/2.3069815:(pow(10.,(v-.069886632)/.42889912)-1.)/14.98325);
+    if(profile==2||profile==3){float a=profile==2?.529136:.281863093,b=profile==2?.0730597:.035388128,c=profile==2?10.1596:87.09937546,ire=(v*1023.-64.)/876.;return sign(ire-b)*(pow(10.,abs(ire-b)/a)-1.)/c*.9;}
+    if(profile==4){float ire=(v*1023.-64.)/876.;return .9*(ire<.04076162?-(pow(10.,(.07623209-ire)/.42889912)-1.)/14.98325:ire<=.105357102?(ire-.073059361)/2.3069815:(pow(10.,(ire-.069886632)/.42889912)-1.)/14.98325);}
     return pow(max(0.,v),2.4);
   }
   float encode(float v, int profile) {
@@ -36,8 +36,8 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     if(profile==9)return sign(v)*pow(abs(v),1./2.4);
     if(profile==5||profile==6){float x=v/.9*(profile==5?155./219.:1.);return ((x>=0.?.432699*log(x+.037584)/log(10.)+.646596:x*5.+.030001222851889303)*876.+64.)/1023.;}
     if(profile==1)return v>=.01125?(420.+log((v+.01)/.19)/log(10.)*261.5)/1023.:(v*(171.2102946929-95.)/.01125+95.)/1023.;
-    if(profile==2||profile==3){float a=profile==2?.529136:.281863093,b=profile==2?.0730597:.035388128,c=profile==2?10.1596:87.09937546;return sign(v)*a*log(c*abs(v)/.9+1.)/log(10.)+b;}
-    if(profile==4){float x=v/.9;return x<-.014?-.42889912*log(-x*14.98325+1.)/log(10.)+.07623209:x<=.014?2.3069815*x+.073059361:.42889912*log(x*14.98325+1.)/log(10.)+.069886632;}
+    if(profile==2||profile==3){float a=profile==2?.529136:.281863093,b=profile==2?.0730597:.035388128,c=profile==2?10.1596:87.09937546;return ((sign(v)*a*log(c*abs(v)/.9+1.)/log(10.)+b)*876.+64.)/1023.;}
+    if(profile==4){float x=v/.9,ire=x<-.014?-.42889912*log(-x*14.98325+1.)/log(10.)+.07623209:x<=.014?2.3069815*x+.073059361:.42889912*log(x*14.98325+1.)/log(10.)+.069886632;return (ire*876.+64.)/1023.;}
     return pow(max(0.,v),1./2.4);
   }
   float decode(float v){return decode(v,profile);}
@@ -68,9 +68,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     }else source=texture(picture,coord);
     vec3 rgb=source.rgb,nodeInput=source.rgb;vec2 maskCoord=vec2(uv.x,1.-uv.y);
     if(!managed&&(stops!=0.||warmth!=0.)){vec3 linear=vec3(decode(rgb.r),decode(rgb.g),decode(rgb.b))*exp2(stops)*vec3(1.+warmth/10000.,1.,1.-warmth/10000.);rgb=vec3(encode(linear.r),encode(linear.g),encode(linear.b));}
-    if(!managed&&nativeView){
-      if(profile!=0){rgb=gamut*vec3(decode(rgb.r),decode(rgb.g),decode(rgb.b));float peak=max(0.,max(rgb.r,max(rgb.g,rgb.b))),mapped=peak<=.6?peak:.6+.4*(1.-exp(-(peak-.6)/.4));rgb=pow(max(vec3(0),rgb*(peak>0.?mapped/peak:1.)),vec3(1./2.4));}
-    }else if(!managed){vec3 p=(clamp((rgb-domainMin)/(domainMax-domainMin),0.,1.)*(size-1.)+.5)/size;rgb=texture(grade,p).rgb;}
+    if(!managed&&!nativeView){vec3 p=(clamp((rgb-domainMin)/(domainMax-domainMin),0.,1.)*(size-1.)+.5)/size;rgb=texture(grade,p).rgb;}
     for(int n=0;n<count;n++){
       vec4 mask=param(12,n);if(mask.w==1.||mask.w==3.)nodeInput=rgb;
       vec4 a=param(0,n),b=param(1,n),c=param(2,n),d=param(3,n),e=param(4,n),f=param(5,n),h=param(6,n),kind=param(7,n);
@@ -150,18 +148,19 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     } else {const look=looks.get(key)!;looks.delete(key);looks.set(key,look);}
     return key;
   };
-  type Decoded={timestamp:number;data?:Uint8Array;layout?:PlaneLayout[];width:number;height:number;format:string;space:VideoColorSpaceInit;error?:Error};
+  type Decoded={timestamp:number;data?:Uint8Array;layout?:PlaneLayout[];width:number;height:number;displayWidth:number;displayHeight:number;format:string;space:VideoColorSpaceInit;error?:Error};
   const nativeFrames=new WeakSet<HTMLVideoElement>();
+  const snapshots=new WeakMap<VideoFrame,{pending?:Decoded;ready?:Decoded}>();
   const decoded=new WeakMap<HTMLVideoElement,{pending?:Decoded;ready?:Decoded}>();let lastFrame:Decoded|undefined;
-  const frameFor=(video:HTMLVideoElement)=>{
+  const frameFor=(video:HTMLVideoElement,snapshot?:VideoFrame)=>{
     if(nativeFrames.has(video))return undefined;
     let frame:VideoFrame;
-    try { frame=new VideoFrame(video); } catch { nativeFrames.add(video);return undefined; }
-    const state=decoded.get(video)??{};
-    decoded.set(video,state);
+    try { frame=snapshot?snapshot.clone():new VideoFrame(video); } catch { nativeFrames.add(video);return undefined; }
+    const state=(snapshot?snapshots.get(snapshot):decoded.get(video))??{};
+    if(snapshot)snapshots.set(snapshot,state);else decoded.set(video,state);
     if(state.pending||state.ready?.timestamp===frame.timestamp){frame.close();return state.ready??state.pending!;}
     const width=frame.visibleRect?.width??frame.codedWidth,height=frame.visibleRect?.height??frame.codedHeight;
-    const current:Decoded={timestamp:frame.timestamp,width,height,format:frame.format||'',space:frame.colorSpace.toJSON()};
+    const current:Decoded={timestamp:frame.timestamp,width,height,displayWidth:frame.displayWidth||width,displayHeight:frame.displayHeight||height,format:frame.format||'',space:frame.colorSpace.toJSON()};
     if(!['I420','I422','I444','NV12','I420P10','I422P10','I444P10','I420P12','I422P12','I444P12'].includes(current.format)){frame.close();nativeFrames.add(video);return undefined;}
     let buffer:Uint8Array<ArrayBuffer>;
     try { buffer=new Uint8Array(frame.allocationSize()); } catch { frame.close();nativeFrames.add(video);return undefined; }
@@ -176,15 +175,15 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
 
   return {
     preload,
-    prepare(video: HTMLVideoElement) {
-      if (typeof VideoFrame !== 'undefined' && video.readyState >= 2 && !video.seeking) frameFor(video);
+    prepare(video: HTMLVideoElement, snapshot?: VideoFrame) {
+      if (typeof VideoFrame !== 'undefined' && (snapshot || video.readyState >= 2 && !video.seeking)) frameFor(video,snapshot);
     },
-    draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map()) {
+    draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame) {
       const key=preload(clip,asset),look=key?looks.get(key):neutral;
       if(look instanceof Error)throw look;if(!look)throw new ColorPending('Preparing color…');
-      const frame=video&&typeof VideoFrame!=='undefined'?frameFor(video):undefined;
+      const frame=video&&typeof VideoFrame!=='undefined'?frameFor(video,snapshot):undefined;
       if(frame?.error)throw frame.error;if(frame&&!frame.data)throw new ColorPending('Decoding color…');
-      const maskPixels=typeof masks==='function'?masks(frame?frame.timestamp/1e6:video?.currentTime??0):masks;
+      const maskPixels=typeof masks==='function'?masks(snapshot?snapshot.timestamp/1e6:frame?frame.timestamp/1e6:video?.currentTime??0):masks;
       const {profile,gamut}=interpretation(clip,asset),stops=Number(clip.properties.inputExposure??0),warmth=Number(clip.properties.inputTemperature??0);
       if(!Number.isFinite(stops)||Math.abs(stops)>8||!Number.isFinite(warmth)||Math.abs(warmth)>2000)throw new Error('Camera exposure or white balance is out of range.');
       gl.useProgram(program);
@@ -226,14 +225,15 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
       }
       gl.uniform1i(uniform('managed'),clip.properties.colorPipeline==='nodes-v2'?1:0);
       gl.uniform1i(uniform('displaySRGB'),hasACES(nodes,clip.id)?1:0);
-      gl.uniform1i(uniform('nativeView'),key?0:1);const matrix=gamutTo709(gamut);gl.uniformMatrix3fv(uniform('gamut'),false,[...matrix[0].map((_,c)=>matrix.map(row=>row[c])).flat()]);
+      gl.uniform1i(uniform('nativeView'),key?0:1);
       gl.uniform1i(uniform('profile'),profiles.indexOf(profile as typeof profiles[number]));gl.uniform1f(uniform('stops'),stops);gl.uniform1f(uniform('warmth'),warmth);
       gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_3D,look.texture);gl.uniform1f(uniform('size'),look.size);gl.uniform3fv(uniform('domainMin'),look.min);gl.uniform3fv(uniform('domainMax'),look.max);
       if(canvas.width!==source.width||canvas.height!==source.height){canvas.width=source.width;canvas.height=source.height;}
       gl.viewport(0,0,canvas.width,canvas.height);
       gl.uniform1i(uniform('yuvMode'),frame?frame.format==='NV12'?2:1:0);
       if(frame){
-        const fit=Math.min(source.width/video!.videoWidth,source.height/video!.videoHeight),w=video!.videoWidth*fit/source.width,h=video!.videoHeight*fit/source.height;
+        // Worker-decoded frames have their own display geometry; the unused video element has no metadata.
+        const fit=Math.min(source.width/frame.displayWidth,source.height/frame.displayHeight),w=frame.displayWidth*fit/source.width,h=frame.displayHeight*fit/source.height;
         gl.uniform4f(uniform('sourceRect'),(1-w)/2,(1-h)/2,w,h);
         // Planar high-depth frames retain source samples; Chromium supplies fallback 601 when camera VUI is absent.
         const sourceMatrix=/P(10|12)$/.test(frame.format)&&asset.colorMatrix!=='auto'?asset.colorMatrix:undefined;
@@ -263,7 +263,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
         gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL,gl.NONE);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,source);
       }
       canvas.dataset.colorPrecision=frame?(frame.format.match(/P(10|12)$/)?.[1]??'8')+'-bit YUV':'8-bit RGB fallback';
-      canvas.dataset.sourceTimestamp=String(frame?frame.timestamp/1e6:video?Math.floor(video.currentTime*(asset.fps||24)+1e-6)/(asset.fps||24):0);
+      canvas.dataset.sourceTimestamp=String(snapshot?snapshot.timestamp/1e6:frame?frame.timestamp/1e6:video?Math.floor(video.currentTime*(asset.fps||24)+1e-6)/(asset.fps||24):0);
       gl.drawArrays(gl.TRIANGLES,0,3);
       return canvas;
     },
@@ -289,19 +289,19 @@ function createSoftwareColorPreview(onReady:()=>void) {
     return key;
   };
   return {
-    preload,prepare(_video:HTMLVideoElement){},
-    draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map()){
+    preload,prepare(_video:HTMLVideoElement,_snapshot?:VideoFrame){},
+    draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame){
       const key=preload(clip,asset),look=key?looks.get(key):undefined;
       if(look instanceof Error)throw look;if(key&&!look)throw new ColorPending('Preparing color…');
       if(canvas.width!==source.width||canvas.height!==source.height){canvas.width=source.width;canvas.height=source.height;}
       context.clearRect(0,0,canvas.width,canvas.height);context.drawImage(source,0,0);
       if(hasACES(nodes,clip.id))throw Error('ACES preview requires WebGL2. Enable browser graphics acceleration or use a supported browser.');
-      const maskPixels=typeof masks==='function'?masks(video?.currentTime??0):masks;
+      const maskPixels=typeof masks==='function'?masks(snapshot?snapshot.timestamp/1e6:video?.currentTime??0):masks;
       let at=0;const pixels=context.getImageData(0,0,canvas.width,canvas.height),transform=colorTransform(clip,asset,nodes,look??undefined,id=>{const mask=maskPixels.get(id);if(!mask)throw new ColorPending('Loading Smart Mask…');return mask.data[at]/255;});
       // ponytail: exact per-pixel fallback is slow without a GPU; move to a worker if software-only devices are common.
       for(let i=0;i<pixels.data.length;i+=4){at=i/4;if(!pixels.data[i+3])continue;const rgb=transform([pixels.data[i]/255,pixels.data[i+1]/255,pixels.data[i+2]/255]);for(let c=0;c<3;c++)pixels.data[i+c]=rgb[c]*255;}
       context.putImageData(pixels,0,0);
-      canvas.dataset.sourceTimestamp=String(video?Math.floor(video.currentTime*(asset.fps||24)+1e-6)/(asset.fps||24):0);
+      canvas.dataset.sourceTimestamp=String(snapshot?snapshot.timestamp/1e6:video?Math.floor(video.currentTime*(asset.fps||24)+1e-6)/(asset.fps||24):0);
       return canvas;
     },
     dispose(){worker.terminate();looks.clear();},

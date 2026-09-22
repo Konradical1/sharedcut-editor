@@ -8,7 +8,7 @@ export const gamuts = ['Rec.709', 'S-Gamut3.Cine', 'S-Gamut3', 'Cinema Gamut', '
 export type Cube = { size: number; data: Float32Array; min: number[]; max: number[] };
 const clamp = (v: number, min = 0, max = 1) => Math.max(min, Math.min(max, v));
 
-/** Normalized full-range RGB after YCbCr decoding. Canon v1 full-range formulas, reflection scale. */
+/** Normalized full-range RGB after YCbCr decoding (v = code/1023). Canon curves are IRE formulas; Canon places 0 IRE at code 64 and 100 IRE at 940 in every container, so black sits at 128/1023 (ACES IDT convention), reflection scale. */
 export function decodeLog(v: number, profile: string): number {
   if (profile === 'Linear') return v;
   if (profile === 'DaVinci Intermediate') return v > .02740668 ? 2 ** (v / .07329248 - 7) - .0075 : v / 10.44426855;
@@ -17,10 +17,10 @@ export function decodeLog(v: number, profile: string): number {
   if (profile === 'Gamma 2.4') return Math.sign(v)*Math.abs(v)**2.4;
   if (profile === 'S-Log3') return v >= 171.2102946929 / 1023 ? 10 ** ((v * 1023 - 420) / 261.5) * .19 - .01 : (v * 1023 - 95) * .01125 / (171.2102946929 - 95);
   if (profile === 'Canon Log' || profile === 'Canon Log 2') {
-    const [a, b, c] = profile === 'Canon Log' ? [.529136, .0730597, 10.1596] : [.281863093, .035388128, 87.09937546];
-    return Math.sign(v - b) * (10 ** (Math.abs(v - b) / a) - 1) / c * .9;
+    const [a, b, c] = profile === 'Canon Log' ? [.529136, .0730597, 10.1596] : [.281863093, .035388128, 87.09937546], ire = (v * 1023 - 64) / 876;
+    return Math.sign(ire - b) * (10 ** (Math.abs(ire - b) / a) - 1) / c * .9;
   }
-  if (profile === 'Canon Log 3') return .9 * (v < .04076162 ? -(10 ** ((.07623209 - v) / .42889912) - 1) / 14.98325 : v <= .105357102 ? (v - .073059361) / 2.3069815 : (10 ** ((v - .069886632) / .42889912) - 1) / 14.98325);
+  if (profile === 'Canon Log 3') { const ire = (v * 1023 - 64) / 876; return .9 * (ire < .04076162 ? -(10 ** ((.07623209 - ire) / .42889912) - 1) / 14.98325 : ire <= .105357102 ? (ire - .073059361) / 2.3069815 : (10 ** ((ire - .069886632) / .42889912) - 1) / 14.98325); }
   if (profile !== 'Rec.709') throw new Error(`Unsupported input profile: ${profile}`);
   return Math.max(0, v) ** 2.4;
 }
@@ -32,9 +32,9 @@ export function encodeLog(v: number, profile: string): number {
   if(profile==='S-Log3')return v>=.01125?(420+Math.log10((v+.01)/.19)*261.5)/1023:(v*(171.2102946929-95)/.01125+95)/1023;
   if(profile==='Canon Log'||profile==='Canon Log 2'){
     const [a,b,c]=profile==='Canon Log'?[.529136,.0730597,10.1596]:[.281863093,.035388128,87.09937546];
-    return Math.sign(v)*a*Math.log10(c*Math.abs(v)/.9+1)+b;
+    return ((Math.sign(v)*a*Math.log10(c*Math.abs(v)/.9+1)+b)*876+64)/1023;
   }
-  if(profile==='Canon Log 3'){const x=v/.9;return x<-.014?-.42889912*Math.log10(-x*14.98325+1)+.07623209:x<=.014?2.3069815*x+.073059361:.42889912*Math.log10(x*14.98325+1)+.069886632;}
+  if(profile==='Canon Log 3'){const x=v/.9,ire=x<-.014?-.42889912*Math.log10(-x*14.98325+1)+.07623209:x<=.014?2.3069815*x+.073059361:.42889912*Math.log10(x*14.98325+1)+.069886632;return (ire*876+64)/1023;}
   if(profile!=='Rec.709')throw new Error(`Unsupported input profile: ${profile}`);
   return Math.max(0,v)**(1/2.4);
 }
@@ -58,6 +58,15 @@ function rgbToXYZ(name: string) {
 }
 const to709 = inverse(rgbToXYZ('Rec.709'));
 export function gamutTo709(gamut:string){const source=rgbToXYZ(gamut);return to709.map(row=>[0,1,2].map(c=>row.reduce((v,x,i)=>v+x*source[i][c],0)));}
+/** Fixed log-to-Rec.709 view with a hue-preserving shoulder, for analysis that needs a display-referred picture (Smart Mask). The viewer never applies it. */
+export function logView(profile:string,gamut:string){
+  const matrix=gamutTo709(gamut);
+  return (input:number[])=>{
+    if(profile==='Rec.709')return input;
+    const rgb=multiply(matrix,input.map(v=>decodeLog(v,profile))), peak=Math.max(...rgb,0), mapped=peak<=.6?peak:.6+.4*(1-Math.exp(-(peak-.6)/.4));
+    return rgb.map(v=>clamp(Math.max(0,v*(peak?mapped/peak:1))**(1/2.4)));
+  };
+}
 export function interpretation(clip: Clip, asset?: MediaAsset) {
   const profile = String(clip.properties.inputProfile ?? asset?.inputProfile ?? 'Rec.709');
   const gamut = String(clip.properties.inputGamut ?? asset?.inputGamut ?? (profile === 'S-Log3' ? 'S-Gamut3.Cine' : profile==='S-Log'||profile==='S-Log2' ? 'S-Gamut' : profile==='DaVinci Intermediate' ? 'DaVinci Wide Gamut' : profile.startsWith('Canon') ? 'Cinema Gamut' : 'Rec.709'));
@@ -101,7 +110,7 @@ export function colorStages(clip: Clip, nodes: GradeNode[]) {
   });
 }
 export function colorTransform(clip: Clip, asset: MediaAsset | undefined, nodes: GradeNode[], base?: Cube, maskAt?: (id:string)=>number) {
-  const {profile,gamut}=interpretation(clip,asset), source=rgbToXYZ(gamut);
+  const {profile}=interpretation(clip,asset);
   if(clip.properties.colorPipeline==='nodes-v2') return managedColorTransform(clip,asset,nodes,maskAt);
   const stages=processingStages(clip,nodes);
   return (input: number[]): number[] => {
@@ -109,13 +118,8 @@ export function colorTransform(clip: Clip, asset: MediaAsset | undefined, nodes:
     const stops=Number(clip.properties.inputExposure??0), temperature=Number(clip.properties.inputTemperature??0);
     if(!Number.isFinite(stops)||Math.abs(stops)>8||!Number.isFinite(temperature)||Math.abs(temperature)>2000)throw new Error('Camera exposure or white balance is out of range.');
     if(stops||temperature)rgb=rgb.map((v,c)=>encodeLog(decodeLog(v,profile)*2**stops*[1+temperature/10000,1,1-temperature/10000][c],profile));
+    // Ungraded footage is shown as recorded, log included; a grade or an imported look does the converting.
     if(base && clip.properties.bypassResolveLook!==true) rgb=sampleCube(base,rgb);
-    else if(profile!=='Rec.709') {
-      rgb=multiply(to709,multiply(source,rgb.map(v=>decodeLog(v,profile))));
-      // A fixed, hue-preserving SDR shoulder. This is SharedCut's view, not Resolve's proprietary DRT.
-      const peak=Math.max(...rgb,0), mapped=peak<=.6?peak:.6+.4*(1-Math.exp(-(peak-.6)/.4));
-      rgb=rgb.map(v=>Math.max(0,v*(peak?mapped/peak:1))**(1/2.4));
-    }
     let nodeInput=rgb;
     for(const stage of stages) {
       if(stage.nodeStart)nodeInput=rgb;

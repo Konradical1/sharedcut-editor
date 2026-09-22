@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { colorTransform, decodeLog, makeCube, cubeText, parseCube, sampleCube } from './color.ts';
 import { timecode } from './timecode.ts';
-import type { Clip, GradeNode } from '../state/models.ts';
+import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 
 test('a fractional spatial mask blends the complete node once, including its LUT',()=>{
   const clip={id:'masked',properties:{colorPipeline:'nodes-v2',inputProfile:'Linear',inputGamut:'Rec.709'}} as unknown as Clip;
@@ -21,8 +21,15 @@ test('Sony/Canon decoding, serial nodes and portable LUT interpolation',()=>{
   assert.equal(timecode(86400/(24000/1001),24000/1001),'01:00:00:00');
   assert.ok(Math.abs(decodeLog(420/1023,'S-Log3')-.18)<1e-12);
   assert.ok(Math.abs(decodeLog(95/1023,'S-Log3'))<1e-12);
-  for(const [profile,a,b,c] of [['Canon Log',.529136,.0730597,10.1596],['Canon Log 2',.281863093,.035388128,87.09937546]] as const)assert.ok(Math.abs(decodeLog(a*Math.log10(c*.18/.9+1)+b,profile)-.18)<1e-9);
-  assert.ok(Math.abs(decodeLog(.42889912*Math.log10(14.98325*.18/.9+1)+.069886632,'Canon Log 3')-.18)<1e-9);
+  // Canon curves are IRE formulas on code values (0 IRE = 64, 100 IRE = 940): black is code 128 in every Canon container, grey 18% sits at 34.3 IRE for Canon Log 3.
+  const canonCode=(ire:number)=>(ire*876+64)/1023;
+  for(const [profile,a,b,c] of [['Canon Log',.529136,.0730597,10.1596],['Canon Log 2',.281863093,.035388128,87.09937546]] as const){assert.ok(Math.abs(decodeLog(canonCode(a*Math.log10(c*.18/.9+1)+b),profile)-.18)<1e-9);assert.ok(Math.abs(decodeLog(canonCode(b),profile))<1e-9,profile+' black');}
+  assert.ok(Math.abs(decodeLog(128/1023,'Canon Log'))<1e-6,'Canon Log black is code 128');assert.ok(Math.abs(decodeLog(95/1023,'Canon Log 2'))<1e-6,'Canon Log 2 black is code 95');
+  assert.ok(Math.abs(decodeLog(canonCode(.42889912*Math.log10(14.98325*.18/.9+1)+.069886632),'Canon Log 3')-.18)<1e-9);
+  assert.ok(Math.abs(decodeLog(128/1023,'Canon Log 3'))<1e-9,'Canon Log 3 black is code 128');
+  assert.ok(Math.abs(decodeLog(canonCode(.328),'Canon Log 3')-.18)<2e-3,'Canon Log 3 18% grey is 32.8 IRE');
+  // ACES IDT (IDT.Canon.C300mk2_CanonLog3_CinemaGamut) constants are the same curve already expressed on code values.
+  for(const v of [.1,.13,.2,.4,.6,.9])assert.ok(Math.abs(decodeLog(v,'Canon Log 3')-.9*(v<.097465473?-(10**((.12783901-v)/.36726845)-1)/14.98325:v<=.15277891?(v-.12512219)/1.9754798:(10**((v-.12240537)/.36726845)-1)/14.98325))<1e-6,'ACES IDT '+v);
   const clip={id:'clip',properties:{}} as Clip;
   const node=(order:number,parameters:Record<string,number>)=>({clipId:'clip',enabled:true,order,name:'Test',parameters} as GradeNode);
   const a=node(1,{exposure:1}),b=node(2,{offset:.1});
@@ -70,4 +77,12 @@ test('ACES output validates its final display and stays isolated to its own clip
  assert.doesNotThrow(()=>processingStages(clip,nodes));
  assert.throws(()=>processingStages({...clip,properties:{...clip.properties,colorPipeline:'legacy'}},nodes),/wide-gamut/);
  effect.outputGamut='Rec.2020';assert.throws(()=>processingStages(clip,nodes),/ACES/);
+});
+
+test('ungraded log footage is shown as recorded; only a grade or an imported look converts it',()=>{
+  const clip={id:'raw',projectId:'p',properties:{}} as unknown as Clip;
+  for(const [inputProfile,inputGamut] of [['S-Log3','S-Gamut3.Cine'],['Canon Log 3','Cinema Gamut']]){
+    const transform=colorTransform(clip,{inputProfile,inputGamut} as unknown as MediaAsset,[]);
+    for(const rgb of [[128/1023,128/1023,128/1023],[.3,.5,.7],[.9,.2,.4]])assert.deepEqual(transform(rgb),rgb,`${inputProfile} must pass through untouched`);
+  }
 });

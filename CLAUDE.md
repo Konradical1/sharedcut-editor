@@ -9,6 +9,16 @@ Short answers. Plain words. A few lines max.
 No long explanations, no detail dumps, no lists of internals.
 Say what happened or what to do, then stop. More detail only if asked.
 
+## Deployment target — Lenovo, not cloud hosting
+
+The Lenovo is the production deployment target. Do not plan cloud hosting or cloud
+object-storage migration unless Konrad explicitly changes this decision. Keep
+projects and media on the Lenovo; the Mac is the fallback. Prioritize Windows
+feature parity through the existing Docker Desktop / WSL2 deployment, including
+portable captions, optical flow, Smart Mask setup, and NVIDIA acceleration.
+The existing public-access tunnel does not change where the application or media
+is hosted. See `docs/LENOVO_SETUP.md`.
+
 ## This server is moving to Windows — write nothing Mac-native
 
 Today the backend runs on an Apple silicon Mac. It is moving to a Windows machine (a Lenovo

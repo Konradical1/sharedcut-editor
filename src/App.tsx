@@ -17,7 +17,7 @@ import Inspector from './components/Inspector';
 const ColorWorkspace = lazy(() => import('./workspaces/ColorWorkspace'));
 const AudioWorkspace = lazy(() => import('./workspaces/AudioWorkspace'));
 const DeliverWorkspace = lazy(() => import('./workspaces/DeliverWorkspace'));
-import { useEditorShortcuts } from './shortcuts';
+import { useEditorShortcuts, useFocusRelease } from './shortcuts';
 import { connectSession, signOut, resolveSyncConflict } from './services/sync';
 // keep the media panel wide enough for every icon tab to stay visible (see .edit-media in styles.css)
 const MIN_MEDIA_WIDTH=232;
@@ -109,6 +109,7 @@ export default function App() {
   useEffect(()=>{document.documentElement.dataset.reducedMotion=String(settings.reducedMotion);document.documentElement.dataset.density=String(settings.timelineDensity);const scale=parseFloat(String(settings.uiScale));document.documentElement.style.setProperty('--ui-scale',String(Number.isFinite(scale)?scale/100:1));},[settings.reducedMotion,settings.timelineDensity,settings.uiScale]);
   useEffect(()=>{document.title=isEditor?`${projects.find(p=>p.id===projectId)?.name??'Project'} — SharedCut`:'SharedCut — Projects';},[isEditor,projectId,projects]);
   useEditorShortcuts(isEditor&&knownProject);
+  useFocusRelease();
   const home=()=>{useEditorStore.getState().setPlaying(false);useEditorStore.getState().setLiveMode('independent');navigate('/');};
   const logout=()=>{void signOut().then(()=>navigate('/login')).catch(error=>useEditorStore.getState().notify(error.message,'error'));};
   return <MotionConfig reducedMotion={settings.reducedMotion?'always':'user'}><div className="app-root">

@@ -27,6 +27,8 @@ export type SmartMaskManifest = {
   /** Index in the decoded source PTS table. Values may be sparse for a partial analysis. */
   frames: { index: number; time: number; file: string }[];
   sourceTimes?: number[]; range: { start: number; end: number }; alpha: 'gray16';
+  /** Present when `preview/<index>.png` playback-size 8-bit mattes were written alongside the native frames. */
+  preview?: 'gray8';
 };
 export type SmartMaskWorkerInput = {
   input: string; output: string; ffmpeg: string; ffprobe: string; document: SmartMaskDocument;
@@ -98,7 +100,7 @@ export function smartMaskSourceTime(clip:Clip,timelineTime:number,asset:Pick<Med
 export function createSmartMask(clip:Clip,asset:MediaAsset,id:string):SmartMaskDocument {
   const dimensions=asset.resolution.match(/(\d+)\s*[×x]\s*(\d+)/i),fps=asset.fps||24;
   const start=smartMaskSourceTime(clip,clip.start,asset),last=smartMaskSourceTime(clip,clip.start+Math.max(0,clip.duration-1/fps),asset);
-  const doc:SmartMaskDocument={version:1,id,name:'Subject',source:{mediaId:asset.id,fps,width:Number(dimensions?.[1]??1920),height:Number(dimensions?.[2]??1080),duration:asset.duration},range:{start:Math.min(start,last),end:Math.min(asset.duration,Math.max(start,last)+1/fps)},prompts:[],repairs:[],settings:{preserveMotionBlur:true,edgeRadius:16,quality:'final'}};
+  const doc:SmartMaskDocument={version:1,id,name:'Subject',source:{mediaId:asset.id,fps,width:Number(dimensions?.[1]??1920),height:Number(dimensions?.[2]??1080),duration:asset.duration},range:{start:Math.min(start,last),end:Math.min(asset.duration,Math.max(start,last)+1/fps)},prompts:[],repairs:[],settings:{preserveMotionBlur:false,edgeRadius:16,quality:'preview'}};
   validateSmartMask(doc);return doc;
 }
 

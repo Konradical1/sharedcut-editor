@@ -48,7 +48,8 @@ try {
   await page.locator('input[type=password]').fill('Studio-QA-Password-2026');
   await page.getByRole('button',{name:'Create account',exact:true}).last().click();
   await page.getByRole('button',{name:'New project',exact:true}).waitFor();
-  assert.match(await page.locator('.dash-heading h1').innerText(), /Projects\s+0/);
+  assert.equal(await page.locator('.dash-heading h1').innerText(), 'Your workspace');
+  assert.equal((await state()).projects.length, 0);
   assert.equal(await page.locator('.dash-featured, .dash-sidebar-note, .dash-footer').count(), 0);
   await page.screenshot({path:join(out,'dashboard-1440.png')});
   console.log('PASS account signup and authenticated dashboard');
@@ -56,7 +57,7 @@ try {
   await page.getByRole('textbox',{name:'Project name'}).fill('Production workflow check');
   await page.getByRole('button',{name:'Create project',exact:true}).click();
   await page.getByRole('button',{name:'Back to projects',exact:true}).click();
-  await page.getByRole('button',{name:'Project options for Production workflow check',exact:true}).click();
+  await page.locator('.drive-project').filter({has:page.getByRole('button',{name:'Open Production workflow check',exact:true})}).getByRole('button',{name:'Project options for Production workflow check',exact:true}).click();
   await page.getByRole('menuitem',{name:'Edit properties',exact:true}).click();
   assert.equal(await page.getByRole('button',{name:/Sharing & access/}).isVisible(),true);
   await page.getByRole('textbox',{name:'Description',exact:true}).fill('Dashboard settings verified');
@@ -112,18 +113,18 @@ try {
   const labelBox = await xLabel.boundingBox();
   await page.mouse.move(labelBox.x + 15, labelBox.y + labelBox.height / 2);
   await page.mouse.down(); await page.mouse.move(labelBox.x + 55, labelBox.y + labelBox.height / 2, {steps:8}); await page.waitForTimeout(1200); await page.mouse.up();
-  assert.equal(await page.getByRole('spinbutton',{name:'Position X',exact:true}).inputValue(), '40');
+  assert.equal(await page.getByRole('textbox',{name:'Position X',exact:true}).inputValue(), '40');
   assert.equal(await page.evaluate(()=>window.getSelection().toString()), '');
   await page.getByRole('button',{name:'Undo my action (⌘Z)',exact:true}).click();
-  assert.equal(await page.getByRole('spinbutton',{name:'Position X',exact:true}).inputValue(), '0');
+  assert.equal(await page.getByRole('textbox',{name:'Position X',exact:true}).inputValue(), '0');
   await page.locator('.inspector-tabs').getByRole('button',{name:'Effects',exact:true}).click();
   await page.getByRole('combobox',{name:'Add clip effect'}).selectOption('Vignette');
-  await page.getByRole('spinbutton',{name:'Vignette amount'}).fill('28');
+  await page.getByRole('textbox',{name:'Vignette amount'}).fill('28');
   await page.getByRole('checkbox',{name:'Enable Vignette'}).uncheck();
   await page.getByRole('button',{name:'Delete Vignette'}).click();
-  assert.equal(await page.getByRole('spinbutton',{name:'Vignette amount'}).count(), 0);
+  assert.equal(await page.getByRole('textbox',{name:'Vignette amount'}).count(), 0);
   await page.getByRole('button',{name:'Undo my action (⌘Z)',exact:true}).click();
-  assert.equal(await page.getByRole('spinbutton',{name:'Vignette amount'}).inputValue(), '28');
+  assert.equal(await page.getByRole('textbox',{name:'Vignette amount'}).inputValue(), '28');
   assert.equal(await page.getByRole('checkbox',{name:'Enable Vignette'}).isChecked(), false);
   await page.getByRole('button',{name:'Delete Vignette'}).click();
   await page.locator('.inspector-tabs').getByRole('button',{name:'Video',exact:true}).click();
@@ -135,7 +136,7 @@ try {
   await page.locator('.timeline-ruler').click({position:{x:80,y:20}});
   assert.equal(await page.locator('#property-x').evaluate(e=>document.activeElement===e),false);
   await page.keyboard.press('Space');await page.getByRole('button',{name:'Pause playback',exact:true}).waitFor();await page.keyboard.press('Space');
-  const seekFrame=async frame=>{const r=await page.locator('.timeline-ruler').boundingBox(),px=await page.locator('.timeline-ruler').evaluate(e=>e.getBoundingClientRect().width/Number(e.dataset.timeSpan));await page.mouse.click(r.x+frame/24*px,r.y+20);};
+  const seekFrame=async frame=>{const r=await page.locator('.timeline-ruler').boundingBox(),px=await page.locator('.timeline-ruler').evaluate(e=>e.getBoundingClientRect().width/Number(e.dataset.timeSpan));await page.mouse.click(r.x+frame/24*px,r.y+20);await page.waitForFunction(frame=>document.querySelector('.transport-time')?.textContent===`00:00:${String(Math.floor(frame/24)).padStart(2,'0')}:${String(frame%24).padStart(2,'0')}`,frame);};
   await seekFrame(0);await page.getByRole('button',{name:'Add Speed keyframe',exact:true}).click();
   await seekFrame(48);await page.locator('#property-speed').fill('200');
   const speedDiamond=page.getByRole('button',{name:'Add Speed keyframe',exact:true});
@@ -151,8 +152,8 @@ try {
   assert.ok(await page.getByRole('button',{name:'Next Position X keyframe',exact:true}).isDisabled());
   await page.locator('.timeline-track').filter({has:page.locator('.timeline-clip.video')}).getByRole('button',{name:/Expand keyframes for/}).click();
   await page.getByRole('button',{name:'Expand Speed curve',exact:true}).click();
-  await page.locator('.animation-graph').scrollIntoViewIfNeeded();
-  const compact=await page.evaluate(()=>{const graph=document.querySelector('.animation-graph').getBoundingClientRect(),controls=document.querySelector('.animation-key-controls').getBoundingClientRect();return {graph:{x:graph.x,y:graph.y},controls:{right:controls.right,y:controls.y}};});
+  await page.locator('.animation-graph:not(.graph-overview)').scrollIntoViewIfNeeded();
+  const compact=await page.evaluate(()=>{const graph=document.querySelector('.animation-graph:not(.graph-overview)').getBoundingClientRect(),controls=document.querySelector('.animation-key-controls').getBoundingClientRect();return {graph:{x:graph.x,y:graph.y},controls:{right:controls.right,y:controls.y}};});
   assert.ok(compact.controls.right<=compact.graph.x&&Math.abs(compact.controls.y-compact.graph.y)<35,'Controls sit beside the graph.');
   assert.ok(await page.locator('.animation-key-controls').evaluate(e=>e.scrollWidth<=e.clientWidth+1),'Sidebar controls fit without clipping.');
   assert.ok(await page.locator('.graph-axis').filter({hasText:'%'}).count()>1);
@@ -164,7 +165,7 @@ try {
   });
   assert.ok(markerGeometry.aligned,'Clip and lane diamonds have identical horizontal centers.');
   assert.ok(markerGeometry.visible,'Frame-zero diamond is fully inside the timeline.');
-  assert.equal(await page.locator('.animation-key-actions button').count(),2);
+  assert.equal(await page.locator('.animation-key-actions button').count(),5);
   await page.getByRole('button',{name:'Ease in/out Speed keyframe',exact:true}).click();
   assert.equal(await page.getByRole('combobox',{name:'Speed interpolation',exact:true}).inputValue(),'bezier');
 
@@ -182,7 +183,8 @@ try {
   await seekFrame(24);assert.ok(Math.abs(Number(await page.locator('#property-speed').inputValue())-150)<1);
   await page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
   const animated=(await state()).clips;assert.ok(animated.every(c=>c.keyframes?.['properties.speed']?.length===2));
-  const line=page.locator('.timeline-clip.video .clip-keyframe-line').last();await line.scrollIntoViewIfNeeded();const lb=await line.boundingBox();
+  await page.locator('.timeline-scroll').evaluate(e=>{e.scrollTop=0;});
+  const line=page.locator('.timeline-clip.video .clip-keyframe-line').last();await line.scrollIntoViewIfNeeded();const lb=await line.locator('svg').boundingBox();
   await page.mouse.move(lb.x+lb.width/2,lb.y+lb.height/2);await page.mouse.down();await page.mouse.move(lb.x+lb.width/2+12,lb.y+lb.height/2,{steps:4});await page.mouse.up();
   await page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');assert.ok((await state()).clips.find(c=>c.trackId===animated[0].trackId).keyframes['properties.speed'][1].time!==2);
   await page.screenshot({path:join(out,'timeline-keyframe-controls.png')});
@@ -190,6 +192,8 @@ try {
   await page.locator('.timeline-track').filter({has:page.locator('.timeline-clip.video')}).getByRole('button',{name:/Collapse keyframes for/}).click();
   await page.locator('.timeline-scroll').evaluate(e=>{e.style.overflowY='';e.style.borderRight='';e.scrollTop=0;});
   console.log('PASS inline diamonds, focus release, speed ramps, linked timing, compact graph and stable expanded scrubbing');
+  for(let i=0;i<6;i++)await page.getByRole('button',{name:'Zoom timeline in',exact:true}).click();
+  await page.locator('.timeline-scroll').evaluate(e=>{e.scrollLeft=0;});
   const gapClip=page.locator('.timeline-clip.video').first(),gapBox=await gapClip.boundingBox();
   const gapPixels=await page.locator('.timeline-ruler').evaluate(e=>e.getBoundingClientRect().width/Number(e.dataset.timeSpan));
   await page.mouse.move(gapBox.x+gapBox.width/2,gapBox.y+gapBox.height/2);await page.mouse.down();await page.mouse.move(gapBox.x+gapBox.width/2+2*gapPixels,gapBox.y+gapBox.height/2,{steps:5});await page.mouse.up();
@@ -199,16 +203,17 @@ try {
   await gapLane.click({position:{x:gapPixels,y:2}});await page.locator('.timeline-gap').waitFor();
   await page.keyboard.press('Delete');await page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
   const gapAfter=(await state()).clips;assert.equal(gapAfter.find(c=>c.trackId===gapBefore.find(c=>c.id===animated[0].id).trackId).start,0);
-  assert.ok(gapAfter.some(c=>c.start>0),'Closing a video gap leaves audio in place.');
+  assert.ok(gapAfter.every(c=>c.start===0),'Closing a video gap keeps linked audio aligned.');
   for(let i=0;i<2;i++)await page.getByRole('button',{name:'Undo my action (⌘Z)',exact:true}).click();
   await page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');assert.ok((await state()).clips.every(c=>c.start===0));
   await page.locator('.timeline-clip.video').first().click();
-  console.log('PASS click gap, Delete shifts only its track, undo restores original placement');
+  for(let i=0;i<6;i++)await page.getByRole('button',{name:'Zoom timeline out',exact:true}).click();
+  console.log('PASS click gap, Delete keeps linked audio aligned, undo restores original placement');
 
 
-  await page.locator('.media-tabs').getByRole('button',{name:'Effects',exact:true}).click();
+  await page.locator('.media-tabs').getByRole('tab',{name:'Effects',exact:true}).click();
   await page.getByRole('button',{name:'Gaussian blur',exact:true}).dragTo(page.locator('.timeline-clip').first());
-  const radius=page.getByRole('spinbutton',{name:'Gaussian blur Radius',exact:true});await radius.waitFor();
+  const radius=page.getByRole('textbox',{name:'Gaussian blur Radius',exact:true});await radius.waitFor();
   const numberBox=await radius.boundingBox();
   await page.mouse.move(numberBox.x+15,numberBox.y+12);await page.mouse.down();await page.mouse.move(numberBox.x+55,numberBox.y+12,{steps:8});await page.waitForTimeout(1200);await page.mouse.up();
   assert.equal(await radius.inputValue(),'14');
@@ -220,7 +225,7 @@ try {
   await page.getByRole('button',{name:'Undo my action (⌘Z)',exact:true}).click();assert.equal(await radius.inputValue(),'10');
   await page.getByRole('button',{name:'Delete Gaussian blur',exact:true}).click();
   await page.locator('.inspector-tabs').getByRole('button',{name:'Video',exact:true}).click();
-  await page.locator('.media-tabs').getByRole('button',{name:'Media',exact:true}).click();
+  await page.locator('.media-tabs').getByRole('tab',{name:'Media',exact:true}).click();
   console.log('PASS effect drag/drop, expandable parameters, numeric text drag and saved undo');
 
 
@@ -229,6 +234,7 @@ try {
   const zoomedPixels=await page.locator('.timeline-ruler').evaluate(el=>el.getBoundingClientRect().width/Number(el.dataset.timeSpan));
   await page.locator('.media-asset').first().dragTo(overwriteLane,{targetPosition:{x:10*zoomedPixels,y:20}});
   await page.waitForFunction(()=>document.querySelectorAll('.timeline-clip').length===4);
+  await page.waitForFunction(()=>!document.querySelector('.toast'));
   const movingClip=page.locator('.timeline-clip.video.selected'),movingBox=await movingClip.boundingBox();
   const moveX=movingBox.x+movingBox.width/2,moveY=movingBox.y+movingBox.height/2;
   await page.mouse.move(moveX,moveY);await page.mouse.down();await page.mouse.move(moveX-8*zoomedPixels,moveY,{steps:8});
@@ -255,10 +261,11 @@ try {
   }
   await page.mouse.up();
   await page.waitForFunction(()=>window.qaVideos.every(v=>!v.seeking));
-  const scrub = await page.evaluate(()=>({distinct:new Set(window.frameHashes).size, blank:window.qaBlankFrames, decoders:window.qaVideos.length, seekTimes:window.qaSeekTimes, selection:window.getSelection().toString(), transition:getComputedStyle(document.querySelector('.local-playhead')).transitionDuration}));
+  const scrub = await page.evaluate(()=>({engine:document.querySelector('.viewer canvas')?.dataset.playbackEngine,distinct:new Set(window.frameHashes).size, blank:window.qaBlankFrames, decoders:window.qaVideos.length, seekTimes:window.qaSeekTimes, selection:window.getSelection().toString(), transition:getComputedStyle(document.querySelector('.local-playhead')).transitionDuration}));
   assert.ok(scrub.distinct>10); assert.equal(scrub.blank,0); assert.equal(scrub.decoders,decoderCount); assert.equal(scrub.selection,''); assert.equal(scrub.transition,'0s');
   const seekP95 = scrub.seekTimes.sort((a,b)=>a-b)[Math.floor(scrub.seekTimes.length*.95)];
-  assert.ok(seekP95 < 300, `Proxy seek p95 ${seekP95}ms exceeds the browser regression budget`);
+  if(!scrub.seekTimes.length)assert.equal(scrub.engine,'webcodecs');
+  else assert.ok(seekP95 < 300, `Proxy seek p95 ${seekP95}ms exceeds the browser regression budget`);
   console.log('PASS rapid bidirectional scrub with no blank frames or decoder recreation', {frames:scrub.distinct,seekP95});
   const playheadBeforeZoom=await page.locator('.local-playhead').evaluate(el=>{const ruler=document.querySelector('.timeline-ruler');return new DOMMatrix(getComputedStyle(el).transform).m41/(parseFloat(ruler.style.width)/Number(ruler.dataset.timeSpan));});
   for(let i=0;i<8;i++)await page.getByRole('button',{name:'Zoom timeline out',exact:true}).click();
@@ -282,8 +289,8 @@ try {
   await page.screenshot({path:join(out,'history-1440.png')});
   await page.getByRole('button',{name:'Inspector',exact:true}).click();
   await page.locator('.timeline-clip').first().click();
-  await page.getByRole('spinbutton',{name:'Zoom',exact:true}).fill('125');
-  await page.getByRole('spinbutton',{name:'Zoom',exact:true}).blur();
+  await page.getByRole('textbox',{name:'Zoom',exact:true}).fill('125');
+  await page.getByRole('textbox',{name:'Zoom',exact:true}).blur();
   await page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
   assert.equal((await state()).clips[0].properties.zoom,125);
   await page.getByRole('button',{name:'Undo my action (⌘Z)',exact:true}).click();
@@ -294,10 +301,10 @@ try {
   const second = await other.newPage(); second.on('pageerror',error=>errors.push(error.message));
   await other.request.post(`${url}/api/auth/signup`,{data:{name:'QA Collaborator',email:'collaborator@example.test',password:'Studio-QA-Password-2026'}});
   await second.goto(`${url}/project/${projectId}`);
-  await second.getByRole('spinbutton',{name:'Position Y',exact:true}).waitFor();
+  await second.getByRole('textbox',{name:'Position Y',exact:true}).waitFor();
   await Promise.all([
-    page.getByRole('spinbutton',{name:'Position X',exact:true}).fill('14').then(()=>page.getByRole('spinbutton',{name:'Position X',exact:true}).blur()),
-    second.getByRole('spinbutton',{name:'Position Y',exact:true}).fill('22').then(()=>second.getByRole('spinbutton',{name:'Position Y',exact:true}).blur()),
+    page.getByRole('textbox',{name:'Position X',exact:true}).fill('14').then(()=>page.getByRole('textbox',{name:'Position X',exact:true}).blur()),
+    second.getByRole('textbox',{name:'Position Y',exact:true}).fill('22').then(()=>second.getByRole('textbox',{name:'Position Y',exact:true}).blur()),
   ]);
   await page.waitForFunction(()=>document.querySelector('#property-x')?.value==='14'&&document.querySelector('#property-y')?.value==='22'&&document.querySelector('.save-status')?.textContent==='Saved');
   await second.waitForFunction(()=>document.querySelector('#property-x')?.value==='14'&&document.querySelector('#property-y')?.value==='22'&&document.querySelector('.save-status')?.textContent==='Saved');
@@ -323,17 +330,17 @@ try {
   await second.locator('.timeline-scroll').evaluate(el=>{el.scrollLeft=40;});
   const afterScroll = await second.locator(`[data-track="${trackId}"]`).evaluate((el,point)=>{const r=el.getBoundingClientRect();return (point.x-r.left)/r.width*Number(el.dataset.timeSpan);},point);
   await checkCursor(await pointAt(page,afterScroll));
-  await second.getByRole('spinbutton',{name:'Position X',exact:true}).hover();
-  const field = await page.getByRole('spinbutton',{name:'Position X',exact:true}).boundingBox();
+  await second.getByRole('textbox',{name:'Position X',exact:true}).hover();
+  const field = await page.getByRole('textbox',{name:'Position X',exact:true}).boundingBox();
   await checkCursor({x:field.x+field.width/2,y:field.y+field.height/2});
-  await second.getByRole('spinbutton',{name:'Speed',exact:true}).hover();
+  await second.getByRole('textbox',{name:'Speed',exact:true}).hover();
   await page.locator('.inspector-scroll').evaluate(el=>{el.scrollTop=0;});
   await hiddenCursor();
-  await page.getByRole('spinbutton',{name:'Speed',exact:true}).scrollIntoViewIfNeeded();
-  const speedBox=await page.getByRole('spinbutton',{name:'Speed',exact:true}).boundingBox();
+  await page.getByRole('textbox',{name:'Speed',exact:true}).scrollIntoViewIfNeeded();
+  const speedBox=await page.getByRole('textbox',{name:'Speed',exact:true}).boundingBox();
   await checkCursor({x:speedBox.x+speedBox.width/2,y:speedBox.y+speedBox.height/2});
-  await second.getByRole('spinbutton',{name:'Position X',exact:true}).hover();
-  await page.getByRole('spinbutton',{name:'Position X',exact:true}).scrollIntoViewIfNeeded();
+  await second.getByRole('textbox',{name:'Position X',exact:true}).hover();
+  await page.getByRole('textbox',{name:'Position X',exact:true}).scrollIntoViewIfNeeded();
   await page.locator('.inspector-section').first().locator('summary').click();
   await hiddenCursor(); // The remote field is now collapsed locally.
   await second.locator('.viewer-stage').hover(); await visibleCursor();
@@ -386,7 +393,7 @@ try {
   const collaboratorId=(await (await other.request.get(`${url}/api/auth/me`)).json()).user.id;
   await page.waitForTimeout(150);
   assert.ok(!(await (await other.request.get(`${url}/api/state`)).json()).presence.some(p=>p.userId===collaboratorId&&p.projectId===projectId),'Leaving a project must withdraw its presence instead of waiting for expiry.');
-  await second.goto(`${url}/project/${projectId}`);await second.getByRole('spinbutton',{name:'Position Y',exact:true}).waitFor();
+  await second.goto(`${url}/project/${projectId}`);await second.getByRole('textbox',{name:'Position Y',exact:true}).waitFor();
   point=await pointAt(second,clipEnd);await second.mouse.move(point.x,point.y);await visibleCursor();
   // Headless Chromium keeps tabs focused; exercise the browser's inactive-window lifecycle explicitly.
   await second.evaluate(()=>{document.hasFocus=()=>false;window.dispatchEvent(new Event('blur'));});
@@ -407,19 +414,19 @@ try {
   await second.locator('.live-join.is-live').click();
   console.log('PASS presenter and live-follow playback');
   await context.setOffline(true);
-  await page.getByRole('spinbutton',{name:'Position X',exact:true}).fill('33');
-  await page.getByRole('spinbutton',{name:'Position X',exact:true}).blur();
+  await page.getByRole('textbox',{name:'Position X',exact:true}).fill('33');
+  await page.getByRole('textbox',{name:'Position X',exact:true}).blur();
   await page.waitForTimeout(600);
-  await second.getByRole('spinbutton',{name:'Position X',exact:true}).fill('44');
-  await second.getByRole('spinbutton',{name:'Position X',exact:true}).blur();
+  await second.getByRole('textbox',{name:'Position X',exact:true}).fill('44');
+  await second.getByRole('textbox',{name:'Position X',exact:true}).blur();
   await second.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
   await context.setOffline(false);
   await page.getByRole('button',{name:'Keep my edits',exact:true}).waitFor({timeout:10000});
   await page.getByRole('button',{name:'Keep my edits',exact:true}).click();
   await page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
   saved=await state();assert.equal(saved.clips[0].properties.x,33);assert.equal(saved.clips[0].properties.y,22);
-  await page.reload();await page.getByRole('spinbutton',{name:'Position X',exact:true}).waitFor();
-  assert.equal(await page.getByRole('spinbutton',{name:'Position X',exact:true}).inputValue(),'33');
+  await page.reload();await page.getByRole('textbox',{name:'Position X',exact:true}).waitFor();
+  assert.equal(await page.getByRole('textbox',{name:'Position X',exact:true}).inputValue(),'33');
   console.log('PASS offline draft, competing-field conflict resolution, and reload recovery');
   await page.getByRole('button',{name:'People',exact:true}).click();
   await page.locator('.person-main').filter({hasText:'QA Collaborator'}).click();

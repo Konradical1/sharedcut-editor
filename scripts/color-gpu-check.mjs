@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {createServer} from 'vite';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 const server=await createServer({server:{port:0,host:'127.0.0.1'}});await server.listen();
-const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH});
+const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH,args:JSON.parse(process.env.QA_BROWSER_ARGS||'[]')});
 try{
  const page=await browser.newPage();await page.goto(server.resolvedUrls.local[0]);
  const results=await page.evaluate(async()=>{
@@ -84,6 +84,21 @@ try{
     for(let x=0;x<64;x++){const expected=transform(Array(3).fill((300+x)/1023));for(let c=0;c<3;c++){const error=Math.abs(actual[x*4+c]-Math.round(expected[c]*255));total+=error;max=Math.max(max,error);}}
     results.push({mode:'10-bit-planes',profile:'S-Log3',meanError:total/192,maxError:max});
   }finally{high.dispose();window.VideoFrame=NativeFrame;}
+  // A queued picture can be half a second behind the native decoder. Color and masks must
+  // consume that exact snapshot, not whichever picture the video element has decoded ahead.
+  const queued=createColorPreview(),picture=document.createElement('canvas');picture.width=64;picture.height=2;
+  const bytes=new Uint8Array(64*2*1.5);for(let i=0;i<128;i++)bytes[i]=i%64<32?65:180;bytes.fill(128,128);
+  const snapshot=new VideoFrame(bytes,{format:'I420',codedWidth:64,codedHeight:2,timestamp:500000});
+  try{
+    // Worker decoding deliberately leaves the native element unloaded, with zero dimensions.
+    const video={currentTime:8,readyState:0,videoWidth:0,videoHeight:0},clip={id:'queued',properties:{inputProfile:'Rec.709',inputGamut:'Rec.709'}},asset={inputProfile:'Rec.709',colorMatrix:'bt709'};
+    queued.prepare(video,snapshot);let rendered,maskTime;
+    for(let n=0;n<100;n++){try{rendered=queued.draw(picture,clip,asset,[],video,time=>{maskTime=time;return new Map();},snapshot);break;}catch(e){if(!(e instanceof ColorPending))throw e;await new Promise(r=>setTimeout(r,10));}}
+    if(!rendered||rendered.dataset.sourceTimestamp!=='0.5'||maskTime!==.5)throw Error('Queued color and mask time followed the decoder instead of the stored picture.');
+    const result=document.createElement('canvas');result.width=64;result.height=2;const pixels=result.getContext('2d');pixels.drawImage(rendered,0,0);
+    const left=pixels.getImageData(16,1,1,1).data,right=pixels.getImageData(48,1,1,1).data;
+    if(left[3]!==255||right[3]!==255||right[0]-left[0]<80)throw Error('Queued YUV picture lost its geometry when the native video had no metadata.');
+  }finally{snapshot.close();queued.dispose();}
   return results;
  });
  for(const result of results){console.log(result);assert.ok(result.meanError<1.5&&result.maxError<6,'GPU must match validated CPU camera and correction math.');}

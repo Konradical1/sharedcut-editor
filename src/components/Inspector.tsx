@@ -17,6 +17,15 @@ import { effectDefinitions, effectValue, effectEnabled, acceptsEffect } from '..
 import { IconButton, EmptyState, NumberInput, durationLabel, fpsLabel } from './ui';
 import { api } from '../services/api';
 import type { FlowPreview } from '../services/opticalFlow';
+import type { StabilizePreview } from '../services/stabilize';
+
+function StabilizeStatus({clipId,lock}:{clipId:string;lock:number}) {
+  const [capability,setCapability]=useState<{available:boolean;reason?:string}>();
+  const [status,setStatus]=useState<StabilizePreview>();
+  useEffect(()=>{let active=true;void api<{available:boolean;reason?:string}>('/stabilize/capabilities').then(value=>{if(active)setCapability(value);}).catch(error=>{if(active)setCapability({available:false,reason:error.message});});return()=>{active=false;};},[]);
+  useEffect(()=>{setStatus(undefined);const changed=(event:Event)=>{const detail=(event as CustomEvent).detail;if(detail.clipId===clipId)setStatus(previous=>JSON.stringify(previous)===JSON.stringify(detail)?previous:detail);};window.addEventListener('frameline:stabilize',changed);return()=>window.removeEventListener('frameline:stabilize',changed);},[clipId]);
+  return <p className="inspector-note" role="status">{capability?.available===false?capability.reason:!capability?'Checking stabilizer…':status?.status==='ready'?'Ready · stabilized preview':status?.status==='failed'?status.error:`Analyzing camera motion${status?.progress?` · ${status.progress}%`:''}. The whole clip plays stabilized as soon as this finishes.`}<br/>{status?.zoom?`Picture zoomed ${status.zoomMin&&status.zoomMin<status.zoom-.0005?`${((status.zoomMin-1)*100).toFixed(1)}–`:''}${((status.zoom-1)*100).toFixed(1)}%. `:''}{lock>=.5?'Locked to the first frame; the zoom grows with the drift. ':'Crop is the budget per side; pans are followed, shake inside the budget is removed. '}Analysis runs once on the original and is cached; the picture is warped in the browser, so grades, Smart Mask and quality switches never re-render it. Values are read at the clip start; keyframes do not animate them.</p>;
+}
 
 function OpticalFlowControl({clipId,enabled}:{clipId:string;enabled:boolean}) {
   const [capability,setCapability]=useState<{available:boolean;error?:string}>();
@@ -152,7 +161,6 @@ export default function Inspector() {
         <Section title="Speed" icon={<Gauge size={12}/>}><Property name="speed" label="Speed" initial={100} min={1} max={800} suffix="%"/>
           {asset?.kind==='video'&&<OpticalFlowControl clipId={selected.id} enabled={Boolean(selected.properties.opticalFlow)}/>}
           <p className="inspector-note">Without keyframes, Speed changes the whole clip and its duration. Add a diamond, move the playhead, then change Speed to create a ramp within the clip.</p><div className="inspector-checks">{[['reverse','Reverse'],['freeze','Freeze frame']].map(([key,label])=><label data-cursor-anchor={key} key={key}><input type="checkbox" checked={Boolean(selected.properties[key])} onChange={e=>s().updateProperty(selected.id,key,e.target.checked)}/>{label}</label>)}</div></Section>
-        <Section title="Stabilization" icon={<WandSparkles size={12}/>} open={false}><label className="inspector-checks"><input type="checkbox" disabled title="Stabilization is not available" checked={false} onChange={e=>s().updateProperty(selected.id,'stabilization',e.target.checked)}/> Stabilize camera motion</label><p className="inspector-note">Stabilization is not available in this version.</p></Section>
       </>}
       {tab==='Audio'&&<><Section title="Clip audio" icon={<Volume2 size={12}/>}><Property name="gain" label="Gain" initial={0} min={-60} max={12} step={.5} suffix="dB"/><Property name="pan" label="Pan" initial={0} min={-100} max={100}/><Property name="audioFadeIn" label="Audio fade in" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><Property name="audioFadeOut" label="Audio fade out" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><label className="inspector-checks"><input type="checkbox" disabled title="Loudness normalization is not available" checked={false} onChange={e=>s().updateProperty(selected.id,'normalize',e.target.checked)}/> Normalize loudness</label></Section><div className="inspector-audio-preview"><Volume2 size={28}/><p>Shape your sound in the Audio workspace.</p><button className="button button-secondary" onClick={()=>s().setWorkspace('audio')}>Open mixer</button></div></>}
       {tab==='Effects'&&<>
@@ -164,6 +172,7 @@ export default function Inspector() {
             <IconButton label={`Delete ${effect.name}`} onClick={()=>s().updateEffect(selected.id,effect.id,null)}><Trash2 size={12}/></IconButton>
           </div><p className="inspector-note">{effectDefinitions[effect.name]?.description}</p>
           {effect.name==='Smart Mask'&&<SmartMaskInspector clip={selected} maskId={effect.maskId} targetId={effect.id}/>}
+          {effect.name==='Stabilize'&&<StabilizeStatus clipId={selected.id} lock={effect.parameters?.lock??0}/>}
           {(effectDefinitions[effect.name]?.parameters??[]).map(p=><Property key={p.key} effectId={effect.id} name={p.key} label={p.label} initial={p.initial} min={p.min} max={p.max} step={p.step} suffix={p.suffix}/>)}
           {effect.name==='Noise Reduction'&&<p className="inspector-note">Temporal picture smoothing is applied during export. Audio preview uses a noise gate.</p>}
         </details>)}<label className="form-field effect-add"><span>Add an effect</span><select data-cursor-anchor="add-effect" aria-label="Add clip effect" defaultValue="" onChange={e=>{if(e.target.value)s().addEffect(selected.id,e.target.value);e.target.value='';}}><option value="">Choose effect…</option>{Object.keys(effectDefinitions).filter(name=>acceptsEffect(selected,asset?.kind,name)).map(name=><option key={name}>{name}</option>)}</select></label></>}

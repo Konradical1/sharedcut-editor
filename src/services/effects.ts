@@ -5,6 +5,7 @@ import type { Clip, Effect } from '../state/models.ts';
 export interface EffectParameter { key: string; label: string; initial: number; min: number; max: number; step?: number; suffix?: string }
 const amount: EffectParameter = { key: 'amount', label: 'Amount', initial: 50, min: 0, max: 100, suffix: '%' };
 export const effectDefinitions: Record<string, { kind: 'video' | 'audio' | 'both'; description: string; parameters: EffectParameter[] }> = {
+  Stabilize: { kind: 'video', description: 'Remove camera shake while following pans. Crop is the budget per side; the camera path is solved to stay inside it, so the zoom is exactly what you set.', parameters: [{...amount,label:'Strength',initial:100},{key:'crop',label:'Crop',initial:5,min:.5,max:15,step:.1,suffix:'%'},{key:'smoothness',label:'Smoothness',initial:50,min:0,max:100},{key:'lock',label:'Lock (tripod)',initial:0,min:0,max:1,step:1}] },
   'Smart Mask': { kind: 'video', description: 'Select a subject, track the shot, and refine its edges.', parameters: [{...amount,initial:100},{key:'invert',label:'Invert',initial:0,min:0,max:1,step:1}] },
   'Film grain': { kind: 'video', description: 'Add texture with adjustable grain strength and seed.', parameters: [amount, { key: 'seed', label: 'Seed', initial: 1, min: 0, max: 10000 }] },
   Bloom: { kind: 'video', description: 'Bleed the highlights into a soft glow.', parameters: [amount, { key: 'threshold', label: 'Threshold', initial: 62, min: 0, max: 100, suffix: '%' }, { key: 'radius', label: 'Radius', initial: 18, min: 1, max: 100, step: .1, suffix: 'px' }] },
@@ -25,7 +26,7 @@ export function effectValue(clip: Clip, effect: Effect, key: string): number {
 export const effectEnabled = (clip: Clip, effect: Effect) => effect.enabled && clip.properties[`${effect.name}_enabled`] !== false;
 export function acceptsEffect(clip: Clip, kind: string | undefined, name: string) {
   if(clip.properties.captionSet)return false;
-  if(name==='Smart Mask')return kind==='video'&&!isTitle(clip)&&!isShape(clip)&&!clip.properties.compositionId;
+  if(name==='Smart Mask'||name==='Stabilize')return kind==='video'&&!isTitle(clip)&&!isShape(clip)&&!clip.properties.compositionId;
   const definition = effectDefinitions[name];
   if(isTitle(clip)||isShape(clip))kind='image';
   return !!definition && (definition.kind !== 'video' || kind !== 'audio') && (definition.kind !== 'audio' || kind !== 'image');

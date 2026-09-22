@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { getMediaCapabilities, prepareMedia, probeMedia, renderTimeline } from './media.ts';
+import { animatedWindows, getMediaCapabilities, prepareMedia, probeMedia, renderTimeline } from './media.ts';
 import type { RenderRequest } from './media.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
@@ -38,7 +38,7 @@ test('real media preparation and timeline export preserve picture, sound, timing
       assert.ok(variant.hasAudio, 'Embedded sound must survive lower-resolution preview.');
       const frames = await exec(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=key_frame', '-of', 'csv=p=0', file]);
       const keys = frames.stdout.trim().split(/\s+/).map(frame => frame.replace(',', ''));
-      assert.ok(quality === 'Stream' ? keys.includes('0') : keys.every(frame => frame === '1'));
+      assert.ok(quality.startsWith('Stream') ? keys.includes('0') : keys.every(frame => frame === '1'));
     }
     assert.equal((await probeMedia(path.join(dir, 'prepared', path.basename(prepared.audioProxyUrl!)))).kind, 'audio');
     const keyframes = await exec(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=key_frame', '-of', 'csv=p=0', path.join(dir, 'prepared', 'proxy.mp4')]);
@@ -175,6 +175,41 @@ test('animated opacity exports changing frames through the shared renderer',asyn
  } finally {await rm(dir,{recursive:true,force:true});}
 });
 
+test('a lone keyframed clip bakes only its own frames and splices back into one composite',async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'frameline-animation-window-'));
+ try {
+  const ffmpegPath=process.env.FFMPEG_PATH||'ffmpeg';
+  const fixture=async(colour:string)=>{const file=path.join(dir,`${colour}.png`);await exec(ffmpegPath,['-v','error','-f','lavfi','-i',`color=${colour}:s=64x64`,'-frames:v','1',file]);return file;};
+  const [red,white,blue]=await Promise.all([fixture('red'),fixture('white'),fixture('blue')]);
+  const project={id:'p',name:'Windows',description:'',shared:false,thumbnail:'',modifiedAt:0,duration:2,resolution:'64 × 64',fps:24,status:'In progress',members:[]} as any;
+  const track={id:'t',timelineId:'tl',name:'Video',kind:'video',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0} as any;
+  const image=(id:string)=>({id,projectId:'p',name:id,kind:'image',duration:4,status:'ready',progress:100,binId:'',thumbnail:'',fps:24,resolution:'64 × 64',size:''} as any);
+  const clip=(id:string,mediaId:string,start:number,duration:number,keyframes?:unknown)=>({id,projectId:'p',timelineId:'tl',trackId:'t',mediaId,name:id,start,duration,sourceIn:0,color:'#fff',disabled:false,properties:{},effects:[],...(keyframes?{keyframes}:{})} as any);
+  const fade={'properties.opacity':[{id:'k0',time:0,value:0,interpolation:'linear'},{id:'k1',time:.25,value:100,interpolation:'linear'}]};
+  const clips=[clip('a','red',0,.75),clip('b','white',.75,.25,fade),clip('c','blue',1,1)];
+
+  // The whole point of the window: six frames are baked one at a time, not all forty-eight.
+  assert.deepEqual(animatedWindows(clips,'tl',24,0,48),[{from:18,to:24}],'only the animated clip’s own frames are baked');
+  assert.deepEqual(animatedWindows(clips,'tl',24,1,24),[],'an animated clip outside the export range costs nothing');
+  assert.deepEqual(animatedWindows([...clips,clip('d','red',.9,.3,fade)],'tl',24,0,48),[{from:18,to:29}],'overlapping windows merge into one bake');
+  assert.deepEqual(animatedWindows([{...clips[1],disabled:true} as any],'tl',24,0,48),[],'a disabled clip is not animation');
+
+  const output=path.join(dir,'spliced.mp4');
+  await renderTimeline({project,timeline:{id:'tl',projectId:'p',name:'Main',duration:2},tracks:[track],clips,
+   assets:[{asset:image('red'),path:red},{asset:image('white'),path:white},{asset:image('blue'),path:blue}],
+   nodes:[],settings:{audio:'Disabled',codec:'H.264',resolution:'64 × 64',fps:'24',rangeIn:'0',rangeOut:'2'},outputPath:output});
+  const pixels=(await exec(ffmpegPath,['-v','error','-i',output,'-f','rawvideo','-pix_fmt','rgb24','-'],{encoding:'buffer',maxBuffer:4e6})).stdout;
+  const frame=(index:number)=>{const at=index*64*64*3;return [pixels[at],pixels[at+1],pixels[at+2]];};
+  assert.equal(pixels.length,48*64*64*3,'the spliced timeline is still exactly the requested range');
+  const [r0,g0,b0]=frame(0);assert.ok(r0>200&&g0<48&&b0<48,`static frames before the window stay untouched, got ${[r0,g0,b0]}`);
+  const [r17]=frame(17);assert.ok(r17>200,'the frame at the window edge still belongs to the clip before it');
+  assert.ok(frame(18).every(v=>v<24),'the animated window starts at zero opacity');
+  assert.ok(frame(23)[0]>150,'the animated window ramps up inside the bake');
+  const [r24,g24,b24]=frame(24);assert.ok(b24>200&&r24<48&&g24<48,`the clip after the window is composited normally, got ${[r24,g24,b24]}`);
+  assert.ok(frame(47)[2]>200,'the tail of the timeline survives the splice');
+ } finally {await rm(dir,{recursive:true,force:true});}
+});
+
 test('audio envelopes fade gain and preserve their position in partial exports',async()=>{
  const dir=await mkdtemp(path.join(tmpdir(),'frameline-audio-fades-'));
  try {
@@ -191,4 +226,21 @@ test('audio envelopes fade gain and preserve their position in partial exports',
   const partial=path.join(dir,'partial.mov');await renderTimeline({...request,outputPath:partial,settings:{...request.settings,rangeIn:'.5',rangeOut:'1'}});
   assert.ok(Math.abs(rms(await samples(partial),0,2400)-rms(full,24000,2400))<.003);
  } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('playable footage is published before color preparation and survives a later failure', { timeout: 30000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-early-ready-'));
+  const controller = new AbortController();
+  let playable = false;
+  const stages: string[] = [];
+  try {
+    const source = path.join(dir, 'source.mp4'), outputDir = path.join(dir, 'prepared');
+    await ff(['-f','lavfi','-i','testsrc2=size=320x180:rate=24:duration=1','-c:v','libx264','-pix_fmt','yuv420p',source]);
+    await assert.rejects(prepareMedia({ inputPath: source, outputDir, baseUrl: '/media', signal: controller.signal,
+      onPlayable: asset => { playable = true; assert.equal(asset.duration, 1); assert.equal(asset.proxyUrl, '/media/proxy.mp4'); assert.ok(!stages.includes('Creating high-precision color preview')); },
+      onStage: stage => { stages.push(stage); if (stage === 'Creating high-precision color preview') { assert.ok(playable); controller.abort(); } }
+    }), /Canceled/);
+    assert.ok((await stat(path.join(outputDir, 'proxy.mp4'))).size > 0, 'background failure must preserve the playable preview');
+    assert.ok(stages.includes('Creating smaller playback previews'));
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

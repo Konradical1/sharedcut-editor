@@ -4,6 +4,10 @@ SharedCut v0.2 is a self-hosted collaborative video editor for a local studio or
 
 ## Run
 
+Testing on the Dell G16? Start with the [Windows laptop test checklist](docs/DELL_G16_TEST.md).
+Moving to the Lenovo? See the [pull and cutover checklist](docs/LENOVO_SETUP.md)
+for Docker setup, the separate private data transfer, and Mac-only worker limitations.
+
 Install **Node.js 22.18 or newer**, npm, and **FFmpeg with ffprobe**. Both media executables must be on `PATH`, or configured with `FFMPEG_PATH` and `FFPROBE_PATH`. The FFmpeg build needs the encoders used by your chosen export, including libx264 for proxies.
 
 ```sh
@@ -75,13 +79,17 @@ Passwords are salted and hashed with scrypt. Sessions use an HttpOnly, SameSite=
 - Add review comments and replies, use personal undo, and save or restore snapshots. Restore first preserves the current edit. Referenced media cannot be deleted while a timeline, snapshot, or pending export needs it.
 - Render selected timeline ranges from the originals with H.264, H.265/HEVC, or ProRes presets and download the resulting MP4 or MOV. Jobs keep running when the browser closes, provided the server stays running.
 
+## Stabilize
+
+Run `npm run setup:stabilize` once on the server (any Python 3.10+; it creates `.venv-stabilize` with OpenCV and NumPy, no GPU needed). Drag **Stabilize** from the Effects tab onto a video clip. **Crop** is the budget per side (default 5 %, so 1.11× zoom): the camera path is solved as an L1-optimal path (Grundmann et al., the method behind YouTube's stabilizer and Resolve's Cropping Ratio) that follows pans and never leaves the budget, so the zoom is exactly what you set. **Strength** blends toward the original, **Smoothness** trades following motion against a gimbal feel, **Lock** holds the first frame like a tripod. Analysis runs once on the camera original (proxies lose tracking on fast pans), in parallel segments with hardware decode when ffmpeg offers it, and is cached; changing a slider re-renders only the cheap warp stage. The zoom holds the budget and only glides up around whip pans; the timeline shows a progress bar on the clip while sections prepare. Preview arrives in four-second sections; export bakes the stabilized picture to ProRes and composites it like any other clip, so speed, reverse and freeze keep working. `FRAME_LINE_STABILIZE_PYTHON` overrides the interpreter. Stabilize cannot share a clip with Smart Mask or optical flow. `npm run test:stabilize` covers the identity/cache logic; `.venv-stabilize/bin/python scripts/stabilize.py --selftest` checks the tracker on synthetic shake.
+
 ## Current limits
 
 Preview processing is SDR, uses browser decoders and 8-bit canvas samples, and is capped at **1920 pixels wide**. Final exports use originals at the selected resolution. Browser and FFmpeg effects are separate implementations, so preview is not a calibrated, pixel-identical mastering monitor. Reverse video can be previewed, but reversed audio is heard in the export; extreme playback speeds may also mute browser audio. Preview noise reduction uses a gate; exports use spectral denoising.
 
-Preview quality selects both the stream and the compositing resolution. **Stream** is the default: a long-GOP 960-pixel variant at roughly 1–8 Mbit/s, which is the only option that plays in real time over the internet. **Full / 1/2 / 1/4** select all-intra streams capped at 1920 / 960 / 480 pixels wide — every frame is a keyframe, so they scrub instantly, but the full-resolution proxy measures around 17 Mbit/s at 1080p and needs a local network. Audio tracks use an audio-only stream. Existing imports gain any missing variants automatically through the server's preparation queue on restart, and variants already on disk are never re-encoded; their current proxies remain available during preparation. Camera originals and export quality are retained. Allow extra disk space for the smaller streams.
+Preview quality selects both the stream and the compositing resolution. **Auto · streaming** is the default: a long-GOP 960-pixel variant, with a 480-pixel alternative for constrained connections. **Full / 1/2 / 1/4** select larger editing/color proxies and require more bandwidth. Audio tracks use an audio-only stream. Existing imports gain missing variants automatically through the server's preparation queue on restart; existing proxies remain available during preparation. Camera originals and export quality are retained. Allow extra disk space for the smaller streams.
 
-Only a few decoders are held open at once, and idle ones drop back to `preload="metadata"`. A paused `<video>` with `preload="auto"` keeps filling its buffer, so a large pool competes with the clip on screen for the same uplink — which is what made playback stutter for remote viewers even at Stream quality.
+Forward MP4 playback decodes pictures in WebCodecs workers and retains bounded queues for the current and upcoming clips. Browser storage automatically caches required byte ranges with a rolling budget. Green indicates verified locally saved bytes; frame preparation is shown separately. Auto mode also prepares server-rendered sections when sustained effects processing exceeds the frame budget. See [playback architecture and reproducible checks](docs/remote-media-loading.md).
 
 **Full quality selects the grading proxy** (`color-v1.mp4`): 10-bit 4:2:2 all-intra at CRF 14, around 9 Mbit/s. It is H.264 High 4:4:4 Intra, a profile no browser decodes in hardware, so treat it as a local-network grading reference rather than a viewing format.
 
@@ -89,7 +97,7 @@ Expect roughly **4x the source size** in prepared media per asset, so budget abo
 
 Prepared media, overlays and hashed bundles are served immutable with a strong ETag, so a viewer re-uses its cached copy instead of re-fetching the footage on every page load. Preview compositing is capped at the timeline frame rate, and clips are warmed at most a few seconds ahead — and not at all while the picture on screen is still loading.
 
-Sony S-Log3 and Canon Log/Log 2/Log 3 support, a managed SDR viewing transform, serial RGB grading, and Resolve bundle imports with resumable source uploads are implemented. See [Resolve and camera color](docs/resolve-color.md) for the workflow and fidelity limits. HDR delivery, AI-generated grading or skin isolation, separate subtitle-file export, and stabilization are not implemented. The grade assistant offers local rule-based SDR suggestions. Unsupported controls are unavailable or produce a clear error; they do not silently become an exported effect.
+Sony S-Log3 and Canon Log/Log 2/Log 3 support, a managed SDR viewing transform, serial RGB grading, and Resolve bundle imports with resumable source uploads are implemented. See [Resolve and camera color](docs/resolve-color.md) for the workflow and fidelity limits. HDR delivery, AI-generated grading or skin isolation, and separate subtitle-file export are not implemented. The grade assistant offers local rule-based SDR suggestions. Unsupported controls are unavailable or produce a clear error; they do not silently become an exported effect.
 
 Project save requests are capped at **20 MiB**. Exports run on a dedicated serial worker and take priority over queued media preparation. Media preparation runs one job per four CPU cores (capped at eight, override with `FRAME_LINE_MEDIA_JOBS`), each given an equal share of the threads; already-running media jobs may overlap an export, and new background work waits for exports.
 

@@ -464,7 +464,7 @@ Speed
 reverse
 freeze frame
 Stabilization
-Placeholder controls.
+Stabilize clip effect: Strength, Crop budget, Smoothness, Lock.
 Audio
 gain
 pan

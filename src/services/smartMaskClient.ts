@@ -27,7 +27,7 @@ export async function analyzeMask(clipId:string,maskId:string,direction:'forward
     if(job.status==='failed')throw Error(job.error||'Mask analysis failed. Your corrections are saved.');
     if(job.status==='ready'){
       const latest=useEditorStore.getState().clips.find(c=>c.id===clipId)?.smartMasks?.find(m=>m.id===maskId);
-      if(latest&&smartMaskSignature(latest)===signature)useEditorStore.getState().updateSmartMask(clipId,maskId,{result:{key:job.key,signature}});
+      if(latest&&smartMaskSignature(latest)===signature){useEditorStore.getState().updateSmartMask(clipId,maskId,{result:{key:job.key,signature}});await connection.flush();}
     }
   }catch(error){useEditorStore.getState().notify((error as Error).message,'error');useMaskEditor.setState(s=>({jobs:{...s.jobs,[id]:{key:s.jobs[id]?.key??'',signature,status:'failed',progress:0,error:(error as Error).message}}}));}
 }

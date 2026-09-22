@@ -10,7 +10,18 @@ import venv
 ROOT = Path(__file__).resolve().parents[1]
 REPO = ROOT / "artifacts/smart-mask/sam2"
 REVISION = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
-WEIGHT_SHA256 = "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318"
+# Pinned checkpoints. FRAME_LINE_SAM2_MODEL picks which one the worker loads; `small` tracks at roughly
+# twice the frame rate of `large` with softer edges on thin limbs.
+WEIGHTS = {
+    "large": ("sam2.1_hiera_large.pt", "2647878d5dfa5098f2f8649825738a9345572bae2d4350a2468587ece47dd318"),
+    "base_plus": ("sam2.1_hiera_base_plus.pt", "a2345aede8715ab1d5d31b4a509fb160c5a4af1970f199d9054ccfb746c004c5"),
+    "small": ("sam2.1_hiera_small.pt", "6d1aa6f30de5c92224f8172114de081d104bbd23dd9dc5c58996f0cad5dc4d38"),
+    "tiny": ("sam2.1_hiera_tiny.pt", "7402e0d864fa82708a20fbd15bc84245c2f26dff0eb43a4b5b93452deb34be69"),
+}
+MODEL = os.environ.get("FRAME_LINE_SAM2_MODEL", "large").lower()
+if MODEL not in WEIGHTS:
+    raise SystemExit(f"FRAME_LINE_SAM2_MODEL must be one of {', '.join(WEIGHTS)}.")
+WEIGHT_NAME, WEIGHT_SHA256 = WEIGHTS[MODEL]
 
 
 def run(*args, **kwargs):
@@ -39,12 +50,12 @@ def setup():
         run("git", "-C", REPO, "checkout", "--detach", REVISION)
     run(python, "-m", "pip", "install", "--no-build-isolation", "-e", REPO,
         env={**os.environ, "SAM2_BUILD_CUDA": "0"})
-    weights = REPO / "checkpoints/sam2.1_hiera_large.pt"
+    weights = REPO / "checkpoints" / WEIGHT_NAME
     weights.parent.mkdir(exist_ok=True)
     if not weights.exists():
         temporary = weights.with_suffix(".download")
         try:
-            urllib.request.urlretrieve("https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt", temporary)
+            urllib.request.urlretrieve(f"https://dl.fbaipublicfiles.com/segment_anything_2/092824/{WEIGHT_NAME}", temporary)
             with temporary.open("rb") as stream:
                 if hashlib.file_digest(stream, "sha256").hexdigest() != WEIGHT_SHA256:
                     raise RuntimeError("Downloaded checkpoint hash does not match the pinned SAM2 weights.")
@@ -54,8 +65,8 @@ def setup():
     with weights.open("rb") as stream:
         if hashlib.file_digest(stream, "sha256").hexdigest() != WEIGHT_SHA256:
             raise RuntimeError("Installed SAM2 checkpoint differs from the pinned checkpoint.")
-    run(python, ROOT / "scripts/smart-mask.py", "--check")
-    print("Installed SAM 2.1 selection preview. Native hair/motion-blur matting is a separate model capability.")
+    run(python, ROOT / "scripts/smart-mask.py", "--check", env={**os.environ, "FRAME_LINE_SAM2_MODEL": MODEL})
+    print(f"Installed the SAM 2.1 {MODEL} selection preview. Native hair/motion-blur matting is a separate model capability.")
 
 
 if __name__ == "__main__":

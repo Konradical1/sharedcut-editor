@@ -33,13 +33,17 @@
     "setup:masks": "node scripts/setup-venv.mjs .venv-mask scripts/mask-requirements.txt scripts/setup-masks.py",
     "test:masks": "node scripts/venv-run.mjs .venv-mask scripts/smart-mask-check.py && node --experimental-strip-types --test src/services/smartMask.test.ts server/smartMask.test.ts",
     "test:masks:browser": "node --experimental-strip-types scripts/smart-mask-browser-check.mjs",
-    "test:optical-flow": "node --experimental-strip-types scripts/optical-flow-ffmpeg-check.mjs"
+    "test:optical-flow": "node --experimental-strip-types scripts/optical-flow-ffmpeg-check.mjs",
+    "setup:stabilize": "node scripts/setup-venv.mjs .venv-stabilize scripts/stabilize-requirements.txt scripts/stabilize.py --check",
+    "test:stabilize": "node --experimental-strip-types --test server/stabilize.test.ts src/services/stabilize.test.ts src/services/stabilizePreview.test.ts"
+
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@napi-rs/canvas": "^1.0.9",
     "@tailwindcss/vite": "^4.1.0",
     "lucide-react": "^0.468.0",
+    "mediabunny": "1.59.0",
     "motion": "^12.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",

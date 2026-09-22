@@ -1,3 +1,4 @@
+import { resetUploads, uploadQueue } from './upload.ts';
 import { stateDelta, applyStateDelta, shareState, stateEqual, type StateDelta } from './stateDelta.ts';
 import { useEditorStore, persistentState, persistedKeys, sealHistory } from '../state/store.ts';
 import { createId } from './index.ts';
@@ -73,6 +74,7 @@ function cacheDraft() {
   if (!storageFull) { storageFull = true; useEditorStore.getState().notify('Local recovery storage is full', 'error', 'Keep this window open until the server confirms Saved.'); }
 }
 function resetSession(session: 'loading' | 'signedOut' = 'signedOut') {
+  resetUploads();
   if (baseline && !same(baseline, persistentState(useEditorStore.getState()))) cacheDraft();
   generation++;
   stopped?.(); stopped = undefined; clearTimeout(timer);
@@ -82,7 +84,7 @@ function resetSession(session: 'loading' | 'signedOut' = 'signedOut') {
   // Clear server data while the demo persistence subscriber is still disabled.
   connection.enabled = true;
   apply(Object.fromEntries(persistedKeys.map(key => [key, key === 'settings' ? { ...useEditorStore.getInitialState().settings } : key === 'currentUserId' ? '' : []])) as unknown as PersistedState);
-  useEditorStore.setState({ transitionPresets: [], transitionFavorites: [], leaks: [], session, cursor: null, dragPreview: null, playing: false, presence: [], locks: [], modal: null, syncConflict: [], notifications: [], clipboard: null, clipboardClips: [], clipboardNodes: [], projectId: '', timelineId: '', selectedClipId: null, selectedClipIds:[], shapeTool:null,compositionTrail:[], selectedTextIds: [], textSelection: null, textPreview: [], textTool: false, selectedNodeId: null, revealedMediaId: null, liveMode: 'independent', followUserId: null });
+  useEditorStore.setState({ transitionPresets: [], transitionFavorites: [], leaks: [], session, cursor: null, dragPreview: null, playing: false, playbackBuffering: false, presence: [], locks: [], modal: null, syncConflict: [], notifications: [], clipboard: null, clipboardClips: [], clipboardNodes: [], projectId: '', timelineId: '', selectedClipId: null, selectedClipIds:[], shapeTool:null,compositionTrail:[], selectedTextIds: [], textSelection: null, textPreview: [], textTool: false, selectedNodeId: null, revealedMediaId: null, liveMode: 'independent', followUserId: null });
   connection.enabled = false;
 }
 // Media is server-owned. Progress must keep moving even while an edit is saving or conflicted.
@@ -358,9 +360,9 @@ export async function connectSession() {
       const cursor = active ? s.cursor : null;
       // Anything a collaborator can see goes in the signature, so a moving cursor or a running
       // playhead still publishes every tick; only genuinely idle repeats are held back.
-      const signature = JSON.stringify([active, s.projectId, s.timelineId, cursor, s.playhead, s.selectedClipId, s.mediaPresenceTab, s.inspectorPresenceTab, s.workspace, s.liveMode === 'presenting', s.playing, s.dragPreview]);
+      const signature = JSON.stringify([active, s.projectId, s.timelineId, cursor, s.playhead, s.selectedClipId, s.mediaPresenceTab, s.inspectorPresenceTab, s.workspace, s.liveMode === 'presenting', s.playing && !s.playbackBuffering, s.dragPreview]);
       if (!presenceDue(signature, publishedSignature, Date.now() - lastPublished) && (incremental && events?.readyState === 1 || Date.now() - lastPublished < 100)) return;
-      const response = await api<{ presence: Presence[]; serverTime?: number }>('/presence', { method: 'POST', signal: AbortSignal.any([presenceAbort.signal, AbortSignal.timeout(5000)]), body: JSON.stringify({ clientId, active, projectId: s.projectId, timelineId: s.timelineId, cursor, playhead: s.playhead, selectedClipId: s.selectedClipId, mediaTab: s.mediaPresenceTab, inspectorTab: s.inspectorPresenceTab, activity: s.workspace, online: true, presenting: s.liveMode === 'presenting', playing: s.playing, preview: active ? s.dragPreview : null }) });
+      const response = await api<{ presence: Presence[]; serverTime?: number }>('/presence', { method: 'POST', signal: AbortSignal.any([presenceAbort.signal, AbortSignal.timeout(5000)]), body: JSON.stringify({ clientId, active, projectId: s.projectId, timelineId: s.timelineId, cursor, playhead: s.playhead, selectedClipId: s.selectedClipId, mediaTab: s.mediaPresenceTab, inspectorTab: s.inspectorPresenceTab, activity: s.workspace, online: true, presenting: s.liveMode === 'presenting', playing: s.playing && !s.playbackBuffering, preview: active ? s.dragPreview : null }) });
       publishedProject = s.projectId; publishedCursor = !!cursor;
       publishedSignature = signature; lastPublished = Date.now();
       presenceFailures = 0; presenceRetryAt = 0;
@@ -405,6 +407,7 @@ export async function connectSession() {
   // The event stream is the fast path; this only covers frames that arrived while we were busy.
   const catchUp = setInterval(() => { if (session === generation && behind()) drainRefresh(); }, 200);
   const leave = (event: BeforeUnloadEvent) => {
+    if (uploadQueue.getState().jobs.some(job => ['queued', 'uploading'].includes(job.status))) { event.preventDefault(); event.returnValue = ''; }
     if (baseline && !same(baseline, persistentState(useEditorStore.getState()))) {
       cacheDraft(); event.preventDefault(); event.returnValue = '';
     }

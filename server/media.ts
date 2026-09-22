@@ -1,5 +1,6 @@
 import { venvPython, quotedFilterPath } from './platform.ts';
 import { resolveSmartMaskArtifact } from './smartMask.ts';
+import type { SmartMaskManifest } from '../src/services/smartMask.ts';
 import { activeSmartMasks } from '../src/services/smartMaskPreview.ts';
 import { transformMotion, motionArtwork, type MotionPose } from '../src/services/motionBlur.ts';
 import { motionBlurFilters } from './motionBlur.ts';
@@ -21,9 +22,11 @@ import type { Clip, GradeNode, MediaAsset, Project, Timeline, Track } from '../s
 import { colorTransform, cubeText, makeCube, parseCube, hasACES, interpretation, processingStages } from '../src/services/color.ts';
 import { tmpdir, cpus, setPriority } from 'node:os';
 import { renderOpticalFlow } from './opticalFlow.ts';
+import { renderStabilized, stabilizeWarpMattes } from './stabilize.ts';
+import { stabilizeEffect, stabilizeRange, stabilizeSettings } from '../src/services/stabilize.ts';
 import { timingPaths } from '../src/services/opticalFlow.ts';
 
-type ProcessOptions = { signal?: AbortSignal; onProgress?: (percent: number) => void; duration?: number; binary?: boolean; maxBytes?: number; jsonProgress?: boolean };
+type ProcessOptions = { signal?: AbortSignal; onProgress?: (percent: number) => void; duration?: number; binary?: boolean; maxBytes?: number; jsonProgress?: boolean | 'stderr' };
 const ffmpeg = () => process.env.FFMPEG_PATH || 'ffmpeg';
 const ffprobe = () => process.env.FFPROBE_PATH || 'ffprobe';
 // Accept self-contained media only: playlist/concat inputs could read other server files.
@@ -38,9 +41,16 @@ export function run(command: string, args: string[], options: ProcessOptions = {
     // from 57ms to 6.5s and dragged a local 64 MB/s import down to 1 MB/s.
     try { setPriority(child.pid!, BACKGROUND_NICE); } catch { /* Not permitted here; thread budget still caps the load. */ }
     const chunks: Buffer[] = [];
-    let size = 0, stderr = '', progressBuffer = '', failure: Error | undefined, killTimer: ReturnType<typeof setTimeout> | undefined;
+    let size = 0, stderr = '', progressBuffer = '', jsonBuffer = '', failure: Error | undefined, killTimer: ReturnType<typeof setTimeout> | undefined;
     const abort = () => { failure = new Error('Canceled by you'); child.kill('SIGTERM'); killTimer = setTimeout(() => child.kill('SIGKILL'), 2000); killTimer.unref(); };
     options.signal?.addEventListener('abort', abort, { once: true });
+    const jsonProgress = (chunk: Buffer) => {
+      jsonBuffer += chunk.toString();
+      const lines = jsonBuffer.split('\n'); jsonBuffer = (lines.pop() || '').slice(-8000);
+      for (const line of lines) { let value: unknown; try { value = JSON.parse(line).progress; } catch { continue; }
+        if (typeof value === 'number' && Number.isFinite(value)) options.onProgress?.(Math.max(0, Math.min(100, value)));
+      }
+    };
     child.stdout.on('data', (chunk: Buffer) => {
       if (!options.duration || options.binary) {
         size += chunk.length;
@@ -50,14 +60,14 @@ export function run(command: string, args: string[], options: ProcessOptions = {
       if (options.onProgress && !options.binary) {
         progressBuffer += chunk.toString();
         const lines = progressBuffer.split('\n'); progressBuffer = lines.pop() || '';
-        if (options.jsonProgress) for (const line of lines) { try { const value = JSON.parse(line).progress; if (Number.isFinite(value)) options.onProgress(Math.max(0, Math.min(100, value))); } catch { /* Ignore native diagnostics. */ } }
+        if (options.jsonProgress === true) jsonProgress(chunk);
         for (const line of lines) if (line.startsWith('out_time_us=')) {
           const seconds = Number(line.slice(12)) / 1_000_000;
           if (Number.isFinite(seconds) && options.duration) options.onProgress(Math.min(99, Math.max(0, seconds / options.duration * 100)));
         }
       }
     });
-    child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8000); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8000); if (options.jsonProgress === 'stderr') jsonProgress(chunk); });
     child.on('error', error => { failure = new Error(`${path.basename(command)} could not start: ${error.message}. Install FFmpeg or set FFMPEG_PATH and FFPROBE_PATH.`); });
     child.on('close', code => {
       clearTimeout(killTimer); options.signal?.removeEventListener('abort', abort);
@@ -94,7 +104,7 @@ export async function probeMedia(inputPath: string, signal?: AbortSignal) {
   const file = await stat(inputPath);
   if (!file.isFile()) throw new Error('Media source is not a file.');
   const data = JSON.parse((await run(ffprobe(), ['-v', 'error', ...safeInput, '-show_streams', '-show_format', '-of', 'json', inputPath], { signal })).toString()) as {
-    streams: { codec_type: string; codec_name?: string; color_range?: string; color_space?: string; color_primaries?: string; color_transfer?: string; width?: number; height?: number; avg_frame_rate?: string; duration?: string; sample_rate?: string; channels?: number; disposition?: { attached_pic?: number } }[];
+    streams: { codec_type: string; codec_name?: string; color_range?: string; color_space?: string; color_primaries?: string; color_transfer?: string; pix_fmt?: string; width?: number; height?: number; avg_frame_rate?: string; duration?: string; sample_rate?: string; channels?: number; disposition?: { attached_pic?: number } }[];
     format: { duration?: string; format_name?: string };
   };
   const video = data.streams.find(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic);
@@ -108,7 +118,9 @@ export async function probeMedia(inputPath: string, signal?: AbortSignal) {
   let embedded = '';
   try { const head=Buffer.alloc(Math.min(file.size,2*1024*1024)); await handle.read(head,0,head.length,0); embedded=head.toString('latin1'); } finally { await handle.close(); }
   const sony = /(S-Log(?:2|3)?)\/(S-Gamut(?:3(?:\.Cine)?)?)/.exec(embedded);
-  const color = sony ? { inputProfile: sony[1], inputGamut: sony[2], colorEvidence: 'Embedded Sony camera metadata: '+sony[0] } : { colorEvidence: video?.color_transfer ? 'Stream transfer tag: '+video.color_transfer+'; verify camera profile' : 'Camera profile untagged; set input manually for log footage' };
+  // Canon writes no log tag: a CAEP-brand MP4 that is 10-bit with no transfer characteristic is a Canon Log recording, and Canon Log 3 is the camera default.
+  const canon = !sony && embedded.slice(0, 1024).includes('CAEP') && /p10|p12|p16/.test(video?.pix_fmt || '') && !video?.color_transfer;
+  const color = sony ? { inputProfile: sony[1], inputGamut: sony[2], colorEvidence: 'Embedded Sony camera metadata: '+sony[0] } : canon ? { inputProfile: 'Canon Log 3', inputGamut: 'Cinema Gamut', colorEvidence: 'Canon container (CAEP), 10-bit, untagged transfer: Canon Log 3 / Cinema Gamut assumed; choose Canon Log 2 if the camera was set that way' } : { colorEvidence: video?.color_transfer ? 'Stream transfer tag: '+video.color_transfer+'; verify camera profile' : 'Camera profile untagged; set input manually for log footage' };
   return { ...color, colorRange: video?.color_range || 'unknown', colorMatrix: video?.color_space || (color.inputProfile === 'S-Log3' ? 'bt709' : 'auto'), frameRate: video?.avg_frame_rate, kind: image ? 'image' as const : video ? 'video' as const : 'audio' as const, duration, fps, hasAudio: Boolean(audio), resolution: video ? `${video.width} × ${video.height}` : `${Math.round(Number(audio?.sample_rate || 48000) / 1000)} kHz · ${audio?.channels === 1 ? 'Mono' : 'Stereo'}`, width: video?.width, height: video?.height, size: file.size };
 }
 
@@ -165,8 +177,12 @@ const BACKGROUND_NICE = Math.max(0, Math.min(19, Number(process.env.FRAME_LINE_M
  * watchable and cuttable.
  */
 export const SKIP_COLOR_PROXY = process.env.FRAME_LINE_SKIP_COLOR_PROXY === '1';
+// v2: CRF 16. Log footage is low-contrast, so CRF 20 spent ~1.5 Mbit/s and the sky fell apart once a grade
+// stretched it; CRF 16 measured 4.5 Mbit/s at 960p60 with half the sky error, same encode time.
+export const STREAM_VARIANT = 'stream-v2.mp4';
+export const STREAM_LOW_VARIANT = 'stream-low-v1.mp4';
 const common = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-threads', jobThreads, '-filter_threads', jobThreads, '-filter_complex_threads', jobThreads];
-/** Scrubbing proxies (all-intra) plus one long-GOP streaming variant; publish only complete files. */
+/** Scrubbing proxies (all-intra) and two streaming sizes; publish only complete files. */
 export async function preparePreviewVariants(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; onProgress?: (percent: number) => void }) {
   const { inputPath, outputDir, baseUrl, signal } = options;
   const metadata = await probeMedia(inputPath, signal);
@@ -179,7 +195,8 @@ export async function preparePreviewVariants(options: { inputPath: string; outpu
   const variants = {
     '1/2': { name: 'proxy-half-v1.mp4', width: 960, crf: '16', gop: '1' },
     '1/4': { name: 'proxy-quarter-v1.mp4', width: 480, crf: '16', gop: '1' },
-    Stream: { name: 'stream-v1.mp4', width: 960, crf: '20', gop: String(Math.max(2, Math.round((metadata.fps || 24) * 2))) },
+    Stream: { name: STREAM_VARIANT, width: 960, crf: '16', gop: String(Math.max(2, Math.round((metadata.fps || 24) * 2))) },
+    StreamLow: { name: STREAM_LOW_VARIANT, width: 480, crf: '20', gop: String(Math.max(2, Math.round((metadata.fps || 24) * 2))) },
   };
   const audioName = 'audio-v1.m4a';
   // An upgrade pass only owes the variants that are missing; re-encoding what is already on disk
@@ -191,7 +208,7 @@ export async function preparePreviewVariants(options: { inputPath: string; outpu
   try {
     if (pending.length || wantAudio) {
       for (const variant of pending) {
-        args.push('-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'copy', '-vf', `scale=w='min(${variant.width},iw)':h=-2:in_range=${metadata.colorRange === 'pc' ? 'pc' : 'tv'}:out_range=${metadata.colorRange === 'pc' ? 'pc' : 'tv'}:in_color_matrix=bt709:out_color_matrix=bt709:flags=lanczos+accurate_rnd+full_chroma_int,setsar=1`, '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', variant.crf, '-g', variant.gop, '-pix_fmt', metadata.colorRange === 'pc' ? 'yuvj420p' : 'yuv420p', '-color_range', metadata.colorRange === 'pc' ? 'pc' : 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-movflags', '+faststart', path.join(temp, variant.name));
+        args.push('-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'copy', '-vf', `scale=w='min(${variant.width},iw)':h=-2:in_range=${metadata.colorRange === 'pc' ? 'pc' : 'tv'}:out_range=${metadata.colorRange === 'pc' ? 'pc' : 'tv'}:in_color_matrix=bt709:out_color_matrix=bt709:flags=lanczos+accurate_rnd+full_chroma_int,setsar=1`, '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', variant.crf, ...(variant.name === STREAM_LOW_VARIANT ? ['-maxrate','900k','-bufsize','1800k'] : []), '-g', variant.gop, '-pix_fmt', metadata.colorRange === 'pc' ? 'yuvj420p' : 'yuv420p', '-color_range', metadata.colorRange === 'pc' ? 'pc' : 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-movflags', '+faststart', path.join(temp, variant.name));
         written.push(variant.name);
       }
       if (wantAudio) { args.push('-map', '0:a:0', '-vn', '-c:a', 'copy', '-movflags', '+faststart', path.join(temp, audioName)); written.push(audioName); }
@@ -269,20 +286,23 @@ export async function prepareWaveform(inputPath: string, duration: number, signa
   return { waveform, waveformVersion: 2 };
 }
 
-export async function prepareMedia(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; onProgress?: (percent: number) => void; onThumbnail?: (url: string) => void }) {
-  const { inputPath, outputDir, baseUrl, signal, onProgress, onThumbnail } = options;
+export async function prepareMedia(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; onProgress?: (percent: number) => void; onThumbnail?: (url: string) => void; onStage?: (stage: string) => void; onPlayable?: (asset: Awaited<ReturnType<typeof probeMedia>> & {proxyUrl: string; thumbnail: string}) => void }) {
+  const { inputPath, outputDir, baseUrl, signal, onProgress, onThumbnail, onStage, onPlayable } = options;
+  onStage?.('Reading camera metadata');
   const metadata = await probeMedia(inputPath, signal);
   await mkdir(outputDir, { recursive: true });
   const proxyName = metadata.kind === 'audio' ? 'audio.m4a' : metadata.kind === 'image' ? 'image.png' : 'proxy.mp4';
   const proxy = path.join(outputDir, proxyName), thumb = path.join(outputDir, 'thumbnail.jpg');
   const input = [...await decodeAccel(), ...safeInput, '-i', inputPath];
-  let filmstripFrames = 0;
+  let filmstripFrames = 0, published = false;
   onProgress?.(5);
   try {
     if (metadata.kind !== 'audio') {
+      onStage?.('Creating thumbnail');
       await prepareMediaThumbnail(inputPath, outputDir, signal);
       onThumbnail?.(`${baseUrl}/thumbnail.jpg`);
     }
+    onStage?.('Creating playable preview');
     if (metadata.kind === 'image') {
       await run(ffmpeg(), [...common, ...input, '-vf', 'scale=w=1920:h=1080:force_original_aspect_ratio=decrease', '-frames:v', '1', proxy], { signal });
     } else {
@@ -290,14 +310,21 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
       await run(ffmpeg(), [...common, ...input, ...video, '-map', '0:a:0?', '-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '128k', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', proxy], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7) });
     }
     onProgress?.(80);
+    onStage?.('Preparing audio waveform');
     const peaks = metadata.hasAudio ? await prepareWaveform(inputPath, metadata.duration, signal) : { waveform: [], waveformVersion: 2 };
+    onPlayable?.({ ...metadata, ...peaks, proxyUrl: `${baseUrl}/${proxyName}`, thumbnail: metadata.kind === 'audio' ? '' : `${baseUrl}/thumbnail.jpg` });
+    published = Boolean(onPlayable);
+    if (metadata.kind === 'video') onStage?.('Creating smaller playback previews');
     const previews: Pick<MediaAsset, 'proxyVariants' | 'audioProxyUrl'> = metadata.kind === 'video' ? await preparePreviewVariants({ inputPath: proxy, outputDir, baseUrl, signal, onProgress: value => onProgress?.(80 + value * .19) }) : {};
     // After the variants, so the strip is tiled from the 480px proxy rather than the 4K original.
+    if (metadata.kind === 'video') onStage?.('Creating timeline thumbnails');
     if (metadata.kind === 'video') filmstripFrames = await prepareMediaFilmstrip(inputPath, outputDir, metadata.duration, signal);
+    if (onPlayable) onPlayable({ ...metadata, ...peaks, ...previews, proxyUrl: `${baseUrl}/${proxyName}`, thumbnail: metadata.kind === 'audio' ? '' : `${baseUrl}/thumbnail.jpg`, ...(filmstripFrames ? { filmstrip: `${baseUrl}/filmstrip.jpg`, filmstripFrames, filmstripVersion: FILMSTRIP_VERSION } : {}) });
+    if (metadata.kind === 'video' && !SKIP_COLOR_PROXY) onStage?.('Creating high-precision color preview');
     const colorPreview=metadata.kind==='video'&&!SKIP_COLOR_PROXY?await prepareColorProxy({inputPath,outputDir,baseUrl,signal}):{};
     onProgress?.(100);
     return { ...metadata, ...previews, ...colorPreview, proxyUrl: `${baseUrl}/${proxyName}`, thumbnail: metadata.kind === 'audio' ? '' : `${baseUrl}/thumbnail.jpg`, ...(filmstripFrames ? { filmstrip: `${baseUrl}/filmstrip.jpg`, filmstripFrames, filmstripVersion: FILMSTRIP_VERSION } : {}), ...peaks };
-  } catch (error) { await rm(proxy, { force: true }); throw error; }
+  } catch (error) { if (!published) await rm(proxy, { force: true }); throw error; }
 }
 
 function audioFilters(clip: Clip): string[] {
@@ -328,6 +355,7 @@ function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset
       const alpha=effect.parameters?.invert?'(1-B/65535)':'B/65535';
       filters.push(`format=gbrap16le,split=2[${label}rgb][${label}a];[${label}a]extractplanes=a[${label}old];[${mask.index}:v:0]${mask.timing.join(',')},format=gray16le[${label}mask];[${label}old][${label}mask]blend=all_expr='A*(1-${q}+${q}*${alpha})'[${label}new];[${label}rgb][${label}new]mergeplanes=0x00010210:gbrap16le`);
     }
+    else if (effect.name === 'Stabilize') { /* Baked into replacement media before compositing; see renderStabilizedTimeline. */ }
     else if (effect.name === 'Film grain') filters.push(`noise=alls=${Math.round(amount / 3)}:allf=t+u:all_seed=${Math.round(effectValue(clip,effect,'seed'))}`);
     else if (effect.name === 'Bloom') {
       const cut = Math.round(effectValue(clip,effect,'threshold') / 100 * 255), gain = (1 / Math.max(.05, 1 - effectValue(clip,effect,'threshold') / 100)).toFixed(3);
@@ -343,22 +371,29 @@ function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset
   return filters;
 }
 
+/** A clip whose own span changes over time, and so cannot be composited in a single pass. */
+export const isAnimated = (clip: Clip) => Boolean(Object.keys(clip.keyframes ?? {}).length || isTitle(clip) && getText(clip).typingEnabled);
+
 export interface RenderRequest {
   project: Project; timeline: Timeline; timelines?: Timeline[]; clips: Clip[]; tracks: Track[]; nodes: GradeNode[];
   assets: { asset: MediaAsset; path: string }[]; settings: Record<string, string>; outputPath: string;
-  signal?: AbortSignal; onProgress?: (percent: number) => void; resolveDir?: string; smartMaskDir?: string;
+  signal?: AbortSignal; onProgress?: (percent: number) => void; onStage?: (stage: string) => void; resolveDir?: string; smartMaskDir?: string; stabilizeDir?: string;
   /** Internal composition renders keep alpha and defer the master limiter to the outer timeline. */
   transparent?: boolean; compositionPath?: string[]; sampledFrame?: boolean;
   transformSamples?: Record<string, MotionPose[]>;
   /** Resolves a light-leak id from the shared overlay pack to a file on disk. */
   overlayPath?: (id: string) => string | null;
+  /** Mattes already re-rendered to match a baked picture, keyed `clipId:maskId`. Stabilize fills this so a
+   *  Smart Mask lands on the stabilized frame; without it the matte would sit on the original framing. */
+  maskArtifacts?: Map<string, { directory: string; manifest: SmartMaskManifest }>;
 }
 
 export async function renderTimeline(request: RenderRequest): Promise<void> {
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&isCaption(c)))return renderCaptionTimeline(request);
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&c.mediaId==='frameline-composition'&&!c.disabled))return renderCompositions(request);
+  if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c)))return renderStabilizedTimeline(request);
   if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&c.properties.opticalFlow))return renderFlowTimeline(request);
-  if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&(Object.keys(c.keyframes??{}).length||isTitle(c)&&getText(c).typingEnabled))) {
+  if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&isAnimated(c))) {
     // Animated export bakes the timeline down to one flattened clip, which a transition spanning
     // two clips cannot survive. Render each window first and splice it in as an ordinary clip.
     if (timelineTransitions(request.clips.filter(clip => clip.projectId === request.project.id), request.timeline.id, request.assets.map(entry => entry.asset)).length) return renderFlattenedTransitions(request);
@@ -397,6 +432,13 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       if (typeof name === 'string' && name && !transitionDefinitions[name]) throw new Error(`${clip.name}: the ${name} transition is not available in this version. Remove it before exporting.`);
     }
   }
+  const colorClips = clips.filter(clip => {
+    const track = tracks.find(track => track.id === clip.trackId);
+    return track?.kind === 'video' && !track.hidden && (activeSmartMasks(clip, request.nodes).length > 0 || clip.properties.colorPipeline === 'nodes-v2' && hasACES(request.nodes, clip.id));
+  });
+  // Stage weights estimate work, not time; native frame counts supply progress within each stage.
+  const colorBudget = colorClips.length ? 50 : 0;
+  let colorsDone = 0;
   const overlayInputs = new Map<string, number>();
   const lutDir = await mkdtemp(path.join(tmpdir(), 'frameline-color-'));
   try {
@@ -531,7 +573,6 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     const explicitAudio = clips.some(other => other.id !== clip.id && tracks.find(t => t.id === other.trackId)?.kind === 'audio' && other.mediaId === clip.mediaId && other.start === clip.start && other.sourceIn === clip.sourceIn && other.duration === clip.duration);
     const audible = audio !== 'Disabled' && source.asset.hasAudio && !p.freeze && !track.muted && (!solo || track.solo) && !(track.kind === 'video' && (clip.properties.audioDetached || explicitAudio));
     if (!visual && !audible) continue;
-    if (p.stabilization) throw new Error(`${clip.name}: stabilization is not available. Disable stabilization before exporting.`);
     if (p.blendMode && p.blendMode !== 'Normal') throw new Error(`${clip.name}: ${p.blendMode} blending is not available. Choose Normal.`);
 
     const speed = property('speed', 100, 1, 800) / 100;
@@ -572,7 +613,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         const matrix=String(p.yuvMatrix||source.asset.colorMatrix||metadata.colorMatrix||'auto').replace('bt2020-ncl','bt2020nc');
         const masks=usedMasks.map(document=>{
           if(!request.smartMaskDir)throw Error(`${clip.name}: Smart Mask storage is unavailable.`);
-          const artifact=resolveSmartMaskArtifact(request.smartMaskDir,clip,document,source.path,source.asset),manifest=artifact.manifest;
+          // A baked picture (Stabilize) hands over its own re-warped matte; everything else resolves the stored one.
+          const artifact=request.maskArtifacts?.get(`${clip.id}:${document.id}`)??resolveSmartMaskArtifact(request.smartMaskDir,clip,document,source.path,source.asset),manifest=artifact.manifest;
           if(manifest.quality!=='final')throw Error(`${clip.name}: analyze a final-quality Smart Mask before exporting.`);
           if(manifest.width!==metadata.width||manifest.height!==metadata.height)throw Error(`${clip.name}: Smart Mask dimensions differ from the source.`);
           const times=manifest.sourceTimes!,step=1/(metadata.fps||fps);
@@ -585,7 +627,13 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         await writeFile(jobPath,JSON.stringify({input:source.path,output,ffmpeg:ffmpeg(),image:source.asset.kind==='image',seek:renderSeek,duration:decoded,width:metadata.width,height:metadata.height,fps:source.asset.kind==='image'?fps:metadata.frameRate||metadata.fps,numericFps:metadata.fps||fps,frames:frameTimes?.length??Math.ceil(decoded*(metadata.fps||fps)),frameTimes,masks,alpha:masks.length>0,managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)}));
         const python=process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color');
         if(!existsSync(python))throw Error('OpenColorIO export is not installed. Run npm run setup:color on the server.');
-        await run(python,[path.resolve('scripts/color-render.py'),jobPath],{signal:request.signal});
+        const colorStage = `Processing color · ${clip.name} (${colorsDone + 1}/${colorClips.length})`;
+        request.onStage?.(colorStage);
+        await run(python,[path.resolve('scripts/color-render.py'),jobPath],{signal:request.signal,jsonProgress:'stderr',onProgress:p=>{
+          request.onStage?.(`${colorStage} · ${Math.floor(p)}%`);
+          onProgress?.((colorsDone+p/100)/colorClips.length*colorBudget);
+        }});
+        onProgress?.(++colorsDone/colorClips.length*colorBudget);
         args.push('-i',output);videoIndex=inputIndex++;
         for(const mask of masks)if(mask.output){
           args.push('-i',mask.output);const timing=['setpts=PTS-STARTPTS'];
@@ -694,8 +742,9 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   }
   args.push('-threads', '2', '-t', String(duration), '-r', String(fps), '-color_range', 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', outputPath);
   await mkdir(path.dirname(outputPath), { recursive: true });
-  onProgress?.(0);
-  try { await run(ffmpeg(), args, { signal, duration, onProgress }); onProgress?.(100); }
+  request.onStage?.('Encoding video and audio');
+  onProgress?.(colorBudget);
+  try { await run(ffmpeg(), args, { signal, duration, onProgress: p => onProgress?.(colorBudget+p*(100-colorBudget)/100) }); onProgress?.(100); }
   catch (error) { await rm(outputPath, { force: true }); throw error; }
   } finally { await rm(lutDir, { recursive: true, force: true }); }
 }
@@ -721,7 +770,7 @@ async function renderFlattenedTransitions(request: RenderRequest) {
       if (!sides.length) continue;
       // The window is rendered whole, so a keyframed *participant* would need per-frame baking of
       // the blend itself. Animation elsewhere on the timeline is fine and is baked afterwards.
-      const animated = sides.find(clip => Object.keys(clip.keyframes ?? {}).length || isTitle(clip) && getText(clip).typingEnabled);
+      const animated = sides.find(isAnimated);
       if (animated) throw new Error(`${animated.name}: a transition cannot sit on a keyframed clip. Remove the keyframes on that clip, or the ${record.name} transition, before exporting.`);
       const track = request.tracks.find(item => item.id === sides[0].trackId);
       if (!track) continue;
@@ -729,9 +778,10 @@ async function renderFlattenedTransitions(request: RenderRequest) {
       const mediaId = `transition-render-${index}`;
       // Track gain, pan and solo are applied once, when the spliced clip is placed back.
       const neutral = request.tracks.map(item => item.id === track.id ? { ...item, gain: 0, pan: 0, solo: false } : { ...item, solo: false });
+      request.onStage?.(`Rendering transition ${index+1}/${records.length} · ${record.name}`);
       await renderTimeline({
         ...request, clips: sides, tracks: neutral, timelines: undefined, transparent: true, sampledFrame: false,
-        outputPath, onProgress: undefined, compositionPath: undefined,
+        outputPath, onStage: undefined, onProgress: p => request.onProgress?.((index+p/100)/records.length*30), compositionPath: undefined,
         settings: { ...request.settings, resolution: request.project.resolution, rangeIn: String(record.start), rangeOut: String(record.end),
           codec: 'Apple ProRes 4444', audio: request.settings.audio === 'Disabled' ? 'Disabled' : 'Linear PCM · 24-bit · 48 kHz', masterGain: '0', masterMuted: 'false' },
       });
@@ -744,11 +794,60 @@ async function renderFlattenedTransitions(request: RenderRequest) {
           start: record.start, duration: span, sourceIn: 0, color: '#8fb3c4', disabled: false, properties: {}, effects: [] },
       ];
     }
-    const flattened = { ...request, clips, assets };
+    const flattened = { ...request, clips, assets, onProgress: (p: number) => request.onProgress?.(30+p*.7) };
     // Only the pre-rendered windows needed transitions; what remains may not even be animated.
-    if (clips.some(clip => clip.timelineId === request.timeline.id && (Object.keys(clip.keyframes ?? {}).length || isTitle(clip) && getText(clip).typingEnabled))) return await renderAnimatedTimeline(flattened);
+    if (clips.some(clip => clip.timelineId === request.timeline.id && !clip.disabled && isAnimated(clip))) return await renderAnimatedTimeline(flattened);
     return await renderTimeline(flattened);
   } finally { await rm(directory, { recursive: true, force: true }); }
+}
+
+/** Bake stabilized picture as source-time replacement media, then composite normally. Timing edits stay on the clip. */
+async function renderStabilizedTimeline(request: RenderRequest) {
+  const directory=await mkdtemp(path.join(tmpdir(),'frameline-stabilize-export-'));
+  try {
+  const clips=[...request.clips],assets=[...request.assets],tracks=[...request.tracks];
+  const records=timelineTransitions(clips.filter(c=>c.projectId===request.project.id),request.timeline.id,assets.map(a=>a.asset));
+  const candidates=clips.filter(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c));
+  const maskArtifacts=new Map(request.maskArtifacts);
+  for(const [index,clip] of candidates.entries()) {
+    if(clip.properties.opticalFlow)throw Error(`${clip.name}: Stabilize and optical flow cannot share a clip yet. Disable optical flow or remove Stabilize.`);
+    const source=assets.find(a=>a.asset.id===clip.mediaId),track=tracks.find(t=>t.id===clip.trackId);
+    if(!source||source.asset.kind!=='video'||!track)throw new Error(`${clip.name}: Stabilize requires a video source.`);
+    const span=clipSpan(clip,records),geo=extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
+    const sourceFps=source.asset.fps||finite(request.settings.fps||request.project.fps,'Frame rate',1,120);
+    const range=stabilizeRange(geo,sourceFps,source.asset.duration);
+    const settings=stabilizeSettings(clip,stabilizeEffect(clip)!);
+    // Resolve every matte against the original before the source is swapped for the bake, then move each one
+    // with the picture's own matrices. Stabilize first, Smart Mask on top of the stabilized frame.
+    const documents=activeSmartMasks(clip,request.nodes);
+    // Moving the mattes owns the front fifth of this clip's slice; the bake owns the rest.
+    const mattes=documents.length?.2:0;
+    const report=(fraction:number)=>request.onProgress?.((index+Math.max(0,Math.min(1,fraction)))/candidates.length*45);
+    for(const [order,document] of documents.entries()) {
+      if(!request.smartMaskDir)throw Error(`${clip.name}: Smart Mask storage is unavailable.`);
+      const artifact=resolveSmartMaskArtifact(request.smartMaskDir,clip,document,source.path,source.asset);
+      const warped=path.join(directory,`mask-${clip.id}-${document.id}`);
+      await mkdir(path.join(warped,'frames'),{recursive:true});
+      await stabilizeWarpMattes({input:source.path,directory:request.stabilizeDir??directory,range,settings,signal:request.signal,
+        onProgress:p=>report(mattes*(order+p/100)/documents.length),
+        frames:artifact.manifest.frames.map(f=>({input:path.join(artifact.directory,f.file),output:path.join(warped,f.file),time:f.time}))});
+      maskArtifacts.set(`${clip.id}:${document.id}`,{directory:warped,manifest:artifact.manifest});
+    }
+    request.onStage?.(`Stabilizing · ${clip.name}`);
+    const baked=await renderStabilized({input:source.path,directory,analysisDirectory:request.stabilizeDir,range,from:range.from,to:range.to,settings,preview:false,signal:request.signal,onProgress:p=>report(mattes+(1-mattes)*p/100)});
+    const mediaId=`stabilize-${clip.id}`,metadata=await probeMedia(baked.output,request.signal);
+    assets.push({path:baked.output,asset:{...source.asset,id:mediaId,duration:range.to-range.from,fps:metadata.fps||sourceFps,hasAudio:false,colorRange:metadata.colorRange,colorMatrix:metadata.colorMatrix}});
+    clips[clips.indexOf(clip)]={...clip,mediaId,sourceIn:clip.sourceIn-range.from,effects:clip.effects.filter(e=>e.name!=='Stabilize'),properties:{...clip.properties,audioDetached:true}};
+    const explicitAudio=request.clips.some(other=>other.id!==clip.id&&tracks.find(t=>t.id===other.trackId)?.kind==='audio'&&other.mediaId===clip.mediaId&&other.start===clip.start&&other.sourceIn===clip.sourceIn&&other.duration===clip.duration);
+    if(source.asset.hasAudio&&!clip.properties.audioDetached&&!explicitAudio&&request.settings.audio!=='Disabled') {
+      const audioId=`stabilize-audio-${clip.id}`;
+      tracks.push({...track,id:audioId,kind:'audio'});
+      // The original carries the sound; the bake is picture only.
+      clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name))});
+    }
+  }
+  await renderTimeline({...request,clips,assets,tracks,maskArtifacts,onProgress:p=>request.onProgress?.(45+p*.55)});
+  } finally {await rm(directory,{recursive:true,force:true});}
 }
 
 /** Bake optical flow before compositing; all subsequent frame reads use the same retimed footage. */
@@ -764,6 +863,7 @@ async function renderFlowTimeline(request: RenderRequest) {
       const source=assets.find(a=>a.asset.id===clip.mediaId),track=tracks.find(t=>t.id===clip.trackId);
       if(!source||source.asset.kind!=='video'||!track)throw new Error(`${clip.name}: optical flow requires a video source.`);
       const span=clipSpan(clip,records),geo=extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
+      request.onStage?.(`Optical flow · ${clip.name}`);
       const baked=await renderOpticalFlow({clip:geo,asset:source.asset,input:source.path,directory,fps,signal:request.signal,onProgress:p=>request.onProgress?.((index+p/100)/candidates.length*45)});
       const mediaId=`flow-${clip.id}`,metadata=await probeMedia(baked.output,request.signal);
       assets.push({path:baked.output,asset:{...source.asset,id:mediaId,duration:geo.duration,fps,hasAudio:false,colorRange:metadata.colorRange,colorMatrix:metadata.colorMatrix}});
@@ -776,9 +876,8 @@ async function renderFlowTimeline(request: RenderRequest) {
         clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,opticalFlow:false,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name))});
       }
     }
-    const animated=(clip:Clip)=>Object.keys(clip.keyframes??{}).length||isTitle(clip)&&getText(clip).typingEnabled;
-    const pictures=clips.filter(c=>tracks.find(t=>t.id===c.trackId)?.kind==='video');
-    if(!records.length&&clips.some(animated)&&!pictures.some(animated)&&request.settings.audio!=='Disabled') {
+        const pictures=clips.filter(c=>tracks.find(t=>t.id===c.trackId)?.kind==='video');
+    if(!records.length&&clips.some(isAnimated)&&!pictures.some(isAnimated)&&request.settings.audio!=='Disabled') {
       // Speed-only picture is already baked. Audio automation must not force full-resolution picture through one render per frame.
       const video=path.join(directory,request.settings.codec?.includes('ProRes')?'picture.mov':'picture.mp4'),sound=path.join(directory,'sound.mov');
       await renderTimeline({...request,clips:pictures,assets,tracks,outputPath:video,settings:{...request.settings,audio:'Disabled'},onProgress:p=>request.onProgress?.(45+p*.15)});
@@ -789,6 +888,25 @@ async function renderFlowTimeline(request: RenderRequest) {
   } finally {await rm(directory,{recursive:true,force:true});}
 }
 
+/**
+ * The frame spans animated clips occupy, snapped outward to the bake's frame grid and merged.
+ *
+ * Frame `f` of the bake covers `[start + f/fps, start + (f+1)/fps)`, so a window has to be a whole
+ * number of frames measured from the export's in point or the spliced result lands off-grid.
+ */
+export function animatedWindows(clips: Clip[], timelineId: string, fps: number, start: number, count: number) {
+  const windows: { from: number; to: number }[] = [];
+  for (const span of clips.filter(clip => clip.timelineId === timelineId && !clip.disabled && isAnimated(clip))
+    .map(clip => ({ from: Math.max(0, Math.floor((clip.start - start) * fps + 1e-7)), to: Math.min(count, Math.ceil((clip.start + clip.duration - start) * fps - 1e-7)) }))
+    .filter(span => span.to > span.from)
+    .sort((a, b) => a.from - b.from)) {
+    const last = windows.at(-1);
+    if (last && span.from <= last.to) last.to = Math.max(last.to, span.to);
+    else windows.push(span);
+  }
+  return windows;
+}
+
 /** Reuse the static renderer for arbitrary animated properties, including future effects. */
 async function renderAnimatedTimeline(request: RenderRequest) {
   const fps=finite(request.settings.fps||request.project.fps,'Frame rate',1,120);
@@ -796,34 +914,59 @@ async function renderAnimatedTimeline(request: RenderRequest) {
   const end=finite(request.settings.rangeOut??request.timeline.duration,'Range out',start+1/fps-1e-8,request.timeline.duration);
   for(const clip of request.clips)if(clip.keyframes)validateKeyframes(clip.keyframes);
   const directory=await mkdtemp(path.join(tmpdir(),'frameline-animation-'));
-  const count=Math.ceil((end-start)*fps-1e-7), files:string[]=[];
+  const count=Math.ceil((end-start)*fps-1e-7);
+  // Only the frames an animated clip actually covers are worth one render each. Everything else is
+  // spliced back as ordinary clips and composited in a single pass, the way transition windows
+  // already are: one keyframe must not cost a 30-minute edit a render per frame.
+  const windows=animatedWindows(request.clips,request.timeline.id,fps,start,count);
+  const total=windows.reduce((frames,window)=>frames+window.to-window.from,0);
+  // Solo and hidden are read off the original tracks: the bake applies them internally, so the
+  // spliced result has to survive the same filters that dropped the clips it replaced.
+  const ownTracks=request.tracks.filter(t=>t.timelineId===request.timeline.id);
+  const soloed=ownTracks.some(t=>t.solo&&!t.muted);
+  const picture=ownTracks.filter(t=>t.kind==='video');
+  const hidden=picture.length>0&&picture.every(t=>t.hidden);
   try {
-    // ponytail: per-frame baking reuses all static effects; batch/GPU rendering when export throughput matters.
-    for(let frame=0;frame<count;frame++) {
-      if(request.signal?.aborted)throw new Error('Canceled by you');
-      const time=start+frame/fps, duration=1/fps;
-      const active=request.clips.filter(c=>c.timelineId===request.timeline.id&&c.start<=time+1e-8&&c.start+c.duration>time+1e-8);
-      let nodes=request.nodes;
-      const transformSamples:Record<string,MotionPose[]>={};
-      const [projectWidth,projectHeight]=dimensions(request.project.resolution);
-      const clips=active.map(original=>{
-        nodes=evaluateNodes(nodes,original,time);
-        const clip=evaluateClip(original,time,fps),elapsed=time-original.start,rate=Number(clip.properties.speed??100)/100;
-        transformSamples[clip.id]=transformMotion(clip,time,request.project.fps,projectWidth,projectHeight);
-        const offset=animatedSourceOffset(original,elapsed,fps)-(clip.properties.reverse?Math.max(0,rate-1)/fps:0);
-        const volume=fadeLevel(clip,time,true);
-        return {...clip,keyframes:undefined,transition:'',start:0,duration,sourceIn:Math.max(0,original.sourceIn+offset),properties:{...clip.properties,transitionOut:'',opacity:Number(clip.properties.opacity??100)*fadeLevel(clip,time),gain:volume>0?Math.max(-60,Number(clip.properties.gain??0)+20*Math.log10(volume)):-60,fadeIn:0,fadeOut:0,audioFadeIn:0,audioFadeOut:0,fadeOrigin:0,fadeDuration:duration}};
-      });
-      const outputPath=path.join(directory,`${frame}.mov`);files.push(`file '${outputPath}'`);
-      await renderTimeline({...request,sampledFrame:true,transformSamples,clips,nodes,timeline:{...request.timeline,duration},outputPath,onProgress:undefined,settings:{...request.settings,rangeIn:'0',rangeOut:String(duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
-      request.onProgress?.((frame+1)/count*90);
+    let clips=[...request.clips];
+    const assets=[...request.assets],tracks=[...request.tracks];
+    let rendered=0;
+    for(const [index,window] of windows.entries()) {
+      const files:string[]=[];
+      // ponytail: per-frame baking reuses all static effects; batch/GPU rendering when export throughput matters.
+      for(let frame=window.from;frame<window.to;frame++) {
+        if(request.signal?.aborted)throw new Error('Canceled by you');
+        const time=start+frame/fps, duration=1/fps;
+        const active=request.clips.filter(c=>c.timelineId===request.timeline.id&&c.start<=time+1e-8&&c.start+c.duration>time+1e-8);
+        let nodes=request.nodes;
+        const transformSamples:Record<string,MotionPose[]>={};
+        const [projectWidth,projectHeight]=dimensions(request.project.resolution);
+        const frameClips=active.map(original=>{
+          nodes=evaluateNodes(nodes,original,time);
+          const clip=evaluateClip(original,time,fps),elapsed=time-original.start,rate=Number(clip.properties.speed??100)/100;
+          transformSamples[clip.id]=transformMotion(clip,time,request.project.fps,projectWidth,projectHeight);
+          const offset=animatedSourceOffset(original,elapsed,fps)-(clip.properties.reverse?Math.max(0,rate-1)/fps:0);
+          const volume=fadeLevel(clip,time,true);
+          return {...clip,keyframes:undefined,transition:'',start:0,duration,sourceIn:Math.max(0,original.sourceIn+offset),properties:{...clip.properties,transitionOut:'',opacity:Number(clip.properties.opacity??100)*fadeLevel(clip,time),gain:volume>0?Math.max(-60,Number(clip.properties.gain??0)+20*Math.log10(volume)):-60,fadeIn:0,fadeOut:0,audioFadeIn:0,audioFadeOut:0,fadeOrigin:0,fadeDuration:duration}};
+        });
+        const outputPath=path.join(directory,`${index}-${frame}.mov`);files.push(`file '${outputPath}'`);
+        request.onStage?.(`Rendering animation · frame ${rendered+1}/${total}`);
+        await renderTimeline({...request,onStage:undefined,sampledFrame:true,transformSamples,clips:frameClips,nodes,timeline:{...request.timeline,duration},outputPath,onProgress:undefined,settings:{...request.settings,rangeIn:'0',rangeOut:String(duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
+        request.onProgress?.(++rendered/total*90);
+      }
+      const list=path.join(directory,`${index}.txt`),baked=path.join(directory,`${index}.mov`);await writeFile(list,files.join('\n'));
+      await run(ffmpeg(),[...common,'-f','concat','-safe','0','-i',list,'-c','copy',baked],{signal:request.signal});
+      const at=start+window.from/fps, span=(window.to-window.from)/fps, mediaId=`animation-${index}`, trackId=`animation-track-${index}`;
+      tracks.push({id:trackId,timelineId:request.timeline.id,name:'Animation',kind:'video',number:1000+index,muted:false,solo:soloed,locked:false,hidden,gain:0,pan:0});
+      assets.push({path:baked,asset:{id:mediaId,projectId:request.project.id,name:'Animation',kind:'video',binId:'',thumbnail:'',duration:span,resolution:request.settings.resolution||request.project.resolution,fps,size:'',status:'ready',progress:100,hasAudio:request.settings.audio!=='Disabled',inputProfile:'Rec.709'}});
+      clips=[
+        ...clips.flatMap(clip=>clip.timelineId===request.timeline.id?uncoveredParts(clip,at,at+span):[clip]),
+        {id:mediaId,projectId:request.project.id,timelineId:request.timeline.id,trackId,mediaId,name:'Animation',start:at,duration:span,sourceIn:0,color:'#668b9e',disabled:false,properties:{},effects:[]},
+      ];
     }
-    const list=path.join(directory,'frames.txt'),baked=path.join(directory,'animation.mov');await writeFile(list,files.join('\n'));
-    await run(ffmpeg(),[...common,'-f','concat','-safe','0','-i',list,'-c','copy',baked],{signal:request.signal});
-    const track:Track={id:'animation-track',timelineId:request.timeline.id,name:'Animation',kind:'video',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0};
-    const clip:Clip={id:'animation-clip',projectId:request.project.id,timelineId:request.timeline.id,trackId:track.id,mediaId:'animation-media',name:'Animation',start:0,duration:count/fps,sourceIn:0,color:'#668b9e',disabled:false,properties:{},effects:[]};
-    const asset:MediaAsset={id:clip.mediaId,projectId:request.project.id,name:'Animation',kind:'video',binId:'',thumbnail:'',duration:count/fps,resolution:request.settings.resolution||request.project.resolution,fps,size:'',status:'ready',progress:100,hasAudio:request.settings.audio!=='Disabled',inputProfile:'Rec.709'};
-    await renderTimeline({...request,timeline:{...request.timeline,duration:count/fps},clips:[clip],tracks:[track],nodes:[],assets:[{asset,path:baked}],settings:{...request.settings,rangeIn:'0',rangeOut:String(end-start)},onProgress:p=>request.onProgress?.(90+p/10)});
+    // Whatever animation is left lies outside the export range by construction — a window is clamped
+    // to it. Dropping those remnants is what guarantees the flattened timeline cannot route back here.
+    clips=clips.filter(clip=>!(clip.timelineId===request.timeline.id&&isAnimated(clip)));
+    await renderTimeline({...request,clips,tracks,assets,onProgress:p=>request.onProgress?.(total?90+p/10:p)});
   } finally {await rm(directory,{recursive:true,force:true});}
 }
 
@@ -840,11 +983,12 @@ async function renderCompositions(request: RenderRequest) {
       const timeline=request.timelines?.find(t=>t.id===parent.properties.compositionId&&t.projectId===request.project.id);
       if(!timeline)throw new Error(`${parent.name}: composition timeline is missing.`);
       const outputPath=path.join(directory,`${index}.mov`),mediaId=`composition-render-${parent.id}`;
-      await renderTimeline({...request,timeline,compositionPath:[...ancestry,request.timeline.id],transparent:true,sampledFrame:false,outputPath,onProgress:undefined,settings:{...request.settings,resolution:request.project.resolution,rangeIn:'0',rangeOut:String(timeline.duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
+      request.onStage?.(`Rendering composition ${index+1}/${parents.length} · ${parent.name}`);
+      await renderTimeline({...request,timeline,onStage:undefined,compositionPath:[...ancestry,request.timeline.id],transparent:true,sampledFrame:false,outputPath,onProgress:p=>request.onProgress?.((index+p/100)/parents.length*50),settings:{...request.settings,resolution:request.project.resolution,rangeIn:'0',rangeOut:String(timeline.duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
       clips[clips.indexOf(parent)]={...parent,mediaId};
       assets.push({path:outputPath,asset:{id:mediaId,projectId:request.project.id,name:parent.name,kind:'video',duration:timeline.duration,binId:'',thumbnail:'',fps:Number(request.settings.fps||request.project.fps),resolution:request.project.resolution,size:'',status:'ready',progress:100,hasAudio:request.settings.audio!=='Disabled',inputProfile:'Rec.709'}});
     }
-    await renderTimeline({...request,clips,assets});
+    await renderTimeline({...request,clips,assets,onProgress:p=>request.onProgress?.(50+p*.5)});
   } finally {await rm(directory,{recursive:true,force:true});}
 }
 

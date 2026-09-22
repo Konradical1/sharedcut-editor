@@ -27,6 +27,7 @@ export async function renderCaptionTimeline(request: RenderRequest) {
   if(!Number.isFinite(fps)||fps<1||fps>120||!Number.isFinite(start)||!Number.isFinite(end)||start<0||end<=start||end>21600||end>request.timeline.duration||[width,height,pw,ph].some(n=>!Number.isInteger(n)||n<16||n>4096||n%2))throw new Error('Invalid caption export range or dimensions.');
   const captions=request.clips.filter(c=>c.timelineId===request.timeline.id&&isCaption(c)&&!c.disabled&&c.start<end&&c.start+c.duration>start&&!request.tracks.find(t=>t.id===c.trackId)?.hidden).sort((a,b)=>a.start-b.start);
   for(const c of captions){if(c.effects.some(e=>e.enabled)||['cropLeft','cropRight','cropTop','cropBottom'].some(k=>Number(c.properties[k]??0)))throw new Error('Caption lines use caption presets. Remove clip effects or cropping before export.');const doc=getText(c);validateText(doc);for(const run of doc.runs)if(!GlobalFonts.has(run.style.fontFamily))throw new Error(`Missing caption font: ${run.style.fontFamily}`);}
+  request.onStage?.('Rendering captions');
   const directory=await mkdtemp(join(tmpdir(),'frameline-captions-'));
   const output=join(directory,'captions.mov');
   const child=spawn(process.env.FFMPEG_PATH||'ffmpeg',['-v','error','-y','-f','rawvideo','-pixel_format','rgba','-video_size',`${width}x${height}`,'-framerate',String(fps),'-i','pipe:0','-an','-c:v','prores_ks','-threads','2','-profile:v','4','-pix_fmt','yuva444p10le',output],{stdio:['pipe','ignore','pipe']});

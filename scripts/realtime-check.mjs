@@ -29,12 +29,14 @@ try {
   await actor.getByRole('button',{name:'Add Rectangle shape',exact:true}).click();
   await actor.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
   const projectUrl=actor.url();
+  // Stop browser saves before seeding a large server snapshot directly.
+  await actor.goto('about:blank');
   const snapshot=await (await contexts[0].request.get(`${url}/api/state`)).json();
   const template=snapshot.state.operations[0];
   snapshot.state.operations.push(...Array.from({length:2298},(_,i)=>({...template,id:`load-history-${i}`,description:'x'.repeat(3500),oldState:[],newState:[]})));
   result.workspaceBytes=Buffer.byteLength(JSON.stringify(snapshot.state));
   assert.equal((await contexts[0].request.put(`${url}/api/state`,{data:snapshot})).status(),200);
-  await actor.reload();
+  await actor.goto(projectUrl);
   await Promise.all(observers.map(p=>p.goto(projectUrl)));
   await Promise.all(pages.map(p=>p.locator('.timeline-track').first().waitFor()));
   await Promise.all(pages.map(p=>p.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved')));
