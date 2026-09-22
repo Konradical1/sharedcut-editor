@@ -143,7 +143,7 @@ def process_frames(source,target,job,mask_targets=None):
         output=np.ascontiguousarray(rgb.transpose(2,0,1)[[1,2,0]],dtype='<f4')
         if channels==4: output=np.concatenate([output,planes[3:4]])
         target.write(output.tobytes());count+=1
-        if count%12==0: print(json.dumps({'progress':min(99,count/job.get('frames',count)*100)}),file=sys.stderr,flush=True)
+        print(json.dumps({'progress':min(99,count/max(1,job.get('frames',count))*100)}),file=sys.stderr,flush=True)
     if not count: raise ValueError('No decoded color frames')
     if job.get('frameTimes') and count!=len(job['frameTimes']): raise ValueError('Decoded source frames do not match Smart Mask timestamps')
 

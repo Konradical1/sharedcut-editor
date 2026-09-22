@@ -38,7 +38,7 @@ test('real media preparation and timeline export preserve picture, sound, timing
       assert.ok(variant.hasAudio, 'Embedded sound must survive lower-resolution preview.');
       const frames = await exec(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=key_frame', '-of', 'csv=p=0', file]);
       const keys = frames.stdout.trim().split(/\s+/).map(frame => frame.replace(',', ''));
-      assert.ok(quality === 'Stream' ? keys.includes('0') : keys.every(frame => frame === '1'));
+      assert.ok(quality.startsWith('Stream') ? keys.includes('0') : keys.every(frame => frame === '1'));
     }
     assert.equal((await probeMedia(path.join(dir, 'prepared', path.basename(prepared.audioProxyUrl!)))).kind, 'audio');
     const keyframes = await exec(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=key_frame', '-of', 'csv=p=0', path.join(dir, 'prepared', 'proxy.mp4')]);

@@ -22,8 +22,8 @@ import { companionAudioTrack, edgeScrollVelocity, rulerStep, timelineZoom, uncov
 import { snapTime, SNAP_PIXELS } from '../services/snapping';
 import { RemotePlayhead } from './Collaboration';
 import { acceptsEffect } from '../services/effects';
-import { useClipActivity, watchSmartMaskJobs, clipActivity, useActivityVersion } from '../services/clipStatus';
-import { clipCached, useFootageVersion } from '../services/footageCache';
+import { useClipActivity, watchSmartMaskJobs, useActivityVersion } from '../services/clipStatus';
+import { clipFootageStatus, useFootageVersion } from '../services/footageCache';
 import { barSegments, type BarState } from '../services/renderBar';
 import { useMaskEditor } from '../services/smartMaskClient';
 import type { Clip, MediaAsset } from '../state/models';
@@ -75,21 +75,29 @@ function TimelinePlayheads({ pixels, color, scrub, scrubMove }: { pixels: number
 
 watchSmartMaskJobs(useMaskEditor);
 
-/** Premiere's ruler bar: green = cached on this machine, yellow = streaming from the server, red = the server is still working on it. */
-function RenderBar({pixels}:{pixels:number}){
+/** Picture coverage in the editor; audio coverage in the audio workspace. */
+function RenderBar({pixels,audioOnly}:{pixels:number;audioOnly:boolean}){
   useFootageVersion();useActivityVersion();
   const clips=useEditorStore(s=>s.clips),media=useEditorStore(s=>s.media),timelineId=useEditorStore(s=>s.timelineId),projectId=useEditorStore(s=>s.projectId);
-  const segments=barSegments(clips.filter(c=>c.timelineId===timelineId&&c.projectId===projectId&&!c.disabled).map(clip=>{
+  const tracks=useEditorStore(s=>s.tracks);
+  const segments=barSegments(clips.filter(c=>c.timelineId===timelineId&&c.projectId===projectId&&!c.disabled&&tracks.some(t=>t.id===c.trackId&&(audioOnly?t.kind==='audio'&&!t.muted:t.kind==='video'&&!t.hidden))).map(clip=>{
     const asset=media.find(m=>m.id===clip.mediaId);
-    const state:BarState=clipActivity(clip.id)||(asset&&asset.status!=='ready')?'red':clipCached(clip.id)?'green':'yellow';
+    const local=clipFootageStatus(clip.id);
+    const state:BarState=local.state==='red'||asset?.status==='failed'?'red':asset&&asset.status!=='ready'?'yellow':isTitle(clip)||isShape(clip)?'green':local.state;
     return {start:clip.start,end:clip.start+clip.duration,state};
   }));
-  return <div className="render-bar" aria-hidden="true">{segments.map((seg,i)=><i key={i} className={seg.state} style={{left:seg.start*pixels,width:Math.max(1,(seg.end-seg.start)*pixels)}}/>)}</div>;
+  return <div className="render-bar" role="img" aria-label="Footage on this computer: gray queued, blue downloading, amber preparing a download, green saved locally, red failed">{segments.map((seg,i)=><i key={i} className={seg.state} style={{left:seg.start*pixels,width:Math.max(1,(seg.end-seg.start)*pixels)}}/>)}</div>;
 }
 
-function ClipActivityBar({clipId}:{clipId:string}) {
+function ClipActivityBar({clipId,cacheable}:{clipId:string;cacheable:boolean}) {
   const activity=useClipActivity(clipId);
-  if(!activity)return null;
+  useFootageVersion();
+  if(!activity) {
+    if(!cacheable)return null;
+    const local=clipFootageStatus(clipId);
+    const label=local.state==='green'?'Cached':local.state==='red'?'Cache failed':local.state==='yellow'?'Waiting':local.state==='blue'?`Caching ${local.progress}%`:local.progress?`Cached ${local.progress}%`:'Queued';
+    return <div className={`clip-cache ${local.state}`} title={`${local.detail}${local.playback?` · ${local.playback.detail}`:""}`} aria-label={`${label}: ${local.detail}`} style={{'--progress':`${local.progress}%`} as CSSProperties}><span>{label}</span></div>;
+  }
   return <div className={`clip-preparing ${activity.status}`} role="status" title={activity.error??`${activity.kind} preparing`} style={{'--progress':`${Math.max(4,activity.progress)}%`} as CSSProperties}><span>{activity.status==='failed'?`${activity.kind} failed`:`${activity.kind} · ${activity.progress}%`}</span></div>;
 }
 
@@ -168,8 +176,10 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
   };
   useEffect(() => () => { cancelAnimationFrame(previewFrame.current); useEditorStore.setState({ dragPreview: null }); }, [timelineId]);
 
-  const drag = useRef<{ids:string[];id:string;x:number;y:number;start:number;duration:number;mode:'move'|'left'|'right';locked:boolean;changed:boolean;renewedAt:number}|null>(null);
+  const drag = useRef<{ids:string[];id:string;x:number;y:number;pointerX:number;pointerY:number;scrollLeft:number;start:number;duration:number;mode:'move'|'left'|'right';locked:boolean;changed:boolean;renewedAt:number}|null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const dragHandlers = useRef({ move: moveDrag, finish: finishDrag });
+  dragHandlers.current = { move: moveDrag, finish: finishDrag };
   const boxStart=useRef<{x:number;y:number;ids:string[]}|null>(null);
   const [box,setBox]=useState<SelectionRect|null>(null);
   const pixels = 6 * zoom;
@@ -213,10 +223,23 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
       if(scrubPointer.current!==null&&el&&actions().liveMode!=='following') {const rect=el.getBoundingClientRect(),scale=el.querySelector('.timeline-ruler')!.getBoundingClientRect().width/width,left=rect.left+164*scale,right=rect.right;
         el.scrollLeft+=edgeScrollVelocity(scrubPointer.current,left,right)*elapsed/scale;
         const ruler=el.querySelector('.timeline-ruler')!.getBoundingClientRect();actions().setPlayhead(Math.round((Math.max(left,Math.min(right,scrubPointer.current))-ruler.left)/(pixels*scale)*fps)/fps);
-      }frame=requestAnimationFrame(tick);};
+      }
+      const d=drag.current;
+      if(d?.changed&&el){
+        const rect=el.getBoundingClientRect(),scale=el.querySelector('.timeline-ruler')!.getBoundingClientRect().width/width;
+        const before=el.scrollLeft;
+        el.scrollLeft+=edgeScrollVelocity(d.pointerX,rect.left+164*scale,rect.right)*elapsed/scale;
+        if(el.scrollLeft!==before)dragHandlers.current.move({clientX:d.pointerX,clientY:d.pointerY},true);
+      }
+      frame=requestAnimationFrame(tick);};
     frame=requestAnimationFrame(tick);window.addEventListener('pointerup',stop);window.addEventListener('pointercancel',stop);window.addEventListener('blur',stop);
     return()=>{cancelAnimationFrame(frame);stop();window.removeEventListener('pointerup',stop);window.removeEventListener('pointercancel',stop);window.removeEventListener('blur',stop);};
   },[pixels,fps,timelineId,width]);
+  useEffect(()=>{
+    const cancel=()=>dragHandlers.current.finish(true);
+    window.addEventListener('blur',cancel);
+    return()=>{window.removeEventListener('blur',cancel);cancel();};
+  },[timelineId]);
   const step=rulerStep(pixels,fps),firstTick=Math.max(0,Math.floor((viewport.left-164)/pixels/step)),lastTick=Math.ceil((viewport.left+viewport.width)/pixels/step);
 
   function startDrag(e:PointerEvent<HTMLDivElement>,clip:Clip,mode:'move'|'left'|'right') {
@@ -226,7 +249,7 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
     if(tracks.find(t=>t.id===clip.trackId)?.locked){actions().notify('Track is locked','info','Unlock the track to move or trim its clips.');return;}
     const selected=mode==='move'?actions().selectedClipIds:[clip.id],links=clips.filter(c=>selected.includes(c.id)).map(c=>c.properties.linkGroup).filter(Boolean);const ids=clips.filter(c=>c.timelineId===timelineId&&(selected.includes(c.id)||linked&&links.includes(c.properties.linkGroup))).map(c=>c.id);
     if(clips.some(c=>ids.includes(c.id)&&tracks.find(t=>t.id===c.trackId)?.locked))return;
-    drag.current={ids,id:clip.id,x:e.clientX,y:e.clientY,start:clip.start,duration:clip.duration,mode,locked:false,changed:false,renewedAt:0};
+    drag.current={ids,id:clip.id,x:e.clientX,y:e.clientY,pointerX:e.clientX,pointerY:e.clientY,scrollLeft:scrollRef.current!.scrollLeft,start:clip.start,duration:clip.duration,mode,locked:false,changed:false,renewedAt:0};
     e.currentTarget.setPointerCapture(e.pointerId);
   }
   function finishTrackResize(cancel = false) {
@@ -236,11 +259,12 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
     else { useEditorStore.setState({ dragPreview: null }); actions().releaseLock(resize.id, '*'); }
     setHeightDraft(null);
   }
-  function moveDrag(e:PointerEvent<HTMLDivElement>) {
+  function moveDrag(e:Pick<PointerEvent<HTMLDivElement>,'clientX'|'clientY'>,immediate=false) {
     const d=drag.current;if(!d||Math.hypot(e.clientX-d.x,e.clientY-d.y)<3&&!d.changed)return;
     if(!d.locked||Date.now()-d.renewedAt>2000){if(!clips.filter(c=>d.ids.includes(c.id)).every(c=>actions().acquireLock(c.id,'manipulation'))){finishDrag(true);actions().notify('This clip is being edited','info','You can inspect it while your collaborator finishes.');return;}d.locked=true;d.renewedAt=Date.now();}
-    d.changed=true;
-    const delta=(e.clientX-d.x)/screenPixels();
+    d.changed=true;d.pointerX=e.clientX;d.pointerY=e.clientY;
+    // Include canvas travel so a stationary pointer keeps moving the clip during edge scrolling.
+    const delta=(e.clientX-d.x)/screenPixels()+(scrollRef.current!.scrollLeft-d.scrollLeft)/pixels;
     let start=d.start,duration=d.duration;
     if(d.mode==='move')start=d.start+Math.max(-Math.min(...clips.filter(c=>d.ids.includes(c.id)).map(c=>c.start)),delta);
     if(d.mode==='left'){start=Math.max(0,Math.min(d.start+d.duration-1/fps,d.start+delta));duration=d.start+d.duration-start;}
@@ -264,12 +288,13 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
     if(d.mode==='move'&&hovered&&!target){draftRef.current=null;setDraft(null);useEditorStore.setState({dragPreview:null});return;}
     const align=(value:number)=>d.mode==='move'?Math.round(value*fps)/fps:value;
     draftRef.current={id:d.id,trackId:d.mode==='move'?target?.id:undefined,start:align(start),duration:align(duration),snap:snapped};
-    publishFrame(() => {
+    const draw = () => {
       const final = draftRef.current; if (!final || !drag.current) return;
       setDraft(final);
       const offset = (tracks.find(t => t.id === final.trackId)?.number ?? sourceTrack!.number) - sourceTrack!.number;
       useEditorStore.setState({ dragPreview: { clips: clips.filter(c => d.ids.includes(c.id)).map(c => ({ id: c.id, start: Math.max(0, c.start + final.start - d.start), duration: Math.max(1/fps, c.duration + final.duration - d.duration), trackId: d.mode === 'move' && tracks.find(t => t.id === c.trackId)?.kind === sourceTrack!.kind ? tracks.find(t => t.timelineId === timelineId && t.kind === tracks.find(t => t.id === c.trackId)?.kind && t.number === tracks.find(t => t.id === c.trackId)!.number + offset)?.id ?? c.trackId : c.trackId })) } });
-    });
+    };
+    if(immediate){cancelAnimationFrame(previewFrame.current);draw();}else publishFrame(draw);
   }
   function finishDrag(cancel=false) {
     const d=drag.current;if(!d)return;
@@ -321,7 +346,7 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
       <div className="timeline-content" style={{minWidth:width+164}}>
         <div className="timeline-ruler-row"><div className="timeline-track-heading"><span>TRACKS</span><ChevronDown size={12}/></div><div className="timeline-ruler" data-cursor-anchor="ruler" data-time-span={width/pixels} style={{width}} onPointerDown={scrub} onPointerMove={scrubMove}>
           <div className="timeline-range" title="Marked export range" style={{left:rangeIn*pixels,width:(rangeOut-rangeIn)*pixels}}/>
-          <RenderBar pixels={pixels}/>
+          <RenderBar pixels={pixels} audioOnly={audioOnly}/>
           {Array.from({length:Math.max(0,lastTick-firstTick+1)},(_,index)=>{const i=index+firstTick;return <div key={i} className="ruler-tick major" style={{left:i*step*pixels}}><span className="mono">{timecode(i*step,fps)}</span></div>;})}
           {markers.map((m,i)=><button key={i} className="timeline-marker" style={{left:m.time*pixels,color:m.color}} title={m.name} aria-label={`Go to marker: ${m.name}`} onClick={e=>{e.stopPropagation();actions().setPlayhead(m.time);}}><Flag size={12} fill="currentColor"/></button>)}
         </div></div>
@@ -390,7 +415,7 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
               {clips.filter(c=>c.trackId===track.id).flatMap(clip=>(!drag.current?.ids.includes(clip.id)&&clip.id!==draft?.id?(movePlacements.length?movePlacements.filter(c=>c.trackId===track.id):lanePlacement?.trackId===track.id?[lanePlacement]:[]).reduce<Clip[]>((parts,p)=>parts.flatMap(part=>uncoveredParts(part,p.start,p.start+p.duration)),[clip]):[clip]).map((part,index)=>({clip,part,index}))).map(({clip,part,index})=>{const asset=media.find(m=>m.id===clip.mediaId);const primary=clips.find(c=>c.id===draft?.id),partner=draft&&drag.current?.mode==='move'&&drag.current.ids.includes(clip.id)&&clip.id!==draft.id||linked&&draft&&primary?.properties.linkGroup&&primary.properties.linkGroup===clip.properties.linkGroup;const position=draft?.id===clip.id?(draft.trackId&&draft.trackId!==clip.trackId?clip:draft):partner?{...part,start:clip.start+draft.start-primary!.start,duration:clip.duration+draft.duration-primary!.duration}:part;const predicted=movePlacements.find(c=>c.id===clip.id);const selected=selectedId===clip.id||selectedIds.includes(clip.id);const linkedSelected=linked&&clip.properties.linkGroup&&clip.properties.linkGroup===clips.find(c=>c.id===selectedId)?.properties.linkGroup;const collaborator=users.find(u=>u.id===selectedBy[clip.id]);const owner=locks.find(l=>l.targetId===clip.id&&l.field==='manipulation');const color=selected||linkedSelected?ownColor:collaborator?.color;return <div key={`${clip.id}-${index}`} data-clip={clip.id} role="button" tabIndex={0} aria-label={`${clip.name}, ${timecode(clip.start)}, ${Math.round(clip.duration)} seconds`} aria-pressed={selected} className={`timeline-clip ${staleCaptions.has(String(clip.properties.captionSet))?'caption-stale':''} ${track.kind} ${selected?'selected':''} ${linkedSelected?'linked-selected':''} ${draft?.id===clip.id?'dragging':''} ${predicted&&predicted.trackId!==clip.trackId||draft?.id===clip.id&&draft.trackId&&draft.trackId!==clip.trackId?'drag-origin':''} ${isComposition(clip)?'composition-clip':''} ${isShape(clip)?'shape-clip':''} ${clip.disabled?'clip-disabled':''} ${owner?'owned':''} ${effectTarget===clip.id?'effect-drop-target':''}`} style={{left:(predicted&&predicted.trackId!==clip.trackId?clip.start:position.start)*pixels,width:Math.max(12,position.duration*pixels),'--clip-color':clip.color,'--selection-color':color??'transparent'} as CSSProperties} onDragOver={e=>{if(e.dataTransfer.types.includes('application/x-frameline-effect')){e.preventDefault();e.stopPropagation();e.dataTransfer.dropEffect=track.locked?'none':'copy';if(!track.locked)setEffectTarget(clip.id);}}} onDragLeave={()=>setEffectTarget(null)} onDrop={e=>{const name=e.dataTransfer.getData('application/x-frameline-effect');if(!name)return;e.preventDefault();e.stopPropagation();setEffectTarget(null);if(!track.locked&&acceptsEffect(clip,asset?.kind,name))actions().addEffect(clip.id,name);}} onPointerDown={e=>startDrag(e,clip,'move')} onPointerMove={moveDrag} onPointerUp={()=>finishDrag()} onPointerCancel={()=>finishDrag(true)} onLostPointerCapture={()=>{if(drag.current)finishDrag(true);}} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();e.stopPropagation();if(e.key==='Enter'&&isComposition(clip))actions().openComposition(clip.id);else actions().selectClip(clip.id);}if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();e.stopPropagation();actions().moveClip(clip.id,clip.start+(e.key==='ArrowRight'?1:-1)/(project?.fps||24));}}} onDoubleClick={e=>{e.stopPropagation();if(isComposition(clip))actions().openComposition(clip.id);}} onContextMenu={e=>{e.preventDefault();if(!actions().selectedClipIds.includes(clip.id))actions().selectClip(clip.id);setMenu({x:e.clientX,y:e.clientY,id:clip.id});}}>
                 {track.kind==='video'&&!isTitle(clip)&&!isShape(clip)&&!isComposition(clip)&&asset?.kind!=='audio'&&<ClipFilmstrip asset={asset} clip={clip} pixels={pixels}/>}
                 <div className="clip-label">{isTitle(clip)?<Type size={10}/>:isShape(clip)?<Shapes size={10}/>:isComposition(clip)?<Layers size={10}/>:track.kind==='audio'?<AudioLines size={10}/>:<Film size={10}/>}<span>{clip.name}</span>{clip.properties.linkGroup&&<Link2 size={10} aria-label="Linked audio/video"/>}{collaborator&&!selected&&<span className="clip-remote-name" style={{color:collaborator.color}}>{collaborator.name}</span>}{owner&&<span className="clip-activity" style={{background:users.find(u=>u.id===owner.userId)?.color}}/>}</div>
-                <ClipActivityBar clipId={clip.id}/>
+                <ClipActivityBar clipId={clip.id} cacheable={!!asset&&asset.kind!=='image'&&!clip.disabled&&(track.kind==='video'?!track.hidden:!track.muted)}/>
                 {track.kind==='audio'&&<Waveform samples={asset?.waveform} from={clip.sourceIn/(asset?.duration||1)} to={(clip.sourceIn+clip.duration*Number(clip.properties.speed||100)/100)/(asset?.duration||1)} reverse={Boolean(clip.properties.reverse)}/>}
                 {Object.keys(clip.keyframes??{}).length>0&&<KeyframeLanes inline clips={[clip]} pixels={pixels} width={clip.duration*pixels} visibleStart={0} visibleEnd={clip.duration*pixels}/>}
                 <ClipFades clip={clip} audio={track.kind==='audio'} pixels={pixels} fps={fps}/>

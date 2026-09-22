@@ -11,6 +11,7 @@
  */
 const CACHE = 'footage-v3';
 const pending = new Map();
+const disabledClients = new Set();
 const CHUNK = 1 << 20;
 const MEDIA = /^\/api\/.+\.(mp4|m4a|mov|webm)$/i;
 
@@ -37,11 +38,11 @@ async function writeMeta(cache, url, meta) {
 async function chunk(request, url, index, cache) {
   const key = chunkKey(url, index);
   const hit = await cache.match(key);
-  if (hit) return { bytes: await hit.arrayBuffer(), meta: null };
+  if (hit) return { bytes: await hit.arrayBuffer(), meta: pending.has(key) ? (await pending.get(key)).meta : await readMeta(cache, url) };
   let job = pending.get(key);
   if (!job) {
     job = (async () => {
-      const start = index * CHUNK;
+      const start = index * CHUNK, started = performance.now();
       const response = await fetch(new Request(request.url, { headers: { Range: `bytes=${start}-${start + CHUNK - 1}` }, credentials: 'include', cache: 'no-store' }));
       const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') || '');
       if (response.status !== 206 || !range || Number(range[1]) !== start || Number(range[2]) !== Math.min(start + CHUNK, Number(range[3])) - 1) throw new Error('Invalid media range');
@@ -56,7 +57,7 @@ async function chunk(request, url, index, cache) {
       // buffered for late readers; the first reader still receives bytes as they arrive.
       const saved = cache.put(key, checked.clone()).then(() => writeMeta(cache, url, meta)).then(() => {
         notify({ type: 'footage-stored', url, index, size: length });
-        notify({ type: 'footage-transfer', bytes: length });
+        notify({ type: 'footage-transfer', bytes: length, milliseconds: performance.now() - started });
       }).catch(error => { notify({ type: 'footage-storage-error', url }); throw error; });
       saved.catch(() => {});
       void saved.finally(() => { pending.delete(key); checked.body.cancel().catch(() => {}); }).catch(() => {});
@@ -125,7 +126,7 @@ async function serveRange(request, url, start, endInclusive) {
 
 self.addEventListener('fetch', event => {
   const { request } = event;
-  if (request.method !== 'GET') return;
+  if (request.method !== 'GET' || disabledClients.has(event.clientId) || request.headers.get('X-Footage-Cache') === 'off') return;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin || !MEDIA.test(url.pathname) || url.pathname.endsWith('/original')) return;
   const range = /^bytes=(\d+)-(\d*)$/.exec(request.headers.get('Range') || '');
@@ -135,5 +136,12 @@ self.addEventListener('fetch', event => {
 });
 
 self.addEventListener('message', event => {
-  if (event.data?.type === 'footage-clear') event.waitUntil(caches.delete(CACHE).then(() => notify({ type: 'footage-cleared' })));
+  if (event.data?.type === 'footage-enabled' && event.source?.id) {
+    if (event.data.enabled) disabledClients.delete(event.source.id); else disabledClients.add(event.source.id);
+  }
+  if (event.data?.type === 'footage-clear') event.waitUntil(
+    Promise.allSettled([...pending.values()].map(job => job.then(result => result.saved)))
+      .then(() => caches.delete(CACHE))
+      .then(() => { notify({ type: 'footage-cleared' }); event.ports?.[0]?.postMessage({ cleared: true }); })
+  );
 });

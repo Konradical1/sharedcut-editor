@@ -1,4 +1,4 @@
-# Local Lenovo host. Start with: docker compose -f compose.windows.yaml up -d --build
+# Local Windows host (Dell test or Lenovo). Start with: docker compose -f compose.windows.yaml up -d --build
 services:
   frameline:
     build: .

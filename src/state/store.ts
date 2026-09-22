@@ -41,7 +41,7 @@ export interface EditorStore extends PersistedState {
   toggleTransitionFavorite(id: string): Promise<void>;
   loadLeaks(): void;
   addLeak(file: File): Promise<void>;
-  playhead: number; rangeIn: number; rangeOut: number; playing: boolean; workspace: Workspace; sidePanel: SidePanel; modal: string | null;
+  playhead: number; rangeIn: number; rangeOut: number; playing: boolean; playbackBuffering: boolean; workspace: Workspace; sidePanel: SidePanel; modal: string | null;
   saveStatus: 'Saving…' | 'Saved' | 'Save failed'; liveMode: LiveMode; followUserId: string | null;
   clipboard: Clip | null; clipboardClips: Clip[]; clipboardNodes: GradeNode[]; clipPreview: Clip | null; draggingMediaId: string | null; inspectorTab: string;
   shapeTool: string | null; compositionTrail: {timelineId:string;playhead:number;clipId:string}[]; selectedClipIds: string[];
@@ -335,7 +335,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     selectedClipId: saved ? saved.clips.find(clip => clip.id === 'c3')?.id ?? null : 'c3', selectedNodeId: demo.selectedNodeId,
     notifications: recoveryMessage ? [{ id: 'recovery', title: 'Recovered the demo project', detail: recoveryMessage, kind: 'error', timestamp: Date.now() }] : [],
     dragPreview: null, presence: demo.presence, locks: [{ id: 'demo-speed-lock', projectId: 'city-after-dark', targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }],
-    playhead: 42, rangeIn: 0, rangeOut: 180, revealedMediaId: null, playing: false, workspace: 'edit', sidePanel: 'inspector', modal: null,
+    playhead: 42, rangeIn: 0, rangeOut: 180, revealedMediaId: null, playing: false, playbackBuffering: false, workspace: 'edit', sidePanel: 'inspector', modal: null,
     clipPreview: null, draggingMediaId: null, inspectorTab: 'Video', selectedTransition: null, draggingTransition: null, leaks: [], transitionPresets: [], transitionFavorites: [], saveStatus: 'Saved', liveMode: 'independent', followUserId: null, clipboard: null, clipboardClips: [], clipboardNodes: [], gradeClipboard: null,
     addTitle(preset = 0, box = {}, placement, animated = true) {
       const state=get();if(!writable())return;
@@ -1296,7 +1296,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (!follow) { followedMotion = null; followedUser = null; }
       if (follow && (!followedMotion || followedUser !== follow.userId)) { followedMotion = playheadMotion(follow, now); followedUser = follow.userId; }
       const remoteTime = follow && connection.enabled ? advancePlayhead(followedMotion!, follow, now) : follow?.playhead;
-      const playhead = follow ? Math.min(durationOf(state), remoteTime!) : state.playing ? Math.min(playbackEnd, state.playhead + elapsed) : state.playhead;
+      const playhead = follow ? Math.min(durationOf(state), remoteTime!) : state.playing && !state.playbackBuffering ? Math.min(playbackEnd, state.playhead + elapsed) : state.playhead;
       const patch: Partial<EditorStore> = { presence, locks: collaborationService.expireLocks(state.locks, now), playhead, playing: playhead >= playbackEnd ? false : follow ? !!follow.playing : state.playing };
       if (state.liveMode === 'following' && !follow) { patch.liveMode = 'independent'; patch.followUserId = null; }
       if (now - lastProcessingTick >= 1000) {
@@ -1343,15 +1343,27 @@ useEditorStore.subscribe((state, previous) => {
 
 let serviceUsers = 0;
 let serviceTimer: ReturnType<typeof setInterval> | undefined;
+let playbackFrame: number | undefined;
 export function initializeEditorServices() {
   serviceUsers++;
   const disconnect = () => { const state = useEditorStore.getState(); state.releaseUserLocks(state.currentUserId); persist(); };
-  if (!serviceTimer) { lastTick = Date.now(); lastProcessingTick = Date.now(); serviceTimer = setInterval(() => { if (useEditorStore.getState().session === 'ready') useEditorStore.getState().tick(Date.now()); }, 1000 / 30); }
+  if (!serviceTimer) {
+    lastTick = Date.now(); lastProcessingTick = Date.now();
+    const visible = () => typeof document !== 'undefined' && document.visibilityState !== 'hidden';
+    const moving = () => { const s=useEditorStore.getState();return s.playing||s.liveMode==='following'; };
+    // Drive visible playback from the display clock. A separate 30 Hz clock aliases 24/25 fps
+    // pictures into repeated/skipped frames even when every source frame is already in memory.
+    if(typeof requestAnimationFrame==='function'){
+      const advance=()=>{if(useEditorStore.getState().session==='ready'&&visible()&&moving())useEditorStore.getState().tick(Date.now());playbackFrame=requestAnimationFrame(advance);};
+      playbackFrame=requestAnimationFrame(advance);
+    }
+    serviceTimer=setInterval(()=>{if(useEditorStore.getState().session==='ready'&&(playbackFrame===undefined||!visible()||!moving()))useEditorStore.getState().tick(Date.now());},1000/30);
+  }
   if (typeof window !== 'undefined') { window.addEventListener('pagehide', disconnect); window.addEventListener('offline', disconnect); }
   let closed = false;
   return () => {
     if (closed) return; closed = true; serviceUsers--;
     if (typeof window !== 'undefined') { window.removeEventListener('pagehide', disconnect); window.removeEventListener('offline', disconnect); }
-    if (serviceUsers === 0) { clearInterval(serviceTimer); serviceTimer = undefined; disconnect(); }
+    if (serviceUsers === 0) { clearInterval(serviceTimer); serviceTimer = undefined; if(playbackFrame!==undefined){cancelAnimationFrame(playbackFrame);playbackFrame=undefined;} disconnect(); }
   };
 }

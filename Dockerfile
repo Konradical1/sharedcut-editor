@@ -20,6 +20,7 @@ ENV FRAME_LINE_STABILIZE_PYTHON=/opt/stabilize/bin/python
 COPY package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+COPY public/fonts ./public/fonts
 COPY server ./server
 COPY src ./src
 COPY scripts/resolve-export.lua ./scripts/resolve-export.lua

@@ -1,9 +1,9 @@
 /** Premiere-style ruler bar: red beats yellow beats green wherever clips overlap. */
-export type BarState = 'green' | 'yellow' | 'red';
+export type BarState = 'gray' | 'blue' | 'green' | 'yellow' | 'red';
 export type BarClip = { start: number; end: number; state: BarState };
 export type BarSegment = { start: number; end: number; state: BarState };
 
-const rank: Record<BarState, number> = { green: 0, yellow: 1, red: 2 };
+const rank: Record<BarState, number> = { green: 0, gray: 1, blue: 2, yellow: 3, red: 4 };
 
 /** One segment per colour run, so the ruler paints a handful of elements rather than one per clip. */
 export function barSegments(clips: BarClip[]): BarSegment[] {

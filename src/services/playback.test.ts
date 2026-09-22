@@ -90,9 +90,9 @@ test('scrubbing retains decoded pictures and reuses decoders while coalescing se
     state.settings = { performanceMode: 'On' }; state.playing = true;
     const initialPaints = canvas.paints;
     now = 10; nextFrame(); assert.equal(canvas.paints, initialPaints, 'Efficient playback skips duplicate refreshes within a timeline frame.');
-    now = 43; nextFrame(); assert.equal(canvas.paints, initialPaints + 1);
+    now = 43; state.playhead=1/24; nextFrame(); assert.equal(canvas.paints, initialPaints + 1);
     assert.equal(canvas.width, 320); assert.equal(canvas.height, 180, 'Efficient mode retains preview resolution.');
-    state.playing = false; nextFrame();
+    state.playing = false; nextFrame(); videos[0].finishSeek(); videos[0].seeks=[];
     now = 60_000; state.playhead = 1; nextFrame();
     const painted = canvas.paints;
     state.playhead = 2; nextFrame(); state.playhead = 3; nextFrame();
@@ -119,6 +119,21 @@ test('scrubbing retains decoded pictures and reuses decoders while coalescing se
     assert.equal(videos.length,1,'Opening the composition keeps its completed media decoder.');
     state.clips=[child,{...child,id:'upcoming-title',mediaId:'frameline-title',start:3.5},{...child,id:'upcoming-video',start:4}];nextFrame();
     assert.equal(videos.length,2,'A title must not consume the efficient-mode video preload slot.');
+    // Two active layers plus three rapid upcoming cuts exceed the old four-decoder cap.
+    state.settings={performanceMode:'Off'};state.playing=true;state.playhead=0;
+    state.clips=Array.from({length:5},(_,i)=>({...child,id:`cut-${i}`,start:i<2?0:i-1,duration:i<2?1:.8,sourceIn:1}));
+    now+=50;nextFrame();videos.forEach(v=>v.finishSeek());now+=50;nextFrame();
+    videos.forEach(v=>v.finishSeek());now+=50;nextFrame();
+    const prepared=videos.length;
+    for(let i=0;i<4;i++){now+=50;state.playhead+=1/24;nextFrame();videos.forEach(v=>v.finishSeek());}
+    assert.equal(videos.length,prepared,'Upcoming decoders survive the spare decoder cap.');
+    const active=videos.slice(-5,-3);active.forEach(v=>{v.seeking=true;});
+    now+=50;state.playhead+=1/24;nextFrame();active.forEach(v=>v.finishSeek());now+=50;nextFrame();
+    assert.equal(videos.length,prepared,'A buffering frame must not discard the prepared next cuts.');
+    state.media=state.media.map(m=>Object.assign({...m},{proxyVariants:{Stream:'/prepared-later.mp4'}}));
+    (videos.at(-1) as any).onerror();now+=50;state.playhead+=1/24;nextFrame();
+    assert.ok(videos.some(v=>v.src==='/prepared-later.mp4'),'A decoder sees Stream proxies published after it was created.');
+
   } finally {
     playback.dispose();
     globals.forEach((key, index) => { if (original[index]) Object.defineProperty(globalThis, key, original[index]!); else Reflect.deleteProperty(globalThis, key); });
@@ -172,4 +187,13 @@ test('efficient playback auto detection respects overrides and missing hardware 
   assert.equal(efficientPlayback('Auto', { hardwareConcurrency: 0, deviceMemory: 0 }), false);
   assert.equal(efficientPlayback('Off', { hardwareConcurrency: 2 }), false);
   assert.equal(efficientPlayback('On', { hardwareConcurrency: 16, deviceMemory: 16 }), true);
+});
+
+
+test('a fractional-frame cut selects the incoming picture on the cut, without repeating the outgoing frame',()=>{
+  const clip={id:'out',projectId:'p',timelineId:'t',trackId:'v',mediaId:'m',start:13.888874999999999,duration:1.1261250000000027,sourceIn:0,properties:{},effects:[]} as unknown as Clip;
+  const incoming={...clip,id:'in',start:15.015000000000002,duration:1};
+  const state={projectId:'p',timelineId:'t',playhead:360/(24000/1001),clips:[clip,incoming],tracks:[{id:'v',timelineId:'t',kind:'video',number:1}] as Track[],media:[{id:'m',kind:'video'}] as MediaAsset[]};
+  assert.deepEqual(playbackLayers(state,24000/1001).map(l=>l.clip.id),['in']);
+  assert.deepEqual(playbackLayers({...state,playhead:state.playhead-1/(24000/1001)},24000/1001).map(l=>l.clip.id),['out']);
 });

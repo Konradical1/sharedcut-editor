@@ -1,3 +1,4 @@
+import { createPreviewCache } from './previewCache.ts';
 import { validateMotionBlur } from '../src/services/motionBlur.ts';
 import { workQueue } from './workQueue.ts';
 import { stateDelta, applyStateDelta } from '../src/services/stateDelta.ts';
@@ -35,7 +36,7 @@ import { exportResolveTimeline, importResolve } from './resolve.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
 import { validateSmartMask, validateSmartMaskBindings } from '../src/services/smartMask.ts';
-import { FILMSTRIP_VERSION, MEDIA_CONCURRENCY, SKIP_COLOR_PROXY, STREAM_VARIANT, getMediaCapabilities, prepareColorProxy, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, preparePreviewVariants, prepareWaveform, renderTimeline, renderSoundEffect } from './media.ts';
+import { FILMSTRIP_VERSION, MEDIA_CONCURRENCY, SKIP_COLOR_PROXY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, prepareColorProxy, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, preparePreviewVariants, prepareWaveform, renderTimeline, renderSoundEffect } from './media.ts';
 
 const scrypt = promisify(scryptCallback);
 const DEFAULT_SETTINGS = { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false, snapping: true, mediaWidth: 278, inspectorWidth: 292, timelineHeight: 294 };
@@ -85,7 +86,17 @@ async function binaryBody(req: IncomingMessage, max: number, onProgress?: (bytes
   if(!length)fail(400,'Empty upload.');return Buffer.concat(chunks);
 }
 
-function send(res: ServerResponse, status: number, body: unknown) { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); }
+function send(res: ServerResponse, status: number, body: unknown) {
+  const json = JSON.stringify(body);
+  const gzip = json.length >= 4096 && (res.req.headers['accept-encoding'] ?? '').split(',').some(item => {
+    const [name, ...params] = item.trim().split(';');
+    return name === 'gzip' && !params.some(p => /^q=0(?:\.0*)?$/.test(p.trim()));
+  });
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', Vary: 'Accept-Encoding', ...(gzip ? { 'Content-Encoding': 'gzip' } : {}) });
+  if (!gzip) { res.end(json); return; }
+  const stream = createGzip({ level: 1 });
+  res.on('close', () => stream.destroy()); stream.on('error', () => res.destroy()); stream.pipe(res); stream.end(json);
+}
 const contentTypes: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon', '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.m4a': 'audio/mp4', '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.woff2': 'font/woff2' };
 function streamFile(req: IncomingMessage, res: ServerResponse, path: string, type?: string, download?: string, immutable?: boolean) {
   let size = 0, modified = 0; try { const file = statSync(path); size = file.size; modified = file.mtimeMs; } catch { fail(404, 'File not found.'); }
@@ -307,16 +318,18 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     queue.add(async () => { try { if (!closed && !controller.signal.aborted) await work(controller.signal); }
       finally { if (aborters.get(id) === controller) aborters.delete(id); } }, render);
   };
+  const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)} ));
   const startRender = (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>) => {
     db.prepare('INSERT OR REPLACE INTO render_snapshots(id,data) VALUES(?,?)').run(job.id, JSON.stringify(snapshot));
     addWork(job.id, async signal => {
             updateJob(job.id, { status: 'rendering', progress: 0, remaining: 'Preparing export · 0s elapsed' }); const extension = job.settings.codec?.includes('ProRes') ? '.mov' : '.mp4'; const outputPath = join(dataDir, 'renders', `${job.id}${extension}`);
-            const started = Date.now(); let progressValue = 0;
+            const started = Date.now(); let progressValue = 0, stage = 'Preparing export', advancedAt = started, reportedAt = 0;
             const report = () => { if (closed || signal.aborted) return; const elapsed = Math.floor((Date.now() - started) / 1000);
-              const eta = progressValue > 0 && progressValue < 100 ? ` · ~${Math.ceil(elapsed * (100 - progressValue) / progressValue)}s remaining` : '';
-              updateJob(job.id, { progress: progressValue, remaining: `${progressValue === 0 ? 'Preparing export' : progressValue >= 100 ? 'Finalizing file' : 'Rendering'} · ${elapsed}s elapsed${eta}` }); };
+              reportedAt = Date.now();
+              const quiet = Math.floor((Date.now() - advancedAt) / 1000);
+              updateJob(job.id, { progress: progressValue, remaining: `${stage} · ${elapsed}s elapsed${quiet >= 30 ? ` · No new frames for ${quiet}s` : ''}` }); };
             const heartbeat = setInterval(report, 1000);
-            try { let previous = -1; await renderTimeline({ ...snapshot, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onProgress: progress => { const next = Math.floor(progress); if (next !== previous) { previous = next; progressValue = Math.max(progressValue, Math.min(100, next)); report(); } } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
+            try { let previous = -1; await renderTimeline({ ...snapshot, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { stage = next; advancedAt = Date.now(); if (Date.now() - reportedAt >= 250) report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); if (Date.now() - reportedAt >= 250) report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
             catch (error) { rmSync(outputPath, { force: true }); if (!closed) updateJob(job.id, { status: 'failed', remaining: signal.aborted ? 'Cancelled' : 'Export failed', error: signal.aborted ? 'Cancelled by user.' : error instanceof Error ? error.message : 'Export failed.' }); }
             finally { clearInterval(heartbeat); if (!closed) db.prepare('DELETE FROM render_snapshots WHERE id=?').run(job.id); }
     }, true);
@@ -1068,6 +1081,30 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (method==='DELETE'&&!flowRoute[2]) { job!.controller.abort(); flowJobs.delete(flowRoute[1]); send(res,200,{ok:true});return; }
           if (['GET','HEAD'].includes(method)&&flowRoute[2]) { streamFile(req,res,join(flowDirectory,`${flowRoute[1]}.mp4`),'video/mp4',undefined,true);return; }
         }
+        if(path==='/api/timeline-previews'&&method==='POST') {
+          const body=await jsonBody(req);object(body);
+          const project=requireProject(textField(body.projectId,160,true),userId);
+          const timeline=state.timelines.find(t=>t.id===body.timelineId&&t.projectId===project.id)??fail(404,'Timeline not found.');
+          const chunk=numberField(body.chunk,0,5400);if(!Number.isInteger(chunk))fail(400,'Invalid preview chunk.');
+          const fps=project.fps, frameStart=chunk*Math.round(fps*4), from=frameStart/fps;
+          const end=Math.min(timeline.duration,(frameStart+Math.round(fps*4))/fps);
+          if(from>=end)fail(400,'Preview is outside the timeline.');
+          const width=numberField(body.width,160,1920),height=numberField(body.height,90,1920);
+          if(!Number.isInteger(width)||!Number.isInteger(height)||width%2||height%2)fail(400,'Invalid preview dimensions.');
+          const settings={resolution:`${width} × ${height}`,fps:String(fps),codec:'H.264',quality:'Automatic',audio:'Disabled',rangeIn:String(from),rangeOut:String(end)};
+          const clips=state.clips.filter(c=>c.projectId===project.id);
+          const ids=new Set(clips.map(c=>c.mediaId));
+          const snapshot=structuredClone({project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips,tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:state.nodes.filter(n=>n.projectId===project.id),assets:state.media.filter(m=>m.projectId===project.id&&ids.has(m.id)).map(asset=>({asset,path:originalPath(asset.id)})),settings,smartMaskDir:join(dataDir,'smart-masks'),stabilizeDir:stabilizeDirectory,resolveDir:resolveDir(project.id)});
+          try { const result=timelinePreviews.request(snapshot);send(res,200,result); }
+          catch(error){if((error as Error).message==='Preview queue busy')fail(429,'Preview queue busy');throw error;}
+          return;
+        }
+        const timelinePreviewRoute=/^\/api\/timeline-previews\/([a-f0-9]{64})\/video\.mp4$/.exec(path);
+        if(timelinePreviewRoute&&['GET','HEAD'].includes(method)){
+          const projectId=textField(url.searchParams.get('projectId'),160,true);requireProject(projectId,userId);
+          const file=timelinePreviews.file(timelinePreviewRoute[1],projectId)??fail(404,'Preview not found.');
+          streamFile(req,res,file,'video/mp4',undefined,true);return;
+        }
         if (path === '/api/stabilize/capabilities' && method === 'GET') { send(res,200,await stabilizeCapabilities()); return; }
         if (path === '/api/stabilize' && method === 'POST') {
           const body = await jsonBody(req), clip = state.clips.find(c => c.id === textField(body.clipId,160,true)) ?? fail(404,'Clip not found.');
@@ -1160,7 +1197,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   for (const asset of state.media) if (asset.status === 'ready') asset.preparationStage = undefined;
   if (saved) persist();
   // Upgrade existing imports in the same bounded worker queue; their current preview stays usable.
-  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && !asset.proxyVariants?.Stream?.endsWith(`/${STREAM_VARIANT}`) && asset.proxyUrl) {
+  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && (!asset.proxyVariants?.Stream?.endsWith(`/${STREAM_VARIANT}`) || !asset.proxyVariants?.StreamLow?.endsWith(`/${STREAM_LOW_VARIANT}`)) && asset.proxyUrl) {
     const filename = asset.proxyUrl.split('/').at(-1)!;
     if (!/^[a-zA-Z0-9_-]+\.mp4$/.test(filename)) continue;
     const inputPath = join(mediaDir(asset.id), 'prepared', filename);

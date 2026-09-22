@@ -25,7 +25,7 @@ import { renderStabilized, stabilizeWarpMattes } from './stabilize.ts';
 import { stabilizeEffect, stabilizeRange, stabilizeSettings } from '../src/services/stabilize.ts';
 import { timingPaths } from '../src/services/opticalFlow.ts';
 
-type ProcessOptions = { signal?: AbortSignal; onProgress?: (percent: number) => void; duration?: number; binary?: boolean; maxBytes?: number; jsonProgress?: boolean };
+type ProcessOptions = { signal?: AbortSignal; onProgress?: (percent: number) => void; duration?: number; binary?: boolean; maxBytes?: number; jsonProgress?: boolean | 'stderr' };
 const ffmpeg = () => process.env.FFMPEG_PATH || 'ffmpeg';
 const ffprobe = () => process.env.FFPROBE_PATH || 'ffprobe';
 // Accept self-contained media only: playlist/concat inputs could read other server files.
@@ -40,9 +40,16 @@ export function run(command: string, args: string[], options: ProcessOptions = {
     // from 57ms to 6.5s and dragged a local 64 MB/s import down to 1 MB/s.
     try { setPriority(child.pid!, BACKGROUND_NICE); } catch { /* Not permitted here; thread budget still caps the load. */ }
     const chunks: Buffer[] = [];
-    let size = 0, stderr = '', progressBuffer = '', failure: Error | undefined, killTimer: ReturnType<typeof setTimeout> | undefined;
+    let size = 0, stderr = '', progressBuffer = '', jsonBuffer = '', failure: Error | undefined, killTimer: ReturnType<typeof setTimeout> | undefined;
     const abort = () => { failure = new Error('Canceled by you'); child.kill('SIGTERM'); killTimer = setTimeout(() => child.kill('SIGKILL'), 2000); killTimer.unref(); };
     options.signal?.addEventListener('abort', abort, { once: true });
+    const jsonProgress = (chunk: Buffer) => {
+      jsonBuffer += chunk.toString();
+      const lines = jsonBuffer.split('\n'); jsonBuffer = (lines.pop() || '').slice(-8000);
+      for (const line of lines) { let value: unknown; try { value = JSON.parse(line).progress; } catch { continue; }
+        if (typeof value === 'number' && Number.isFinite(value)) options.onProgress?.(Math.max(0, Math.min(100, value)));
+      }
+    };
     child.stdout.on('data', (chunk: Buffer) => {
       if (!options.duration || options.binary) {
         size += chunk.length;
@@ -52,14 +59,14 @@ export function run(command: string, args: string[], options: ProcessOptions = {
       if (options.onProgress && !options.binary) {
         progressBuffer += chunk.toString();
         const lines = progressBuffer.split('\n'); progressBuffer = lines.pop() || '';
-        if (options.jsonProgress) for (const line of lines) { try { const value = JSON.parse(line).progress; if (Number.isFinite(value)) options.onProgress(Math.max(0, Math.min(100, value))); } catch { /* Ignore native diagnostics. */ } }
+        if (options.jsonProgress === true) jsonProgress(chunk);
         for (const line of lines) if (line.startsWith('out_time_us=')) {
           const seconds = Number(line.slice(12)) / 1_000_000;
           if (Number.isFinite(seconds) && options.duration) options.onProgress(Math.min(99, Math.max(0, seconds / options.duration * 100)));
         }
       }
     });
-    child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8000); });
+    child.stderr.on('data', (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-8000); if (options.jsonProgress === 'stderr') jsonProgress(chunk); });
     child.on('error', error => { failure = new Error(`${path.basename(command)} could not start: ${error.message}. Install FFmpeg or set FFMPEG_PATH and FFPROBE_PATH.`); });
     child.on('close', code => {
       clearTimeout(killTimer); options.signal?.removeEventListener('abort', abort);
@@ -147,8 +154,9 @@ export const SKIP_COLOR_PROXY = process.env.FRAME_LINE_SKIP_COLOR_PROXY === '1';
 // v2: CRF 16. Log footage is low-contrast, so CRF 20 spent ~1.5 Mbit/s and the sky fell apart once a grade
 // stretched it; CRF 16 measured 4.5 Mbit/s at 960p60 with half the sky error, same encode time.
 export const STREAM_VARIANT = 'stream-v2.mp4';
+export const STREAM_LOW_VARIANT = 'stream-low-v1.mp4';
 const common = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y', '-threads', jobThreads, '-filter_threads', jobThreads, '-filter_complex_threads', jobThreads];
-/** Scrubbing proxies (all-intra) plus one long-GOP streaming variant; publish only complete files. */
+/** Scrubbing proxies (all-intra) and two streaming sizes; publish only complete files. */
 export async function preparePreviewVariants(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; onProgress?: (percent: number) => void }) {
   const { inputPath, outputDir, baseUrl, signal } = options;
   const metadata = await probeMedia(inputPath, signal);
@@ -162,6 +170,7 @@ export async function preparePreviewVariants(options: { inputPath: string; outpu
     '1/2': { name: 'proxy-half-v1.mp4', width: 960, crf: '16', gop: '1' },
     '1/4': { name: 'proxy-quarter-v1.mp4', width: 480, crf: '16', gop: '1' },
     Stream: { name: STREAM_VARIANT, width: 960, crf: '16', gop: String(Math.max(2, Math.round((metadata.fps || 24) * 2))) },
+    StreamLow: { name: STREAM_LOW_VARIANT, width: 480, crf: '20', gop: String(Math.max(2, Math.round((metadata.fps || 24) * 2))) },
   };
   const audioName = 'audio-v1.m4a';
   // An upgrade pass only owes the variants that are missing; re-encoding what is already on disk
@@ -173,7 +182,7 @@ export async function preparePreviewVariants(options: { inputPath: string; outpu
   try {
     if (pending.length || wantAudio) {
       for (const variant of pending) {
-        args.push('-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'copy', '-vf', `scale=w='min(${variant.width},iw)':h=-2:in_range=${metadata.colorRange === 'pc' ? 'pc' : 'tv'}:out_range=${metadata.colorRange === 'pc' ? 'pc' : 'tv'}:in_color_matrix=bt709:out_color_matrix=bt709:flags=lanczos+accurate_rnd+full_chroma_int,setsar=1`, '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', variant.crf, '-g', variant.gop, '-pix_fmt', metadata.colorRange === 'pc' ? 'yuvj420p' : 'yuv420p', '-color_range', metadata.colorRange === 'pc' ? 'pc' : 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-movflags', '+faststart', path.join(temp, variant.name));
+        args.push('-map', '0:v:0', '-map', '0:a:0?', '-c:a', 'copy', '-vf', `scale=w='min(${variant.width},iw)':h=-2:in_range=${metadata.colorRange === 'pc' ? 'pc' : 'tv'}:out_range=${metadata.colorRange === 'pc' ? 'pc' : 'tv'}:in_color_matrix=bt709:out_color_matrix=bt709:flags=lanczos+accurate_rnd+full_chroma_int,setsar=1`, '-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', variant.crf, ...(variant.name === STREAM_LOW_VARIANT ? ['-maxrate','900k','-bufsize','1800k'] : []), '-g', variant.gop, '-pix_fmt', metadata.colorRange === 'pc' ? 'yuvj420p' : 'yuv420p', '-color_range', metadata.colorRange === 'pc' ? 'pc' : 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-movflags', '+faststart', path.join(temp, variant.name));
         written.push(variant.name);
       }
       if (wantAudio) { args.push('-map', '0:a:0', '-vn', '-c:a', 'copy', '-movflags', '+faststart', path.join(temp, audioName)); written.push(audioName); }
@@ -342,7 +351,7 @@ export const isAnimated = (clip: Clip) => Boolean(Object.keys(clip.keyframes ?? 
 export interface RenderRequest {
   project: Project; timeline: Timeline; timelines?: Timeline[]; clips: Clip[]; tracks: Track[]; nodes: GradeNode[];
   assets: { asset: MediaAsset; path: string }[]; settings: Record<string, string>; outputPath: string;
-  signal?: AbortSignal; onProgress?: (percent: number) => void; resolveDir?: string; smartMaskDir?: string; stabilizeDir?: string;
+  signal?: AbortSignal; onProgress?: (percent: number) => void; onStage?: (stage: string) => void; resolveDir?: string; smartMaskDir?: string; stabilizeDir?: string;
   /** Internal composition renders keep alpha and defer the master limiter to the outer timeline. */
   transparent?: boolean; compositionPath?: string[]; sampledFrame?: boolean;
   transformSamples?: Record<string, MotionPose[]>;
@@ -397,6 +406,13 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       if (typeof name === 'string' && name && !transitionDefinitions[name]) throw new Error(`${clip.name}: the ${name} transition is not available in this version. Remove it before exporting.`);
     }
   }
+  const colorClips = clips.filter(clip => {
+    const track = tracks.find(track => track.id === clip.trackId);
+    return track?.kind === 'video' && !track.hidden && (activeSmartMasks(clip, request.nodes).length > 0 || clip.properties.colorPipeline === 'nodes-v2' && hasACES(request.nodes, clip.id));
+  });
+  // Stage weights estimate work, not time; native frame counts supply progress within each stage.
+  const colorBudget = colorClips.length ? 50 : 0;
+  let colorsDone = 0;
   const overlayInputs = new Map<string, number>();
   const lutDir = await mkdtemp(path.join(tmpdir(), 'frameline-color-'));
   try {
@@ -585,7 +601,13 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         await writeFile(jobPath,JSON.stringify({input:source.path,output,ffmpeg:ffmpeg(),image:source.asset.kind==='image',seek:renderSeek,duration:decoded,width:metadata.width,height:metadata.height,fps:source.asset.kind==='image'?fps:metadata.frameRate||metadata.fps,numericFps:metadata.fps||fps,frames:frameTimes?.length??Math.ceil(decoded*(metadata.fps||fps)),frameTimes,masks,alpha:masks.length>0,managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)}));
         const python=process.env.FRAME_LINE_COLOR_PYTHON||path.resolve('.venv-color/bin/python');
         if(!existsSync(python))throw Error('OpenColorIO export is not installed. Run npm run setup:color on the server.');
-        await run(python,[path.resolve('scripts/color-render.py'),jobPath],{signal:request.signal});
+        const colorStage = `Processing color · ${clip.name} (${colorsDone + 1}/${colorClips.length})`;
+        request.onStage?.(colorStage);
+        await run(python,[path.resolve('scripts/color-render.py'),jobPath],{signal:request.signal,jsonProgress:'stderr',onProgress:p=>{
+          request.onStage?.(`${colorStage} · ${Math.floor(p)}%`);
+          onProgress?.((colorsDone+p/100)/colorClips.length*colorBudget);
+        }});
+        onProgress?.(++colorsDone/colorClips.length*colorBudget);
         args.push('-i',output);videoIndex=inputIndex++;
         for(const mask of masks)if(mask.output){
           args.push('-i',mask.output);const timing=['setpts=PTS-STARTPTS'];
@@ -694,8 +716,9 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   }
   args.push('-threads', '2', '-t', String(duration), '-r', String(fps), '-color_range', 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', outputPath);
   await mkdir(path.dirname(outputPath), { recursive: true });
-  onProgress?.(0);
-  try { await run(ffmpeg(), args, { signal, duration, onProgress }); onProgress?.(100); }
+  request.onStage?.('Encoding video and audio');
+  onProgress?.(colorBudget);
+  try { await run(ffmpeg(), args, { signal, duration, onProgress: p => onProgress?.(colorBudget+p*(100-colorBudget)/100) }); onProgress?.(100); }
   catch (error) { await rm(outputPath, { force: true }); throw error; }
   } finally { await rm(lutDir, { recursive: true, force: true }); }
 }
@@ -729,9 +752,10 @@ async function renderFlattenedTransitions(request: RenderRequest) {
       const mediaId = `transition-render-${index}`;
       // Track gain, pan and solo are applied once, when the spliced clip is placed back.
       const neutral = request.tracks.map(item => item.id === track.id ? { ...item, gain: 0, pan: 0, solo: false } : { ...item, solo: false });
+      request.onStage?.(`Rendering transition ${index+1}/${records.length} · ${record.name}`);
       await renderTimeline({
         ...request, clips: sides, tracks: neutral, timelines: undefined, transparent: true, sampledFrame: false,
-        outputPath, onProgress: undefined, compositionPath: undefined,
+        outputPath, onStage: undefined, onProgress: p => request.onProgress?.((index+p/100)/records.length*30), compositionPath: undefined,
         settings: { ...request.settings, resolution: request.project.resolution, rangeIn: String(record.start), rangeOut: String(record.end),
           codec: 'Apple ProRes 4444', audio: request.settings.audio === 'Disabled' ? 'Disabled' : 'Linear PCM · 24-bit · 48 kHz', masterGain: '0', masterMuted: 'false' },
       });
@@ -744,7 +768,7 @@ async function renderFlattenedTransitions(request: RenderRequest) {
           start: record.start, duration: span, sourceIn: 0, color: '#8fb3c4', disabled: false, properties: {}, effects: [] },
       ];
     }
-    const flattened = { ...request, clips, assets };
+    const flattened = { ...request, clips, assets, onProgress: (p: number) => request.onProgress?.(30+p*.7) };
     // Only the pre-rendered windows needed transitions; what remains may not even be animated.
     if (clips.some(clip => clip.timelineId === request.timeline.id && !clip.disabled && isAnimated(clip))) return await renderAnimatedTimeline(flattened);
     return await renderTimeline(flattened);
@@ -783,6 +807,7 @@ async function renderStabilizedTimeline(request: RenderRequest) {
         frames:artifact.manifest.frames.map(f=>({input:path.join(artifact.directory,f.file),output:path.join(warped,f.file),time:f.time}))});
       maskArtifacts.set(`${clip.id}:${document.id}`,{directory:warped,manifest:artifact.manifest});
     }
+    request.onStage?.(`Stabilizing · ${clip.name}`);
     const baked=await renderStabilized({input:source.path,directory,analysisDirectory:request.stabilizeDir,range,from:range.from,to:range.to,settings,preview:false,signal:request.signal,onProgress:p=>report(mattes+(1-mattes)*p/100)});
     const mediaId=`stabilize-${clip.id}`,metadata=await probeMedia(baked.output,request.signal);
     assets.push({path:baked.output,asset:{...source.asset,id:mediaId,duration:range.to-range.from,fps:metadata.fps||sourceFps,hasAudio:false,colorRange:metadata.colorRange,colorMatrix:metadata.colorMatrix}});
@@ -812,6 +837,7 @@ async function renderFlowTimeline(request: RenderRequest) {
       const source=assets.find(a=>a.asset.id===clip.mediaId),track=tracks.find(t=>t.id===clip.trackId);
       if(!source||source.asset.kind!=='video'||!track)throw new Error(`${clip.name}: optical flow requires a video source.`);
       const span=clipSpan(clip,records),geo=extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
+      request.onStage?.(`Optical flow · ${clip.name}`);
       const baked=await renderOpticalFlow({clip:geo,asset:source.asset,input:source.path,directory,fps,signal:request.signal,onProgress:p=>request.onProgress?.((index+p/100)/candidates.length*45)});
       const mediaId=`flow-${clip.id}`,metadata=await probeMedia(baked.output,request.signal);
       assets.push({path:baked.output,asset:{...source.asset,id:mediaId,duration:geo.duration,fps,hasAudio:false,colorRange:metadata.colorRange,colorMatrix:metadata.colorMatrix}});
@@ -897,7 +923,8 @@ async function renderAnimatedTimeline(request: RenderRequest) {
           return {...clip,keyframes:undefined,transition:'',start:0,duration,sourceIn:Math.max(0,original.sourceIn+offset),properties:{...clip.properties,transitionOut:'',opacity:Number(clip.properties.opacity??100)*fadeLevel(clip,time),gain:volume>0?Math.max(-60,Number(clip.properties.gain??0)+20*Math.log10(volume)):-60,fadeIn:0,fadeOut:0,audioFadeIn:0,audioFadeOut:0,fadeOrigin:0,fadeDuration:duration}};
         });
         const outputPath=path.join(directory,`${index}-${frame}.mov`);files.push(`file '${outputPath}'`);
-        await renderTimeline({...request,sampledFrame:true,transformSamples,clips:frameClips,nodes,timeline:{...request.timeline,duration},outputPath,onProgress:undefined,settings:{...request.settings,rangeIn:'0',rangeOut:String(duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
+        request.onStage?.(`Rendering animation · frame ${rendered+1}/${total}`);
+        await renderTimeline({...request,onStage:undefined,sampledFrame:true,transformSamples,clips:frameClips,nodes,timeline:{...request.timeline,duration},outputPath,onProgress:undefined,settings:{...request.settings,rangeIn:'0',rangeOut:String(duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
         request.onProgress?.(++rendered/total*90);
       }
       const list=path.join(directory,`${index}.txt`),baked=path.join(directory,`${index}.mov`);await writeFile(list,files.join('\n'));
@@ -930,11 +957,12 @@ async function renderCompositions(request: RenderRequest) {
       const timeline=request.timelines?.find(t=>t.id===parent.properties.compositionId&&t.projectId===request.project.id);
       if(!timeline)throw new Error(`${parent.name}: composition timeline is missing.`);
       const outputPath=path.join(directory,`${index}.mov`),mediaId=`composition-render-${parent.id}`;
-      await renderTimeline({...request,timeline,compositionPath:[...ancestry,request.timeline.id],transparent:true,sampledFrame:false,outputPath,onProgress:undefined,settings:{...request.settings,resolution:request.project.resolution,rangeIn:'0',rangeOut:String(timeline.duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
+      request.onStage?.(`Rendering composition ${index+1}/${parents.length} · ${parent.name}`);
+      await renderTimeline({...request,timeline,onStage:undefined,compositionPath:[...ancestry,request.timeline.id],transparent:true,sampledFrame:false,outputPath,onProgress:p=>request.onProgress?.((index+p/100)/parents.length*50),settings:{...request.settings,resolution:request.project.resolution,rangeIn:'0',rangeOut:String(timeline.duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
       clips[clips.indexOf(parent)]={...parent,mediaId};
       assets.push({path:outputPath,asset:{id:mediaId,projectId:request.project.id,name:parent.name,kind:'video',duration:timeline.duration,binId:'',thumbnail:'',fps:Number(request.settings.fps||request.project.fps),resolution:request.project.resolution,size:'',status:'ready',progress:100,hasAudio:request.settings.audio!=='Disabled',inputProfile:'Rec.709'}});
     }
-    await renderTimeline({...request,clips,assets});
+    await renderTimeline({...request,clips,assets,onProgress:p=>request.onProgress?.(50+p*.5)});
   } finally {await rm(directory,{recursive:true,force:true});}
 }
 

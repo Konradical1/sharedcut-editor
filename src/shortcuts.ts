@@ -12,10 +12,13 @@ export function useFocusRelease() {
       // Space is still safe over one — the handler below cancels the key before the popup opens.
       if(typingSurface(target)||target?.closest('label,select,[role="combobox"],[aria-haspopup]'))return;
       const active=document.activeElement;
-      if(active instanceof HTMLElement)active.blur();
+      // Keep timeline lanes focused so selected gaps receive Delete.
+      if(active instanceof HTMLElement&&(typingSurface(active)||active.matches('button,input,select')))active.blur();
     };
+    // Commit typed values before a timeline click changes the frame they belong to.
+    document.addEventListener('pointerdown',release,true);
     document.addEventListener('pointerup',release);
-    return()=>document.removeEventListener('pointerup',release);
+    return()=>{document.removeEventListener('pointerdown',release,true);document.removeEventListener('pointerup',release);};
   },[]);
 }
 export function useEditorShortcuts(enabled: boolean) {

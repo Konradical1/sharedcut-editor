@@ -12,7 +12,7 @@ function FootageCacheRow() {
   const [usage, setUsage] = useState<number | null>(null);
   const refresh = () => void footageUsage().then(setUsage);
   if (usage === null) refresh();
-  return <div className="settings-row"><span><strong>Cached footage</strong><small>{usage === null ? '…' : `${(usage / 1e6).toFixed(0)} MB on this computer`}</small></span><Button onClick={() => void clearFootageCache().then(refresh)}>Clear cache</Button></div>;
+  return <div className="settings-row"><span><strong>Cached footage</strong><small>{usage === null ? '…' : `${(usage / 1e6).toFixed(0)} MB on this computer`}</small></span><Button onClick={() => void clearFootageCache().then(refresh).catch(error => useEditorStore.getState().notify('Could not clear footage cache', 'error', error.message))}>Clear cache</Button></div>;
 }
 
 const categories = [

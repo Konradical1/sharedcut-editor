@@ -1,3 +1,4 @@
+import { createTimelinePreview } from './timelinePreview.ts';
 import { createSmartMaskPreview, activeSmartMasks, fittedSmartMask, lumaAlphaFilter, SmartMaskPending, type SmartMaskPixels } from './smartMaskPreview.ts';
 import { createMotionPreview } from './motionPreview.ts';
 import { transformMotion, drawMotionPose, motionArtwork } from './motionBlur.ts';
@@ -8,6 +9,7 @@ import { drawShape, getShape, isShape } from './shapes.ts';
 import { effectValue, effectEnabled, detailPixels } from './effects.ts';
 import type { Clip, GradeNode, MediaAsset, Project, Settings, Timeline, Track } from '../state/models.ts';
 import { gradeValues } from './grade.ts';
+import { createVideoFrames } from './videoFrames.ts';
 import { createColorPreview, ColorPending } from './colorPreview.ts';
 import { createFlowPreview } from './flowPreview.ts';
 import { createStabilizePreview } from './stabilizePreview.ts';
@@ -28,7 +30,7 @@ export function projectSize(resolution: string) {
 }
 
 type PlaybackState = {
-  projectId: string; timelineId: string; playhead: number; playing: boolean;
+  projectId: string; timelineId: string; playhead: number; playing: boolean; renderPreviewAllowed?: boolean;
   projects: Project[]; timelines?: Timeline[]; clips: Clip[]; tracks: Track[]; media: MediaAsset[]; nodes: GradeNode[]; settings: Settings;
   /** Shared overlay pack served by /api/transitions; absent until the library has loaded. */
   leaks?: { id: string; name: string; url: string; duration: number; fps: number; hasAudio: boolean }[];
@@ -108,7 +110,8 @@ export function playbackLayers(state: Pick<PlaybackState, 'clips' | 'tracks' | '
   const solo = tracks.some(t => t.solo && !t.muted);
   const active = state.clips.filter(c => c.projectId === state.projectId && c.timelineId === state.timelineId).flatMap(clip => {
     const span = clipSpan(clip, records);
-    if (!(span.start <= state.playhead && span.end > state.playhead)) return [];
+    // Imported fractional-rate cuts can differ from the frame clock by a few floating-point bits.
+    if (!(span.start <= state.playhead + 1e-7 && span.end > state.playhead + 1e-7)) return [];
     return [evaluateClip(extendClip(clip, span.start, span.end - span.start), state.playhead, fps)];
   }).filter(clip=>!clip.disabled);
   return active.flatMap(clip => {
@@ -143,15 +146,17 @@ type AudioRoute = {
 };
 type Decoder = AudioRoute & {
   url: string; element: HTMLMediaElement | HTMLImageElement; image: boolean; pending: boolean; blocked: boolean;
-  lastUsed: number; waitingSince?: number; error?: string; audioOnly: boolean; videoCallback?: number;
+  frames?: ReturnType<typeof createVideoFrames>; framesFailed?: boolean; lastUsed: number; waitingSince?: number; error?: string; audioOnly: boolean; videoCallback?: number;
 };
 
-/** Native decoders follow the store's playhead; this loop only paints and synchronizes media. */
+/** The timeline consumes prepared frames; native media remains the audio/compatibility path. */
 export function attachPlayback(canvas: HTMLCanvasElement, getState: () => PlaybackState, getOptions: () => PreviewOptions, onStatus: (status: PlaybackStatus) => void) {
   const output = canvas.getContext('2d', { alpha: false })!;
   const composite = document.createElement('canvas');
   const context = composite.getContext('2d', { alpha: false })!;
   let motion:ReturnType<typeof createMotionPreview>|undefined;
+  const timelinePreview=createTimelinePreview(()=>{dirty=true;});
+  let expensiveFrames=0, expensiveUntil=-Infinity;
   const layer = document.createElement('canvas'), reference = document.createElement('canvas');
   const layerContext = layer.getContext('2d')!, referenceContext = reference.getContext('2d')!;
   // Each side of a cut is rendered whole before the transition composites them, so a transition
@@ -186,7 +191,11 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   const leaks = new Map<string, { element: HTMLVideoElement; source?: MediaElementAudioSourceNode; gain?: GainNode; lastUsed: number }>();
   const decoders = new Map<string, Decoder>();
   const streamFallbacks = new Map<string, string>();
-  const selectedUrl = (asset: MediaAsset, options: PreviewOptions, visual: boolean) => { const url = playbackUrl(asset, options, visual); return url ? streamFallbacks.get(url) ?? url : url; };
+  const automaticStreams = new Map<string,string>();
+  const selectedUrl = (asset: MediaAsset, options: PreviewOptions, visual: boolean) => {
+    const url = playbackUrl(asset, options, visual);
+    return url ? streamFallbacks.get(url) ?? (visual&&!options.original&&options.quality==='Stream'?automaticStreams.get(asset.id):undefined) ?? url : url;
+  };
   const groups = new Map<string, { canvas: HTMLCanvasElement; reference: HTMLCanvasElement; audio: AudioRoute }>();
   let color: ReturnType<typeof createColorPreview> | undefined;
   let audio: AudioContext | undefined, master: GainNode | undefined, masterAnalyser: AnalyserNode | undefined;
@@ -206,12 +215,15 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   document.fonts.addEventListener('loadingdone', fontsChanged);
   const status = (value: PlaybackStatus) => { const key = JSON.stringify(value); if (key !== statusKey) { statusKey = key; onStatus(value); } };
   const cleanup = (decoder: Decoder) => {
+    decoder.frames?.dispose();
     decoder.element.onload = null; decoder.element.onerror = null;
     if (!decoder.image) { const media = decoder.element as HTMLMediaElement; if (decoder.videoCallback !== undefined) (media as HTMLVideoElement).cancelVideoFrameCallback(decoder.videoCallback); media.pause(); media.removeAttribute('src'); media.load(); }
     decoder.source?.disconnect(); decoder.filters.forEach(node => node.disconnect()); decoder.gain?.disconnect(); decoder.pan?.disconnect(); decoder.analyser?.disconnect();
   };
   const decoderFor = (clip: Clip, asset: MediaAsset, visual: boolean, options: PreviewOptions) => {
     const requestedUrl = playbackUrl(asset, options, visual);
+    // Pick at decoder creation, not on each throughput sample: no quality oscillation mid-shot.
+    if(visual&&!options.original&&options.quality==='Stream'&&!decoders.has(clip.id)&&asset.proxyVariants?.StreamLow&&requestedUrl&&![...decoders.values()].some(decoder=>decoder.url===requestedUrl&&!decoder.audioOnly)&&footageCache.preferLowStream(requestedUrl))automaticStreams.set(asset.id,asset.proxyVariants.StreamLow);
     const url = selectedUrl(asset, options, visual), audioOnly = !visual || asset.kind === 'audio';
     const fallback = !url && visual && asset.thumbnail;
     if (!url && !fallback) return;
@@ -223,14 +235,14 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         decoder = { url: String(url || fallback), element, image, audioOnly, pending: false, blocked: false, filters: [], lastUsed: performance.now() };
         const current = decoder;
         element.crossOrigin = 'anonymous'; element.onerror = () => {
-          const stream = asset.proxyVariants?.Stream;
+          const stream = getState().media.find(item => item.id === asset.id)?.proxyVariants?.Stream;
           if (!image && stream && stream !== current.url && requestedUrl) streamFallbacks.set(requestedUrl, stream);
           else current.error = `${asset.name}: ${!image && (element as HTMLMediaElement).error?.code === 2 ? 'download failed' : 'source could not be decoded'}. Retry playback.`;
           dirty = true;
         };
         if (image) element.onload = () => { dirty = true; };
         else {
-          const media = element as HTMLMediaElement; media.preload = 'auto'; media.addEventListener('loadedmetadata', () => { dirty = true; }); media.addEventListener('loadeddata', () => { dirty = true; }); media.addEventListener('seeked', () => { dirty = true; });
+          const media = element as HTMLMediaElement; media.preload = visual && !options.original && typeof VideoDecoder !== 'undefined' && typeof Worker !== 'undefined' ? 'none' : 'auto'; media.addEventListener('loadedmetadata', () => { dirty = true; }); media.addEventListener('loadeddata', () => { dirty = true; }); media.addEventListener('seeked', () => { dirty = true; });
           if (media instanceof HTMLVideoElement) {
             media.playsInline = true;
             const decodedFrame = () => { if (!disposed && media.src) { dirty = true; current.videoCallback = media.requestVideoFrameCallback?.(decodedFrame); } };
@@ -241,7 +253,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       }
     decoder.lastUsed = performance.now();
     // Undo the idle downgrade below: a decoder asked for by name is on screen or about to be.
-    if (!decoder.image && (decoder.element as HTMLMediaElement).preload !== 'auto') (decoder.element as HTMLMediaElement).preload = 'auto';
+    if (!decoder.image && decoder.audioOnly && (decoder.element as HTMLMediaElement).preload !== 'auto') (decoder.element as HTMLMediaElement).preload = 'auto';
     return decoder;
   };
   const connect = (decoder: AudioRoute, clip: Clip, source: () => AudioNode, destination = master as AudioNode | undefined) => {
@@ -286,6 +298,15 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       dirty = true;
     }).finally(() => { decoder.pending = false; });
   };
+  const buffered = (decoder: Decoder, clip: Clip, fps: number) => {
+    const media=decoder.element;
+    const cacheEnabled=getState().settings.footageCache!==false;
+    if(decoder.frames&&decoder.frames.cacheEnabled!==cacheEnabled){decoder.frames.dispose();decoder.frames=undefined;}
+    if(decoder.frames?.failed){decoder.frames.dispose();decoder.frames=undefined;decoder.framesFailed=true;}
+    if (decoder.framesFailed || !(media instanceof HTMLVideoElement) || typeof VideoDecoder==='undefined' || typeof Worker==='undefined' || !/\.mp4(?:\?|$)/i.test(decoder.url) || clip.properties.reverse || clip.properties.freeze || Number(clip.properties.speed??100)>200) return undefined;
+    media.pause(); media.preload='none';
+    return decoder.frames??=createVideoFrames(decoder.url,fps,()=>{dirty=true;},cacheEnabled);
+  };
   const draw = (target: CanvasRenderingContext2D, clip: Clip, width: number, height: number, projectWidth: number, projectHeight: number, time = getState().playhead) => {
     const p=clip.properties,project=getState().projects.find(p=>p.id===clip.projectId);
     const poses=transformMotion(clip,time,project?.fps??24,projectWidth,projectHeight);
@@ -302,12 +323,13 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   const tick = () => {
     if (disposed) return;
     frame = requestAnimationFrame(tick);
-    const state = getState(), options = getOptions(), project = state.projects.find(p => p.id === state.projectId);
+    let state = getState();
+    const options = getOptions(), project = state.projects.find(p => p.id === state.projectId);
     footageCache.update(state, options, (asset, visual) => selectedUrl(asset, options, visual));
     const efficient = efficientPlayback(state.settings.performanceMode);
     // 'Match timeline' leaves the cap at the sequence rate; an explicit rate overrides it.
     const previewFps = parseFloat(String(state.settings.playbackFrameRate)) || project?.fps || 24;
-    const slot = Math.floor(performance.now() * previewFps / 1000);
+    const slot = Math.floor((state.playing&&!stalled?state.playhead:performance.now()/1000) * previewFps + 1e-6);
     // Compositing faster than the timeline's frame rate produces frames nothing will ever show: a
     // 24 fps sequence on a 120 Hz display was doing five times the grade and effect work per frame.
     // A 60 fps source sets `dirty` on every decoded frame, so the cap cannot defer to it here.
@@ -316,6 +338,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // frame is as often as it can possibly pay off. `dirty` is the escape hatch: a decoder that has
     // just finished seeking paints immediately rather than waiting out the slot.
     if (stalled && !dirty && slot === renderSlot) return;
+    if(state.playing)state={...state,playhead:Math.floor(state.playhead*previewFps+1e-6)/previewFps};
+    const renderStarted=performance.now();
     const dependencies = [state.timelineId, state.timelines, state.playhead, state.playing, state.clips, state.tracks, state.media, state.leaks, state.nodes, state.settings, project, options.original, options.quality, options.volume, options.compare, options.fontsRevision];
     if (!dirty && !stalled && dependencies.every((value, i) => value === previous[i])) return;
     previous = dependencies; dirty = false; renderSlot = slot;
@@ -331,7 +355,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     context.fillStyle = '#000'; context.fillRect(0, 0, width, height); referenceContext.clearRect(0, 0, width, height);
     const seeks: [HTMLMediaElement, number][] = [];
     const layers = playbackLayers(state,project?.fps||24), activeIds = new Set<string>(), warmIds = new Set<string>(), activeGroups = new Set<string>(), trackLevels: Record<string, number> = {};
-    let sourceClip = '', sourceTimestamp = '';
+    let sourceClip = '', sourceTimestamp = '', engine = ''; let decodedAhead = Infinity;
     let missing = false, loading = false, picture = false, error = '', warning = '';
     if (master && audio) master.gain.setTargetAtTime((state.settings.masterMuted || state.settings.monitorAudio === false ? 0 : 10 ** (Number(state.settings.masterGain ?? 0) / 20)) * options.volume / 100, audio.currentTime, .015);
     const updateAudio = (route:AudioRoute,clip:Clip,track:Track,time:number,audible:boolean) => {
@@ -477,7 +501,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         const id=`${clip.id}:flow:${record.key}`;
         const synthetic={...asset,hasAudio:false,colorProxyUrl:record.url,sourceUrl:record.url,proxyUrl:record.url,proxyVariants:{},duration:record.duration,fps:record.fps};
         const decoder=decoderFor({...clip,id},synthetic,true,{...options,original:false});
-        if(decoder)activeIds.add(id);
+        if(decoder){activeIds.add(id);(decoder.element as HTMLMediaElement).preload='auto';}
         return decoder;
       };
       // Stabilize is a per-frame warp of the picture this clip already decodes: no substitute media, so
@@ -505,12 +529,47 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       const fallback = !url && visual && asset.thumbnail;
       if (!url) missing = true;
       if (!url && !fallback) continue;
-      const decoder = flowReady && !audible ? interpolated : decoderFor(clip, asset, visual && !flowReady, options);
+      const decoderId=!visual&&asset.kind==='video'?`${clip.id}:audio`:clip.id;
+      const decoder = flowReady && !audible ? interpolated : decoderFor(decoderId===clip.id?clip:{...clip,id:decoderId}, asset, visual && !flowReady, options);
       if (!decoder) continue;
-      if(decoder!==interpolated)activeIds.add(clip.id);
+      if(decoder!==interpolated)activeIds.add(decoderId);
       if (decoder.error) { error = decoder.error; footageCache.setDecoderStatus(clip.id, decoder.url, decoder.error, true); continue; }
-      if (!decoder.image) {
+      const frames=visual&&!flowReady&&rate>0&&rate*Number(clip.properties.speed??100)/100<=2?buffered(decoder,clip,asset.fps||24):undefined;
+      if(!frames&&decoder.frames){decoder.frames.dispose();decoder.frames=undefined;}
+      let queuedFrame:VideoFrame|undefined;
+      if(frames){
+        const media=decoder.element as HTMLVideoElement,targetTime=sourceTime(original,time,asset.fps||24,Number.isFinite(media.duration)?media.duration:asset.duration||Infinity);
+        if(decoder.gain&&audio)decoder.gain.gain.setValueAtTime(0,audio.currentTime);
+        media.muted=true;
+        frames.update(targetTime);queuedFrame=frames.frame(targetTime);engine='webcodecs';decodedAhead=Math.min(decodedAhead,frames.ahead);
+        // Picture decodes ahead; sound stays on the timeline clock and must never leak during pre-roll.
+        if(audible){
+          const sound=decoderFor({...clip,id:`${clip.id}:audio`},asset,false,options);
+          if(sound){
+            activeIds.add(`${clip.id}:audio`);const element=sound.element as HTMLMediaElement;
+            const running=state.playing&&!stalled;
+            if(!running)element.pause();
+            if(element.readyState>=1&&!element.seeking&&Math.abs(element.currentTime-targetTime)>(running?.12:1/(asset.fps||24)))seeks.push([element,targetTime]);
+            element.playbackRate=Math.max(.0625,Math.min(8,rate*Number(clip.properties.speed??100)/100));
+            connect(sound,clip,()=>audio!.createMediaElementSource(element),destination);updateAudio(sound,clip,track,time,running);element.muted=!sound.gain;
+            if(running)play(sound);if(sound.error)error=sound.error;
+          }
+        }
+        for(const frame of frames.prepare(targetTime,Math.max(.001,rate*Number(clip.properties.speed??100)/100)/previewFps))color?.prepare(media,frame);
+        if(!queuedFrame){
+          decoder.waitingSince??=performance.now();
+          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow){automaticStreams.set(asset.id,asset.proxyVariants.StreamLow);dirty=true;}
+          // Failed codecs switch through buffered() immediately. A network timeout remains visible.
+          if(performance.now()-decoder.waitingSince>30000){decoder.framesFailed=true;frames.dispose();decoder.frames=undefined;dirty=true;}
+          loading=true;footageCache.setDecoderStatus(clip.id,decoder.url,`${asset.name} · ${frames.ahead?'Decoding requested frame':'Buffering video'}`);continue;
+        }
+        decoder.waitingSince=undefined;
+        footageCache.setDecoderStatus(clip.id,decoder.url);
+      }
+      if (!decoder.image && !frames) {
+        if(visual)engine='native';
         const media = decoder.element as HTMLMediaElement;
+        media.preload='auto';
         if (media.readyState < 2 || media.seeking) {
           decoder.waitingSince ??= performance.now();
           const waited = performance.now() - decoder.waitingSince;
@@ -520,12 +579,12 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           footageCache.setDecoderStatus(clip.id, decoder.url, `${asset.name} · ${media.seeking ? 'Seeking frame' : media.readyState < 1 ? 'Loading media metadata' : 'Buffering / decoding frame'}`);
         } else { decoder.waitingSince = undefined; footageCache.setDecoderStatus(clip.id, decoder.url); }
       }
-      if (!decoder.image && decoder!==interpolated) {
+      if (!decoder.image && decoder!==interpolated && !frames) {
         const media = decoder.element as HTMLMediaElement;
         const fps = asset.fps || project?.fps || 24;
         const targetTime = sourceTime(original, time, fps, Number.isFinite(media.duration) ? media.duration : asset.duration || Infinity);
         const speed = rate * Number(clip.properties.speed ?? 100) / 100;
-        const normalPlayback = state.playing && !clip.properties.reverse && !clip.properties.freeze && speed >= .0625 && speed <= 8;
+        const normalPlayback = state.playing && !stalled && !clip.properties.reverse && !clip.properties.freeze && speed >= .0625 && speed <= 8;
         if (!normalPlayback) media.pause();
         // Paint the completed seek before starting the newest request; never queue stale pointer positions.
         const drift = media.readyState >= 1 ? media.currentTime - targetTime : 0;
@@ -565,18 +624,18 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         if(media.seeking){loading=true;continue;}
       }
       sourceClip = clip.id;
-      sourceTimestamp = String(element instanceof HTMLVideoElement ? Math.floor(element.currentTime * (asset.fps || 24) + 1e-6) / (asset.fps || 24) : 0);
-      const sourceWidth = element instanceof HTMLVideoElement ? element.videoWidth : element.naturalWidth;
-      const sourceHeight = element instanceof HTMLVideoElement ? element.videoHeight : element.naturalHeight;
+      sourceTimestamp = String(queuedFrame?queuedFrame.timestamp/1e6:element instanceof HTMLVideoElement ? Math.floor(element.currentTime * (asset.fps || 24) + 1e-6) / (asset.fps || 24) : 0);
+      const sourceWidth = queuedFrame?.displayWidth ?? (element instanceof HTMLVideoElement ? element.videoWidth : element.naturalWidth);
+      const sourceHeight = queuedFrame?.displayHeight ?? (element instanceof HTMLVideoElement ? element.videoHeight : element.naturalHeight);
       if (!sourceWidth || !sourceHeight) continue;
       layerContext.clearRect(0, 0, width, height);
       const fit = Math.min(width / sourceWidth, height / sourceHeight);
-      layerContext.drawImage(element, (width - sourceWidth * fit) / 2, (height - sourceHeight * fit) / 2, sourceWidth * fit, sourceHeight * fit);
+      layerContext.drawImage(queuedFrame??element, (width - sourceWidth * fit) / 2, (height - sourceHeight * fit) / 2, sourceWidth * fit, sourceHeight * fit);
       if (options.compare) draw(referenceTarget, clip, width, height, projectWidth, projectHeight,time);
       // While the analysis runs, hold the original at the crop the solve will apply so the framing never jumps.
       const framed = stabilizeFx && !stabilizeSolveFor ? {...clip, properties:{...clip.properties, zoom: Number(clip.properties.zoom ?? 100) * stabilizeZoom(stabilizeSettings(original, stabilizeFx))}} : clip;
       const warp = stabilizeSolveFor ? {solve:stabilizeSolveFor,time:sourceTime(original,time,sourceFps,asset.duration||Infinity),sourceWidth,sourceHeight} : undefined;
-      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp);
+      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame);
     }
     flush(Infinity);
     };
@@ -584,7 +643,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     /** The stabilize warp in this layer's pixels. Picture and matte take the same one, which is what puts the
      *  matte on the stabilized frame instead of the original framing. */
     const warpTransform = (warp:LayerWarp) => stabilizeLayerTransform(warp.solve,warp.time,width,height,warp.sourceWidth,warp.sourceHeight);
-    const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp) => {
+    const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp,snapshot?:VideoFrame) => {
       let masks=new Map<string,SmartMaskPixels>();
       try {
         const nodes = evaluateNodes(state.nodes.filter(node => node.clipId === clip.id),clip,time).filter(node=>node.enabled);
@@ -602,13 +661,13 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         };
         if(maskCount || nodes.length || clip.properties.resolveLookUrl || Number(clip.properties.inputExposure) || Number(clip.properties.inputTemperature) || clip.properties.yuvMatrix || clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto') {
           color ??= createColorPreview(()=>{dirty=true;});
-          const previewAsset=element?.currentSrc.includes('/files/')?{...asset,colorMatrix:'bt709'}:asset;
-          const result = color.draw(layer,clip,previewAsset,nodes,element,sampleTime=>loadMasks(element?sampleTime:sourceTime(clip,time,asset.fps||24,asset.duration)));
+          const previewAsset=element?.src.includes('/files/')?{...asset,colorMatrix:'bt709'}:asset;
+          const result = color.draw(layer,clip,previewAsset,nodes,element,sampleTime=>loadMasks(element?sampleTime:sourceTime(clip,time,asset.fps||24,asset.duration)),snapshot);
           if(element)sourceTimestamp=result.dataset.sourceTimestamp ?? '';
           canvas.dataset.colorPrecision=result.dataset.colorPrecision??'8-bit RGB fallback';
           layerContext.clearRect(0,0,width,height); layerContext.drawImage(result,0,0);
         }
-      } catch (cause) { if(cause instanceof ColorPending||cause instanceof SmartMaskPending){loading=true;footageCache.setDecoderStatus(clip.id,asset.proxyUrl??'',`${asset.name} · ${cause instanceof ColorPending?'Preparing color frame':'Preparing mask'}`);const pending=seeks.findIndex(([media])=>media===element);if(pending>=0)seeks.splice(pending,1);}else error=cause instanceof Error?cause.message:'Color preview unavailable.'; layerContext.clearRect(0,0,width,height);return; }
+      } catch (cause) { if(cause instanceof ColorPending||cause instanceof SmartMaskPending){loading=true;footageCache.setDecoderStatus(clip.id,asset.proxyUrl??'',`${asset.name} · ${cause instanceof ColorPending?'Preparing color frame':'Preparing mask'}`);const pending=seeks.findIndex(([media])=>media===element);if(pending>=0)seeks.splice(pending,1);}else {error=cause instanceof Error?cause.message:'Color preview unavailable.';footageCache.setDecoderStatus(clip.id,asset.proxyUrl??'',`${asset.name}: ${error}`,true);} layerContext.clearRect(0,0,width,height);return; }
       // Stabilize goes first. Grading and node masks read the frame the camera shot; from here on every
       // screen-space effect below, and the Smart Mask cut, sees the stabilized picture.
       if(warp) {
@@ -667,21 +726,29 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       }
       draw(target,clip,width,height,projectWidth,projectHeight,time);
     };
-    renderLayers(state.timelineId,state.playhead,context,referenceContext);
+    const prepared=state.renderPreviewAllowed!==false&&!options.compare&&!options.original&&options.quality==='Stream'?timelinePreview.get(state,state.playhead,width,height,performance.now()<expensiveUntil):undefined;
+    if(prepared){
+      renderLayers(state.timelineId,state.playhead,context,referenceContext,false,true);
+      context.drawImage(prepared.frame,0,0,width,height);picture=true;engine='render-cache';warning='Rendered preview · ready';sourceClip=`preview:${prepared.key}`;sourceTimestamp=String(state.playhead);
+    }else renderLayers(state.timelineId,state.playhead,context,referenceContext);
+    if(!prepared&&!loading&&state.playing&&performance.now()-renderStarted>1000/previewFps*.7){
+      if(++expensiveFrames>=6){expensiveUntil=performance.now()+15000;expensiveFrames=0;}
+    }else expensiveFrames=Math.max(0,expensiveFrames-1);
     // Warm upcoming pictures and their looks independently of the audio clips.
     const upcoming=timelineTransitions(state.clips,state.timelineId,state.media).filter(record=>record.start>state.playhead&&record.start-state.playhead<1.5);
     // Every warmed decoder is another preload="auto" stream competing for the same link. Off the
     // LAN that is what made the first pass stall: several of them pulling clips minutes away while
     // the clip on screen was still starving. Nothing past the horizon is worth opening, and while
-    // the picture itself is still loading nothing is worth opening at all.
+    // the picture is loading retain prepared decoders without opening additional streams.
     const horizon = state.playing ? 5 : 2;
-    const candidates=loading?[]:state.clips.filter(clip=>state.media.some(asset=>asset.id===clip.mediaId)&&clip.timelineId===state.timelineId&&clip.projectId===state.projectId&&!clip.disabled&&!activeIds.has(clip.id)&&clip.start>state.playhead&&clip.start-state.playhead<horizon&&state.tracks.some(t=>t.id===clip.trackId&&(t.kind==='video'?!t.hidden:!t.muted)))
+    const candidates=state.clips.filter(clip=>state.media.some(asset=>asset.id===clip.mediaId)&&clip.timelineId===state.timelineId&&clip.projectId===state.projectId&&!clip.disabled&&!activeIds.has(clip.id)&&clip.start>state.playhead&&clip.start-state.playhead<horizon&&state.tracks.some(t=>t.id===clip.trackId&&(t.kind==='video'?!t.hidden:!t.muted)))
       .sort((a,b)=>(upcoming.some(r=>r.incomingId===b.id||r.outgoingId===b.id)?1:0)-(upcoming.some(r=>r.incomingId===a.id||r.outgoingId===a.id)?1:0)||a.start-b.start);
     const nearby=[...candidates.filter(c=>state.tracks.find(t=>t.id===c.trackId)?.kind==='video').slice(0,efficient?1:3),...(state.playing?candidates.filter(c=>state.tracks.find(t=>t.id===c.trackId)?.kind==='audio').slice(0,efficient?1:2):[])];
     for (const clip of nearby) {
+      if (loading && !decoders.has(clip.id)) continue;
       const asset = state.media.find(asset => asset.id === clip.mediaId);
       if (!asset) continue;
-      if(state.tracks.find(t=>t.id===clip.trackId)?.kind==='video'&&clip.properties.resolveLookUrl) {try{color??=createColorPreview(()=>{dirty=true;});color.preload(clip,asset);}catch{/* The active clip reports an invalid transform. */}}
+      if(state.tracks.find(t=>t.id===clip.trackId)?.kind==='video'&&(clip.properties.resolveLookUrl||state.nodes.some(node=>node.clipId===clip.id&&node.enabled)||Number(clip.properties.inputExposure)||Number(clip.properties.inputTemperature)||clip.properties.yuvMatrix||clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto')) {try{color??=createColorPreview(()=>{dirty=true;});color.preload(clip,asset);}catch{/* The active clip reports an invalid transform. */}}
       const decoder = decoderFor(clip, asset, state.tracks.find(t=>t.id===clip.trackId)?.kind==='video' && asset.kind !== 'audio', options);
       warmIds.add(clip.id);
       if (decoder && !decoder.image) {
@@ -690,6 +757,18 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         const warmSpan = window ? clipSpan(clip, [window]) : null;
         const warmClip = warmSpan ? extendClip(clip, warmSpan.start, warmSpan.end - warmSpan.start) : clip;
         const time = sourceTime(warmClip, Math.max(state.playhead, warmClip.start), asset.fps || project?.fps || 24, asset.duration || Infinity);
+        const track=state.tracks.find(t=>t.id===clip.trackId);
+        const frames=track?.kind==='video'?buffered(decoder,clip,asset.fps||24):undefined;
+        if(frames){
+          if(asset.hasAudio&&!clip.properties.audioDetached&&!track?.muted){
+            const sound=decoderFor({...clip,id:`${clip.id}:audio`},asset,false,options);
+            if(sound){warmIds.add(`${clip.id}:audio`);const element=sound.element as HTMLMediaElement;element.pause();element.muted=true;if(element.readyState>=1&&!element.seeking&&Math.abs(element.currentTime-time)>.05)seeks.push([element,time]);}
+          }
+          media.muted=true;frames.update(time);
+          for(const frame of frames.prepare(time,Math.max(.001,Number(clip.properties.speed??100)/100)/previewFps))color?.prepare(media as HTMLVideoElement,frame);
+          continue;
+        }
+        media.preload='auto';
         if (media.readyState >= 1 && !media.seeking && Math.abs(media.currentTime - time) > .05) seeks.push([media, Math.min(Number.isFinite(media.duration)?Math.max(0,media.duration-.001):Infinity,(Math.floor(time*(asset.fps||project?.fps||24)+1e-6)+.5)/(asset.fps||project?.fps||24))]);
         // Have the first color snapshot ready at the cut, as well as its decoder and LUT.
         if (media instanceof HTMLVideoElement && !seeks.some(([element]) => element === media)) {
@@ -702,16 +781,16 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       // Pausing stops playback but NOT the fetch: preload='auto' keeps filling the buffer, so a pool
       // of idle decoders quietly competes with the clip on screen for the same uplink. Only the warm
       // set (the next cuts) is worth buffering ahead; everything else drops back to metadata.
-      if (!decoder.image) { const media = decoder.element as HTMLMediaElement; media.pause(); const want = warmIds.has(id) ? 'auto' : 'metadata'; if (media.preload !== want) media.preload = want; }
-      if (!state.clips.some(clip => clip.id === id || id.startsWith(`${clip.id}:flow:`))) { cleanup(decoder); decoders.delete(id); }
+      if (!decoder.image) { const media = decoder.element as HTMLMediaElement; if(!decoder.frames||!warmIds.has(id))media.pause(); const want = decoder.frames ? 'none' : warmIds.has(id) ? 'auto' : 'metadata'; if (media.preload !== want) media.preload = want; }
+      if (!state.clips.some(clip => clip.id === id || id===`${clip.id}:audio` || id.startsWith(`${clip.id}:flow:`))) { cleanup(decoder); decoders.delete(id); }
     }
     for(const [key,entry] of sideCanvases)if(performance.now()-entry.lastUsed>5000)sideCanvases.delete(key);
     for(const [id,entry] of leaks)if(performance.now()-entry.lastUsed>8000){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();leaks.delete(id);}
     for(const [id,group] of groups)if(!activeGroups.has(id)){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();groups.delete(id);}
-    for (const [id, decoder] of [...decoders].filter(([id]) => !activeIds.has(id)).sort((a, b) => a[1].lastUsed - b[1].lastUsed)) {
+    for (const [id, decoder] of [...decoders].filter(([id]) => !activeIds.has(id) && !warmIds.has(id)).sort((a, b) => a[1].lastUsed - b[1].lastUsed)) {
       // Every retained decoder is a live hardware decode session and a buffer competing for the
-      // uplink. Twelve of them starved the clip on screen; the warm set is at most 5, so 4 idle
-      // spare slots is already generous. ponytail: fixed cap, make it adaptive if seek-back churns.
+      // uplink. Never evict the next cuts we just prepared: recreating them each tick
+      // discards their seek and decoded frame before the cut. Only idle spares can be evicted.
       if (decoders.size <= Math.max(efficient?2:4, activeIds.size)) break;
       cleanup(decoder); decoders.delete(id);
     }
@@ -724,7 +803,11 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       window.dispatchEvent(new CustomEvent('frameline:frame', { detail: canvas }));
     }
     for (const [media, time] of seeks) media.currentTime = time;
+    if (seeks.length) dirty = true;
+    if (loading) for (const decoder of decoders.values()) if (!decoder.image && !decoder.frames) (decoder.element as HTMLMediaElement).pause();
     stalled = loading;
+    canvas.dataset.playbackEngine=engine;canvas.dataset.decodedAhead=String(Number.isFinite(decodedAhead)?decodedAhead:0);canvas.dataset.buffering=String(loading);
+    window.dispatchEvent(new CustomEvent('frameline:playback-health',{detail:{playing:state.playing,playhead:state.playhead,loading,error,engine,reason:loading?[...activeIds].map(id=>footageCache.clipFootageStatus(id).playback?.detail).filter(Boolean).join('; '):'',decodedAhead:Number.isFinite(decodedAhead)?decodedAhead:0}}));
 
 
     if (performance.now() - meterTime > 80) {
@@ -732,14 +815,15 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if (masterAnalyser && state.playing) { const samples = new Float32Array(masterAnalyser.fftSize); masterAnalyser.getFloatTimeDomainData(samples); rms = Math.sqrt(samples.reduce((sum, value) => sum + value * value, 0) / samples.length); }
       window.dispatchEvent(new CustomEvent('frameline:meters', { detail: { tracks: trackLevels, master: rms } }));
     }
-    const blocker = [...activeIds].map(id => footageCache.clipFootageStatus(id)).find(item => item.state === 'yellow' || item.state === 'red');
+    const blocker = [...activeIds].map(id => footageCache.clipFootageStatus(id)).map(item => item.playback).find(Boolean);
+    const automaticLow=[...activeIds].some(id=>{const decoder=decoders.get(id);return decoder&&[...automaticStreams.values()].includes(decoder.url);});
     const fallbackActive = [...activeIds].some(id => { const decoder = decoders.get(id); return decoder && [...streamFallbacks.values()].includes(decoder.url); });
-    status(error ? { title: 'Playback unavailable', detail: error, error: true } : loading ? { title: 'Loading picture…', detail: blocker?.detail ?? 'Preparing required layers', loading: true } : missing ? { title: 'Original media offline', detail: 'Import the source files to play this timeline.' } : !picture && !layers.some(l => l.audible) ? { title: 'No picture at playhead' } : fallbackActive ? { title: 'Stream fallback', detail: 'The selected source could not play smoothly. Showing the compatible Stream preview with reduced precision; exports still use originals.', fallback: true } : warning ? { title: warning } : null);
+    status(error ? { title: 'Playback unavailable', detail: error, error: true } : loading ? { title: 'Loading picture…', detail: blocker?.detail ?? 'Preparing required layers', loading: true } : missing ? { title: 'Original media offline', detail: 'Import the source files to play this timeline.' } : !picture && !layers.some(l => l.audible) ? { title: 'No picture at playhead' } : fallbackActive ? { title: 'Stream fallback', detail: 'The selected source could not play smoothly. Showing the compatible Stream preview with reduced precision; exports still use originals.', fallback: true } : automaticLow ? { title: 'Auto preview · reduced bandwidth', detail: 'Using the smaller streaming preview to keep playback moving. Originals and export quality are unchanged.' } : warning ? { title: warning } : null);
   };
   frame = requestAnimationFrame(tick);
   return {
     retry() {
-      streamFallbacks.clear(); footageCache.retryFootage();
+      streamFallbacks.clear(); automaticStreams.clear(); footageCache.retryFootage();
       for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); }
       decoders.clear(); dirty = true;
     },
@@ -750,6 +834,6 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       for (const decoder of decoders.values()) decoder.blocked = false;
       dirty = true;
     },
-    dispose() { disposed = true; maskPreview.dispose();fittedMasks.clear();maskCuts.clear();motion?.dispose(); flowPreview.dispose(); stabilizePreview.dispose(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',fontsChanged); color?.dispose(); cancelAnimationFrame(frame); for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); } decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
+    dispose() { disposed = true; timelinePreview.dispose();maskPreview.dispose();fittedMasks.clear();maskCuts.clear();motion?.dispose(); flowPreview.dispose(); stabilizePreview.dispose(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',fontsChanged); color?.dispose(); cancelAnimationFrame(frame); for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); } decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
   };
 }

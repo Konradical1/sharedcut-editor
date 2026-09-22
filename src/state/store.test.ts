@@ -833,3 +833,13 @@ test('a multi-drop skips media that is not ready and sends audio to its own lane
   assert.equal(state().clips.find(c=>c.mediaId===video.id)!.start,0);
   assert.equal(audio.start,3,'Audio still follows the video in time.');
 });
+
+
+test('local buffering holds the playhead and resumes without jumping over elapsed loading time', () => {
+  store.setState({ playing: true, playhead: 10, liveMode: 'independent', playbackBuffering: true });
+  const now = Date.now(); state().tick(now); state().tick(now + 1000);
+  assert.equal(state().playhead, 10);
+  assert.equal(state().playing, true, 'play intent survives buffering');
+  store.setState({ playbackBuffering: false }); state().tick(now + 1100);
+  assert.ok(Math.abs(state().playhead - 10.1) < .001);
+});

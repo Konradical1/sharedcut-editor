@@ -76,6 +76,14 @@ test('HTTP accounts, private/shared projects, role enforcement, conflicts and pe
     const publishedHistory = await state();
     publishedHistory.state.operations.push({ id: 'history-check', projectId: 'shared-project', userId: alice.id, timestamp: Date.now(), targetId: 'shared-project', type: 'PropertyChanged', description: 'Saved entry', oldState: [], newState: [] });
     assert.equal((await save(publishedHistory)).response.status, 200);
+    const compressionFixture = await state();
+    compressionFixture.state.projects[0].description = 'Compression regression. '.repeat(150);
+    assert.equal((await save(compressionFixture)).response.status, 200);
+    const compressed = await request('/state', 'GET', undefined, aliceCookie, { 'accept-encoding': 'gzip' });
+    assert.equal(compressed.response.headers.get('content-encoding'), 'gzip');
+    const plain = await request('/state', 'GET', undefined, aliceCookie, { 'accept-encoding': 'gzip;q=0' });
+    assert.equal(plain.response.headers.get('content-encoding'), null);
+    assert.deepEqual(compressed.data.state, plain.data.state, 'compression preserves the entire sync and undo document');
     const reordered = await state(); reordered.state.operations = reordered.state.operations.map(op => Object.fromEntries(Object.entries(op).reverse()) as typeof op);
     assert.equal((await save(reordered)).response.status, 200, 'JSON field order is not a history edit.');
     const modifiedHistory = await state(); modifiedHistory.state.operations[0].description = 'Rewritten entry';
@@ -202,6 +210,17 @@ test('real upload, authenticated range playback, locks, export download and medi
     assert.equal((await request('/locks', 'POST', { projectId: 'film', targetId: 'clip', field: 'speed' })).status, 409);
     data = (await request('/state')).data; data.state.clips[0].properties.speed = 200; assert.equal((await request('/state', 'PUT', data)).status, 423);
     assert.equal((await request('/locks', 'DELETE', { projectId: 'film', targetId: 'clip', field: 'speed' }, editorCookie)).status, 200);
+    const previewRequest={projectId:'film',timelineId:'timeline',chunk:0,width:320,height:180};
+    assert.equal((await request('/timeline-previews','POST',{...previewRequest,chunk:-1})).status,400);
+    assert.equal((await request('/timeline-previews','POST',previewRequest,'')).status,401);
+    let preview=(await request('/timeline-previews','POST',previewRequest)).data;
+    for(let i=0;i<100&&preview.status==='preparing';i++){await new Promise(resolve=>setTimeout(resolve,100));preview=(await request('/timeline-previews','POST',previewRequest)).data;}
+    assert.equal(preview.status,'ready',preview.error);
+    const previewBytes=await fetch(`${base}${preview.url}`,{headers:{cookie,range:'bytes=0-31'}});assert.equal(previewBytes.status,206);assert.equal((await previewBytes.arrayBuffer()).byteLength,32);
+    assert.equal((await fetch(`${base}${preview.url}`)).status,401);
+    assert.equal((await request('/timeline-previews','POST',previewRequest)).data.key,preview.key,'Unchanged edits reuse the finished render.');
+    data=(await request('/state')).data;data.state.clips[0].properties.opacity=90;assert.equal((await request('/state','PUT',data)).status,200);
+    assert.notEqual((await request('/timeline-previews','POST',previewRequest)).data.key,preview.key,'Editing an effect invalidates the rendered preview.');
     const render = await request('/renders', 'POST', { projectId: 'film', name: 'First export', preset: 'Quick Export', settings: { resolution: '320 × 180', fps: '24', codec: 'H.264', audio: 'AAC · 320 kb/s · 48 kHz' } }); assert.equal(render.status, 202);
     data = await waitFor(state => ['complete', 'failed'].includes(state.renderJobs[0]?.status)); const job = data.state.renderJobs[0]; assert.equal(job.status, 'complete', job.error);
     const download = await fetch(`${base}${job.outputUrl}`, { headers: { cookie } }); assert.equal(download.status, 200); assert.match(download.headers.get('content-disposition')!, /First export/); assert.ok((await download.arrayBuffer()).byteLength > 1000);
