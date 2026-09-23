@@ -795,9 +795,12 @@ export function bloomFilters(context: TransitionPlanContext, peak: number): stri
   const sigma = Math.max(2, context.width * .008).toFixed(2);
   const floor = Math.round(cut * 255), gain = (1 / Math.max(.05, 1 - cut)).toFixed(3);
   const lift = `clip((val-${floor})*${gain},0,255)`;
-  return [`[IN]split=2[bla${context.tag}][blb${context.tag}]`,
-    `[blb${context.tag}]format=gbrp,lutrgb=r='${lift}':g='${lift}':b='${lift}',gblur=sigma=${sigma}[blc${context.tag}]`,
-    `[bla${context.tag}][blc${context.tag}]blend=all_mode=screen:all_opacity=${amount.toFixed(3)}[OUT]`];
+  // Screen only means "brighten" on RGB. Blended on the window's YUV frames it also lifted both chroma
+  // planes, which is why a white flash exported pink. Alpha (c3) keeps the picture's own coverage.
+  const glow = [0, 1, 2].map(c => `c${c}_mode=screen:c${c}_opacity=${amount.toFixed(3)}`).join(':');
+  return [`[IN]format=gbrap16le,split=2[bla${context.tag}][blb${context.tag}]`,
+    `[blb${context.tag}]format=gbrp,lutrgb=r='${lift}':g='${lift}':b='${lift}',gblur=sigma=${sigma},format=gbrap16le[blc${context.tag}]`,
+    `[bla${context.tag}][blc${context.tag}]blend=${glow}:c3_opacity=0[OUT]`];
 }
 
 /* ---------------------------------------------------------------------------------------- */

@@ -90,19 +90,28 @@ test('renewing locks extends only live ownership and never revives a stale lease
   assert.equal(state().operations.length, 0);
 });
 
-test('In/Out range is finite, ordered, bounded, temporary, and resets with the timeline', () => {
-  state().setRange(-20, 240);
-  assert.deepEqual([state().rangeIn, state().rangeOut], [0, 180]);
-  state().setRange(90, 25);
-  assert.deepEqual([state().rangeIn, state().rangeOut], [25, 90]);
-  state().setRange(Number.NaN, 20);
-  assert.deepEqual([state().rangeIn, state().rangeOut], [25, 90]);
-  assert.equal(state().operations.length, 0);
-  state().setTimeline('review-timeline');
-  assert.deepEqual([state().rangeIn, state().rangeOut], [0, 180]);
-  state().setRange(10, 20);
-  state().openProject('the-long-way-home');
-  assert.deepEqual([state().rangeIn, state().rangeOut], [0, 180]);
+test('In/Out range is finite, ordered, bounded, remembered per timeline, and defaults to the edit length', () => {
+  const saved = new Map<string, string>(), original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: (key: string) => saved.get(key) ?? null, setItem: (key: string, value: string) => saved.set(key, value) } });
+  const contentEnd = (timelineId: string) => Math.max(...state().clips.filter(c => c.timelineId === timelineId).map(c => c.start + c.duration));
+  try {
+    const projectId = state().projectId, timelineId = state().timelineId;
+    state().setRange(-20, 240);
+    assert.deepEqual([state().rangeIn, state().rangeOut], [0, 180]);
+    state().setRange(90, 25);
+    assert.deepEqual([state().rangeIn, state().rangeOut], [25, 90]);
+    state().setRange(Number.NaN, 20);
+    assert.deepEqual([state().rangeIn, state().rangeOut], [25, 90]);
+    assert.equal(state().operations.length, 0);
+    state().setTimeline('review-timeline');
+    assert.deepEqual([state().rangeIn, state().rangeOut], [0, contentEnd('review-timeline')], 'An unmarked timeline exports its edit, not its padded length.');
+    state().setRange(10, 20);
+    state().openProject('the-long-way-home');
+    assert.deepEqual([state().rangeIn, state().rangeOut], [0, contentEnd(state().timelineId)]);
+    state().openProject(projectId);
+    assert.equal(state().timelineId, timelineId);
+    assert.deepEqual([state().rangeIn, state().rangeOut], [25, 90], 'Reopening restores the marks a reload used to drop.');
+  } finally { if (original) Object.defineProperty(globalThis, 'localStorage', original); else delete (globalThis as { localStorage?: unknown }).localStorage; }
 });
 
 test('revealing media validates project ownership and resets on navigation', () => {
@@ -842,4 +851,19 @@ test('local buffering holds the playhead and resumes without jumping over elapse
   assert.equal(state().playing, true, 'play intent survives buffering');
   store.setState({ playbackBuffering: false }); state().tick(now + 1100);
   assert.ok(Math.abs(state().playhead - 10.1) < .001);
+});
+
+test('a speed keyframe ramp resizes the clip, stopping at the next clip on the track', () => {
+  const c = clip();
+  const lone = { ...c, id: 'lone', trackId: 'lone-track', start: 0, duration: 4, sourceIn: 0, keyframes: undefined, properties: { ...Object.fromEntries(Object.entries(c.properties).filter(([key]) => key !== 'linkGroup')), speed: 100, reverse: false, freeze: false } };
+  const next = { ...lone, id: 'next', start: 5, duration: 2 };
+  store.setState({ clips: [...state().clips, lone, next] });
+  const ramp = (to: number): Keyframe[] => [{ id: 'k0', time: 0, value: 100, interpolation: 'linear' }, { id: 'k1', time: 4, value: to, interpolation: 'linear' }];
+  state().setKeyframes('lone', 'properties.speed', ramp(200));
+  // The same 4 s of footage under a 100→200% ramp: t + t²/8 = 4 → t ≈ 2.93 s.
+  assert.ok(Math.abs(clip('lone').duration - 2.928) < .01, `sped-up clip shortens (${clip('lone').duration})`);
+  state().setKeyframes('lone', 'properties.speed', ramp(50));
+  assert.ok(Math.abs(clip('lone').duration - 5) < 1e-6, `slowed clip grows only up to the next clip (${clip('lone').duration})`);
+  store.setState({ clips: state().clips.filter(c => c.id !== 'next') });
+  state().updateProperty('lone', 'speed', 100);
 });

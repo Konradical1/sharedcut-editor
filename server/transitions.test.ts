@@ -11,6 +11,7 @@ import { transitionLibrary } from './transitions.ts';
 import { validateTransition, transitionDefinitions, timelineTransitions, maximumDuration, availableHandle, bestAlign } from '../src/services/transitions.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
+import { primaryDefaults } from '../src/services/color.ts';
 
 const exec = promisify(execFile);
 const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
@@ -290,4 +291,50 @@ test('the shared overlay pack is named and timed for use', async () => {
   // Peaks must not all sit at the middle, or aligning the cut to them would be pointless.
   const spread = new Set(leaks.map(leak => Math.round(leak.peakAt! * 10))).size;
   assert.ok(spread >= 4, `Measured peaks should vary across the pack, saw ${spread} distinct tenths.`);
+});
+
+test('23.976 cuts keep every frame, a flash stays white, and a clip split by a window keeps its grade', { timeout: 300000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-frames-'));
+  try {
+    // NTSC timing is where float placement broke: a clip at frame 64 sits at 2.66933…s, and each edge
+    // compared or truncated on float seconds dropped a frame to the black base.
+    const fps = 24000 / 1001, red = path.join(dir, 'red.mp4');
+    await ff(['-f', 'lavfi', '-i', 'color=c=red:s=320x180:r=24000/1001:d=8', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', red]);
+    const project = { id: 'project', resolution: '320 × 180', fps } as Project;
+    const track: Track = { id: 'base', timelineId: 'timeline', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
+    const at = (frame: number) => frame / fps;
+    const graded = (id: string, from: number, to: number, source: number): Clip => ({ ...clip(id, at(from), at(to) - at(from), at(source)), mediaId: 'red', properties: { ...defaultProperties, colorPipeline: 'nodes-v2' } });
+    const cuts = [graded('a', 0, 64, 10), graded('b', 64, 106, 80), graded('c', 106, 132, 130)];
+    // Saturation 0 turns red grey, so an ungraded piece is unmistakable.
+    const nodes = cuts.map(item => ({ id: `grade-${item.id}`, clipId: item.id, projectId: 'project', name: 'Balance', kind: 'serial', enabled: true, order: 1, position: { x: 0, y: 0 }, parameters: { ...primaryDefaults, saturation: 0 } })) as RenderRequest['nodes'];
+    const outputPath = path.join(dir, 'frames.mp4');
+    const request = (clips: Clip[]): RenderRequest => ({ project, timeline: { id: 'timeline', projectId: 'project', name: 'frames', duration: at(132) }, tracks: [track], clips, nodes,
+      assets: [{ asset: { ...asset, id: 'red', duration: 8, fps, hasAudio: false }, path: red }], outputPath,
+      settings: { resolution: '320 × 180', fps: String(fps), codec: 'H.264', rangeIn: '0', rangeOut: String(at(132)), audio: 'Disabled' } });
+    const frames = async () => {
+      const raw = (await ff(['-i', outputPath, '-vf', 'scale=1:1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'])).stdout;
+      return Array.from({ length: raw.length / 3 }, (_, i) => [raw[i * 3], raw[i * 3 + 1], raw[i * 3 + 2]]);
+    };
+
+    await renderTimeline(request(cuts));
+    let picture = await frames();
+    assert.equal(picture.length, 132);
+    assert.deepEqual(picture.flatMap((rgb, i) => rgb.every(channel => channel < 30) ? [i] : []), [], 'No frame at a cut falls through to black.');
+
+    const flashed = cuts.map(item => item.id === 'b' ? { ...item, transition: 'Camera flash', properties: { ...item.properties, transitionDuration: .35, transitionAlign: 'center' } } : item);
+    await renderTimeline(request(flashed));
+    picture = await frames();
+    assert.equal(picture.length, 132);
+    assert.deepEqual(picture.flatMap((rgb, i) => rgb.every(channel => channel < 30) ? [i] : []), [], 'The window edges are whole frames.');
+    // Screen on YUV planes lifted chroma and turned the flash pink; on grey input it has to stay grey.
+    for (const [i, [r, g, b]] of picture.entries()) assert.ok(Math.max(r, g, b) - Math.min(r, g, b) < 24, `Frame ${i} is tinted ${r},${g},${b}`);
+
+    // A keyframe anywhere pre-renders the windows and splices the cut clips back in pieces. Grades are keyed by
+    // clip id, and renamed pieces used to export ungraded; here that is red instead of grey.
+    const animated = flashed.map(item => item.id === 'c' ? { ...item, keyframes: { 'properties.opacity': [{ id: 'k1', time: 0, value: 100, interpolation: 'linear' as const }, { id: 'k2', time: .5, value: 100, interpolation: 'linear' as const }] } } : item);
+    await renderTimeline(request(animated));
+    picture = await frames();
+    assert.equal(picture.length, 132);
+    for (const [i, [r, g, b]] of picture.entries()) assert.ok(Math.max(r, g, b) - Math.min(r, g, b) < 24 && Math.max(r, g, b) > 30, `Frame ${i} lost its grade or went black: ${r},${g},${b}`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

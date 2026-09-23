@@ -4,7 +4,7 @@ import { captionDocument, captionPreset, groupCaptionWords, isCaption, validateC
 import { isComposition, retimeTitleClip, validateCompositions } from '../services/compositions.ts';
 import { defaultShape, getShape, isShape, validateShape, type ShapeDocument } from '../services/shapes.ts';
 import { createTitleTemplate } from '../services/titleTemplates.ts';
-import { animationProperties, boundedAnimationValue, copyAnimatedNodes, evaluateClip, evaluateNodes, frameTime, setAnimatedValue, trimAnimation, validateKeyframes } from '../services/animation.ts';
+import { animationProperties, boundedAnimationValue, copyAnimatedNodes, evaluateClip, evaluateNodes, frameTime, retimedDuration, setAnimatedValue, trimAnimation, validateKeyframes } from '../services/animation.ts';
 import type { Keyframe, KeyframeValue } from './models.ts';
 import { create } from 'zustand';
 import type { Clip, CollaborativeLock, Comment, GradeNode, MediaAsset, Notification, Operation, OperationType, Presence, Project, ProjectState, RenderJob, Settings, Snapshot, Timeline, Track, User, Workspace } from './models.ts';
@@ -150,6 +150,18 @@ function applyChanges(state: ProjectState, changes: Change[]): ProjectState & {t
 const overlap = (a: Change, b: Change) => a.collection === b.collection && a.id === b.id && (a.replace || b.replace || [...Object.keys(a.value ?? {}), ...a.unset ?? []].some(key => [...Object.keys(b.value ?? {}), ...b.unset ?? []].some(other => key === other || key.startsWith(`${other}.`) || other.startsWith(`${key}.`))));
 const projectState = (state: EditorStore): ProjectState => ({ timelines: state.timelines.filter(t=>t.projectId===state.projectId), clips: state.clips.filter(item => item.projectId === state.projectId), tracks: state.tracks.filter(item => state.timelines.some(t => t.id === item.timelineId && t.projectId === state.projectId)), nodes: state.nodes.filter(item => item.projectId === state.projectId), comments: state.comments.filter(item => item.projectId === state.projectId) });
 const durationOf = (state: EditorStore) => state.timelines.find(t => t.id === state.timelineId)?.duration ?? 180;
+// In/Out is kept per timeline for this viewer. Held only in memory, any reload (a server restart reconnects the
+// page) turned "In / Out range" into 0 → timeline length, and a 180 s timeline holding 45 s of edit exported 3 min.
+const rangeKey = (timelineId: string) => `sharedcut-range-${timelineId}`;
+const initialRange = (state: Pick<EditorStore, 'timelines' | 'clips'>, timelineId: string) => {
+  const duration = state.timelines.find(t => t.id === timelineId)?.duration ?? 180;
+  const content = Math.max(0, ...state.clips.filter(c => c.timelineId === timelineId).map(c => c.start + c.duration));
+  try {
+    const saved = JSON.parse(localStorage.getItem(rangeKey(timelineId)) || 'null');
+    if (Array.isArray(saved) && saved.every(Number.isFinite) && saved[0] >= 0 && saved[0] < saved[1] && saved[1] <= duration) return { rangeIn: saved[0] as number, rangeOut: saved[1] as number };
+  } catch { /* Storage can be missing or blocked; the edit's own length is the fallback. */ }
+  return { rangeIn: 0, rangeOut: content > 0 ? Math.min(content, duration) : duration };
+};
 const updatedProjects = (state: EditorStore, clips: Clip[]) => {
   const primaryTimelineId = state.timelines.find(timeline => timeline.projectId === state.projectId)?.id;
   const duration = Math.max(0, ...clips.filter(clip => clip.timelineId === primaryTimelineId).map(clip => clip.start + clip.duration));
@@ -455,9 +467,8 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const timing=['properties.speed','properties.reverse','properties.freeze'].filter(path=>JSON.stringify(clip.keyframes?.[path])!==JSON.stringify(keyframes[path]));
       const group=timing.length?editableGroup(clip,'*'):[clip];if(!group)return;
       commit('PropertyChanged',id,`edited keyframes on ${clip.name}`,group.map(c=>{
-        if(c.id===id)return {collection:'clips' as const,id,value:{keyframes}};
-        const channels={...c.keyframes};for(const path of timing){if(keyframes[path])channels[path]=keyframes[path].map(k=>({...k,time:k.time+clip.start-c.start}));else delete channels[path];}
-        return {collection:'clips' as const,id:c.id,value:{keyframes:channels}};
+        const channels=c.id===id?keyframes:{...c.keyframes};if(c.id!==id)for(const path of timing){if(keyframes[path])channels[path]=keyframes[path].map(k=>({...k,time:k.time+clip.start-c.start}));else delete channels[path];}
+        return {collection:'clips' as const,id:c.id,value:{keyframes:channels,...(timing.length?{duration:retimedDuration(c,{...c,keyframes:channels},get().clips)}:{})}};
       }),gesture);
     },
     installCaptions(job,wordsPerLine,preset,replaceSet) {
@@ -548,7 +559,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (!timeline) return;
       const selected = next.clips.find(c => c.projectId === id && c.name === 'Neon crossing') ?? next.clips.find(c => c.timelineId === timeline.id);
       const memberIds = next.projects.find(p => p.id === id)!.members.map(member => member.userId);
-      set({ selectedClipIds:[],compositionTrail:[],shapeTool:null, projectId: id, timelineId: timeline.id, selectedClipId: selected?.id ?? null, selectedNodeId: next.nodes.find(node => node.clipId === selected?.id && node.name === 'Balance')?.id ?? null, workspace: 'edit', selectedTextIds: selected && isTitle(selected) ? [selected.id] : [], textSelection: null, textTool: false, textPreview: [], playhead: selected?.start ?? 0, rangeIn: 0, rangeOut: timeline.duration, revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, modal: null, presence: connection.enabled ? [] : createDemoProject(id).presence.filter(p => memberIds.includes(p.userId) && p.userId !== next.currentUserId), locks: !connection.enabled && id === 'city-after-dark' ? [{ id: createId('lock'), projectId: id, targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }] : [] });
+      set({ selectedClipIds:[],compositionTrail:[],shapeTool:null, projectId: id, timelineId: timeline.id, selectedClipId: selected?.id ?? null, selectedNodeId: next.nodes.find(node => node.clipId === selected?.id && node.name === 'Balance')?.id ?? null, workspace: 'edit', selectedTextIds: selected && isTitle(selected) ? [selected.id] : [], textSelection: null, textTool: false, textPreview: [], playhead: selected?.start ?? 0, ...initialRange(next, timeline.id), revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, modal: null, presence: connection.enabled ? [] : createDemoProject(id).presence.filter(p => memberIds.includes(p.userId) && p.userId !== next.currentUserId), locks: !connection.enabled && id === 'city-after-dark' ? [{ id: createId('lock'), projectId: id, targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }] : [] });
     },
     createProject(input) {
       const state = get();
@@ -583,7 +594,12 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     },
     selectNode(id) { if (!id || get().nodes.some(node => node.id === id && node.projectId === get().projectId)) set({ selectedNodeId: id }); },
     setPlayhead(time) { if (Number.isFinite(time)) set({ playhead: clamp(time, 0, durationOf(get())), liveMode: get().liveMode === 'following' ? 'independent' : get().liveMode, followUserId: null }); },
-    setRange(inTime, outTime) { if (Number.isFinite(inTime) && Number.isFinite(outTime)) set({ rangeIn: clamp(Math.min(inTime, outTime), 0, durationOf(get())), rangeOut: clamp(Math.max(inTime, outTime), 0, durationOf(get())) }); },
+    setRange(inTime, outTime) {
+      if (!Number.isFinite(inTime) || !Number.isFinite(outTime)) return;
+      const range = { rangeIn: clamp(Math.min(inTime, outTime), 0, durationOf(get())), rangeOut: clamp(Math.max(inTime, outTime), 0, durationOf(get())) };
+      set(range);
+      try { localStorage.setItem(rangeKey(get().timelineId), JSON.stringify([range.rangeIn, range.rangeOut])); } catch { /* In-memory only when storage is unavailable. */ }
+    },
     setPlaying(playing) { const state = get(); set({ playing, ...(playing && state.playhead >= (connection.enabled ? Math.max(0,...state.clips.filter(c=>c.timelineId===state.timelineId).map(c=>c.start+c.duration)) : durationOf(state)) ? { playhead: 0 } : {}) }); },
     setSidePanel(sidePanel) { set({ sidePanel }); }, setModal(modal) { set({ modal }); },
     setKeyframes(clipId, path, keys, gesture) {
@@ -597,7 +613,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (sorted.length) keyframes[path] = sorted; else delete keyframes[path];
       try { validateKeyframes(keyframes); } catch { return; }
       const timing=['properties.speed','properties.reverse','properties.freeze'].includes(path),group=timing?editableGroup(clip,'*'):[clip];if(!group)return;
-      commit('PropertyChanged', clipId, `edited ${property.label} keyframes on ${clip.name}`, group.map(c=>{const channels={...c.keyframes};if(sorted.length)channels[path]=sorted.map(k=>({...k,time:k.time+clip.start-c.start}));else delete channels[path];return {collection:'clips',id:c.id,value:{keyframes:channels}};}), gesture);
+      commit('PropertyChanged', clipId, `edited ${property.label} keyframes on ${clip.name}`, group.map(c=>{const channels={...c.keyframes};if(sorted.length)channels[path]=sorted.map(k=>({...k,time:k.time+clip.start-c.start}));else delete channels[path];return {collection:'clips',id:c.id,value:{keyframes:channels,...(timing?{duration:retimedDuration(c,{...c,keyframes:channels},get().clips)}:{})}};}), gesture);
     },
     keyframeProperty(clipId, path, value) {
       const clip = editableClip(clipId, '*'); if (!clip) return;
@@ -630,7 +646,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (clip.keyframes?.[`properties.${key}`]) { get().keyframeProperty(clipId,`properties.${key}`,next); return; }
       const field = key === 'disabled' ? 'disabled' : `properties.${key}`;
       const group=['speed','reverse','freeze'].includes(key)?editableGroup(clip,key):[clip];if(!group)return;
-      commit('PropertyChanged', clipId, `changed ${key} on ${clip.name}`, group.map(c=>({ collection: 'clips', id: c.id, value: { [field]: next, ...(['fadeIn','fadeOut','audioFadeIn','audioFadeOut'].includes(key)?{'properties.fadeOrigin':0,'properties.fadeDuration':c.duration}:{}), ...(key === 'speed' ? { duration: c.duration * Number(c.properties.speed || 100) / Number(next) } : {}) } })), gesture);
+      commit('PropertyChanged', clipId, `changed ${key} on ${clip.name}`, group.map(c=>({ collection: 'clips', id: c.id, value: { [field]: next, ...(['fadeIn','fadeOut','audioFadeIn','audioFadeOut'].includes(key)?{'properties.fadeOrigin':0,'properties.fadeDuration':c.duration}:{}), ...(key === 'speed' ? { duration: retimedDuration(c, { ...c, properties: { ...c.properties, speed: next } }, get().clips) } : {}) } })), gesture);
     },
     unlinkClip(id) {
       const state=get(),clip=editableClip(id);if(!clip||!clip.properties.linkGroup)return;
@@ -804,7 +820,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const track: Track = { id: createId('track'), timelineId: state.timelineId, name: `${kind === 'video' ? 'Video' : 'Audio'} ${number}`, kind, number, muted: false, solo: false, locked: false, hidden: false, gain: 0, pan: 0 };
       commit('TrackCreated', track.id, `added ${track.name}`, [{ collection: 'tracks', id: track.id, value: record(track), replace: true }]);
     },
-    setTimeline(id) { const state = get(); const timeline = state.timelines.find(t => t.id === id && t.projectId === state.projectId); if (!timeline) return; const clip = state.clips.find(c => c.timelineId === id); set({ selectedTransition:null,compositionTrail:[],selectedClipIds:clip?[clip.id]:[],shapeTool:null, timelineId: id, selectedTextIds: clip && isTitle(clip) ? [clip.id] : [], textSelection: null, textTool: false, textPreview: [], selectedClipId: clip?.id ?? null, selectedNodeId: null, playhead: 0, rangeIn: 0, rangeOut: timeline.duration, revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, locks: state.locks.filter(lock => lock.userId !== state.currentUserId) }); },
+    setTimeline(id) { const state = get(); const timeline = state.timelines.find(t => t.id === id && t.projectId === state.projectId); if (!timeline) return; const clip = state.clips.find(c => c.timelineId === id); set({ selectedTransition:null,compositionTrail:[],selectedClipIds:clip?[clip.id]:[],shapeTool:null, timelineId: id, selectedTextIds: clip && isTitle(clip) ? [clip.id] : [], textSelection: null, textTool: false, textPreview: [], selectedClipId: clip?.id ?? null, selectedNodeId: null, playhead: 0, ...initialRange(state, id), revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, locks: state.locks.filter(lock => lock.userId !== state.currentUserId) }); },
     selectTransition(clipId, side) {
       // Deliberately no clip selection: a transition is stored on the incoming clip, and selecting
       // that clip alongside it lit up the whole second shot on the timeline. The inspector reads

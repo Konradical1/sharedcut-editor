@@ -159,7 +159,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   db.exec('CREATE TABLE IF NOT EXISTS render_snapshots(id TEXT PRIMARY KEY,data TEXT NOT NULL)');
   const saved = db.prepare('SELECT revision,state FROM workspace WHERE id=1').get() as { revision: number; state: string } | undefined;
   let state: PersistedState = saved ? JSON.parse(saved.state) : emptyState();
-  let revision = saved?.revision ?? 0;
+  // Progress ticks bump the revision without rewriting the workspace row; this keeps the counter from going backwards on restart.
+  db.exec('CREATE TABLE IF NOT EXISTS workspace_revision(id INTEGER PRIMARY KEY,revision INTEGER NOT NULL)');
+  const tickRevision = (db.prepare('SELECT revision FROM workspace_revision WHERE id=1').get() as { revision: number } | undefined)?.revision ?? 0;
+  // +1: a client may already hold the last tick, and an offline project import must still look new to it.
+  let revision = Math.max(saved?.revision ?? 0, tickRevision + 1);
   const presence = new Map<string, { person: Presence; session: string; active: boolean }>(); const locks = new Map<string, CollaborativeLock>();
   // Keep insertion order stable: simultaneous active devices must not trade ownership on every heartbeat.
   const visiblePresence = () => {
@@ -279,6 +283,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     broadcastTimer.unref?.();
   };
   const lockChanged = () => { lockRevision++; broadcast(); };
+  // Re-serialising the 31 MB workspace on every render tick starved the event loop, so ticks stay in memory.
+  const touch = () => { revision++; db.prepare('INSERT INTO workspace_revision(id,revision) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision').run(revision); broadcast(); };
   const persist = () => { const nextRevision = revision + 1; db.prepare('INSERT INTO workspace(id,revision,state) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,state=excluded.state').run(nextRevision, JSON.stringify(state)); revision = nextRevision; broadcast(); };
   // A fresh install has no workspace row until something is edited, so `project-bundle.mjs import`
   // found nothing to merge into and told you to start the server first — which by itself never
@@ -317,7 +323,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     }
   };
   const updateAsset = (id: string, patch: Partial<Asset>) => { if (!state.media.some(asset => asset.id === id)) return; const previous = state.media; state.media = state.media.map(asset => asset.id === id ? { ...asset, ...patch } : asset); try { persist(); } catch (error) { state.media = previous; throw error; } };
-  const updateJob = (id: string, patch: Partial<RenderJob>) => { if (!state.renderJobs.some(job => job.id === id)) return; const previous = state.renderJobs; state.renderJobs = state.renderJobs.map(job => job.id === id ? { ...job, ...patch } : job); try { persist(); } catch (error) { state.renderJobs = previous; throw error; } };
+  const updateJob = (id: string, patch: Partial<RenderJob>, save = true) => { if (!state.renderJobs.some(job => job.id === id)) return; const previous = state.renderJobs; state.renderJobs = state.renderJobs.map(job => job.id === id ? { ...job, ...patch } : job); try { if (save) persist(); else touch(); } catch (error) { state.renderJobs = previous; throw error; } };
   const addWork = (id: string, work: (signal: AbortSignal) => Promise<void>, render = false) => {
     const controller = new AbortController(); aborters.set(id, controller);
     queue.add(async () => { try { if (!closed && !controller.signal.aborted) await work(controller.signal); }
@@ -332,7 +338,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             const report = () => { if (closed || signal.aborted) return; const elapsed = Math.floor((Date.now() - started) / 1000);
               reportedAt = Date.now();
               const quiet = Math.floor((Date.now() - advancedAt) / 1000);
-              updateJob(job.id, { progress: progressValue, remaining: `${stage} · ${elapsed}s elapsed${quiet >= 30 ? ` · No new frames for ${quiet}s` : ''}` }); };
+              updateJob(job.id, { progress: progressValue, remaining: `${stage} · ${elapsed}s elapsed${quiet >= 30 ? ` · No new frames for ${quiet}s` : ''}` }, false); };
             const heartbeat = setInterval(report, 1000);
             try { let previous = -1; await renderTimeline({ ...snapshot, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { stage = next; advancedAt = Date.now(); if (Date.now() - reportedAt >= 250) report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); if (Date.now() - reportedAt >= 250) report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
             catch (error) { rmSync(outputPath, { force: true }); if (!closed) updateJob(job.id, { status: 'failed', remaining: signal.aborted ? 'Cancelled' : 'Export failed', error: signal.aborted ? 'Cancelled by user.' : error instanceof Error ? error.message : 'Export failed.' }); }

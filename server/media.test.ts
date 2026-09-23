@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { animatedWindows, getMediaCapabilities, prepareMedia, probeMedia, renderTimeline } from './media.ts';
+import { animatedWindows, retimeSchedule, getMediaCapabilities, prepareMedia, probeMedia, renderTimeline } from './media.ts';
 import type { RenderRequest } from './media.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
@@ -243,4 +243,27 @@ test('playable footage is published before color preparation and survives a late
     assert.ok((await stat(path.join(outputDir, 'proxy.mp4'))).size > 0, 'background failure must preserve the playable preview');
     assert.ok(stages.includes('Creating smaller playback previews'));
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a speed-ramped clip exports continuous sound, not per-frame chops',async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'frameline-ramp-audio-'));
+ try {
+  const ffmpegPath=process.env.FFMPEG_PATH||'ffmpeg';
+  const tone=path.join(dir,'tone.wav');
+  await exec(ffmpegPath,['-v','error','-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=6','-ac','2',tone]);
+  const ramp={'properties.speed':[{id:'k0',time:0,value:100,interpolation:'linear'},{id:'k1',time:2,value:50,interpolation:'linear'}]};
+  const clip={id:'a',projectId:'p',timelineId:'tl',trackId:'t',mediaId:'tone',name:'Tone',start:0,duration:2,sourceIn:0,color:'#fff',disabled:false,properties:{},effects:[],keyframes:ramp} as any;
+  assert.ok(retimeSchedule(clip)!.commands.length>10,'the ramp is scheduled as a curve, not one tempo');
+  assert.equal(retimeSchedule({...clip,keyframes:undefined,properties:{speed:100,reverse:true}}),null,'reverse falls back');
+  const project={id:'p',name:'Ramp',description:'',shared:false,thumbnail:'',modifiedAt:0,duration:2,resolution:'64 × 64',fps:24,status:'In progress',members:[]} as any;
+  const track={id:'t',timelineId:'tl',name:'Audio',kind:'audio',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0} as any;
+  const asset={id:'tone',projectId:'p',name:'tone',kind:'audio',duration:6,status:'ready',progress:100,binId:'',thumbnail:'',fps:0,resolution:'',size:'',hasAudio:true} as any;
+  const out=path.join(dir,'out.mov');
+  await renderTimeline({project,timeline:{id:'tl',projectId:'p',name:'Ramp',duration:2},clips:[clip],tracks:[track],nodes:[],assets:[{asset,path:tone}],settings:{codec:'Apple ProRes 422 HQ',audio:'Linear PCM · 24-bit · 48 kHz',resolution:'64 × 64'},outputPath:out} as any);
+  // A steady tone must stay steady: per-frame atempo leaves dropouts in 10 ms windows.
+  const {stdout}=await exec(ffmpegPath,['-v','error','-i',out,'-af','atrim=start=0.1:end=1.9,asetnsamples=n=480:p=0,astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-','-f','null','-']);
+  const levels=[...stdout.matchAll(/RMS_level=(-?[\d.]+|-inf)/g)].map(m=>Number(m[1]==='-inf'?-200:m[1]));
+  assert.ok(levels.length>100,'measured the tone');
+  assert.ok(Math.min(...levels)>Math.max(...levels)-6,`tone level stays within 6 dB (min ${Math.min(...levels)}, max ${Math.max(...levels)})`);
+ } finally {await rm(dir,{recursive:true,force:true});}
 });

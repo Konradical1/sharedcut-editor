@@ -139,6 +139,26 @@ export function animatedSourceOffset(clip: Clip, elapsed: number, fps=24) {
   return Math.max(0,integrate(end)-minimum-((reverseKeys?.length?sampleKeyframes(reverseKeys,end):clip.properties.reverse)?1/fps:0));
 }
 
+/**
+ * Length that plays the same footage after a speed edit, stopped at the next clip on the track so
+ * a slow-down never overlaps it. A keyframed reverse or freeze keeps its length: the footage span
+ * is no longer a forward integral to preserve.
+ */
+export function retimedDuration(before: Clip, after: Clip, clips: Clip[]) {
+  const rate=(c:Clip)=>Math.max(.01,Number(c.properties.speed??100)/100);
+  let high=before.duration*rate(before)/rate(after);
+  if(hasAnimatedTiming(before)||hasAnimatedTiming(after)) {
+    const still=(c:Clip)=>c.properties.reverse||c.properties.freeze||['properties.reverse','properties.freeze'].some(p=>c.keyframes?.[p]?.some(k=>k.value));
+    if(still(before)||still(after))return before.duration;
+    const span=animatedSourceOffset(before,before.duration);
+    // Offset grows monotonically with elapsed time here; 1% speed is the slowest, so 100× bounds it.
+    let low=0;high=before.duration*100;
+    for(let i=0;i<48;i++){const mid=(low+high)/2;if(animatedSourceOffset(after,mid)<span)low=mid;else high=mid;}
+  }
+  const next=Math.min(Infinity,...clips.filter(c=>c.id!==before.id&&c.timelineId===before.timelineId&&c.trackId===before.trackId&&c.start>=before.start+before.duration-1e-6).map(c=>c.start));
+  return Math.max(.01,Math.min(high,next-before.start));
+}
+
 export function copyAnimatedNodes(clip:Clip,source:GradeNode[],newId:()=>string):GradeNode[] {
   const copies=source.map(node=>({...structuredClone(node),id:newId(),clipId:clip.id,projectId:clip.projectId}));
   if(clip.keyframes)clip.keyframes=Object.fromEntries(Object.entries(clip.keyframes).map(([path,keys])=>{const index=source.findIndex(n=>path.startsWith(`nodes.${n.id}.`));return [index<0?path:path.replace(`nodes.${source[index].id}.`,`nodes.${copies[index].id}.`),keys];}));

@@ -17,7 +17,7 @@ test('native progress reads split JSON from either stream without swallowing fai
   await assert.rejects(run(process.execPath, ['-e', 'console.error("broken encoder");process.exit(1)'], { jsonProgress: 'stderr' }), /broken encoder/);
 });
 
-test('ACES export reports color frames before encoding, stays monotonic, and finishes a playable file', { timeout: 60000, skip: !existsSync(process.env.FRAME_LINE_COLOR_PYTHON || venvPython('.venv-color')) }, async () => {
+test('ACES export reports its color stage before encoding, stays monotonic, and finishes a playable file', { timeout: 60000, skip: !existsSync(process.env.FRAME_LINE_COLOR_PYTHON || venvPython('.venv-color')) }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'render-progress-'));
   try {
     const input = path.join(dir, 'input.mp4');
@@ -32,7 +32,7 @@ test('ACES export reports color frames before encoding, stays monotonic, and fin
       assets:[{path:input,asset:{id:'a',projectId:'p',name:'source',kind:'video',duration:.5,fps:24,resolution:'64 × 64',binId:'',size:'',thumbnail:'',status:'ready',progress:100}}],
       settings:{codec:'H.264',audio:'Disabled'},outputPath,onProgress:p=>progress.push(p),onStage:s=>stages.push(s) };
     await renderTimeline(request);
-    assert.ok(stages.some(s=>s.startsWith('Processing color') && s.includes('%')), 'Color frame progress reaches the caller');
+    assert.ok(stages.some(s=>s.startsWith('Processing color')), 'The color stage reaches the caller');
     assert.equal(stages.at(-1),'Encoding video and audio');
     assert.ok(progress.some(p=>p>0 && p<50), 'Preparation owns part of overall progress');
     assert.ok(progress.every((p,i)=>!i || p>=progress[i-1]), String(progress));

@@ -1,5 +1,6 @@
 """Float scene processing; ACES display rendering is native OpenColorIO, not a baked LUT."""
 import bisect, json, os, signal, subprocess, sys
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import PyOpenColorIO as ocio
 if ocio.__version__!='2.5.2': raise RuntimeError('This reference pipeline requires OpenColorIO 2.5.2; run npm run setup:color.')
@@ -112,9 +113,12 @@ def frame_read(stream,size):
     if data and len(data)!=size: raise ValueError('Truncated color frame')
     return data
 
+def threads(job): return max(1,int(job.get('threads') or os.cpu_count() or 1))
+
 def process_frames(source,target,job,mask_targets=None):
     w,h=job['width'],job['height'];count=0;channels=4 if job.get('alpha') else 3
     masks=job.get('masks',[]);cached={}
+    pool=ThreadPoolExecutor(threads(job))
     while data:=frame_read(source,w*h*channels*4):
         planes=np.frombuffer(data,dtype='<f4').reshape(channels,h,w)
         rgb=np.ascontiguousarray(planes[[2,0,1]].transpose(1,2,0))
@@ -136,10 +140,12 @@ def process_frames(source,target,job,mask_targets=None):
                 else: alpha=cache[1]
             alphas[doc['id']]=alpha
             if mask_targets and doc['id'] in mask_targets: mask_targets[doc['id']].write(np.rint(np.clip(alpha,0,1)*65535).astype('<u2').tobytes())
-        for row in range(0,h,128):
-            values=rgb[row:row+128]
+        # Every stage is per-pixel and numpy/OCIO release the GIL, so stripes grade in parallel with identical output.
+        def stripe(row):
+            values=rgb[row:row+64]
             if job.get('inputCube'): values=lut(values,{'cube':job['inputCube'],'amount':1})
-            rgb[row:row+128]=grade(values,job['stages'],{id:a[row:row+128] for id,a in alphas.items()},job.get('managed',True))
+            rgb[row:row+64]=grade(values,job['stages'],{id:a[row:row+64] for id,a in alphas.items()},job.get('managed',True))
+        list(pool.map(stripe,range(0,h,64)))
         output=np.ascontiguousarray(rgb.transpose(2,0,1)[[1,2,0]],dtype='<f4')
         if channels==4: output=np.concatenate([output,planes[3:4]])
         target.write(output.tobytes());count+=1
@@ -155,9 +161,10 @@ def render(job):
         raise InterruptedError('Color render canceled')
     signal.signal(signal.SIGTERM,stop)
     try:
-        input_args=['-loop','1','-framerate',str(job['fps'])] if job.get('image') else ['-ss',str(job['seek'])]
-        decoder=subprocess.Popen([ff,'-v','error','-threads','2','-filter_threads','1',*input_args,'-i',job['input'],'-t',str(job['duration']),'-an','-vf',f"scale=in_color_matrix={job['matrix']}:in_range={job['range']},format={pixel_format}",'-fps_mode','passthrough','-f','rawvideo','-'],stdout=subprocess.PIPE);children.append(decoder)
-        encoder=subprocess.Popen([ff,'-v','error','-y','-threads','2','-filter_threads','1','-f','rawvideo','-pixel_format',pixel_format,'-video_size',f"{job['width']}x{job['height']}",'-framerate',str(job['fps']),'-i','-','-vf','format=gbrap16le' if job.get('alpha') else 'format=gbrp16le','-c:v','ffv1','-threads','2','-level','3','-color_range','pc','-colorspace','rgb','-color_primaries','bt709','-color_trc','bt709',job['output']],stdin=subprocess.PIPE);children.append(encoder)
+        input_args=['-loop','1','-framerate',str(job['fps'])] if job.get('image') else ['-ss',f"{max(0,job['seek']):.6f}"]
+        n=str(threads(job))
+        decoder=subprocess.Popen([ff,'-v','error','-threads',n,'-filter_threads',n,*input_args,'-i',job['input'],'-t',str(job['duration']),'-an','-vf',f"scale=in_color_matrix={job['matrix']}:in_range={job['range']},format={pixel_format}",'-fps_mode','passthrough','-f','rawvideo','-'],stdout=subprocess.PIPE);children.append(decoder)
+        encoder=subprocess.Popen([ff,'-v','error','-y','-threads',n,'-filter_threads',n,'-f','rawvideo','-pixel_format',pixel_format,'-video_size',f"{job['width']}x{job['height']}",'-framerate',str(job['fps']),'-i','-','-vf','format=gbrap16le' if job.get('alpha') else 'format=gbrp16le','-c:v','ffv1','-threads',n,'-level','3','-color_range','pc','-colorspace','rgb','-color_primaries','bt709','-color_trc','bt709',job['output']],stdin=subprocess.PIPE);children.append(encoder)
         for mask in job.get('masks',[]):
             if not mask.get('output'): continue
             p=subprocess.Popen([ff,'-v','error','-y','-threads','1','-f','rawvideo','-pixel_format','gray16le','-video_size',f"{job['width']}x{job['height']}",'-framerate',str(job['fps']),'-i','-','-c:v','ffv1','-level','3','-color_range','pc',mask['output']],stdin=subprocess.PIPE)
@@ -172,9 +179,23 @@ def render(job):
             try: p.wait(timeout=5)
             except subprocess.TimeoutExpired: p.kill();p.wait()
 
+def write_cube(job,size,path):
+    """Sample the exact grade on a size^3 grid. Without masks every stage is per-pixel, so the export can apply it with lut3d."""
+    axis=np.linspace(0,1,size,dtype=np.float32);b,g,r=np.meshgrid(axis,axis,axis,indexing='ij')
+    grid=np.stack([r,g,b],-1).reshape(size*size,size,3)  # .cube order: red varies fastest
+    def rows(i):
+        values=grid[i:i+size]
+        if job.get('inputCube'): values=lut(values,{'cube':job['inputCube'],'amount':1})
+        grid[i:i+size]=grade(values,job['stages'],{},job.get('managed',True))
+    list(ThreadPoolExecutor(threads(job)).map(rows,range(0,len(grid),size)))
+    with open(path,'w') as f:
+        f.write(f'LUT_3D_SIZE {size}\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n')
+        np.savetxt(f,grid.reshape(-1,3),fmt='%.7g')
+
 if __name__=='__main__':
     if sys.argv[1:]==['--check']:
         print(json.dumps({'ocio':ocio.__version__,'config':CONFIG,'view':VIEW}));sys.exit(0)
     job=json.loads(open(sys.argv[1]).read())
+    if sys.argv[2:3]==['--cube']: write_cube(job,int(sys.argv[3]),sys.argv[4]);sys.exit(0)
     if '--stream' in sys.argv: process_frames(sys.stdin.buffer,sys.stdout.buffer,job)
     else: render(job)

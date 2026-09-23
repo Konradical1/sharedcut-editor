@@ -64,7 +64,9 @@ test('gap deletion is track-only, atomic, undoable and respects locks; timing an
  store.setState({tracks:s().tracks.map(t=>({...t,locked:false})),clips:[a,partner]});
  s().keyframeProperty(a.id,'properties.speed',100);s().setPlayhead(3);s().updateProperty(a.id,'speed',200);
  const picture=s().clips.find(c=>c.id===a.id)!,audio=s().clips.find(c=>c.id===partner.id)!;
- assert.equal(evaluateClip(picture,2.5).properties.speed,150);assert.equal(animatedSourceOffset(picture,1),1.5);assert.equal(animatedSourceOffset(audio,1),1.5);assert.equal(picture.duration,2);
+ assert.equal(evaluateClip(picture,2.5).properties.speed,150);assert.equal(animatedSourceOffset(picture,1),1.5);assert.equal(animatedSourceOffset(audio,1),1.5);
+ // Same 2 s of footage: 1.5 s by t=1, the last 0.5 s at 200% → 1.25 s, linked sound in step.
+ assert.ok(Math.abs(picture.duration-1.25)<1e-6);assert.ok(Math.abs(audio.duration-1.25)<1e-6);
  s().setKeyframes(a.id,'properties.speed',[]);assert.equal(s().clips.find(c=>c.id===partner.id)!.keyframes?.['properties.speed'],undefined);
  } finally {store.setState(baseline,true);}
 });
