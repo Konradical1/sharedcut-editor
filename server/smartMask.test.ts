@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, cpSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, cpSync, readdirSync, watch } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
-import { maskAnalysis, maskSourceFingerprint, resolveSmartMaskArtifact, resolveSmartMaskRepairBase, runMaskProcess, smartMaskService, validateMaskManifest } from './smartMask.ts';
+import { commitFolder, maskAnalysis, maskSourceFingerprint, resolveSmartMaskArtifact, resolveSmartMaskRepairBase, runMaskProcess, smartMaskService, validateMaskManifest } from './smartMask.ts';
 import { createSmartMask, smartMaskSignature, validateSmartMaskBindings } from '../src/services/smartMask.ts';
 import type { SmartMaskManifest } from '../src/services/smartMask.ts';
 import type { Clip, MediaAsset } from '../src/state/models.ts';
@@ -116,6 +116,40 @@ for (const engine of ['mask', 'media'] as const) test(`cancelling a running ${en
     assert.equal(existsSync(marker), false);
     await assert.rejects(runMaskProcess(process.execPath, ['-e', 'process.exit(0)'], AbortSignal.abort()), /cancelled/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('editor-size and native frame runs return the same source frame, never a neighbour', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'frameline-mask-chunk-')), ff = process.env.FFMPEG_PATH || 'ffmpeg', source = join(directory, 'source.mkv');
+  const service = smartMaskService(join(directory, 'cache'));
+  // Long-GOP H.264 with every frame a different brightness, so a frame off by one reads as a different level.
+  await run(ff, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=64x32:r=24:d=3', '-vf', "geq=lum='N*3':cb=128:cr=128", '-c:v', 'libx264', '-g', '48', '-pix_fmt', 'yuv420p', source]);
+  const level = async (jpeg: string) => (await run(ff, ['-v', 'error', '-i', jpeg, '-vf', 'scale=1:1,format=gray', '-f', 'rawvideo', '-']))[0];
+  const video = { ...asset, fps: 24, duration: 3, resolution: '64 × 32' } as MediaAsset;
+  try {
+    for (const frame of [5, 30, 71]) {
+      const display = await service.source(clip, video, source, frame, 'display'), native = await service.source(clip, video, source, frame);
+      assert.notEqual(display, native);
+      assert.ok(Math.abs(await level(display) - await level(native)) <= 1, `frame ${frame} matches its single-frame decode`);
+    }
+    // The first request decoded its whole aligned run, so a neighbour is already on disk and is a different frame.
+    const before = readdirSync(join(directory, 'cache', 'source')).length;
+    const six = await service.source(clip, video, source, 6, 'display');
+    assert.equal(readdirSync(join(directory, 'cache', 'source')).length, before);
+    assert.ok(await level(six) > await level(await service.source(clip, video, source, 5, 'display')));
+  } finally { await service.close(); rmSync(directory, { recursive: true, force: true, maxRetries: 10 }); }
+});
+
+test('a finished analysis commits even while a folder watcher blocks renaming it', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'frameline-mask-commit-')), from = join(directory, '.partial-x'), to = join(directory, 'final');
+  mkdirSync(join(from, 'frames'), { recursive: true });
+  writeFileSync(join(from, 'frames', '0.png'), 'alpha'); writeFileSync(join(from, 'manifest.json'), '{}'); writeFileSync(join(from, 'binding.json'), '{"projectId":"p"}');
+  // A per-folder watch is what the Vite dev server held on data/; on Windows it makes renaming the parent fail with EPERM.
+  const watcher = watch(join(from, 'frames'), () => {});
+  try {
+    await commitFolder(from, to);
+    assert.equal(readFileSync(join(to, 'frames', '0.png'), 'utf8'), 'alpha');
+    assert.equal(JSON.parse(readFileSync(join(to, 'binding.json'), 'utf8')).projectId, 'p');
+  } finally { watcher.close(); await delay(50); rmSync(directory, { recursive: true, force: true, maxRetries: 10 }); }
 });
 
 test('HTTP routes require editor writes and validate masks inside snapshots', async () => {

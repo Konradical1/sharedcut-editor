@@ -1,5 +1,5 @@
 import { createTimelinePreview } from './timelinePreview.ts';
-import { createSmartMaskPreview, activeSmartMasks, fittedSmartMask, lumaAlphaFilter, SmartMaskPending, type SmartMaskPixels } from './smartMaskPreview.ts';
+import { createSmartMaskPreview, activeSmartMasks, fittedSmartMask, lumaAlphaFilter, SmartMaskPending, unanalyzedSmartMask, type SmartMaskPixels } from './smartMaskPreview.ts';
 import { createMotionPreview } from './motionPreview.ts';
 import { transformMotion, drawMotionPose, motionArtwork } from './motionBlur.ts';
 import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, trimAnimation } from './animation.ts';
@@ -654,8 +654,11 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           for(const [id,mask] of maskPreview.read(clip,nodes,sampleTime,asset)){
             // Only a WebGL node mask needs layer-fitted pixels; the clip effect composites the matte canvas directly.
             if(!nodes.some(n=>n.mask?.id===id&&n.mask.enabled)){masks.set(id,mask);continue;}
+            // A node limited to a subject that is not found yet grades nothing (or everything, inverted), never the whole frame.
+            if(mask===unanalyzedSmartMask)warning='Smart Mask · not analyzed here yet · masked grade is off';
+            const matte=mask===unanalyzedSmartMask?{...mask,data:new Uint8Array([0])}:mask;
             const doc=clip.smartMasks!.find(m=>m.id===id)!,key=`${mask.key}:${width}:${height}:${doc.source.width}:${doc.source.height}`;
-            let fitted=fittedMasks.get(key);if(!fitted){while(fittedMasks.size>=24)fittedMasks.delete(fittedMasks.keys().next().value!);fitted={width,height,key,data:fittedSmartMask(mask,width,height,doc.source.width,doc.source.height)};fittedMasks.set(key,fitted);}masks.set(id,fitted);
+            let fitted=fittedMasks.get(key);if(!fitted){while(fittedMasks.size>=24)fittedMasks.delete(fittedMasks.keys().next().value!);fitted={width,height,key,data:fittedSmartMask(matte,width,height,doc.source.width,doc.source.height)};fittedMasks.set(key,fitted);}masks.set(id,fitted);
           }
           return masks;
         };
@@ -683,6 +686,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         if(!amount)continue;
         if(effect.name==='Smart Mask') {
           const mask=masks.get(effect.maskId!);if(!mask){loading=true;layerContext.clearRect(0,0,width,height);return;}
+          if(mask===unanalyzedSmartMask){warning='Smart Mask · not analyzed here yet · showing the full picture';continue;}
           const doc=clip.smartMasks!.find(m=>m.id===effect.maskId)!,invert=!!effect.parameters?.invert;
           const fit=Math.min(width/doc.source.width,height/doc.source.height),fitWidth=doc.source.width*fit,fitHeight=doc.source.height*fit,left=(width-fitWidth)/2,top=(height-fitHeight)/2;
           const filter=mask.canvas?lumaAlphaFilter(amount,invert):null;

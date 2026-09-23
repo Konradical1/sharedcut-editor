@@ -32,6 +32,9 @@ export function lumaAlphaFilter(amount:number,invert:boolean):string|null{
   return `url(#${id})`;
 }
 const empty:SmartMaskPixels={width:1,height:1,data:new Uint8Array([0]),key:'empty'};
+/** A mask with no analysis for this frame yet. The picture plays unmasked instead of blanking the clip and
+ *  stalling playback on a load that can never finish; export still requires the analysis. */
+export const unanalyzedSmartMask:SmartMaskPixels={width:1,height:1,data:new Uint8Array([255]),key:'unanalyzed'};
 
 /** Technical interpretation lives outside prompt intent and must revalidate a completed analysis. */
 export function smartMaskPreviewContext(clip:Clip,asset?:Pick<MediaAsset,'inputProfile'|'inputGamut'|'colorMatrix'>):string{
@@ -69,16 +72,19 @@ export function createSmartMaskPreview(onReady:()=>void){
       for(const doc of activeSmartMasks(clip,nodes)){
         // The frame showing at range.start carries a timestamp up to one frame earlier; the manifest decides.
         if(time<doc.range.start-1/doc.source.fps||time>=doc.range.end-1e-7){result.set(doc.id,empty);continue;}
-        if(!doc.result||doc.result.signature!==smartMaskSignature(doc))throw new SmartMaskPending('Analyze Smart Mask to update this frame.');
+        if(!doc.result){result.set(doc.id,unanalyzedSmartMask);continue;}
+        // Edited since its analysis: keep showing that analysis until the new one lands. Its pixels are immutable,
+        // so the historical manifest is served without the current-intent check.
+        const current=doc.result.signature===smartMaskSignature(doc);
         const key=doc.result.key,query=`?projectId=${encodeURIComponent(clip.projectId)}`,base=`/api/smart-masks/${key}`;
-        const context=smartMaskPreviewContext(clip,asset);
+        const context=current?smartMaskPreviewContext(clip,asset):'historical';
         const manifest=get(manifests,`${key}:${context}`,async signal=>{
-          const value=await(await response(`${base}/manifest${query}&clipId=${encodeURIComponent(clip.id)}&context=${encodeURIComponent(context)}`,signal)).json() as SmartMaskManifest;
+          const value=await(await response(current?`${base}/manifest${query}&clipId=${encodeURIComponent(clip.id)}&context=${encodeURIComponent(context)}`:`${base}/manifest${query}`,signal)).json() as SmartMaskManifest;
           if(value.key!==key||value.signature!==doc.result!.signature||value.mediaId!==clip.mediaId||!Array.isArray(value.frames))throw Error('Smart Mask revision does not match this clip.');return value;
         },32);
         const index=smartMaskFrame(time,doc.source,manifest.sourceTimes);
         let indices=indexSets.get(manifest);if(!indices){indices=new Set(manifest.frames.map(f=>f.index));indexSets.set(manifest,indices);}
-        if(!indices.has(index)){if(time<doc.range.start-1e-7){result.set(doc.id,empty);continue;}throw new SmartMaskPending('This Smart Mask frame needs analysis.');}
+        if(!indices.has(index)){result.set(doc.id,time<doc.range.start-1e-7?empty:unanalyzedSmartMask);continue;}
         const load=(frameIndex:number)=>async(signal:AbortSignal)=>{
           // Playback reads the 8-bit playback-size matte when the analysis wrote one; the lossless 16-bit PNG remains authoritative for export.
           const blob=await(await response(`${base}/${manifest.preview?'preview':'frames'}/${frameIndex}.png${query}`,signal)).blob(),bitmap=await createImageBitmap(blob,{colorSpaceConversion:'none'});

@@ -977,12 +977,14 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           requireProject(clip.projectId, userId);
           const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId) ?? fail(404, 'Media not found.');
           if (asset.kind !== 'video' || !existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
+          // The editor asks for timing as it opens; start the preview model now so the first click is quick.
+          if (path.endsWith('source-times')) masks.warm();
           const sourceTimes = await masks.sourceTimes(clip, asset, originalPath(asset.id));
           if (path.endsWith('source-times')) { send(res, 200, { sourceTimes }); return; }
           const frame = Number(url.searchParams.get('frame'));
           if (!Number.isSafeInteger(frame) || frame < 0 || frame >= sourceTimes.length) fail(400, 'Invalid source frame.');
           res.setHeader('X-Smart-Mask-Time', String(sourceTimes[frame])); res.setHeader('X-Smart-Mask-Frame', String(frame));
-          const image = await masks.source(clip, asset, originalPath(asset.id), frame);
+          const image = await masks.source(clip, asset, originalPath(asset.id), frame, url.searchParams.get('size') === 'display' ? 'display' : 'native');
           streamFile(req, res, image, 'image/jpeg'); return;
         }
         if (path === '/api/smart-masks/preview' && method === 'POST') {

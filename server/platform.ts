@@ -1,5 +1,7 @@
-﻿import { join } from 'node:path';
+﻿import { renameSync } from 'node:fs';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const windows = process.platform === 'win32';
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -27,3 +29,23 @@ export function filterPath(path: string) {
 
 /** `filterPath` already quoted and escaped, ready to interpolate. */
 export const quotedFilterPath = (path: string) => `'${filterPath(path)}'`;
+
+/**
+ * Windows refuses a rename with EPERM/EACCES/EBUSY while any process holds a handle on the file or on
+ * anything inside a directory - Defender and the search indexer open freshly written files for a moment.
+ * That failed finished Smart Mask analyses at 99%. POSIX renames never hit this, so only Windows retries.
+ */
+export const locked = (error: unknown) => windows && ['EPERM', 'EACCES', 'EBUSY'].includes((error as NodeJS.ErrnoException).code ?? '');
+export async function renameWithRetry(from: string, to: string, attempts = 20) {
+  for (let attempt = 0; ; attempt++) {
+    try { renameSync(from, to); return; }
+    catch (error) { if (!locked(error) || attempt >= attempts) throw error; await delay(Math.min(1000, 50 * 2 ** attempt)); }
+  }
+}
+/** Blocking twin for small metadata files; gives up after about a second. */
+export function renameWithRetrySync(from: string, to: string) {
+  for (let attempt = 0; ; attempt++) {
+    try { renameSync(from, to); return; }
+    catch (error) { if (!locked(error) || attempt >= 8) throw error; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(250, 10 * 2 ** attempt)); }
+  }
+}

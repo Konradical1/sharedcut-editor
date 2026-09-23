@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createSmartMask, smartMaskSignature, validateSmartMask, validateSmartMaskBindings, smartMaskFrame, smartMaskSourceTime, smartMaskRepairAlpha } from './smartMask.ts';
 import type { Clip, MediaAsset } from '../state/models.ts';
-import { activeSmartMasks, createSmartMaskPreview, fittedSmartMask, SmartMaskPending, smartMaskPreviewContext } from './smartMaskPreview.ts';
+import { activeSmartMasks, createSmartMaskPreview, fittedSmartMask, SmartMaskPending, smartMaskPreviewContext, unanalyzedSmartMask } from './smartMaskPreview.ts';
 
 const clip={id:'clip',mediaId:'media',start:10,sourceIn:2,duration:2,properties:{speed:100},effects:[]} as unknown as Clip;
 const asset={id:'media',kind:'video',fps:24,resolution:'1920 × 1080',duration:10} as MediaAsset;
@@ -34,6 +34,22 @@ test('smart mask intent persists separately from revisions; source timing, bound
   assert.equal(smartMaskRepairAlpha(.5,'foreground',.5),.75);
   assert.deepEqual(Array.from(fittedSmartMask({width:2,height:1,data:new Uint8Array([0,255]),key:'test'},2,3,2,1)),[0,0,0,255,0,0]);
   assert.deepEqual(activeSmartMasks({...masked,effects:[{...masked.effects[0],enabled:false}]},[]),[]);
+});
+
+test('an unanalyzed mask plays the full picture and an edited one keeps its last analysis',()=>{
+  const doc=createSmartMask(clip,asset,'mask'),masked={...clip,projectId:'project',smartMasks:[doc],effects:[{id:'effect',name:'Smart Mask',enabled:true,amount:100,maskId:doc.id}]};
+  const original=globalThis.fetch,requests:string[]=[];
+  globalThis.fetch=async input=>{requests.push(String(input));return new Response('{}',{status:503});};
+  const preview=createSmartMaskPreview(()=>{});
+  try{
+    // No analysis at all: pass the picture through instead of blanking the clip and stalling playback.
+    assert.equal(preview.read(masked,[],2.5,asset).get(doc.id),unanalyzedSmartMask);
+    assert.equal(requests.length,0);
+    // Edited after analysis: read the immutable historical manifest, not the current-intent route that would refuse it.
+    const edited={...doc,result:{key:'c'.repeat(64),signature:'older intent'}};
+    assert.throws(()=>preview.read({...masked,smartMasks:[edited]},[],2.5,asset),SmartMaskPending);
+    assert.equal(new URL(requests[0],'http://localhost').searchParams.has('clipId'),false);
+  }finally{preview.dispose();globalThis.fetch=original;}
 });
 
 test('preview revalidates cached mattes when clip or source color interpretation changes',async()=>{

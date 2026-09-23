@@ -1,5 +1,5 @@
 import {pendingMaskRepairPreview} from '../services/smartMaskRepairPreview';
-import {smartMaskPreviewContext} from '../services/smartMaskPreview';
+import {lumaAlphaFilter,smartMaskPreviewContext} from '../services/smartMaskPreview';
 import {useEffect,useRef,useState,type CSSProperties,type PointerEvent} from 'react';
 import {Brush,ChevronLeft,ChevronRight,CircleMinus,CirclePlus,Eraser,RotateCcw,Trash2,Undo2,X} from 'lucide-react';
 import {useEditorStore} from '../state/store';
@@ -17,6 +17,42 @@ const tools:{tool:MaskTool;label:string;hint:string;key:string;Icon:typeof Brush
   {tool:'background',label:'Remove',hint:'Erase this frame out of the subject',key:'X',Icon:Eraser},
   {tool:'unknown',label:'Reset',hint:'Paint this frame back to the analyzed estimate',key:'R',Icon:RotateCcw},
 ];
+
+/** Loaded source frames and mattes by URL, newest last; stepping back and forth redraws from memory. A busy
+ *  server answers 429, so a failure retries a few times before it is reported. */
+const frameImages=new Map<string,Promise<HTMLImageElement>>();
+function frameImage(url:string):Promise<HTMLImageElement>{
+  const known=frameImages.get(url);if(known){frameImages.delete(url);frameImages.set(url,known);return known;}
+  const load=(attempt:number):Promise<HTMLImageElement>=>new Promise<HTMLImageElement>((resolve,reject)=>{const image=new Image();image.decoding='async';image.onload=()=>resolve(image);image.onerror=()=>reject(Error('Image unavailable.'));image.src=url;})
+    .catch(error=>attempt<3?new Promise(wait=>setTimeout(wait,400*(attempt+1))).then(()=>load(attempt+1)):Promise.reject(error));
+  const entry=load(0);frameImages.set(url,entry);
+  entry.catch(()=>{if(frameImages.get(url)===entry)frameImages.delete(url);});
+  while(frameImages.size>40)frameImages.delete(frameImages.keys().next().value!);
+  return entry;
+}
+
+/** Matte over picture in the canvas compositor: no pixel readback and nothing per pixel in JavaScript. */
+function composite(ctx:CanvasRenderingContext2D,matte:HTMLCanvasElement,view:MaskView){
+  const {width,height}=matte;
+  if(view==='alpha'){ctx.drawImage(matte,0,0);return;}
+  const filter=lumaAlphaFilter(100,false);
+  if(!filter)return compositePixels(ctx,matte,view);
+  // The gray matte becomes this layer's alpha; the layer then takes the tint colour or the picture.
+  const layer=document.createElement('canvas');layer.width=width;layer.height=height;const l=layer.getContext('2d')!;
+  l.filter=filter;l.drawImage(matte,0,0);l.filter='none';l.globalCompositeOperation='source-in';
+  if(view==='overlay'){l.fillStyle='rgb(0,228,188)';l.fillRect(0,0,width,height);ctx.globalAlpha=.4;ctx.drawImage(layer,0,0);ctx.globalAlpha=1;return;}
+  l.drawImage(ctx.canvas,0,0);
+  ctx.fillStyle=view==='white'?'#fff':'#000';ctx.fillRect(0,0,width,height);ctx.drawImage(layer,0,0);
+}
+// ponytail: browsers without canvas filters (older Safari) blend on the CPU; drop once they all have it.
+function compositePixels(ctx:CanvasRenderingContext2D,matte:HTMLCanvasElement,view:MaskView){
+  const {width,height}=matte,pixels=ctx.getImageData(0,0,width,height),a=matte.getContext('2d')!.getImageData(0,0,width,height);
+  for(let i=0;i<pixels.data.length;i+=4){const coverage=a.data[i]/255;
+    if(view==='overlay'){const tint=coverage*.4;pixels.data[i]*=1-tint;pixels.data[i+1]=pixels.data[i+1]*(1-tint)+228*tint;pixels.data[i+2]=pixels.data[i+2]*(1-tint)+188*tint;}
+    else for(let c=0;c<3;c++)pixels.data[i+c]=pixels.data[i+c]*coverage+(view==='white'?255:0)*(1-coverage);
+  }
+  ctx.putImageData(pixels,0,0);
+}
 export default function SmartMaskOverlay(){
   const editor=useMaskEditor(),s=useEditorStore(),clip=s.clips.find(c=>c.id===editor.clipId&&c.projectId===s.projectId),mask=clip?.smartMasks?.find(m=>m.id===editor.maskId);
   const sourceContext=clip?smartMaskPreviewContext(clip,s.media.find(asset=>asset.id===clip.mediaId)):'';
@@ -54,20 +90,22 @@ export default function SmartMaskOverlay(){
         .catch(cause=>{if(live)setPreview({frame,intent:frameIntent,error:cause instanceof Error?cause.message:'Frame preview failed.'});});},150);
     return()=>{live=false;clearTimeout(timer);};
   },[clip?.id,mask?.id,frame,frameIntent,valid,!!times]);
+  // Fit reads the editor-size frame (a tenth of the bytes, decoded 24 at a time on the server); zoom reads native pixels.
+  const sourceUrl=(index:number)=>clip?`/api/smart-masks/source?clipId=${encodeURIComponent(clip.id)}&frame=${index}&context=${encodeURIComponent(sourceContext)}${zoom==='Fit'?'&size=display':''}`:'';
   useEffect(()=>{
     if(!mask||!clip||!canvas.current)return;
     const sourceIdentity=JSON.stringify([clip.id,frame,sourceContext]);
     // Updating guides or an arriving AI preview must not disable the next stroke.
     // Only a different source frame needs to block drawing while it loads.
     let live=true;if(loadedSource.current!==sourceIdentity)setLoaded(false);setError('');
-    const picture=new Image(),alpha=new Image();
-    const draw=()=>{
+    const alphaUrl=matteReady?maskAssetUrl(key!,clip.projectId,`frames/${frame}.png`):previewReady?preview!.url!:undefined;
+    const draw=(picture:HTMLImageElement,alpha?:HTMLImageElement)=>{
       if(!live||!canvas.current)return;
       // Fit view composites at display resolution; native pixels only when zoomed in.
       const ratio=mask.source.width/mask.source.height,fitWidth=Math.min(size.width,size.height*ratio),dpr=window.devicePixelRatio||1;
       const target=canvas.current;target.width=zoom==='Fit'?Math.max(1,Math.min(mask.source.width,Math.round(fitWidth*dpr))):mask.source.width;target.height=zoom==='Fit'?Math.max(1,Math.min(mask.source.height,Math.round(fitWidth/ratio*dpr))):mask.source.height;
       const ctx=target.getContext('2d')!;ctx.clearRect(0,0,target.width,target.height);ctx.drawImage(picture,0,0,target.width,target.height);
-      if((matteReady||previewReady)&&alpha.complete&&alpha.naturalWidth){
+      if(alpha){
         const matte=document.createElement('canvas');matte.width=target.width;matte.height=target.height;const m=matte.getContext('2d')!;m.drawImage(alpha,0,0,matte.width,matte.height);
         if(matteReady&&!valid&&repairsPreview){
           const pixels=m.getImageData(0,0,matte.width,matte.height),coverage=document.createElement('canvas');coverage.width=matte.width;coverage.height=matte.height;const brush=coverage.getContext('2d')!;
@@ -81,23 +119,18 @@ export default function SmartMaskOverlay(){
           }
           m.putImageData(pixels,0,0);
         }
-        if(editor.view==='alpha'){ctx.drawImage(matte,0,0);}
-        else{
-          const pixels=ctx.getImageData(0,0,target.width,target.height),a=m.getImageData(0,0,target.width,target.height);
-          for(let i=0;i<pixels.data.length;i+=4){const coverage=a.data[i]/255;
-            if(editor.view==='overlay'){const tint=coverage*.4;pixels.data[i]*=1-tint;pixels.data[i+1]=pixels.data[i+1]*(1-tint)+228*tint;pixels.data[i+2]=pixels.data[i+2]*(1-tint)+188*tint;}
-            else for(let c=0;c<3;c++)pixels.data[i+c]=pixels.data[i+c]*coverage+(editor.view==='white'?255:0)*(1-coverage);
-          }
-          ctx.putImageData(pixels,0,0);
-        }
+        composite(ctx,matte,editor.view);
       }
       loadedSource.current=sourceIdentity;setLoaded(true);
+      // Stepping is the common gesture: the neighbours are already decoded by the time the arrow key lands.
+      for(const near of [1,-1,2,-2,3])if(frame+near>=bounds.first&&frame+near<=bounds.last)void frameImage(sourceUrl(frame+near)).catch(()=>{});
     };
-    // Scrubbing settles before the frame is fetched, and a transient failure retries before it is reported.
-    let attempts=0;const source=`/api/smart-masks/source?clipId=${encodeURIComponent(clip.id)}&frame=${frame}&context=${encodeURIComponent(sourceContext)}`;
-    picture.onload=draw;picture.onerror=()=>{if(!live)return;if(attempts++<3)setTimeout(()=>{if(live)picture.src=`${source}&retry=${attempts}`;},400*attempts);else setError('The source frame could not be loaded. Step to another frame to retry.');};
-    const settle=setTimeout(()=>{if(live)picture.src=source;},120);
-    if(matteReady||previewReady){alpha.onload=()=>{if(picture.complete&&picture.naturalWidth)draw();};alpha.onerror=()=>{if(live)setError(matteReady?'This matte frame is unavailable. Analyze this range again.':'The frame preview image is unavailable.');};alpha.src=matteReady?maskAssetUrl(key!,clip.projectId,`frames/${frame}.png`):preview!.url!;}
+    // A frame already in memory draws at once; a new one waits a moment so a fast scrub does not queue every frame.
+    const url=sourceUrl(frame);
+    const settle=setTimeout(()=>{
+      const alpha=alphaUrl?frameImage(alphaUrl).catch(()=>{if(live)setError(matteReady?'This matte frame is unavailable. Analyze this range again.':'The frame preview image is unavailable.');return undefined;}):Promise.resolve(undefined);
+      void Promise.all([frameImage(url),alpha]).then(([picture,matte])=>draw(picture,matte)).catch(()=>{if(live)setError('The source frame could not be loaded. Step to another frame to retry.');});
+    },frameImages.has(url)&&(!alphaUrl||frameImages.has(alphaUrl))?0:60);
     return()=>{live=false;clearTimeout(settle);};
   },[clip?.id,mask?.id,key,frame,editor.view,intent,manifest,sourceContext,previewReady?preview?.url:'',zoom,zoom==='Fit'?Math.round(size.width):0,zoom==='Fit'?Math.round(size.height):0]);
   useEffect(()=>()=>{if(editor.clipId)useEditorStore.getState().releaseLock(editor.clipId,'smartMasks');},[editor.clipId]);

@@ -1,9 +1,9 @@
 import { killProcessTree, runWorkerProcess } from './processTree.ts';
-import { venvPython, filterPath } from './platform.ts';
+import { venvPython, filterPath, locked, renameWithRetry, renameWithRetrySync } from './platform.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync, rmSync, statSync, lstatSync, openSync, readSync, closeSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, lstatSync, openSync, readSync, closeSync, cpSync, copyFileSync } from 'node:fs';
+import { basename, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { smartMaskFrame, smartMaskSignature, validateSmartMask } from '../src/services/smartMask.ts';
@@ -26,8 +26,14 @@ export const runMaskProcess = (command: string, args: string[], signal?: AbortSi
 
 let capabilitiesRequest: ReturnType<typeof checkCapabilities> | undefined;
 let capabilitiesExpiry = 0;
+// Each check starts Python and imports torch (seconds). A working engine only changes when someone
+// reinstalls it, so a success holds for ten minutes; a failure is retried after 30 seconds.
 export function smartMaskCapabilities() {
-  if (!capabilitiesRequest || Date.now() >= capabilitiesExpiry) { capabilitiesExpiry = Date.now() + 30_000; capabilitiesRequest = checkCapabilities(); }
+  if (!capabilitiesRequest || Date.now() >= capabilitiesExpiry) {
+    capabilitiesExpiry = Date.now() + 30_000;
+    const request = capabilitiesRequest = checkCapabilities();
+    void request.then(result => { if (capabilitiesRequest === request && result.available) capabilitiesExpiry = Date.now() + 600_000; });
+  }
   return capabilitiesRequest;
 }
 async function checkCapabilities() {
@@ -54,7 +60,19 @@ function inputMatrix(clip: Clip, asset: MediaAsset) {
   return value.startsWith('bt2020') ? 'bt2020' : ['bt470bg', 'smpte170m'].includes(value) ? 'bt601' : ['bt709', 'bt601'].includes(value) ? value : 'auto';
 }
 function json(path: string) { return JSON.parse(readFileSync(path, 'utf8')); }
-function atomicJson(path: string, value: unknown) { const temporary = `${path}.${randomUUID()}.tmp`; writeFileSync(temporary, JSON.stringify(value), { mode: 0o600 }); renameSync(temporary, path); }
+function atomicJson(path: string, value: unknown) { const temporary = `${path}.${randomUUID()}.tmp`; writeFileSync(temporary, JSON.stringify(value), { mode: 0o600 }); renameWithRetrySync(temporary, path); }
+// Node retries EBUSY/EPERM itself here, which Windows raises while a scanner still holds a file open.
+const remove = (path: string) => rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+const DISPLAY_WIDTH = 1920, CHUNK = 24, NATIVE_CHUNK = 8;
+/** Moves a finished analysis into place. A folder watcher (the Vite dev server did this to data/, as can
+ *  OneDrive or backup tools) keeps Windows from renaming a directory for as long as it watches, so after a
+ *  few seconds copy instead. binding.json goes last: restore only trusts a folder that has it. */
+export async function commitFolder(from: string, to: string) {
+  try { await renameWithRetry(from, to, 6); return; }
+  catch (error) { if (!locked(error)) throw error; }
+  cpSync(from, to, { recursive: true, filter: source => basename(source) !== 'binding.json' });
+  copyFileSync(join(from, 'binding.json'), join(to, 'binding.json'));
+}
 function regularFile(path: string) { try { const file = lstatSync(path); return file.isFile() && file.size > 0; } catch { return false; } }
 function alphaHeader(path: string, width: number, height: number) {
   const descriptor = openSync(path, 'r'), header = Buffer.alloc(26);
@@ -120,7 +138,7 @@ export function resolveSmartMaskRepairBase(directory: string, clip: Clip, mask: 
 export function smartMaskService(directory: string) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const jobs = new Map<string, Job>(), controllers = new Map<string, AbortController>();
-  const sourceRequests = new Map<string, Promise<string>>();
+  const sourceRequests = new Map<string, Promise<void>>();
   // Scrubbing the frame slider fires a burst of frame requests; queue them instead of rejecting the fifth.
   let sourceActive = 0; const sourceWaiting: (() => void)[] = [];
   const sourceSlot = () => new Promise<void>(resolveSlot => { if (sourceActive < 4) { sourceActive++; resolveSlot(); } else if (sourceWaiting.length >= 64) fail(429, 'Source frame requests are busy. Retry shortly.'); else sourceWaiting.push(() => { sourceActive++; resolveSlot(); }); });
@@ -165,6 +183,8 @@ export function smartMaskService(directory: string) {
   let queue = Promise.resolve(), closed = false;
   const save = (job: Job) => { jobs.set(job.key, job); atomicJson(join(directory, `${job.key}.job.json`), job); };
   for (const name of readdirSync(directory)) {
+    // Nothing runs before the service starts, so every unfinished analysis folder is an interrupted one.
+    if (name.startsWith('.partial-') || name.endsWith('.tmp')) { try { remove(join(directory, name)); } catch { /* Retried next start. */ } continue; }
     if (!/^[a-f0-9]{64}\.job\.json$/.test(name)) continue;
     try { const job = json(join(directory, name)) as Job; if (['queued', 'processing'].includes(job.status)) { job.status = 'failed'; job.error = 'The server restarted. Analyze the mask again.'; } save(job); } catch { /* Ignore interrupted or corrupt job records. */ }
   }
@@ -189,38 +209,73 @@ export function smartMaskService(directory: string) {
     })();
     timeRequests.set(key, request); return request;
   };
-  return {
-    get,
-    sourceTimes,
-    async source(clip: Clip, asset: MediaAsset, sourcePath: string, frame: number) {
-      if (closed) fail(503, 'The server is stopping.');
-      const times = await sourceTimes(clip, asset, sourcePath);
-      if (!Number.isSafeInteger(frame) || frame < 0 || frame >= times.length) fail(400, 'Invalid source frame.');
-      const analysis = maskAnalysis(clip, asset), key = hash([clip.projectId, asset.id, maskSourceFingerprint(sourcePath), analysis.identity, frame]);
-      const root = join(directory, 'source'), output = join(root, `${key}.jpg`);
-      if (regularFile(output)) return output;
-      const pending = sourceRequests.get(key); if (pending) return pending;
-      const controller = new AbortController(); controllers.set(`source-${key}`, controller);
-      const request = (async () => {
-        await sourceSlot();
-        try { if (regularFile(output)) return output; } catch { /* Extract below. */ }
-        mkdirSync(root, { recursive: true, mode: 0o700 });
+  /** `count` consecutive analysis-graded source frames from `first`, in one FFmpeg run; concurrent asks share it. */
+  const extract = (clip: Clip, asset: MediaAsset, sourcePath: string, times: number[], analysis: { text: string }, first: number, count: number, output: (index: number) => string, size: 'native' | 'display'): Promise<void> => {
+    if (closed) fail(503, 'The server is stopping.');
+    const frames = Array.from({ length: count }, (_, offset) => first + offset);
+    if (frames.every(index => regularFile(output(index)))) return Promise.resolve();
+    const key = hash([output(first), count]), pending = sourceRequests.get(key); if (pending) return pending;
+    const controller = new AbortController();
+    const request = (async () => {
+      // The entry is cleared even when the slot wait itself is rejected as busy; a stuck rejected promise
+      // used to fail every later request for that frame.
+      let slot = false;
+      try {
+        await sourceSlot(); slot = true;
+        const root = join(directory, 'source'); mkdirSync(root, { recursive: true, mode: 0o700 });
         const temporary = join(root, `.source-${randomUUID()}`); mkdirSync(temporary, { mode: 0o700 });
         try {
-          const lut = join(temporary, 'analysis.cube'), jpeg = join(temporary, 'frame.jpg'); writeFileSync(lut, analysis.text, { mode: 0o600 });
-          const escaped = filterPath(lut);
+          const lut = join(temporary, 'analysis.cube'); writeFileSync(lut, analysis.text, { mode: 0o600 });
           const scale: string[] = [], range = clip.properties.dataLevels, matrix = inputMatrix(clip, asset);
           if (range === 'Full' || range === 'Video') scale.push(`in_range=${range === 'Full' ? 'pc' : 'tv'}`);
           if (matrix !== 'auto') scale.push(`in_color_matrix=${matrix}`);
-          const filters = [...(scale.length ? [`scale=${scale.join(':')}`] : []), `lut3d=file='${escaped}'`];
-          // Accurate input seek to the frame's own presentation time decodes from the nearest keyframe only,
-          // instead of every frame from the start; the first output frame is exactly source frame `frame`.
-          await runMaskProcess(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-format_whitelist', 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,mxf', '-ss', times[frame].toFixed(6), '-i', sourcePath, '-vf', filters.join(','), '-frames:v', '1', '-q:v', '2', jpeg], AbortSignal.any([controller.signal, AbortSignal.timeout(60_000)]));
-          if (!regularFile(jpeg)) fail(404, 'Source frame is unavailable.');
-          renameSync(jpeg, output); return output;
-        } finally { rmSync(temporary, { recursive: true, force: true }); sourceRequests.delete(key); controllers.delete(`source-${key}`); releaseSlot(); }
-      })();
-      sourceRequests.set(key, request); return request;
+          const filters = [...(scale.length ? [`scale=${scale.join(':')}`] : []), `lut3d=file='${filterPath(lut)}'`];
+          const width = Number(asset.resolution.match(/(\d+)\s*[×x]/)?.[1]);
+          if (size === 'display' && width > DISPLAY_WIDTH) filters.push(`scale=${DISPLAY_WIDTH}:-2`);
+          // Accurate input seek to the first frame's own presentation time decodes from the nearest keyframe only;
+          // passthrough then keeps every following decoded frame, so file N is exactly source frame N.
+          await runMaskProcess(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-protocol_whitelist', 'file,pipe', '-format_whitelist', 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,mxf', '-ss', times[first].toFixed(6), '-i', sourcePath, '-vf', filters.join(','), '-frames:v', String(count), '-fps_mode', 'passthrough', '-q:v', size === 'display' ? '3' : '2', '-start_number', String(first), join(temporary, '%d.jpg')], AbortSignal.any([controller.signal, AbortSignal.timeout(120_000)]));
+          for (const index of frames) { const file = join(temporary, `${index}.jpg`); if (regularFile(file)) await renameWithRetry(file, output(index)); }
+        } finally { remove(temporary); }
+      } finally { sourceRequests.delete(key); controllers.delete(`source-${key}`); if (slot) releaseSlot(); }
+    })();
+    controllers.set(`source-${key}`, controller); sourceRequests.set(key, request); return request;
+  };
+  return {
+    get,
+    sourceTimes,
+    /** Opening the mask editor loads the model while the person finds their subject, so the first click
+     *  previews in about a second instead of waiting for Python, torch and SAM to start. */
+    warm() {
+      if (closed) return;
+      void smartMaskCapabilities();
+      try {
+        const active = previewWorkerFor();
+        if (!active.pending.size) { clearTimeout(active.idle); active.idle = setTimeout(() => { if (!active.pending.size) stopPreviewWorker('Idle.'); }, 600_000); active.idle.unref(); }
+      } catch { /* Not installed; the editor already reports that from capabilities. */ }
+    },
+    /** One analysis-graded source frame. `native` is the full-resolution frame the model and zoomed views read;
+     *  `display` is at most 1920 wide for the editor's fitted view, a tenth of the bytes. */
+    async source(clip: Clip, asset: MediaAsset, sourcePath: string, frame: number, size: 'native' | 'display' = 'native') {
+      if (closed) fail(503, 'The server is stopping.');
+      const times = await sourceTimes(clip, asset, sourcePath);
+      if (!Number.isSafeInteger(frame) || frame < 0 || frame >= times.length) fail(400, 'Invalid source frame.');
+      const analysis = maskAnalysis(clip, asset), fingerprint = maskSourceFingerprint(sourcePath);
+      const root = join(directory, 'source');
+      const output = (index: number) => join(root, `${hash([clip.projectId, asset.id, fingerprint, analysis.identity, index, ...(size === 'display' ? ['display-1'] : [])])}.jpg`);
+      if (regularFile(output(frame))) return output(frame);
+      // Starting FFmpeg and seeking costs about a second; the next frames cost almost nothing more. Decode an
+      // aligned run at once so stepping, scrubbing and previewing nearby frames are cache hits, and warm the
+      // neighbouring run near its edge. Native 4K frames are 1-2 MB each, so their runs are shorter.
+      const run = size === 'display' ? CHUNK : NATIVE_CHUNK, first = frame - frame % run, offset = frame - first;
+      await extract(clip, asset, sourcePath, times, analysis, first, Math.min(run, times.length - first), output, size).catch(() => {});
+      if (offset >= run / 2 && first + run < times.length) void extract(clip, asset, sourcePath, times, analysis, first + run, Math.min(run, times.length - first - run), output, size).catch(() => {});
+      if (offset < run / 4 && first > 0) void extract(clip, asset, sourcePath, times, analysis, first - run, run, output, size).catch(() => {});
+      if (regularFile(output(frame))) return output(frame);
+      // The run failed or came up short: decode exactly this one frame.
+      await extract(clip, asset, sourcePath, times, analysis, frame, 1, output, size);
+      if (!regularFile(output(frame))) fail(404, 'Source frame is unavailable.');
+      return output(frame);
     },
     /** Alpha for one source frame from the guides on that frame; the same window, candidate choice and cleanup the tracker applies. */
     async preview(clip: Clip, asset: MediaAsset, sourcePath: string, mask: SmartMaskDocument, frame: number, prompts: SmartMaskDocument['prompts']) {
@@ -245,9 +300,9 @@ export function smartMaskService(directory: string) {
             active.child.stdin!.write(JSON.stringify({ id, image, width: mask.source.width, height: mask.source.height, prompts, output: temporary }) + '\n');
           });
           if (!regularFile(temporary)) fail(500, 'The preview worker returned no image.');
-          renameSync(temporary, output); return output;
+          await renameWithRetry(temporary, output); return output;
         } finally {
-          rmSync(temporary, { force: true }); previewRequests.delete(key);
+          remove(temporary); previewRequests.delete(key);
           if (previewWorker === active && !active.pending.size) { active.idle = setTimeout(() => { if (!active.pending.size) stopPreviewWorker('Idle.'); }, 600_000); active.idle.unref(); }
         }
       })();
@@ -312,11 +367,15 @@ export function smartMaskService(directory: string) {
           if (controller.signal.aborted || closed) throw new Error('Smart Mask cancelled.');
           if (maskSourceFingerprint(sourcePath) !== sourceFingerprint) throw new Error('The original media changed during analysis.');
           atomicJson(join(temporary, 'binding.json'), binding);
-          rmSync(join(temporary, 'job.json')); rmSync(join(temporary, 'analysis.cube'));
-          renameSync(temporary, join(directory, key));
+          remove(join(temporary, 'job.json')); remove(join(temporary, 'analysis.cube'));
+          // A folder under this key without the restore check above passing is leftover from an interrupted
+          // commit and is never served; replace it rather than failing the rename onto it.
+          const final = join(directory, key);
+          if (existsSync(final)) remove(final);
+          await commitFolder(temporary, final);
           job.status = 'ready'; job.progress = 100; job.manifestUrl = `/api/smart-masks/${key}/manifest?projectId=${encodeURIComponent(clip.projectId)}`; save(job);
         } catch (error) { job.status = controller.signal.aborted ? 'cancelled' : 'failed'; job.error = (error as Error).message; save(job); }
-        finally { controllers.delete(key); rmSync(temporary, { recursive: true, force: true }); }
+        finally { controllers.delete(key); try { remove(temporary); } catch { /* A locked leftover is harmless; it is never served. */ } }
       }).catch(error => {
         job.status = controller.signal.aborted ? 'cancelled' : 'failed'; job.error = (error as Error).message; controllers.delete(key);
         try { save(job); } catch { /* Keep the in-memory failure visible if the cache volume is full. */ }

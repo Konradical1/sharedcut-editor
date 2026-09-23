@@ -38,9 +38,29 @@ def emit(**message):
     print(json.dumps(message, allow_nan=False), flush=True)
 
 
+DIGESTS = ROOT / "artifacts/smart-mask/digests.json"
+
+
 def digest(path):
-    with open(path, "rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    """SHA-256 of a file, remembered by path, size and mtime. Hashing the 900 MB checkpoint took seconds
+    on every capability check, preview start and job.
+    ponytail: size+mtime identity; drop the cache file if weights are ever swapped in place with both preserved."""
+    stat = Path(path).stat()
+    key = f"{Path(path).resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+    try:
+        known = json.loads(DIGESTS.read_text())
+    except (OSError, ValueError):
+        known = {}
+    if key not in known:
+        with open(path, "rb") as stream:
+            known[key] = hashlib.file_digest(stream, "sha256").hexdigest()
+        try:
+            temporary = DIGESTS.with_name(f"{DIGESTS.name}.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(known))
+            os.replace(temporary, DIGESTS)
+        except OSError:
+            pass  # A read-only install just hashes again next time.
+    return known[key]
 
 
 def capabilities():
@@ -214,9 +234,10 @@ def finish_frames(job, indices, times, output, load_alpha):
         repairs.setdefault(frame_at(times, repair["time"]), []).append(repair)
     for kind in ("base-frames", "frames", "preview", "source"):
         (output / kind).mkdir(exist_ok=True)
-    for n, index in enumerate(indices):
+    source = job["document"]["source"]
+
+    def save(index):
         alpha = load_alpha(index)
-        source = job["document"]["source"]
         if alpha.shape != (source["height"], source["width"]) or not np.isfinite(alpha).all():
             raise ValueError("Matting engine returned invalid alpha.")
         base = output / "base-frames" / f"{index}.png"
@@ -228,7 +249,16 @@ def finish_frames(job, indices, times, output, load_alpha):
         else:
             os.link(base, output / "frames" / f"{index}.png")
         save_preview(alpha16, output / "preview" / f"{index}.png")
-        emit(progress=90 + 9*(n+1)/len(indices), stage="Saving matte", frame=index)
+        return index
+    parallel(save, indices, "Saving matte")
+
+
+def parallel(work, items, stage):
+    """PNG compression and NumPy release the GIL, so a few threads save frames several times faster than one."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 2)) as pool:
+        for n, index in enumerate(pool.map(work, items)):
+            emit(progress=90 + 9*(n+1)/len(items), stage=stage, frame=index)
 
 
 def finish_repair_job(job):
@@ -242,7 +272,7 @@ def finish_repair_job(job):
         repairs.setdefault(frame_at(manifest["sourceTimes"], repair["time"]), []).append(repair)
     for kind in ("base-frames", "frames", "preview", "source"):
         (output / kind).mkdir(exist_ok=True)
-    for n, frame in enumerate(manifest["frames"]):
+    def save(frame):
         index = frame["index"]
         original = base / "base-frames" / f"{index}.png"
         os.link(original, output / "base-frames" / f"{index}.png")
@@ -260,7 +290,8 @@ def finish_repair_job(job):
                 with Image.open(original) as image:
                     save_preview(np.asarray(image).astype(np.uint16), output / "preview" / f"{index}.png")
         os.link(base / "source" / f"{index}.jpg", output / "source" / f"{index}.jpg")
-        emit(progress=90 + 9*(n+1)/len(manifest["frames"]), stage="Saving corrections", frame=index)
+        return index
+    parallel(save, manifest["frames"], "Saving corrections")
     manifest.update({key: job[key] for key in ("version", "key", "signature", "projectId", "mediaId", "sourceFingerprint")}, preview="gray8")
     (output / "manifest.json").write_text(json.dumps(manifest, allow_nan=False))
 
@@ -281,11 +312,12 @@ def region_for(center, side, width, height):
 
 def mask_bounds(binary, region):
     """Source-pixel bounding box (x0, y0, x1, y1) of a crop-resolution mask, or None when empty."""
+    import cv2
     import numpy as np
-    ys, xs = np.nonzero(binary)
-    if not len(xs):
+    x, y, w, h = cv2.boundingRect(binary.astype(np.uint8))
+    if not w:
         return None
-    return (xs.min() + region[0], ys.min() + region[1], xs.max() + region[0], ys.max() + region[1])
+    return (x + region[0], y + region[1], x + w - 1 + region[0], y + h - 1 + region[1])
 
 
 def follow(bounds, region, width, height, include=None):
@@ -352,16 +384,38 @@ def antialias(binary):
         return np.zeros(binary.shape, dtype=np.uint8)
     if mask.all():
         return np.full(binary.shape, 255, dtype=np.uint8)
+    # The ramp is two pixels wide, so only the subject's box plus a margin needs distances; the rest of a
+    # 4K window is plain background. Same values as the whole-image transform, a fraction of the work.
+    x, y, w, h = cv2.boundingRect(mask)
+    x0, y0 = max(0, x - 3), max(0, y - 3)
+    x1, y1 = min(mask.shape[1], x + w + 3), min(mask.shape[0], y + h + 3)
+    crop = mask[y0:y1, x0:x1]
     # Pixel centres sit half a pixel from the contour; measure to the contour, not to the neighbouring pixel.
-    inside, outside = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE), cv2.distanceTransform(1 - mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-    signed = np.where(mask > 0, inside - .5, .5 - outside)
-    return np.rint(np.clip(signed/2 + .5, 0, 1)*255).astype(np.uint8)
+    inside, outside = cv2.distanceTransform(crop, cv2.DIST_L2, cv2.DIST_MASK_PRECISE), cv2.distanceTransform(1 - crop, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    signed = np.where(crop > 0, inside - .5, .5 - outside)
+    alpha = np.zeros(binary.shape, dtype=np.uint8)
+    alpha[y0:y1, x0:x1] = np.rint(np.clip(signed/2 + .5, 0, 1)*255).astype(np.uint8)
+    return alpha
 
 
-def track(job, indices, times, decoded, destination, caps):
+def model_input(path, region, size, mean, std):
+    """Normalized model tensor for one crop. OpenCV decodes a 4K JPEG several times faster than Pillow, and a
+    window at least twice the model size decodes at half resolution straight out of the DCT."""
+    import cv2
+    import torch
+    x0, y0, w, h = region
+    reduce = 2 if min(w, h) >= 2*size else 1
+    image = cv2.imread(str(path), cv2.IMREAD_REDUCED_COLOR_2 if reduce == 2 else cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Decoded source frame is unreadable: {path.name}")
+    patch = image[y0//reduce:(y0 + h)//reduce, x0//reduce:(x0 + w)//reduce]
+    patch = cv2.cvtColor(cv2.resize(patch, (size, size), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
+    return (torch.from_numpy(patch).permute(2, 0, 1).float()/255 - mean)/std
+
+
+def track(job, indices, times, decoded, destination, caps, frames_ready=lambda: None):
     import numpy as np
     import torch
-    from PIL import Image
     sys.path.insert(0, str(SAM_REPO))
     import sam2.sam2_video_predictor as video_module
     from sam2.build_sam import build_sam2_video_predictor
@@ -394,14 +448,14 @@ def track(job, indices, times, decoded, destination, caps):
 
         def __getitem__(self, index):
             x0, y0, w, h = regions.get(index, (0, 0, width, height))  # init_state warms up on frame 0
-            with Image.open(decoded / f"{indices[index]}.jpg") as image:
-                patch = image.crop((x0, y0, x0 + w, y0 + h)).resize((predictor.image_size, predictor.image_size), Image.BILINEAR)
-                tensor = torch.from_numpy(np.array(patch))
-            return (tensor.permute(2, 0, 1).float()/255 - mean)/std
+            return model_input(decoded / f"{indices[index]}.jpg", (x0, y0, w, h), predictor.image_size, mean, std)
     loader = video_module.load_video_frames
     video_module.load_video_frames = lambda **_: (LazyFrames(), height, width)
+    frames_ready()  # The decoder ran while the model loaded; the first frame is needed from here on.
     try:
-        state = predictor.init_state(str(decoded), offload_video_to_cpu=True, offload_state_to_cpu=True)
+        # Tracker state stays on the GPU: memory older than the attention horizon is pruned below, so it
+        # stays bounded, and shuttling it to the CPU every frame cost more than the model itself.
+        state = predictor.init_state(str(decoded), offload_video_to_cpu=True, offload_state_to_cpu=False)
     finally:
         video_module.load_video_frames = loader
     state["cached_features"] = {}  # The warm-up features were computed on the whole frame, not the follow window.
@@ -453,7 +507,10 @@ def track(job, indices, times, decoded, destination, caps):
         alpha = np.zeros((height, width), dtype=np.uint8)
         alpha[y0:y0 + h, x0:x0 + w] = antialias(binary)
         np.save(destination / f"{indices[index]}.npy", alpha)
-    with torch.inference_mode(), accelerated(caps["device"]):
+    # Edge ramps and writes run beside the model instead of between its frames; OpenCV and file I/O release the GIL.
+    from concurrent.futures import ThreadPoolExecutor
+    savers, saving = ThreadPoolExecutor(max_workers=2), []
+    with savers, torch.inference_mode(), accelerated(caps["device"]):
         for reverse, start in ((False, first), (True, first)):
             if reverse and first == 0:
                 continue
@@ -471,7 +528,7 @@ def track(job, indices, times, decoded, destination, caps):
                 previous = np.zeros((height, width), dtype=bool)
                 previous[y0:y0 + h, x0:x0 + w] = binary
                 if not (reverse and index == first):
-                    save(index, binary, region)
+                    saving.append(savers.submit(save, index, binary, region))
                     done += 1
                     emit(progress=10 + 45*done/total, stage="Tracking subject", frame=indices[index])
                 following = index + (-1 if reverse else 1)
@@ -485,6 +542,8 @@ def track(job, indices, times, decoded, destination, caps):
                     for old in list(outputs["non_cond_frame_outputs"]):
                         if abs(old-index) > horizon:
                             del outputs["non_cond_frame_outputs"][old]
+        for pending in saving:
+            pending.result()
     anchors = sorted(indices[index] for index in grouped)
     del state, predictor
     if caps["device"] == "mps":
@@ -623,13 +682,18 @@ def main(job):
         directory.mkdir(parents=True, exist_ok=True)
     try:
         emit(progress=1, stage="Decoding original frames")
-        decode(job, indices, times, rgb)
-        with Image.open(rgb / f"{indices[0]}.jpg") as image:
-            if image.size != (width, height):
-                raise ValueError("Decoded source dimensions differ from the saved mask.")
+
+        def decoded():
+            decode(job, indices, times, rgb)
+            with Image.open(rgb / f"{indices[0]}.jpg") as image:
+                if image.size != (width, height):
+                    raise ValueError("Decoded source dimensions differ from the saved mask.")
+        from concurrent.futures import ThreadPoolExecutor
         import torch
-        with torch.inference_mode(), accelerated(caps["device"]):
-            anchors = track(job, indices, times, rgb, work / "tracking", caps)
+        # FFmpeg decodes in its own process while the model loads, instead of one waiting on the other.
+        with ThreadPoolExecutor(max_workers=1) as decoder, torch.inference_mode(), accelerated(caps["device"]):
+            decoding = decoder.submit(decoded)
+            anchors = track(job, indices, times, rgb, work / "tracking", caps, decoding.result)
         alpha_directory = work / "tracking"
         if caps["preserveMotionBlur"]:
             matte(job, indices, anchors, rgb, work / "tracking", work / "alpha", caps)
