@@ -64,7 +64,7 @@ Poll `GET /api/captions/<job id>` until `status` is `complete`. You only need th
       "properties": { "flipH": true, "zoom": 110 },
       "keyframes": { "properties.zoom": [[0, 118, "outCubic"], [0.4, 110]] } },
     { "id": "music", "track": "a2", "media": "beat.mp3", "start": 0, "in": 0, "duration": 60,
-      "gain": [[0.9, 0], [1.1, -14, "outCubic"], [2.4, -14], [2.7, 0]] }   // ducking: [time, dB, ease]
+      "gain": [[0.9, 0, "outCubic"], [1.1, -14], [2.4, -14, "inOutCubic"], [2.7, 0]] }   // ducking: [time, dB, ease]
   ],
   "text": [ { "id": "title", "track": "v2", "start": 0, "duration": 1.5, "doc": { /* TextDocument */ } } ],
   "graphics": [ { "id": "bar", "track": "v2", "start": 1, "duration": 2,
@@ -78,7 +78,8 @@ Poll `GET /api/captions/<job id>` until `status` is `complete`. You only need th
 ```
 
 - Times are in seconds. Keyframe times count from the clip's start. Keys are
-  `[time, value, ease]`, or full keyframe objects.
+  `[time, value, ease]`, or full keyframe objects. The ease shapes the move from that key to the
+  next one, so put it on the key where the move starts (an ease on the last key does nothing).
 - Eases: `linear`, `hold`, `inOutCubic`, `outCubic`, `inCubic`, `outBack`, `inOutBack`, `outExpo`, `inOutExpo`.
 - `gain` keys stay in the single fast export pass. A keyframed graphic no longer splits the sound into
   per-frame pieces: animated timelines render the picture silent, render the sound once, then mux

@@ -212,3 +212,30 @@ test("a frame editor reads its clip untransformed at any source second, playing 
   assert.equal(ramp.properties.speed, 400, 'playing a ramp, the rate it has reached drives the decoder');
   assert.ok(Math.abs(sourceTime(ramp, 7.25 * 100 / 400, 60, asset.duration) - 7.25) < 1e-9, 'and still reads the asked source second');
 });
+
+test('a flipped clip mirrors after its effects, as the export does, so an off-center vignette follows the picture',async()=>{
+  const { attachPlayback }=await import('./playback.ts'),napi=await import('@napi-rs/canvas');
+  const globals=['document','window','HTMLVideoElement','Image','requestAnimationFrame','cancelAnimationFrame'] as const;
+  const originals=globals.map(key=>Object.getOwnPropertyDescriptor(globalThis,key));
+  let nextFrame=()=>{};
+  const makeCanvas=()=>Object.assign(napi.createCanvas(64,64),{dataset:{} as Record<string,string>});
+  // Source: red left half, blue right half.
+  const source=napi.createCanvas(64,64),paint=source.getContext('2d');paint.fillStyle='#ff0000';paint.fillRect(0,0,32,64);paint.fillStyle='#0000ff';paint.fillRect(32,0,32,64);
+  const url=`data:image/png;base64,${(await source.encode('png')).toString('base64')}`;
+  const TestImage=class extends (napi.Image as any) { set src(value:string){super.src=Buffer.from(value.split(',')[1],'base64');queueMicrotask(()=>(this as any).onload?.());} get src(){return url;} };
+  const replacements={document:{fonts:new EventTarget(),createElement:()=>makeCanvas()},window:new EventTarget(),HTMLVideoElement:class {},Image:TestImage,requestAnimationFrame:(f:()=>void)=>{nextFrame=f;return 1;},cancelAnimationFrame:()=>{}};
+  for(const key of globals)Object.defineProperty(globalThis,key,{configurable:true,value:replacements[key]});
+  const clip={id:'c',projectId:'p',timelineId:'main',trackId:'v1',mediaId:'m',name:'selfie',start:0,duration:4,sourceIn:0,color:'#fff',disabled:false,properties:{flipH:true},
+    effects:[{id:'v',name:'Vignette',enabled:true,amount:100,parameters:{centerX:0,centerY:50}}]} as unknown as Clip;
+  const state={projectId:'p',timelineId:'main',playhead:0,playing:false,projects:[{id:'p',resolution:'64 × 64',fps:8}],timelines:[{id:'main',projectId:'p',name:'main',duration:4}],clips:[clip],
+    tracks:[{id:'v1',timelineId:'main',number:1,kind:'video',muted:false,hidden:false,solo:false,gain:0,pan:0}],media:[{id:'m',projectId:'p',name:'still',kind:'image',status:'ready',duration:4,fps:0,proxyUrl:url,thumbnail:url}],nodes:[],settings:{}};
+  const canvas=makeCanvas();
+  const playback=attachPlayback(canvas as unknown as HTMLCanvasElement,()=>state as any,()=>({original:false,quality:'Full',volume:0,compare:false}),()=>{});
+  try {
+    for(let i=0;i<5;i++){nextFrame();await new Promise(r=>setTimeout(r,5));}
+    const pixel=(x:number)=>[...canvas.getContext('2d').getImageData(x,32,1,1).data];
+    // Export: vignette centered on the source's left (red) edge, then hflip -> bright red on the right, dark blue on the left.
+    assert.ok(pixel(62)[0]>200&&pixel(62)[2]<40,`the red half is mirrored to the right and keeps the vignette's bright center, got ${pixel(62)}`);
+    assert.ok(pixel(1)[2]<150&&pixel(1)[0]<40,`the blue half is mirrored to the left and darkened, got ${pixel(1)}`);
+  } finally {playback.dispose();globals.forEach((key,i)=>{if(originals[i])Object.defineProperty(globalThis,key,originals[i]!);else Reflect.deleteProperty(globalThis,key);});}
+});

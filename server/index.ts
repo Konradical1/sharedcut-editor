@@ -365,14 +365,21 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       if (signal.aborted) throw new Error('Import cancelled.');
       updateAsset(id, { status: 'processing', progress: 0, error: undefined });
       let previous = -1;
+      // Prepared files are served immutable, so a refresh that rewrites them in place needs new URLs or browsers keep the old pictures.
+      const version = refresh ? `?v=${Date.now().toString(36)}` : '', bust = (url?: string) => url && version ? url + version : url;
       const publish = (result: Awaited<ReturnType<typeof probeMedia>> & Partial<Omit<Asset, 'size'>>) => {
-        const { size, ...metadata } = result;
+        const { size, ...fresh } = result;
+        const metadata: typeof fresh = { ...fresh };
+        if (version) {
+          for (const key of ['proxyUrl', 'thumbnail', 'audioProxyUrl', 'colorProxyUrl', 'filmstrip'] as const) if (metadata[key]) metadata[key] = bust(metadata[key])!;
+          if (metadata.proxyVariants) metadata.proxyVariants = Object.fromEntries(Object.entries(metadata.proxyVariants).map(([k, url]) => [k, bust(url)!]));
+        }
         updateAsset(id, { ...metadata, ...(asset.importLink ? { thumbnail: state.media.find(item => item.id === id)?.thumbnail || metadata.thumbnail } : {}), size: size >= 1e9 ? `${(size / 1e9).toFixed(1)} GB` : `${(size / 1e6).toFixed(1)} MB`, sourceUrl: `/api/media/${id}/original`, status: 'ready', progress: 100 });
       };
       const result = await prepareMedia({ inputPath: originalPath(id), outputDir: join(mediaDir(id), 'prepared'), baseUrl: `/api/media/${id}/files`, signal, refresh,
         onStage: preparationStage => { if (!signal.aborted) updateAsset(id, { preparationStage }); },
         onPlayable: result => { if (!signal.aborted) publish(result); },
-        onThumbnail: thumbnail => { if (!asset.importLink) updateAsset(id, { thumbnail }); },
+        onThumbnail: thumbnail => { if (!asset.importLink) updateAsset(id, { thumbnail: bust(thumbnail) }); },
         onProgress: progress => { const next = Math.floor(progress); if (state.media.find(item => item.id === id)?.status !== 'ready' && next !== previous && Date.now() - (progressAt.get(id) ?? 0) >= 5000) { previous = next; progressAt.set(id, Date.now()); updateAsset(id, { progress: next }); } }
       });
       if (!signal.aborted) { publish(result); updateAsset(id, { preparationStage: undefined, error: undefined }); }
@@ -1272,8 +1279,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   for (const asset of state.media) if (asset.status === 'ready') asset.preparationStage = undefined;
   if (saved) persist();
   // Upgrade existing imports in the same bounded worker queue; their current preview stays usable.
-  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && (!asset.proxyVariants?.Stream?.endsWith(`/${STREAM_VARIANT}`) || !asset.proxyVariants?.StreamLow?.endsWith(`/${STREAM_LOW_VARIANT}`)) && asset.proxyUrl) {
-    const filename = asset.proxyUrl.split('/').at(-1)!;
+  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && (!asset.proxyVariants?.Stream?.split('?')[0].endsWith(`/${STREAM_VARIANT}`) || !asset.proxyVariants?.StreamLow?.split('?')[0].endsWith(`/${STREAM_LOW_VARIANT}`)) && asset.proxyUrl) {
+    const filename = asset.proxyUrl.split('?')[0].split('/').at(-1)!;
     if (!/^[a-zA-Z0-9_-]+\.mp4$/.test(filename)) continue;
     const inputPath = join(mediaDir(asset.id), 'prepared', filename);
     if (!existsSync(inputPath)) continue;

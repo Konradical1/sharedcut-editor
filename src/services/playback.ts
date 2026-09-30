@@ -695,15 +695,14 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if (!sourceWidth || !sourceHeight) continue;
       layerContext.clearRect(0, 0, width, height);
       const fit = Math.min(width / sourceWidth, height / sourceHeight);
-      // Mirrored before the transform, like the export's hflip ahead of crop and zoom.
-      if (clip.properties.flipH) { layerContext.save(); layerContext.translate(width, 0); layerContext.scale(-1, 1); }
       layerContext.drawImage(queuedFrame??element, (width - sourceWidth * fit) / 2, (height - sourceHeight * fit) / 2, sourceWidth * fit, sourceHeight * fit);
-      if (clip.properties.flipH) layerContext.restore();
-      if (options.compare) draw(referenceTarget, clip, width, height, projectWidth, projectHeight,time);
+      // The export flips after grade, masks, stabilize and effects (all in source orientation) and before crop and zoom.
+      const flip = Boolean(clip.properties.flipH);
+      if (options.compare) { if (flip) mirrorLayer(); draw(referenceTarget, clip, width, height, projectWidth, projectHeight,time); if (flip) mirrorLayer(); }
       // While the analysis runs, hold the original at the crop the solve will apply so the framing never jumps.
       const framed = stabilizeFx && !stabilizeSolveFor ? {...clip, properties:{...clip.properties, zoom: Number(clip.properties.zoom ?? 100) * stabilizeZoom(stabilizeSettings(original, stabilizeFx))}} : clip;
       const warp = stabilizeSolveFor ? {solve:stabilizeSolveFor,time:sourceTime(original,time,sourceFps,asset.duration||Infinity),sourceWidth,sourceHeight} : undefined;
-      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame);
+      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip);
     }
     flush(Infinity);
     };
@@ -711,7 +710,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     /** The stabilize warp in this layer's pixels. Picture and matte take the same one, which is what puts the
      *  matte on the stabilized frame instead of the original framing. */
     const warpTransform = (warp:LayerWarp) => stabilizeLayerTransform(warp.solve,warp.time,width,height,warp.sourceWidth,warp.sourceHeight);
-    const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp,snapshot?:VideoFrame) => {
+    const mirrorLayer = () => { layerContext.save(); layerContext.setTransform(-1, 0, 0, 1, width, 0); layerContext.globalCompositeOperation = 'copy'; layerContext.drawImage(layer, 0, 0); layerContext.restore(); };
+    const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp,snapshot?:VideoFrame,flip=false) => {
       let masks=new Map<string,SmartMaskPixels>();
       try {
         const nodes = evaluateNodes(state.nodes.filter(node => node.clipId === clip.id),focusing?.clip??clip,focusing?.time??time).filter(node=>node.enabled);
@@ -796,8 +796,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           layerContext.putImageData(pixels,0,0);
         }
       }
+      // A frame editor (mask strokes, tracker boxes) works on the source picture, so it stays unmirrored.
       if(focusing)target.drawImage(layer,0,0);
-      else draw(target,clip,width,height,projectWidth,projectHeight,time);
+      else {if(flip)mirrorLayer();draw(target,clip,width,height,projectWidth,projectHeight,time);}
     };
     const prepared=!focused&&state.renderPreviewAllowed!==false&&!options.compare&&!options.original&&options.quality==='Stream'?timelinePreview.get(state,state.playhead,width,height,performance.now()<expensiveUntil):undefined;
     if(focused){
