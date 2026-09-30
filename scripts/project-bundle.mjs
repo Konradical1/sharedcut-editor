@@ -5,8 +5,9 @@
  *   node scripts/project-bundle.mjs export "Newspaper" ~/Desktop/newspaper-bundle
  *   node scripts/project-bundle.mjs import ~/Desktop/newspaper-bundle
  *
- * Stop the server on BOTH ends first — this reads and writes the SQLite workspace row directly,
- * and a running server holds the whole state in memory and will overwrite an import on its next save.
+ * Stop the server on BOTH ends first — this reads the workspace from SQLite and writes the JSON
+ * workspace row directly, and a running server holds the whole state in memory and will overwrite
+ * an import when it stops. The next start picks the written row up.
  *
  * ponytail: copies whole media directories including generated proxies, so a bundle is bigger than
  * the originals but imports with nothing to re-encode. Delete `prepared/` from the bundle if transfer
@@ -21,13 +22,27 @@ const DATA = resolve(process.env.FRAME_LINE_DATA ?? 'data');
 // `renderJobs` are finished exports pointing at files that do not travel; neither is worth carrying.
 const BY_PROJECT = ['media', 'clips', 'nodes', 'comments', 'snapshots'];
 
+// The server keeps the workspace one row per entity in `workspace_items` and rewrites the single JSON
+// row only now and then (always on a clean stop), so after a crash the items are newer. They are the
+// current copy unless something (this script, an older build) wrote the JSON row since.
+const LISTS = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'];
+const current = db => {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='workspace_meta'").get()) return undefined;
+  const meta = Object.fromEntries(db.prepare('SELECT key,value FROM workspace_meta').all().map(row => [row.key, String(row.value)]));
+  if (meta.revision === undefined || meta.legacyWritten === '1') return undefined;
+  const state = { ...Object.fromEntries(LISTS.map(key => [key, []])), ...JSON.parse(meta.fields ?? '{}') };
+  for (const row of db.prepare('SELECT collection,data FROM workspace_items ORDER BY collection,seq,rowid').all()) (state[row.collection] ??= []).push(JSON.parse(String(row.data)));
+  return { revision: Number(meta.revision), state };
+};
 const open = () => {
   const file = join(DATA, 'frameline.sqlite');
   if (!existsSync(file)) throw new Error(`No database at ${file}. Set FRAME_LINE_DATA or run from the repo root.`);
   const db = new DatabaseSync(file);
   const row = db.prepare('SELECT revision,state FROM workspace WHERE id=1').get();
   if (!row) throw new Error('The workspace is empty — start the server once before bundling.');
-  return { db, revision: Number(row.revision), state: JSON.parse(String(row.state)) };
+  const items = current(db);
+  // Writing the JSON row back with a higher revision is what makes the next server start import it.
+  return { db, revision: Math.max(Number(row.revision), items?.revision ?? 0), state: items?.state ?? JSON.parse(String(row.state)) };
 };
 
 function exportProject(needle, outDir) {
