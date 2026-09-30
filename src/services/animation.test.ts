@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { useEditorStore as store } from '../state/store.ts';
-import { animationProperties, animatedSourceOffset, copyAnimatedNodes, ease, evaluateClip, evaluateNodes, fadeLevel, sampleKeyframes, trimAnimation, validateKeyframes } from './animation.ts';
+import { animationProperties, animatedSourceOffset, copyAnimatedNodes, ease, evaluateClip, evaluateNodes, fadeLevel, sampleKeyframes, setAnimatedValue, trimAnimation, validateKeyframes } from './animation.ts';
 import { edgeScrollVelocity, rulerStep, timelineZoom } from './timeline.ts';
-import type { Keyframe } from '../state/models.ts';
+import { presetDocument } from './text.ts';
+import { defaultShape } from './shapes.ts';
+import type { Clip, Keyframe } from '../state/models.ts';
 const keys=(a:number,b:number):Keyframe[]=>[{id:'a',time:0,value:a,interpolation:'linear'},{id:'b',time:2,value:b,interpolation:'linear'}];
 
 test('animation evaluation, text/effect discovery, Bézier handles, holds and split timing',()=>{
@@ -69,6 +71,25 @@ test('gap deletion is track-only, atomic, undoable and respects locks; timing an
  assert.ok(Math.abs(picture.duration-1.25)<1e-6);assert.ok(Math.abs(audio.duration-1.25)<1e-6);
  s().setKeyframes(a.id,'properties.speed',[]);assert.equal(s().clips.find(c=>c.id===partner.id)!.keyframes?.['properties.speed'],undefined);
  } finally {store.setState(baseline,true);}
+});
+
+test('one-pass evaluation matches channel-by-channel evaluation, never touches the stored clip and reuses an unchanged pose',()=>{
+ const channelByChannel=(clip:Clip,time:number)=>Object.entries(clip.keyframes??{}).filter(([path,k])=>k.length&&!path.startsWith('nodes.')).reduce((next,[path,k])=>setAnimatedValue(next,path,sampleKeyframes(k,time-clip.start)),clip);
+ const base={id:'t',projectId:'p',timelineId:'tl',trackId:'v',start:10,duration:4,sourceIn:0,disabled:false,name:'t',color:'#fff'};
+ const title={...base,mediaId:'frameline-title',properties:{zoom:100,textDocument:JSON.stringify(presetDocument(3))},effects:[{id:'e1',name:'Gaussian blur',enabled:true,amount:50,parameters:{radius:4}}],
+  keyframes:{'properties.zoom':keys(100,200),'effects.e1.amount':keys(0,100),'effects.e1.parameters.radius':keys(0,10),'effects.missing.amount':keys(0,1),'text.runs.1.style.fontSize':keys(40,80),'text.x':keys(0,.5),'properties.disabled':[{id:'d',time:0,value:false,interpolation:'hold'},{id:'e',time:1,value:true,interpolation:'hold'}],'nodes.n.enabled':keys(0,1)}} as unknown as Clip;
+ const shape={...base,id:'s',mediaId:'frameline-shape',properties:{shapeDocument:JSON.stringify(defaultShape())},effects:[],keyframes:{'shape.x':keys(0,.5),'shape.width':keys(.2,20)}} as unknown as Clip;
+ // One run's color goes invalid: that channel alone is dropped, the rest still apply.
+ const invalid={...title,keyframes:{...title.keyframes,'text.runs.0.style.color':[{id:'c',time:0,value:'red',interpolation:'hold'}]}} as Clip;
+ for(const clip of [title,shape,invalid]) {
+  const stored=structuredClone(clip);
+  for(const time of [9,10.5,11.25,13,20])assert.deepEqual(evaluateClip(clip,time),channelByChannel(clip,time),`${clip.id} at ${time}`);
+  assert.deepEqual(clip,stored,'the stored clip is never written');
+ }
+ assert.equal(evaluateClip(title,20),evaluateClip(title,21),'past the last key the evaluated clip is the same object');
+ assert.notEqual(evaluateClip(title,11),evaluateClip(title,11.5));
+ assert.equal(animationProperties(evaluateClip(title,20)),animationProperties(evaluateClip(title,22)),'an unchanged pose lists its properties once');
+ assert.equal(evaluateNodes([],{...title,keyframes:{'properties.zoom':keys(1,2)}},11).length,0);
 });
 
 test('easeInOutCubic and easeOutBack handles validate, keep time monotonic and overshoot where drawn',()=>{

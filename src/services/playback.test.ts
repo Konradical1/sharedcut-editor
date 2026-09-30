@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Clip, MediaAsset, Track } from '../state/models.ts';
 import { gradeValues } from './grade.ts';
-import { efficientPlayback, focusClip, gradePixels, playbackLayers, playbackUrl, projectSize, sourceTime } from './playback.ts';
+import { efficientPlayback, focusClip, gradePixels, playbackLayers, playbackUrl, projectSize, sourceTime, upcomingClips } from './playback.ts';
 
 test('preview quality selects a smaller stream, audio selects its own stream, and old imports fall back', () => {
   const asset = { sourceUrl: '/original', proxyUrl: '/full', proxyVariants: { '1/2': '/half', '1/4': '/quarter' }, audioProxyUrl: '/audio' } as unknown as MediaAsset;
@@ -238,4 +238,88 @@ test('a flipped clip mirrors after its effects, as the export does, so an off-ce
     assert.ok(pixel(62)[0]>200&&pixel(62)[2]<40,`the red half is mirrored to the right and keeps the vignette's bright center, got ${pixel(62)}`);
     assert.ok(pixel(1)[2]<150&&pixel(1)[0]<40,`the blue half is mirrored to the left and darkened, got ${pixel(1)}`);
   } finally {playback.dispose();globals.forEach((key,i)=>{if(originals[i])Object.defineProperty(globalThis,key,originals[i]!);else Reflect.deleteProperty(globalThis,key);});}
+});
+
+test('warm-up opens the next cuts on every layer within the horizon, soonest first, and fewer in efficient mode', () => {
+  const track = (id: string, kind: string, extra = {}) => ({ id, timelineId: 't', kind, number: 1, muted: false, hidden: false, ...extra });
+  const tracks = [track('v1', 'video'), track('v2', 'video'), track('v3', 'video', { hidden: true }), track('a1', 'audio'), track('a2', 'audio', { muted: true })] as Track[];
+  const clip = (id: string, trackId: string, start: number, mediaId = 'm') => ({ id, projectId: 'p', timelineId: 't', trackId, mediaId, start, duration: .3, sourceIn: 0, properties: {}, effects: [], disabled: false }) as unknown as Clip;
+  const clips = [clip('on-screen', 'v1', 0), clip('v1-a', 'v1', 10.3), clip('v1-b', 'v1', 10.6), clip('v1-c', 'v1', 10.9), clip('title', 'v1', 10.1, 'frameline-title'),
+    clip('v2-a', 'v2', 11), clip('v2-far', 'v2', 15), clip('hidden', 'v3', 10.5), clip('a1-a', 'a1', 10.2), clip('a1-b', 'a1', 10.4), clip('a1-c', 'a1', 13), clip('muted', 'a2', 10.1)];
+  const state = { projectId: 'p', timelineId: 't', playhead: 10, playing: true, tracks, clips, media: [{ id: 'm', kind: 'video' }] as MediaAsset[] };
+  const ids = (list: Clip[]) => list.map(c => c.id);
+  const open = new Set(['on-screen']);
+  assert.deepEqual(ids(upcomingClips(state, open, false)), ['a1-a', 'v1-a', 'a1-b', 'v1-b', 'v2-a'], 'the next two per visible or audible layer; hidden, muted, far and media-less clips wait');
+  assert.deepEqual(ids(upcomingClips(state, open, false, new Set(['v2-a']))), ['v2-a', 'a1-a', 'v1-a', 'a1-b', 'v1-b'], 'a clip in an upcoming transition goes first');
+  assert.deepEqual(ids(upcomingClips({ ...state, playing: false }, open, false)), ['v1-a', 'v1-b', 'v2-a'], 'paused, only pictures within two seconds');
+  assert.deepEqual(ids(upcomingClips(state, open, true)), ['v1-a', 'v2-a', 'a1-a'], 'efficient mode: one per layer, two pictures and one sound');
+  assert.deepEqual(ids(upcomingClips(state, new Set(['v1-a']), false)).slice(0, 3), ['a1-a', 'a1-b', 'v1-b'], 'a clip already open is not warmed again');
+});
+
+test('a failed layer is drawn around, named with a retry and reopened in the background; the playhead never waits for it', async () => {
+  const { attachPlayback } = await import('./playback.ts');
+  const globals = ['document', 'window', 'HTMLVideoElement', 'requestAnimationFrame', 'cancelAnimationFrame', 'performance'] as const;
+  const original = globals.map(key => Object.getOwnPropertyDescriptor(globalThis, key));
+  const videos: Video[] = [];
+  let nextFrame = () => {}, now = 0;
+  class Video extends EventTarget {
+    static ready = 2;
+    readyState = Video.ready; seeking = false; paused = true; duration = 5; videoWidth = 320; videoHeight = 180;
+    src = ''; muted = true; playbackRate = 1; currentTime = 0; onerror?: () => void; rejectPlay?: string;
+    play() { if (this.rejectPlay && !this.muted) return Promise.reject(Object.assign(new Error('blocked'), { name: this.rejectPlay })); this.paused = false; return Promise.resolve(); }
+    pause() { this.paused = true; }
+    removeAttribute() {} load() {}
+  }
+  class Canvas {
+    width = 300; height = 150; dataset: Record<string, string> = {}; paints = 0;
+    getContext() { return new Proxy({}, { get: (_, key) => key === 'drawImage' ? () => this.paints++ : () => {} }); }
+  }
+  const replacements = {
+    document: { fonts: new EventTarget(), createElement: (name: string) => { if (name === 'canvas') return new Canvas(); const video = new Video(); videos.push(video); return video; } },
+    window: new EventTarget(), HTMLVideoElement: Video, performance: { now: () => now },
+    requestAnimationFrame: (callback: () => void) => { nextFrame = callback; return 1; }, cancelAnimationFrame: () => {},
+  };
+  for (const key of globals) Object.defineProperty(globalThis, key, { configurable: true, value: replacements[key] });
+  const canvas = new Canvas(), statuses: unknown[] = [], health: { loading: boolean; error: string }[] = [];
+  const layer = (id: string, name: string, number: number) => ({ clip: { id, name, projectId: 'p', timelineId: 't', trackId: `v${number}`, mediaId: `m-${id}`, start: 0, duration: 5, sourceIn: 0, properties: {}, effects: [] }, track: { id: `v${number}`, timelineId: 't', kind: 'video', number }, media: { id: `m-${id}`, name, kind: 'video', sourceUrl: `/${id}.mp4`, duration: 5, fps: 24 } });
+  const base = layer('base', 'Interview', 1), graphic = layer('graphic', 'Lower third', 2);
+  const state = { projectId: 'p', timelineId: 't', playhead: 0, playing: true, projects: [{ id: 'p', resolution: '320 × 180', fps: 24 }],
+    clips: [base.clip, graphic.clip], tracks: [base.track, graphic.track], media: [base.media, graphic.media], nodes: [], settings: {} };
+  window.addEventListener('frameline:playback-health', event => health.push((event as CustomEvent).detail));
+  const playback = attachPlayback(canvas as unknown as HTMLCanvasElement, () => state as unknown as ReturnType<Parameters<typeof attachPlayback>[1]>, () => ({ original: false, quality: 'Full', volume: 0, compare: false }), status => statuses.push(status));
+  const step = (ms = 42) => { now += ms; state.playhead += 1 / 24; nextFrame(); };
+  const graphicVideos = () => videos.filter(v => v.src === '/graphic.mp4');
+  try {
+    step(); assert.equal(graphicVideos().length, 1);
+    graphicVideos()[0].onerror!();
+    const painted = canvas.paints;
+    step();
+    assert.deepEqual(statuses.at(-1), { title: 'Playing without 1 layer', detail: 'Lower third (source could not be decoded)', skipped: true }, 'the failed layer is named, not blocking');
+    assert.equal(health.at(-1)!.loading, false, 'the playhead is not held for a failed layer');
+    assert.ok(canvas.paints > painted && canvas.dataset.hasPicture === 'true', 'the rest of the picture is still drawn');
+    // After the pause the layer is reopened in the background; while it loads it is still drawn around.
+    Video.ready = 0; step(2100); step();
+    assert.equal(graphicVideos().length, 2, 'a fresh decoder replaces the failed one');
+    assert.deepEqual(statuses.at(-1), { title: 'Playing without 1 layer', detail: 'Lower third (reconnecting)', skipped: true });
+    assert.equal(health.at(-1)!.loading, false, 'a reconnecting layer is not waited for either');
+    graphicVideos()[1].readyState = 2; step();
+    assert.equal(statuses.at(-1), null, 'once it has a picture the layer is back and the notice clears');
+    // A genuinely new layer that is not ready yet still holds the picture, as before.
+    state.clips = [...state.clips, { ...layer('late', 'B-roll', 3).clip }]; state.tracks = [...state.tracks, layer('late', 'B-roll', 3).track]; state.media = [...state.media, layer('late', 'B-roll', 3).media];
+    step();
+    assert.equal(health.at(-1)!.loading, true, 'an unready layer that has not failed is loading, not skipped');
+    videos.filter(v => v.src === '/late.mp4').forEach(v => { v.readyState = 2; });
+    Video.ready = 2;
+    // Autoplay refused: the picture keeps running muted instead of failing the layer.
+    const refusing = videos.filter(v => v.src === '/base.mp4');
+    refusing.forEach(v => { v.rejectPlay = 'NotAllowedError'; v.paused = true; });
+    step(); await new Promise(resolve => setTimeout(resolve, 0)); step(); step();
+    assert.ok(refusing.every(v => !v.paused && v.muted), 'the refused element plays muted');
+    assert.equal(health.at(-1)!.error, '', 'autoplay policy is not a layer failure');
+    playback.retry(); step();
+    assert.equal(statuses.at(-1), null);
+  } finally {
+    playback.dispose();
+    globals.forEach((key, index) => { if (original[index]) Object.defineProperty(globalThis, key, original[index]!); else Reflect.deleteProperty(globalThis, key); });
+  }
 });

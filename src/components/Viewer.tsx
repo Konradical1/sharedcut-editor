@@ -5,7 +5,7 @@ import MotionTrackerOverlay from './MotionTrackerOverlay';
 import TextOverlay from './TextOverlay';
 import ShapeOverlay from './ShapeOverlay';
 import { refreshFonts, useFonts, detectLocalFonts } from '../services/fonts';
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { SkipBack, SkipForward, Play, Pause, ChevronLeft, ChevronRight, Volume2, VolumeX, Maximize, Scan, Settings2, Columns2, Radio } from 'lucide-react';
 import { useEditorStore } from '../state/store';
 import { attachPlayback, projectSize, type PlaybackStatus } from '../services/playback';
@@ -21,8 +21,16 @@ import { IconButton, timecode } from './ui';
  */
 const viewerQuality = (preference: unknown) => preference === 'Quarter resolution' ? '1/4' : preference === 'Half resolution' ? '1/2' : preference === 'Full resolution' ? 'Full' : 'Stream';
 
+/** How often the footage panel re-reads the cache: decoder statuses change at every cut while playing. */
+const FOOTAGE_REFRESH_MS = 500;
 function FootageLoading({ retry }: { retry: () => void }) {
-  useFootageVersion();
+  const version = useFootageVersion(), [shown, setShown] = useState(version), latest = useRef(version);
+  latest.current = version;
+  const stale = version !== shown;
+  useEffect(() => { if (!stale) return; const timer = setTimeout(() => setShown(latest.current), FOOTAGE_REFRESH_MS); return () => clearTimeout(timer); }, [stale, shown]);
+  return useMemo(() => <FootageSummary retry={retry}/>, [shown, retry]);
+}
+function FootageSummary({ retry }: { retry: () => void }) {
   const { entries, transferred, speed, active } = footageSummary();
   const ready = entries.filter(entry => entry.state === 'green').length;
   const failures = entries.some(entry => entry.state === 'red');
@@ -86,7 +94,7 @@ export default function Viewer({ compact = false, colorAccurate=false }: { compa
     return () => observer.disconnect();
   }, []);
   useEffect(() => {
-    const engine = attachPlayback(canvas.current!, () => { const state=useEditorStore.getState();const view=state.clipPreview || state.textPreview.length ? {...state,renderPreviewAllowed:false,clips:state.clips.map(clip=>state.textPreview.find(c=>c.id===clip.id)??(clip.id===state.clipPreview?.id?state.clipPreview:clip))} : state;return {...view,focus:sourceFocus()}; }, () => options.current, value => { setStatus(value); useEditorStore.setState({ playbackBuffering: !!(value?.loading || value?.error) }); });
+    const engine = attachPlayback(canvas.current!, () => { const state=useEditorStore.getState();const view=state.clipPreview || state.textPreview.length ? {...state,renderPreviewAllowed:false,clips:state.clips.map(clip=>state.textPreview.find(c=>c.id===clip.id)??(clip.id===state.clipPreview?.id?state.clipPreview:clip))} : state;return {...view,focus:sourceFocus()}; }, () => options.current, value => { setStatus(value); useEditorStore.setState({ playbackBuffering: !!value?.loading }); });
     playback.current = engine;
     const unfollow = followFocus(canvas.current!);
     const gesture = (event: Event) => {
@@ -113,7 +121,7 @@ export default function Viewer({ compact = false, colorAccurate=false }: { compa
   const step = (delta: number) => { if (!stepFocus(delta)) setPlayhead(playhead + delta / fps); };
   const lockedPlayback = liveMode === 'following';
   const blockingStatus = status && (status.error || status.loading || status.title === 'No picture at playhead');
-  const retry = () => { retryFootage(); playback.current?.retry(); };
+  const retry = useCallback(() => { retryFootage(); playback.current?.retry(); }, []);
   return <section ref={ref} className={`viewer panel ${compact ? 'viewer-compact' : ''}`} aria-label="Video viewer">
     <header className="viewer-header"><div className="row"><span className="viewer-sequence-dot"/><span>{focused ? 'Source' : compact ? 'Program monitor' : 'Timeline viewer'}</span><span className="viewer-divider">/</span><span className="muted">{focused ? focusClip?.name : project?.name}</span></div><div className="row">{focused ? <select aria-label="Viewer zoom" title="Source pixels. Scroll to pan when zoomed in; paused frames show the original's own pixels." value={focusZoom} onChange={e => { useFocusZoom.setState({ zoom: e.target.value as typeof focusZoom }); e.currentTarget.blur(); }}>{FOCUS_ZOOMS.map(z => <option key={z} value={z}>{z === 'Fit' ? 'Fit' : `${z}%`}</option>)}</select> : <select aria-label="Viewer zoom" value={zoom} onChange={e => setZoom(e.target.value)}><option>Fit</option><option>50%</option><option>100%</option><option>150%</option></select>}<IconButton label="Viewer settings" className={settings ? 'active' : ''} onClick={() => setSettings(!settings)}><Settings2 size={15}/></IconButton></div></header>
     <FootageLoading retry={retry}/>
@@ -133,7 +141,7 @@ export default function Viewer({ compact = false, colorAccurate=false }: { compa
         </>}
         {blockingStatus && <div className="viewer-playback-status" role={status.error ? 'alert' : 'status'}><span>{status.title}</span>{status.detail && <small>{status.detail}</small>}{(status.error || status.loading) && <button onClick={retry}>Retry media</button>}</div>}
       </div>
-      {status && !blockingStatus && <span className="viewer-demo-note" role="status" title={status.detail}>{status.title}{status.fallback && <> · reduced precision <button onClick={retry}>Retry selected quality</button></>}</span>}
+      {status && !blockingStatus && <span className="viewer-demo-note" role="status" title={status.detail}>{status.title}{status.fallback && <> · reduced precision <button onClick={retry}>Retry selected quality</button></>}{status.skipped && <> · {status.detail} <button onClick={retry}>Retry</button></>}</span>}
       {liveMode !== 'independent' && <div className={`live-viewer-badge ${liveMode}`}><Radio size={13}/><b>LIVE</b> {liveMode === 'following' ? `Following ${users.find(u => u.id === followUserId)?.name ?? 'collaborator'}` : 'Presenting timeline'}</div>}
       {settings && <div className="viewer-settings popover"><span className="eyebrow">VIEWER OVERLAYS</span><label><input type="checkbox" checked={safe} onChange={e => setSafe(e.target.checked)}/> Title & action safe areas</label><label><input type="checkbox" checked={compare} onChange={e => setCompare(e.target.checked)}/> Compare ungraded image</label><label><input type="checkbox" checked={original} onChange={e => setOriginal(e.target.checked)}/> Decode original media</label><small className="muted">Preview uses browser decoders and SDR processing up to 1920 pixels wide. Exports use originals at the selected resolution.</small></div>}
     </div>

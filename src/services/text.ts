@@ -133,8 +133,9 @@ export function typingCount(doc: TextDocument, elapsed: number, budget?: number)
   }
   return count;
 }
-export function drawText(ctx: TextCanvas, doc: TextDocument, width: number, height: number, projectWidth = width, projectHeight = height, elapsed = Infinity, visibleCharacters?: number) {
-  if(doc.caption){drawCaption(ctx as CanvasRenderingContext2D,doc,width,height,projectWidth,projectHeight,elapsed);return;}
+/** `shutter: false` draws a moving caption as one sample instead of its motion-blur shutter (live playback). */
+export function drawText(ctx: TextCanvas, doc: TextDocument, width: number, height: number, projectWidth = width, projectHeight = height, elapsed = Infinity, visibleCharacters?: number, shutter = true) {
+  if(doc.caption){drawCaption(ctx as CanvasRenderingContext2D,doc,width,height,projectWidth,projectHeight,elapsed,shutter);return;}
   const fx = { ...defaultTextEffects, ...doc };
   const reveal = fx.typingEnabled && visibleCharacters !== undefined ? Math.min(visibleCharacters, typingCount({...doc,typingEnabled:false},elapsed)) : typingCount(doc, elapsed);
   ctx.save(); ctx.scale(width / projectWidth, height / projectHeight); ctx.translate(doc.x * projectWidth, doc.y * projectHeight);
@@ -225,14 +226,11 @@ export function remapTextRuns(base: TextDocument, current: TextDocument, next: T
 }
 
 // Reuse two transparent canvases per target; temporal samples add before compositing once.
-const captionSurfaces=new WeakMap<object,{sample:HTMLCanvasElement;sum:HTMLCanvasElement}>();
-function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,height:number,pw:number,ph:number,elapsed:number) {
+// `sum` also keeps the last composite: a caption holds one pose for most of its frames.
+const captionSurfaces=new WeakMap<object,{sample:HTMLCanvasElement;sum:HTMLCanvasElement;doc?:TextDocument;pose?:string}>();
+function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,height:number,pw:number,ph:number,elapsed:number,shutter:boolean) {
   const data=doc.caption!,preset=captionPreset(data.preset),time=Number.isFinite(elapsed)?elapsed:.5;
   if(time<0||time>=data.duration)return;
-  const scale=Math.min(pw/1920,ph/1080),style={...doc.runs[0].style,fontSize:doc.runs[0].style.fontSize*scale};
-  // A line stays within its safe width even when a corrected word is unusually long.
-  ctx.save();ctx.font=canvasFont(style);const measured=ctx.measureText(data.words.map(w=>w.text).join(' ')).width;ctx.restore();
-  style.fontSize*=Math.min(1,pw*doc.width/Math.max(1,measured));
   const timing=captionTiming(data),entrance=Math.min(data.duration,timing.entranceDuration),exit=Math.min(data.duration,timing.exitDuration);
   const motion=(t:number)=>{
     const u=Math.max(0,Math.min(1,entrance>0?t/entrance:1)),ease=1-(1-u)**3;
@@ -251,18 +249,28 @@ function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,
   const wordZoom=(w:CaptionData['words'][number],t:number)=>{const local=t-captionHighlightLead-w.start;return data.wordPop&&local>=0&&local<wordPopDuration?snapZoom(local/wordPopDuration):1;};
   const popping=Boolean(data.wordPop)&&data.words.some(w=>{const local=time-captionHighlightLead-w.start;return local>=0&&local<wordPopDuration+1/60;});
   const moving=['pull','pop','rise','bounce','snap'].includes(preset.motion)&&entrance>0&&time<entrance+1/60;
-  const count=moving||popping?7:1,shutter=Math.min(1/60,Math.max(entrance,popping?wordPopDuration:0)/4);
+  // ponytail: seven outlined, shadowed rasters per moving frame were most of live playback's canvas time, so live
+  // playback draws the pose at the frame's own time (the shutter is at most 1/60 s); paused frames and exports keep it.
+  const count=shutter&&(moving||popping)?7:1,exposure=Math.min(1/60,Math.max(entrance,popping?wordPopDuration:0)/4);
   let surfaces=captionSurfaces.get(ctx);
   if(!surfaces){
     const make=()=>{if(typeof document!=='undefined')return document.createElement('canvas');return new (ctx.canvas.constructor as {new(w:number,h:number):HTMLCanvasElement})(width,height);};
     surfaces={sample:make(),sum:make()};captionSurfaces.set(ctx,surfaces);
   }
+  const cue=Math.max(data.words[0]?.start??0,time-captionHighlightLead),active=data.words.findIndex(w=>cue>=w.start&&cue<w.end);
+  // A single sample is fully described by its motion, word pops and highlighted word; the document object stands for the rest.
+  const still=count===1?motion(time):undefined,pose=still&&`${width}:${height}:${pw}:${ph}:${active}:${still.zoom}:${still.y}:${still.blur}:${still.alpha}:${data.words.map(w=>wordZoom(w,time)).join()}`;
+  if(pose&&surfaces.doc===doc&&surfaces.pose===pose&&surfaces.sum.width===width&&surfaces.sum.height===height){ctx.drawImage(surfaces.sum,0,0);return;}
+  surfaces.doc=doc;surfaces.pose=pose||undefined;
   for(const canvas of [surfaces.sample,surfaces.sum])if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height;}
+  const scale=Math.min(pw/1920,ph/1080),style={...doc.runs[0].style,fontSize:doc.runs[0].style.fontSize*scale};
+  // A line stays within its safe width even when a corrected word is unusually long.
+  ctx.save();ctx.font=canvasFont(style);const measured=ctx.measureText(data.words.map(w=>w.text).join(' ')).width;ctx.restore();
+  style.fontSize*=Math.min(1,pw*doc.width/Math.max(1,measured));
   const sum=surfaces.sum.getContext('2d')!,sample=surfaces.sample.getContext('2d')!;
   sum.clearRect(0,0,width,height);
-  const cue=Math.max(data.words[0]?.start??0,time-captionHighlightLead),active=data.words.findIndex(w=>cue>=w.start&&cue<w.end);
   for(let i=0;i<count;i++){
-    const t=Math.max(0,time-(count===1?0:(1-i/(count-1))*shutter)),m=motion(t);
+    const t=Math.max(0,time-(count===1?0:(1-i/(count-1))*exposure)),m=motion(t);
     sample.clearRect(0,0,width,height);sample.save();sample.globalAlpha=m.alpha;
     const cx=(doc.x+doc.width/2)*width,cy=(doc.y*ph+style.fontSize*.55)*height/ph;
     sample.translate(cx,cy+m.y*scale*height/ph);sample.scale(m.zoom,m.zoom);sample.translate(-cx,-cy);
