@@ -28,7 +28,7 @@ try {
   source.start=2;snap.state.projects[0].resolution='640 × 360';
   let response=await context.request.put(url+'/api/state',{data:snap});assert.equal(response.status(),200,await response.text());
   await page.reload();await page.getByRole('tab',{name:'Captions',exact:true}).click();
-  assert.equal(await page.locator('.caption-preset').count(),16);
+  assert.equal(await page.locator('.caption-preset').count(),17);
   const card=page.getByRole('button',{name:'Select Electric pull-in captions',exact:true}),art=card.locator('.caption-art');await art.scrollIntoViewIfNeeded();const box=await art.boundingBox();
   await page.mouse.move(box.x+box.width*.1,box.y+box.height/2);await page.waitForTimeout(100);const first=await art.locator('canvas').evaluate(c=>c.toDataURL());
   await page.mouse.move(box.x+box.width*.3,box.y+box.height/2);await page.waitForTimeout(100);assert.notEqual(await art.locator('canvas').evaluate(c=>c.toDataURL()),first);
@@ -81,6 +81,8 @@ try {
   await page.screenshot({path:join(out,'caption-overlap-choice.png')});
   await page.getByRole('button',{name:'Cancel',exact:true}).click();
 
+  // One line exports with a custom highlight color and per-word pop, through the same drawCaption as the preview.
+  snap=await snapshot();{const line=snap.state.clips.find(c=>c.properties.captionSet),doc=JSON.parse(line.properties.textDocument);doc.caption={...doc.caption,accent:'#c4f876',wordPop:true};doc.outlineWidth=20;line.properties.textDocument=JSON.stringify(doc);response=await context.request.put(url+'/api/state',{data:snap});assert.equal(response.status(),200,await response.text());}
   snap=await snapshot();const project=snap.state.projects[0],timeline=snap.state.timelines[0];
   response=await context.request.post(url+'/api/renders',{data:{projectId:project.id,name:'Caption QA',preset:'Custom',settings:{timelineId:timeline.id,rangeIn:'2',rangeOut:String(2+source.duration),codec:'H.264',audio:'AAC · 320 kb/s · 48 kHz',resolution:'640 × 360'}}});assert.equal(response.status(),202,await response.text());
   const job=(await response.json()).job;
@@ -101,6 +103,6 @@ try {
     assert.equal((await snapshot()).state.tracks.flatMap(t=>t.captionSets??[]).length,i===remaining.length-1?0:1,'Only deleting the last line clears registration');
   }
   await page.getByRole('button',{name:'Generate captions',exact:true}).click();assert.equal(await page.getByLabel('Existing captions',{exact:true}).count(),0);await page.getByRole('button',{name:'Cancel',exact:true}).click();
-  console.log('PASS caption timing controls, apply-to-set property picker, number field editing, overlap choice; real local transcription, nonzero range, 16 scrubbable presets, per-line editing, regrouping, stale warning, regeneration, real export, reload and responsive layout');
+  console.log('PASS caption timing controls, apply-to-set property picker, number field editing, overlap choice; real local transcription, nonzero range, 17 scrubbable presets, accent and word-pop export, per-line editing, regrouping, stale warning, regeneration, real export, reload and responsive layout');
 } catch(error){await page.screenshot({path:join(out,'failure.png')});console.log((await page.locator('body').innerText()).slice(-8000));throw error;}
 finally{await browser.close();await app.close();await rm(temp,{recursive:true,force:true});}

@@ -17,7 +17,8 @@ export function refreshFonts() {
     try {
       const { fonts } = await api<{ fonts: SharedFont[] }>('/fonts');
       for (const font of fonts) if (!loaded.has(font.id)) {
-        const face = await new FontFace(font.family, `url("${font.url}")`).load(); document.fonts.add(face); loaded.add(font.id);
+        // One static file answers every weight, as it does on the export canvas; otherwise the browser fakes bold.
+        const face = await new FontFace(font.family, `url("${font.url}")`, { weight: '100 900' }).load(); document.fonts.add(face); loaded.add(font.id);
       }
       useFonts.setState(s => ({ shared: fonts, error: '', revision: s.revision + 1 }));
     } catch (error) { useFonts.setState({ error: (error as Error).message }); }

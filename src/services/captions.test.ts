@@ -75,3 +75,35 @@ test('caption registration follows the last line; overlaps and replacements rema
     assert.equal(getText(s().clips.find(c=>c.id===lines[1].id)!).caption!.exitDuration,0);
   } finally {useEditorStore.setState(before);}
 });
+
+test('reel captions: accent, snap pop with motion blur, thick outline and restyle that keeps custom styling', async()=>{
+  const {validateCaption,snapZoom,restyleCaption,captionPreset}=await import('./captions.ts');
+  const {drawText}=await import('./text.ts');
+  const {createCanvas,GlobalFonts}=await import('@napi-rs/canvas');
+  GlobalFonts.registerFromPath('public/fonts/Montserrat.ttf','Montserrat');
+  const words=[{text:'SHOT',start:0,end:.4},{text:'TRACKER',start:.4,end:.9}];
+  assert.throws(()=>validateCaption({words,preset:'reel',duration:1,accent:'lime'}),/#rrggbb/);
+  assert.throws(()=>validateCaption({words,preset:'reel',duration:1,wordPop:'yes' as unknown as boolean}));
+  validateCaption({words,preset:'reel',duration:1,accent:'#c4f876',wordPop:true});
+  assert.ok(Math.abs(snapZoom(0)-.8)<1e-9&&Math.abs(snapZoom(1)-1)<1e-9);
+  const peak=Math.max(...Array.from({length:201},(_,i)=>snapZoom(i/200)));assert.ok(Math.abs(peak-1.06)<.003,`overshoot peaks at 1.06, got ${peak}`);
+
+  const custom={...captionDocument(words,'movie',1),outlineWidth:25,y:.62};custom.runs[0].style={...custom.runs[0].style,fontFamily:'FL-montserrat-black',fontSize:190};
+  custom.caption={...custom.caption!,accent:'#c4f876',wordPop:true};
+  const reel=restyleCaption(custom,'reel');
+  assert.equal(reel.caption!.preset,'reel');assert.equal(reel.outlineWidth,25);assert.equal(reel.y,.62);
+  assert.equal(reel.runs[0].style.fontFamily,'FL-montserrat-black');assert.equal(reel.runs[0].style.fontSize,190);
+  assert.equal(reel.runs[0].style.fontWeight,captionPreset('reel').weight,'untouched style follows the new preset');
+  assert.equal(reel.caption!.accent,'#c4f876');assert.equal(reel.caption!.wordPop,true);
+
+  const doc={...captionDocument(words,'reel',1),y:.6,outlineWidth:25};doc.runs[0].style={...doc.runs[0].style,fontSize:170};doc.caption={...doc.caption!,accent:'#c4f876',wordPop:true};
+  const frame=(time:number)=>{const canvas=createCanvas(540,960),ctx=canvas.getContext('2d');drawText(ctx as unknown as CanvasRenderingContext2D,doc,540,960,1080,1920,time);return ctx.getImageData(0,0,540,960).data;};
+  const settled=frame(.8),popping=frame(.47);
+  let accent=0,dark=0,partial=0;
+  for(let i=0;i<settled.length;i+=4){const [r,g,b,a]=[settled[i],settled[i+1],settled[i+2],settled[i+3]];if(a>200&&Math.abs(r-0xc4)<20&&Math.abs(g-0xf8)<20&&Math.abs(b-0x76)<20)accent++;if(a>200&&r<40&&g<40&&b<40)dark++;}
+  for(let i=3;i<popping.length;i+=4)if(popping[i]>20&&popping[i]<200)partial++;
+  assert.ok(accent>500,`the active word takes the accent color (${accent} px)`);
+  assert.ok(dark>2000,`a thick outline surrounds the letters (${dark} px)`);
+  let changed=0;for(let i=0;i<settled.length;i++)if(Math.abs(settled[i]-popping[i])>30)changed++;
+  assert.ok(changed>1000,'the spoken word is mid-pop');assert.ok(partial>1500,`temporal samples blur the pop (${partial} soft px)`);
+});

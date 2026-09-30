@@ -1,7 +1,8 @@
 import type { Clip, Track } from '../state/models.ts';
 
 export interface CaptionWord { text: string; start: number; end: number; uncertain?: boolean }
-export interface CaptionData { words: CaptionWord[]; preset: string; duration: number; entranceDuration?: number; exitDuration?: number }
+/** `accent` overrides the preset's highlight color (and turns the highlight on); `wordPop` pops each word as it is spoken. */
+export interface CaptionData { words: CaptionWord[]; preset: string; duration: number; entranceDuration?: number; exitDuration?: number; accent?: string; wordPop?: boolean }
 export interface CaptionSet { id: string; start: number; end: number; signature: string; trackIds: string[]; wordsPerLine: number; preset: string; jobId: string }
 export interface CaptionJob { wordsPerLine?: number; preset?: string; replaceSet?: string; removeSets?: string[]; id: string; projectId: string; timelineId: string; status: 'waiting'|'running'|'complete'|'failed'|'cancelled'; stage: string; progress: number; start: number; end: number; trackIds: string[]; signature: string; words?: CaptionWord[]; error?: string }
 export const captionPresets = [
@@ -21,6 +22,7 @@ export const captionPresets = [
   { id:'blue', name:'Blue focus', group:'Social', font:'Montserrat', weight:800, color:'#ffffff', accent:'#81bcff', motion:'blur', highlight:true, outline:3, backing:false },
   { id:'lemon', name:'Lemon bounce', group:'Social', font:'Barlow Condensed', weight:700, color:'#ffe354', accent:'#ffffff', motion:'bounce', highlight:true, outline:4, backing:false },
   { id:'clean-sync', name:'Clean sync', group:'Social', font:'TikTok Sans', weight:700, color:'#d6dae2', accent:'#ffffff', motion:'none', highlight:true, outline:1, backing:true },
+  { id:'reel', name:'Reel snap', group:'Social', font:'Montserrat', weight:900, color:'#ffffff', accent:'#c4f876', motion:'snap', highlight:true, outline:8, backing:false },
 ] as const;
 export const captionPreset = (id: string) => captionPresets.find(p=>p.id===id) ?? captionPresets[0];
 export const isCaption = (clip: Clip) => typeof clip.properties.captionSet === 'string';
@@ -35,6 +37,8 @@ export function validateWords(words: unknown, limit=100000): asserts words is Ca
 export function validateCaption(data: CaptionData) {
   if(!data||!captionPresets.some(p=>p.id===data.preset)||!Number.isFinite(data.duration)||data.duration<=0||data.duration>604800)throw new Error('Invalid caption style or duration.');
   for(const value of [data.entranceDuration,data.exitDuration])if(value!==undefined&&(!Number.isFinite(value)||value<0||value>5))throw new Error('Caption animation duration must be between 0 and 5 seconds.');
+  if(data.accent!==undefined&&(typeof data.accent!=='string'||!/^#[\da-f]{6}$/i.test(data.accent)))throw new Error('Caption highlight color must be a #rrggbb color.');
+  if(data.wordPop!==undefined&&typeof data.wordPop!=='boolean')throw new Error('Invalid caption word pop.');
   validateWords(data.words,1000);
 }
 export function validateCaptionSets(sets: CaptionSet[]) {
@@ -81,5 +85,27 @@ export function captionDocument(words: CaptionWord[], presetId: string, duration
 
 export function captionTiming(data: CaptionData) {
   const motion=captionPreset(data.preset).motion;
-  return {entranceDuration:data.entranceDuration??(motion==='none'?0:motion==='fade'?.055:.16),exitDuration:data.exitDuration??(motion==='none'?0:.065)};
+  return {entranceDuration:data.entranceDuration??(motion==='none'?0:motion==='fade'?.055:motion==='snap'?.18:.16),exitDuration:data.exitDuration??(motion==='none'?0:.065)};
+}
+
+/** Scale for a snap pop: 0.8 → 1.06 → 1.0 on an easeOutBack whose overshoot is exactly that 6%. */
+export function snapZoom(progress: number) {
+  const u=Math.max(0,Math.min(1,progress)),c1=3.39,x=u-1;
+  return .8+.2*(1+(c1+1)*x**3+c1*x*x);
+}
+/** How long a spoken word's own pop lasts when `wordPop` is on. */
+export const wordPopDuration=.18;
+
+/**
+ * Switch a line's preset without losing what the editor changed: any style the line holds that differs
+ * from its old preset's default (font, size, color, outline, shadow, placement) carries over.
+ */
+export function restyleCaption(doc: import('./text.ts').TextDocument, presetId: string): import('./text.ts').TextDocument {
+  const data=doc.caption!,before=captionDocument(data.words,data.preset,data.duration),next=captionDocument(data.words,presetId,data.duration);
+  const effects=(['outlineColor','outlineWidth','shadowColor','shadowOpacity','shadowBlur','shadowX','shadowY'] as const).filter(key=>doc[key]!==undefined&&doc[key]!==before[key]);
+  const was=before.runs[0].style,style=doc.runs[0].style;
+  const custom=Object.fromEntries(Object.entries(style).filter(([key,value])=>value!==was[key as keyof typeof was]));
+  return {...next,...Object.fromEntries(effects.map(key=>[key,doc[key]])),x:doc.x,y:doc.y,width:doc.width,height:doc.height,
+    runs:next.runs.map(run=>({...run,style:{...run.style,...custom}})),
+    caption:{...next.caption!,entranceDuration:data.entranceDuration,exitDuration:data.exitDuration,accent:data.accent,wordPop:data.wordPop}};
 }

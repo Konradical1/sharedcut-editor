@@ -2,7 +2,7 @@ import { createSmartMask, validateSmartMask, smartMaskSignature, type SmartMaskD
 import { createMotionTracker, MAX_TRACKERS, validateMotionTracker, type MotionTracker, type MotionTrackerLink } from '../services/motionTracker.ts';
 import { starterGrade, primaryDefaults, interpretation, validateGradeNode, acesOutputUpgrade } from '../services/color.ts';
 import { eligibility, proposedNodes, type AssistantMode, type BalanceValues, type LookOption, type ShotNote } from '../services/colorAssistant.ts';
-import { captionDocument, captionPreset, groupCaptionWords, isCaption, validateCaption, type CaptionJob, type CaptionSet, type CaptionWord } from '../services/captions.ts';
+import { captionDocument, captionPreset, groupCaptionWords, isCaption, restyleCaption, validateCaption, type CaptionJob, type CaptionSet, type CaptionWord } from '../services/captions.ts';
 import { isComposition, retimeTitleClip, validateCompositions } from '../services/compositions.ts';
 import { defaultShape, getShape, isShape, validateShape, type ShapeDocument } from '../services/shapes.ts';
 import { createTitleTemplate } from '../services/titleTemplates.ts';
@@ -513,7 +513,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       preset=captionPreset(preset).id;
       const state=get(),track=state.tracks.find(t=>t.timelineId===state.timelineId&&t.captionSets?.some(s=>s.id===setId));if(!track||track.locked||!writable()||!available(track.id,'*'))return;
       const clips=state.clips.filter(c=>c.timelineId===state.timelineId&&c.properties.captionSet===setId);if(clips.some(c=>!editableClip(c.id,'textDocument')))return;
-      const changes:Change[]=clips.map(c=>{const doc=getText(c),next=captionDocument(doc.caption!.words,preset,doc.caption!.duration);next.caption={...next.caption!,entranceDuration:doc.caption!.entranceDuration,exitDuration:doc.caption!.exitDuration};return {collection:'clips',id:c.id,value:{'properties.textDocument':JSON.stringify({...next,x:doc.x,y:doc.y,width:doc.width,height:doc.height})}};});
+      const changes:Change[]=clips.map(c=>({collection:'clips',id:c.id,value:{'properties.textDocument':JSON.stringify(restyleCaption(getText(c),preset))}}));
       changes.push({collection:'tracks',id:track.id,value:{captionSets:track.captionSets!.map(s=>s.id===setId?{...s,preset}:s)}});commit('PropertyChanged',track.id,'changed caption preset',changes);
     },
     updateCaption(id,words) {

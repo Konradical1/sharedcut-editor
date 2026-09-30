@@ -1,4 +1,4 @@
-import { captionHighlightLead, captionPreset, captionTiming, validateCaption, type CaptionData } from './captions.ts';
+import { captionHighlightLead, captionPreset, captionTiming, snapZoom, validateCaption, wordPopDuration, type CaptionData } from './captions.ts';
 import type { Clip } from '../state/models.ts';
 
 export interface TextStyle { fontFamily: string; fontSize: number; fontWeight: number; italic: boolean; underline: boolean; letterSpacing: number; color: string }
@@ -239,6 +239,7 @@ function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,
     let zoom=1,y=0,blur=0;
     if(preset.motion==='pull')zoom=1.28-.28*ease;
     if(preset.motion==='pop')zoom=.82+.18*ease+.07*Math.sin(u*Math.PI);
+    if(preset.motion==='snap')zoom=snapZoom(u);
     if(preset.motion==='bounce'){zoom=.9+.1*ease;y=-10*Math.sin(u*Math.PI*1.5)*(1-u);}
     if(preset.motion==='rise')y=22*(1-ease);
     if(preset.motion==='blur')blur=10*(1-ease);
@@ -246,8 +247,11 @@ function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,
     const alpha=(fade>0?Math.min(1,t/fade):1)*(exit>0?Math.min(1,(data.duration-t)/exit):1);
     return {zoom,y,blur,alpha:Math.max(0,alpha)};
   };
-  const moving=['pull','pop','rise','bounce'].includes(preset.motion)&&entrance>0&&time<entrance+1/60;
-  const count=moving?7:1;
+  // A word pops from its own start; the shutter below then smears the scale along its direction of travel.
+  const wordZoom=(w:CaptionData['words'][number],t:number)=>{const local=t-captionHighlightLead-w.start;return data.wordPop&&local>=0&&local<wordPopDuration?snapZoom(local/wordPopDuration):1;};
+  const popping=Boolean(data.wordPop)&&data.words.some(w=>{const local=time-captionHighlightLead-w.start;return local>=0&&local<wordPopDuration+1/60;});
+  const moving=['pull','pop','rise','bounce','snap'].includes(preset.motion)&&entrance>0&&time<entrance+1/60;
+  const count=moving||popping?7:1,shutter=Math.min(1/60,Math.max(entrance,popping?wordPopDuration:0)/4);
   let surfaces=captionSurfaces.get(ctx);
   if(!surfaces){
     const make=()=>{if(typeof document!=='undefined')return document.createElement('canvas');return new (ctx.canvas.constructor as {new(w:number,h:number):HTMLCanvasElement})(width,height);};
@@ -258,13 +262,26 @@ function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,
   sum.clearRect(0,0,width,height);
   const cue=Math.max(data.words[0]?.start??0,time-captionHighlightLead),active=data.words.findIndex(w=>cue>=w.start&&cue<w.end);
   for(let i=0;i<count;i++){
-    const t=Math.max(0,time-(count===1?0:(1-i/(count-1))*Math.min(1/60,entrance/4))),m=motion(t);
+    const t=Math.max(0,time-(count===1?0:(1-i/(count-1))*shutter)),m=motion(t);
     sample.clearRect(0,0,width,height);sample.save();sample.globalAlpha=m.alpha;
     const cx=(doc.x+doc.width/2)*width,cy=(doc.y*ph+style.fontSize*.55)*height/ph;
     sample.translate(cx,cy+m.y*scale*height/ph);sample.scale(m.zoom,m.zoom);sample.translate(-cx,-cy);
     if(preset.backing){sample.fillStyle='#080b10cc';sample.fillRect(doc.x*width-8*scale*width/pw,doc.y*height-5*scale*height/ph,doc.width*width+16*scale*width/pw,style.fontSize*1.3*height/ph);}
-    const plain={...doc,caption:undefined,blur:m.blur*scale,outlineWidth:(doc.outlineWidth??0)*scale,shadowBlur:(doc.shadowBlur??8)*scale,shadowY:(doc.shadowY??4)*scale,runs:data.words.map((w,n)=>({text:(n?' ':'')+w.text,style:{...style,color:preset.highlight&&n===active?preset.accent:style.color}}))};
-    drawText(sample,plain,width,height,pw,ph,t);sample.restore();
+    const color=(n:number)=>(preset.highlight||data.accent)&&n===active?data.accent??preset.accent:style.color;
+    const plain={...doc,caption:undefined,blur:m.blur*scale,outlineWidth:(doc.outlineWidth??0)*scale,shadowBlur:(doc.shadowBlur??8)*scale,shadowX:(doc.shadowX??0)*scale,shadowY:(doc.shadowY??4)*scale,runs:data.words.map((w,n)=>({text:(n?' ':'')+w.text,style:{...style,color:color(n)}}))};
+    const zooms=data.words.map(w=>wordZoom(w,t));
+    if(zooms.every(z=>z===1))drawText(sample,plain,width,height,pw,ph,t);
+    else {
+      // The line always fits on one row (the font shrinks to fit above), so each word sits at its measured offset.
+      sample.font=canvasFont(style);const line=sample.measureText(data.words.map(w=>w.text).join(' ')).width,left=doc.x*pw+(doc.width*pw-line)/2;
+      data.words.forEach((w,n)=>{
+        const offset=sample.measureText(data.words.slice(0,n).map(v=>v.text+' ').join('')).width,size=sample.measureText(w.text).width,wx=(left+offset+size/2)*width/pw;
+        sample.save();sample.translate(wx,cy);sample.scale(zooms[n],zooms[n]);sample.translate(-wx,-cy);
+        drawText(sample,{...plain,x:(left+offset)/pw,width:(size+style.fontSize*.2)/pw,align:'left',runs:[{text:w.text,style:{...style,color:color(n)}}]},width,height,pw,ph,t);
+        sample.restore();
+      });
+    }
+    sample.restore();
     sum.globalCompositeOperation='lighter';sum.globalAlpha=1/count;sum.drawImage(surfaces.sample,0,0);
   }
   sum.globalCompositeOperation='source-over';sum.globalAlpha=1;ctx.drawImage(surfaces.sum,0,0);
