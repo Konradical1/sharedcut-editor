@@ -90,7 +90,7 @@ export function update(state: { clips: Clip[]; tracks: Track[]; media: MediaAsse
     const track = state.tracks.find(t => t.id === clip.trackId), asset = state.media.find(m => m.id === clip.mediaId);
     if (!track || !asset || asset.status !== 'ready' || asset.kind === 'image' || (track.kind === 'video' ? track.hidden : track.muted)) continue;
     const url = urlFor(asset, track.kind === 'video' && asset.kind !== 'audio');
-    if (!url || !/^\/api\/.+\.(mp4|m4a|mov|webm)(\?|$)/i.test(url)) continue;
+    if (!url || !/^\/api\/.+\.(mp4|m4a|mov)(\?|$)/i.test(url)) continue;
     const end = clip.start + clip.duration, span = sourceSpan(clip);
     const handles = transitions.filter(t => t.incomingId === clip.id || t.outgoingId === clip.id);
     // Reserve borrowed transition handles even when playback retimes them. This is a conservative

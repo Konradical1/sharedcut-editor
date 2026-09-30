@@ -426,3 +426,33 @@ test('gain keys stay in the static pass and a keyed graphic no longer chops the 
   assert.ok(Math.abs(ratio+6)<.5,`the keyed duck lands at -6 dB, got ${ratio.toFixed(2)}`);
  } finally {await rm(dir,{recursive:true,force:true});}
 });
+
+test('ProRes 4444 graphics keep their alpha in previews and composite over footage on export',{timeout:120000},async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'frameline-alpha-'));
+ try {
+  // Red on the left half, fully transparent on the right.
+  const graphic=path.join(dir,'mg.mov');
+  await ff(['-f','lavfi','-i','color=red:s=64x64:r=24:d=0.5,format=rgba,geq=r=255:g=0:b=0:a=if(lt(X\\,32)\\,255\\,0)','-c:v','prores_ks','-profile:v','4444','-pix_fmt','yuva444p10le',graphic]);
+  const probed=await probeMedia(graphic);assert.equal(probed.hasAlpha,true,'a yuva ProRes is detected as alpha');
+  const prepared=await prepareMedia({inputPath:graphic,outputDir:path.join(dir,'prepared'),baseUrl:'/f'});
+  assert.equal(prepared.hasAlpha,true);assert.equal(prepared.proxyUrl,'/f/proxy-alpha-v1.webm');assert.ok(!('colorProxyUrl' in prepared&&prepared.colorProxyUrl),'no opaque grading proxy');
+  for(const url of [prepared.proxyUrl,...Object.values(prepared.proxyVariants!)]){
+   const file=path.join(dir,'prepared',path.basename(url));
+   assert.ok((await probeMedia(file)).hasAlpha,`${url} carries alpha`);
+   // FFmpeg's native VP9 decoder ignores the alpha side stream; libvpx is what browsers mirror.
+   const rgba=(await ff(['-c:v','libvpx-vp9','-i',file,'-frames:v','1','-vf','scale=64:64','-f','rawvideo','-pix_fmt','rgba','pipe:1'])).stdout;
+   const alpha=(x:number)=>rgba[(32*64+x)*4+3];
+   assert.ok(alpha(8)>240&&alpha(56)<15,`${url}: opaque left, clear right, got ${alpha(8)}/${alpha(56)}`);
+  }
+  const blue=path.join(dir,'blue.png');await ff(['-f','lavfi','-i','color=blue:s=64x64','-frames:v','1',blue]);
+  const project={id:'p',name:'Alpha',description:'',shared:false,thumbnail:'',modifiedAt:0,duration:.25,resolution:'64 × 64',fps:24,status:'In progress',members:[]} as any;
+  const track=(id:string,number:number)=>({id,timelineId:'tl',name:id,kind:'video',number,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0}) as any;
+  const clip=(id:string,trackId:string,mediaId:string)=>({id,projectId:'p',timelineId:'tl',trackId,mediaId,name:id,start:0,duration:.25,sourceIn:0,color:'#fff',disabled:false,properties:{},effects:[]}) as any;
+  const asset=(id:string,kind:string)=>({id,projectId:'p',name:id,kind,duration:.5,status:'ready',progress:100,binId:'',thumbnail:'',fps:24,resolution:'64 × 64',size:'',hasAlpha:kind==='video'}) as any;
+  const outputPath=path.join(dir,'out.mp4');
+  await renderTimeline({project,timeline:{id:'tl',projectId:'p',name:'Main',duration:.25},tracks:[track('v1',1),track('v2',2)],clips:[clip('bg','v1','b'),clip('mg','v2','g')],assets:[{asset:asset('b','image'),path:blue},{asset:asset('g','video'),path:graphic}],nodes:[],settings:{audio:'Disabled',codec:'H.264',resolution:'64 × 64',fps:'24'},outputPath});
+  const frame=(await ff(['-i',outputPath,'-frames:v','1','-f','rawvideo','-pix_fmt','rgb24','pipe:1'])).stdout;
+  const at=(x:number)=>[...frame.subarray((32*64+x)*3,(32*64+x)*3+3)];
+  assert.ok(at(8)[0]>200&&at(8)[2]<60,`graphic on the left, got ${at(8)}`);assert.ok(at(56)[2]>200&&at(56)[0]<60,`the footage shows through the transparent half, got ${at(56)}`);
+ } finally {await rm(dir,{recursive:true,force:true});}
+});

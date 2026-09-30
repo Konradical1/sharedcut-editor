@@ -7,6 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { DatabaseSync } from 'node:sqlite';
 import { createFrameLineServer } from './index.ts';
+import { PROBE_VERSION } from './media.ts';
 
 const exec = promisify(execFile);
 
@@ -43,7 +44,7 @@ test('a startup re-probe of an old HLG phone clip reports it upright and re-prep
     db.prepare('UPDATE workspace SET state=? WHERE id=1').run(JSON.stringify(state)); db.close();
 
     ({ app, base } = await start());
-    const again = await asset(a => a.probeVersion === 2 && a.status === 'ready' && a.proxyUrl.includes('?v=') && a.colorProxyUrl?.includes('?v=') && !a.preparationStage);
+    const again = await asset(a => a.probeVersion === PROBE_VERSION && a.status === 'ready' && a.proxyUrl.includes('?v=') && a.colorProxyUrl?.includes('?v=') && !a.preparationStage);
     assert.equal(again.resolution, '72 × 128'); assert.equal(again.colorTransfer, 'arib-std-b67');
     for (const url of [again.proxyUrl, again.thumbnail, again.colorProxyUrl, ...Object.values(again.proxyVariants)] as string[]) {
       assert.match(url, /\?v=/, `${url} is a new URL, not the cached one`);

@@ -67,6 +67,8 @@ export function efficientPlayback(mode: Settings['performanceMode'] | undefined,
 export function playbackUrl(asset: MediaAsset, options: Pick<PreviewOptions, 'original' | 'quality'>, visual: boolean) {
   if (options.original) return asset.sourceUrl || asset.proxyUrl;
   if (!visual && asset.audioProxyUrl) return asset.audioProxyUrl;
+  // A graphic's grading proxy (if an older import made one) is opaque, and its ProRes original will not play in a browser.
+  if(asset.hasAlpha&&(options.quality==='Full'||options.quality==='Color'))return asset.proxyUrl||asset.sourceUrl;
   if(visual&&options.quality==='Full'&&asset.colorProxyUrl)return asset.colorProxyUrl;
   if(options.quality==='Color')return asset.colorProxyUrl||asset.sourceUrl||asset.proxyUrl;
   // An import that predates the upgrade pass has no streaming variant yet. Half resolution is the
@@ -401,6 +403,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
      */
     const scrubFor = (clip: Clip, asset: MediaAsset, decoder: Decoder) => {
       const url = asset.proxyVariants?.['1/4'];
+      // The scrub worker demuxes MP4 only; an alpha WebM seeks through its video element instead.
+      if (url && !/\.mp4(?:\?|$)/i.test(url)) return undefined;
       // A frame editor loops one clip: each lap starts with a backward seek, which the stand-in covers while playing too.
       if (state.playing && !focusing || !url || decoder.url === url || (decoder.url !== asset.proxyUrl && !Object.values(asset.proxyVariants ?? {}).includes(decoder.url)) || typeof VideoDecoder === 'undefined' || typeof Worker === 'undefined') return undefined;
       // Keyed by file: pictures are source frames, so every cut from one take shares a decoder.

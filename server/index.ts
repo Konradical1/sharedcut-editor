@@ -1309,7 +1309,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     } catch (error) { if (!signal.aborted) console.error(`Camera metadata check failed for ${asset.name}:`, error); }
   });
   // Assets still due a camera check get their grading proxy from that check, after any matrix correction.
-  for(const asset of state.media) if(!SKIP_COLOR_PROXY&&asset.kind==='video'&&asset.status==='ready'&&asset.cameraMetadataVersion===2&&!asset.colorProxyUrl&&existsSync(originalPath(asset.id))) {
+  for(const asset of state.media) if(!SKIP_COLOR_PROXY&&asset.kind==='video'&&asset.status==='ready'&&asset.cameraMetadataVersion===2&&!asset.colorProxyUrl&&!asset.hasAlpha&&existsSync(originalPath(asset.id))) {
     if(existsSync(join(mediaDir(asset.id),'prepared','color-v1.mp4'))){updateAsset(asset.id,{colorProxyUrl:`/api/media/${asset.id}/files/color-v1.mp4`});continue;}
     addWork(`color-${asset.id}`,async signal=>{
       try{const preview=await prepareColorProxy({inputPath:originalPath(asset.id),outputDir:join(mediaDir(asset.id),'prepared'),baseUrl:`/api/media/${asset.id}/files`,signal});if(!signal.aborted&&!closed)updateAsset(asset.id,preview);}
@@ -1321,10 +1321,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && asset.probeVersion !== PROBE_VERSION && existsSync(originalPath(asset.id))) {
     addWork(`probe-${asset.id}`, async signal => {
       try {
-        const { resolution, width, height, colorTransfer, colorMatrix, probeVersion } = await probeMedia(originalPath(asset.id), signal);
+        const { resolution, width, height, colorTransfer, colorMatrix, probeVersion, hasAlpha } = await probeMedia(originalPath(asset.id), signal);
         if (signal.aborted || closed) return;
-        updateAsset(asset.id, { resolution, width, height, colorTransfer, colorMatrix, probeVersion } as Partial<Asset>);
-        if (colorTransfer === 'arib-std-b67' || colorTransfer === 'smpte2084') processAsset(asset.id, true);
+        updateAsset(asset.id, { resolution, width, height, colorTransfer, colorMatrix, probeVersion, hasAlpha } as Partial<Asset>);
+        // Graphics with alpha were proxied to opaque H.264 (a black backdrop); they prepare again as alpha WebM.
+        if (colorTransfer === 'arib-std-b67' || colorTransfer === 'smpte2084' || hasAlpha) processAsset(asset.id, true);
       } catch (error) { if (!signal.aborted) console.error(`Re-probe failed for ${asset.name}:`, error); }
     });
   }

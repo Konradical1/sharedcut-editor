@@ -105,8 +105,10 @@ function dimensions(value: string): [number, number] {
   return [width, height];
 }
 
-/** Bump to re-probe every ready video at startup (v2: display rotation, transfer). */
-export const PROBE_VERSION = 2;
+/** Bump to re-probe every ready video at startup (v2: display rotation, transfer; v3: alpha). */
+export const PROBE_VERSION = 3;
+/** An alpha plane in the decoded format (ProRes 4444, PNG/QuickTime Animation), or VP9/WebM's alpha side stream. */
+export const alphaFormat = (pixFmt?: string, alphaMode?: string) => /^(yuva|gbrap|ya\d|argb|rgba|abgr|bgra)/.test(pixFmt ?? '') || alphaMode === '1';
 // ponytail: tone-mapping knob; compare 100 against 203 on real footage and set FRAME_LINE_HDR_NPL.
 const hdrNpl = () => Number(process.env.FRAME_LINE_HDR_NPL) || 100;
 /** The HDR-to-SDR table as a transform, or undefined for SDR sources. */
@@ -128,7 +130,7 @@ export async function probeMedia(inputPath: string, signal?: AbortSignal) {
   const file = await stat(inputPath);
   if (!file.isFile()) throw new Error('Media source is not a file.');
   const data = JSON.parse((await run(ffprobe(), ['-v', 'error', ...safeInput, '-show_streams', '-show_format', '-of', 'json', inputPath], { signal })).toString()) as {
-    streams: { codec_type: string; codec_name?: string; color_range?: string; color_space?: string; color_primaries?: string; color_transfer?: string; pix_fmt?: string; width?: number; height?: number; avg_frame_rate?: string; duration?: string; sample_rate?: string; channels?: number; disposition?: { attached_pic?: number }; side_data_list?: { rotation?: number }[] }[];
+    streams: { codec_type: string; codec_name?: string; color_range?: string; color_space?: string; color_primaries?: string; color_transfer?: string; pix_fmt?: string; width?: number; height?: number; avg_frame_rate?: string; duration?: string; sample_rate?: string; channels?: number; disposition?: { attached_pic?: number }; side_data_list?: { rotation?: number }[]; tags?: Record<string, string> }[];
     format: { duration?: string; format_name?: string };
   };
   const video = data.streams.find(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic);
@@ -142,7 +144,7 @@ export async function probeMedia(inputPath: string, signal?: AbortSignal) {
   const rotation = Number(video?.side_data_list?.find(d => d.rotation !== undefined)?.rotation ?? 0);
   const [width, height] = Math.abs(rotation) % 180 === 90 ? [video?.height, video?.width] : [video?.width, video?.height];
   const color: CameraColor = (video && await readCameraColor(inputPath, file.size)) || { colorEvidence: video?.color_transfer ? 'Stream transfer tag: '+video.color_transfer+'; verify camera profile' : 'Camera profile untagged; set input manually for log footage' };
-  return { ...color, cameraMetadataVersion: 2, colorRange: video?.color_range || 'unknown', colorMatrix: video?.color_space || color.colorMatrix || 'auto', frameRate: video?.avg_frame_rate, kind: image ? 'image' as const : video ? 'video' as const : 'audio' as const, duration, fps, hasAudio: Boolean(audio), resolution: video ? `${width} × ${height}` : `${Math.round(Number(audio?.sample_rate || 48000) / 1000)} kHz · ${audio?.channels === 1 ? 'Mono' : 'Stereo'}`, width, height, colorTransfer: video?.color_transfer, probeVersion: PROBE_VERSION, size: file.size };
+  return { ...color, cameraMetadataVersion: 2, colorRange: video?.color_range || 'unknown', colorMatrix: video?.color_space || color.colorMatrix || 'auto', frameRate: video?.avg_frame_rate, kind: image ? 'image' as const : video ? 'video' as const : 'audio' as const, duration, fps, hasAlpha: Boolean(video && !image && alphaFormat(video.pix_fmt, video.tags?.alpha_mode ?? video.tags?.ALPHA_MODE)), hasAudio: Boolean(audio), resolution: video ? `${width} × ${height}` : `${Math.round(Number(audio?.sample_rate || 48000) / 1000)} kHz · ${audio?.channels === 1 ? 'Mono' : 'Stereo'}`, width, height, colorTransfer: video?.color_transfer, probeVersion: PROBE_VERSION, size: file.size };
 }
 
 /**
@@ -333,6 +335,7 @@ export async function preparePreviewVariants(options: { inputPath: string; outpu
   const metadata = await probeMedia(inputPath, signal);
   if (metadata.kind !== 'video') throw new Error('Preview variants require a prepared video.');
   await mkdir(outputDir, { recursive: true });
+  if (metadata.hasAlpha) return prepareAlphaVariants(inputPath, outputDir, baseUrl, metadata, signal, options.refresh);
   const temp = await mkdtemp(path.join(outputDir, '.preview-'));
   // All-intra holds every frame as a keyframe, which is what makes scrubbing instant and what makes
   // the file ~80 Mbit/s at 1080p. That is unstreamable off-site, so playback gets a long-GOP variant
@@ -365,6 +368,31 @@ export async function preparePreviewVariants(options: { inputPath: string; outpu
   } finally { await rm(temp, { recursive: true, force: true }); }
 }
 
+/**
+ * H.264 has no alpha, so a ProRes 4444 graphic previewed over black. Browsers decode VP9 WebM with its alpha
+ * plane (Chrome, Edge, Firefox), and the canvas composites it like any other layer. Read from the original:
+ * hardware decoders drop the alpha plane, and so does FFmpeg's native VP9 decoder on a WebM input.
+ * Two sizes cover every quality: the stream sizes are the same files, since graphics are short and light.
+ */
+async function prepareAlphaVariants(inputPath: string, outputDir: string, baseUrl: string, metadata: Awaited<ReturnType<typeof probeMedia>>, signal?: AbortSignal, refresh?: boolean) {
+  const half = 'proxy-half-alpha-v1.webm', quarter = 'proxy-quarter-alpha-v1.webm', audioName = 'audio-v1.m4a';
+  const temp = await mkdtemp(path.join(outputDir, '.preview-'));
+  try {
+    const written: string[] = [], args = [...common, ...safeInput, '-i', inputPath];
+    for (const [name, width] of [[half, 960], [quarter, 480]] as const) if (refresh || !existsSync(path.join(outputDir, name))) {
+      args.push('-map', '0:v:0', '-map', '0:a:0?', '-vf', `scale=w='min(${width},iw)':h=-2:flags=lanczos`, ...alphaVideo(metadata.fps), '-c:a', 'libopus', '-b:a', '128k', path.join(temp, name));
+      written.push(name);
+    }
+    if (metadata.hasAudio && (refresh || !existsSync(path.join(outputDir, audioName)))) { args.push('-map', '0:a:0', '-vn', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', path.join(temp, audioName)); written.push(audioName); }
+    if (written.length) await run(ffmpeg(), args, { signal, duration: metadata.duration });
+    for (const name of written) await rename(path.join(temp, name), path.join(outputDir, name));
+    const url = (name: string) => `${baseUrl}/${name}`;
+    return { proxyVariants: { '1/2': url(half), '1/4': url(quarter), Stream: url(half), StreamLow: url(quarter) }, ...(metadata.hasAudio ? { audioProxyUrl: url(audioName) } : {}) };
+  } finally { await rm(temp, { recursive: true, force: true }); }
+}
+/** VP9 with alpha. `-auto-alt-ref 0` is required: alt-ref frames and the alpha side stream do not mix. */
+const alphaVideo = (fps: number) => ['-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-auto-alt-ref', '0', '-crf', '28', '-b:v', '0', '-deadline', 'realtime', '-cpu-used', '8', '-row-mt', '1', '-g', String(Math.max(1, Math.round((fps || 24) / 2))), '-color_range', 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'];
+
 export async function prepareMediaThumbnail(inputPath: string, outputDir: string, signal?: AbortSignal, transfer?: string) {
   await mkdir(outputDir, { recursive: true });
   const temporary = await mkdtemp(path.join(outputDir, '.thumbnail-'));
@@ -381,6 +409,8 @@ export async function prepareColorProxy(options:{inputPath:string;outputDir:stri
   if(existsSync(output)&&!options.refresh)return {colorProxyUrl:`${baseUrl}/${name}`};
   const metadata=await probeMedia(inputPath,signal);
   if(metadata.kind!=='video')throw Error('Color preview requires video.');
+  // An opaque grading proxy would put a graphic back on black; the alpha preview grades instead.
+  if(metadata.hasAlpha)return {};
   await mkdir(outputDir,{recursive:true});const temp=await mkdtemp(path.join(outputDir,'.color-'));
   try{
     const matrix=['bt709','bt470bg','smpte170m','bt2020nc'].includes(metadata.colorMatrix)?metadata.colorMatrix:'auto';
@@ -438,9 +468,9 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
   const metadata = await probeMedia(inputPath, signal);
   await mkdir(outputDir, { recursive: true });
   // image-v2: portrait stills fit a 1920 square instead of a 1080-high landscape box.
-  const proxyName = metadata.kind === 'audio' ? 'audio.m4a' : metadata.kind === 'image' ? 'image-v2.png' : 'proxy.mp4';
+  const proxyName = metadata.kind === 'audio' ? 'audio.m4a' : metadata.kind === 'image' ? 'image-v2.png' : metadata.hasAlpha ? 'proxy-alpha-v1.webm' : 'proxy.mp4';
   const proxy = path.join(outputDir, proxyName), thumb = path.join(outputDir, 'thumbnail.jpg');
-  const input = [...await decodeAccel(), ...safeInput, '-i', inputPath];
+  const input = [...metadata.hasAlpha ? [] : await decodeAccel(), ...safeInput, '-i', inputPath];
   let filmstripFrames = 0, published = false;
   onProgress?.(5);
   try {
@@ -450,7 +480,9 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
       onThumbnail?.(`${baseUrl}/thumbnail.jpg`);
     }
     onStage?.('Creating playable preview');
-    if (metadata.kind === 'image') {
+    if (metadata.hasAlpha) {
+      await run(ffmpeg(), [...common, ...input, '-map', '0:v:0', '-map', '0:a:0?', '-vf', `scale=w='min(1920,iw)':h=-2:flags=lanczos`, ...alphaVideo(metadata.fps), '-c:a', 'libopus', '-b:a', '128k', '-progress', 'pipe:1', '-nostats', proxy], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7) });
+    } else if (metadata.kind === 'image') {
       await run(ffmpeg(), [...common, ...input, '-vf', 'scale=w=1920:h=1920:force_original_aspect_ratio=decrease', '-frames:v', '1', proxy], { signal });
     } else {
       const video = metadata.kind === 'video' ? ['-map', '0:v:0', '-vf', `scale=w='min(1920,iw)':h=-2:in_color_matrix=${["bt709","bt470bg","smpte170m","bt2020nc"].includes(metadata.colorMatrix)?metadata.colorMatrix:"auto"}:in_range=${metadata.colorRange==="pc"?"pc":metadata.colorRange==="tv"?"tv":"auto"}:out_range=${metadata.colorRange==="pc"?"pc":"tv"}:out_color_matrix=bt709:flags=lanczos+accurate_rnd+full_chroma_int${await toneMap(metadata.colorTransfer,outputDir,metadata.colorRange==="pc"?"pc":"tv")},setsar=1,setparams=range=${metadata.colorRange==="pc"?"full":"limited"}:color_primaries=bt709:color_trc=bt709:colorspace=bt709`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '16', '-g', '1', '-pix_fmt', metadata.colorRange==='pc'?'yuvj420p':'yuv420p', '-color_range', metadata.colorRange==='pc'?'pc':'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'] : ['-vn'];
@@ -462,7 +494,7 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
     onPlayable?.({ ...metadata, ...peaks, proxyUrl: `${baseUrl}/${proxyName}`, thumbnail: metadata.kind === 'audio' ? '' : `${baseUrl}/thumbnail.jpg` });
     published = Boolean(onPlayable);
     if (metadata.kind === 'video') onStage?.('Creating smaller playback previews');
-    const previews: Pick<MediaAsset, 'proxyVariants' | 'audioProxyUrl'> = metadata.kind === 'video' ? await preparePreviewVariants({ inputPath: proxy, outputDir, baseUrl, signal, refresh: options.refresh, onProgress: value => onProgress?.(80 + value * .19) }) : {};
+    const previews: Pick<MediaAsset, 'proxyVariants' | 'audioProxyUrl'> = metadata.kind === 'video' ? await preparePreviewVariants({ inputPath: metadata.hasAlpha ? inputPath : proxy, outputDir, baseUrl, signal, refresh: options.refresh, onProgress: value => onProgress?.(80 + value * .19) }) : {};
     // After the variants, so the strip is tiled from the 480px proxy rather than the 4K original.
     if (metadata.kind === 'video') onStage?.('Creating timeline thumbnails');
     if (metadata.kind === 'video') filmstripFrames = await prepareMediaFilmstrip(inputPath, outputDir, metadata.duration, signal);
