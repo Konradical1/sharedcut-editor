@@ -341,7 +341,7 @@ export async function connectSession() {
   // Exchange only ephemeral presence at 20Hz; project persistence has its own slower poll.
   const clientId = createId('presence'), presenceAbort = new AbortController();
   let pollingPresence = false, lastPresence = 0, presenceRetryAt = 0, presenceFailures = 0, lastPublished = 0;
-  let publishedProject: string | null = null, publishedCursor = false, presenceRefreshPending = false;
+  let publishedProject: string | null = null, publishedCursor = false, presenceRefreshPending = false, publishedPlaying = false;
   let publishedSignature = '';
   const pollPresence = async () => {
     if (pollingPresence || session !== generation || Date.now() < presenceRetryAt || (typeof document !== 'undefined' && document.hidden && !publishedCursor && Date.now() - lastPresence < 1000)) return;
@@ -358,13 +358,14 @@ export async function connectSession() {
       }
       const active = typeof document === 'undefined' || (!document.hidden && document.hasFocus());
       const cursor = active ? s.cursor : null;
-      // Anything a collaborator can see goes in the signature, so a moving cursor or a running
-      // playhead still publishes every tick; only genuinely idle repeats are held back.
+      // Anything a collaborator can see goes in the signature, so a moving cursor still publishes every
+      // tick; only genuinely idle repeats are held back, and a running playhead is sent at 4 Hz.
       const signature = JSON.stringify([active, s.projectId, s.timelineId, cursor, s.playhead, s.selectedClipId, s.mediaPresenceTab, s.inspectorPresenceTab, s.workspace, s.liveMode === 'presenting', s.playing && !s.playbackBuffering, s.dragPreview]);
-      if (!presenceDue(signature, publishedSignature, Date.now() - lastPublished) && (incremental && events?.readyState === 1 || Date.now() - lastPublished < 100)) return;
+      // Starting and stopping go out at once; only a playhead already known to be running is held to 4 Hz.
+      if (!presenceDue(signature, publishedSignature, Date.now() - lastPublished, s.playing && publishedPlaying) && (incremental && events?.readyState === 1 || Date.now() - lastPublished < 100)) return;
       const response = await api<{ presence: Presence[]; serverTime?: number }>('/presence', { method: 'POST', signal: AbortSignal.any([presenceAbort.signal, AbortSignal.timeout(5000)]), body: JSON.stringify({ clientId, active, projectId: s.projectId, timelineId: s.timelineId, cursor, playhead: s.playhead, selectedClipId: s.selectedClipId, mediaTab: s.mediaPresenceTab, inspectorTab: s.inspectorPresenceTab, activity: s.workspace, online: true, presenting: s.liveMode === 'presenting', playing: s.playing && !s.playbackBuffering, preview: active ? s.dragPreview : null }) });
       publishedProject = s.projectId; publishedCursor = !!cursor;
-      publishedSignature = signature; lastPublished = Date.now();
+      publishedSignature = signature; lastPublished = Date.now(); publishedPlaying = s.playing;
       presenceFailures = 0; presenceRetryAt = 0;
       receivePresence({ ...response, projectId: s.projectId });
     } catch (error) { presenceRetryAt = Date.now() + Math.min(3000, 250 * 2 ** presenceFailures++); if (session === generation) { useEditorStore.setState({ serverOnline: false }); if (error instanceof ApiError && error.status === 401) resetSession(); } }
@@ -393,7 +394,9 @@ export async function connectSession() {
     const state = useEditorStore.getState();
     if (session !== generation || data.projectId && data.projectId !== state.projectId || (data.serverTime ?? 0) < presenceServerTime) return;
     presenceServerTime = data.serverTime ?? 0;
-    useEditorStore.setState({ presence: receivedPresence(data.presence.filter(person => person.userId !== state.currentUserId && person.projectId === state.projectId), data.serverTime, performance.now()), serverOnline: true });
+    const presence = receivedPresence(data.presence.filter(person => person.userId !== state.currentUserId && person.projectId === state.projectId), data.serverTime, performance.now(), state.presence);
+    // Every setState runs every store selector; an unchanged reply (alone in the project) skips that.
+    if (presence !== state.presence || !state.serverOnline) useEditorStore.setState({ presence, serverOnline: true });
   };
   events?.addEventListener('presence', ((event: MessageEvent) => {
     try { receivePresence(JSON.parse(event.data)); } catch { /* the next heartbeat recovers */ }

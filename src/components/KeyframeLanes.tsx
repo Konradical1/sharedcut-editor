@@ -1,5 +1,5 @@
 import { intersects, selectionRect, shiftKeyframes, type SelectionRect } from '../services/selection';
-import { useEffect, useRef, useState, type PointerEvent } from 'react';
+import { memo, useEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
 import { ChevronDown, ChevronRight, Diamond, Spline, Plus, Trash2 } from 'lucide-react';
 import type { Clip, Keyframe } from '../state/models';
 import { useEditorStore } from '../state/store';
@@ -7,8 +7,13 @@ import { animationProperties, evaluateClip, evaluateNodes, frameTime, linearCurv
 import { NumberInput } from './ui';
 import { graphScale, graphStep } from '../services/graphScale';
 
-export default function KeyframeLanes({ clips, pixels, width, visibleStart, visibleEnd, inline=false }: { inline?:boolean; clips: Clip[]; pixels: number; width: number; visibleStart: number; visibleEnd: number }) {
-  const nodes=useEditorStore(s=>s.nodes), playhead=useEditorStore(s=>s.playhead), selected=useEditorStore(s=>s.selectedClipId);
+type LaneProps = { inline?:boolean; clips: Clip[]; pixels: number; width: number; visibleStart: number; visibleEnd: number };
+// Timeline passes a fresh `clips` array every render; compare its members so an unrelated re-render skips every lane.
+const sameLanes = (a: LaneProps, b: LaneProps) => a.inline===b.inline&&a.pixels===b.pixels&&a.width===b.width&&a.visibleStart===b.visibleStart&&a.visibleEnd===b.visibleEnd&&a.clips.length===b.clips.length&&a.clips.every((clip,i)=>clip===b.clips[i]);
+export default memo(KeyframeLanes, sameLanes);
+
+function KeyframeLanes({ clips, pixels, width, visibleStart, visibleEnd, inline=false }: LaneProps) {
+  const nodes=useEditorStore(s=>s.nodes), selected=useEditorStore(s=>s.selectedClipId);
   const fps=useEditorStore(s=>s.projects.find(p=>p.id===s.projectId)?.fps??24);
   const [choice,setChoice]=useState(''), [expanded,setExpanded]=useState<string[]>([]), [selection,setSelection]=useState<string[]>([]);
   const [draft,setDraft]=useState<{path:string;keys:Keyframe[]}|null>(null);
@@ -20,8 +25,10 @@ export default function KeyframeLanes({ clips, pixels, width, visibleStart, visi
   const draftRef=useRef(draft), actions=useEditorStore.getState;
   const clip=clips.find(c=>c.id===choice)??clips.find(c=>c.id===selected)??clips[0];
   useEffect(()=>{setSelection([]);setDraft(null);setGroupDraft(undefined);channelDraft.current=undefined;return()=>{const g=gesture.current;if(g){clearInterval(g.lease);actions().releaseLock(clip!.id,'*');gesture.current=null;draftRef.current=null;useEditorStore.setState({clipPreview:null});}};},[clip?.id]);
+  // Only paths and labels are read here, and they do not change with time: evaluating at the clip start keeps the
+  // lanes off the moving playhead (it re-rendered ~60 lanes every playback frame).
+  const properties=useMemo(()=>clip?animationProperties(evaluateClip(clip,clip.start),evaluateNodes(nodes,clip,clip.start)):[],[clip,nodes]);
   if(!clip)return <div className="animation-empty">Add a clip to animate this track.</div>;
-  const properties=animationProperties(evaluateClip(clip,playhead),evaluateNodes(nodes,clip,playhead));
   const paths=Object.keys(clip.keyframes??{});
   const finish=(commit:boolean)=>{const g=gesture.current;if(!g)return;clearInterval(g.lease);gesture.current=null;if(commit&&channelDraft.current)actions().setAnimationChannels(clip.id,channelDraft.current);actions().releaseLock(clip.id,'*');draftRef.current=null;channelDraft.current=undefined;setGroupDraft(undefined);setDraft(null);useEditorStore.setState({clipPreview:null});};
   const start=(e:PointerEvent<SVGElement|HTMLButtonElement>,path:string,keys:Keyframe[],index:number,kind:'point'|'in'|'out',range=1,low=0)=>{

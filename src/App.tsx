@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent } from 'react';
 import { MotionConfig } from 'motion/react';
 import { ChevronLeft, ChevronDown, PanelLeft, SlidersHorizontal, Scissors, Palette, AudioLines, ArrowUpRight, History, Camera, Users, MessageSquare, Radio, Settings, Check, Cloud, X, MonitorPlay } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useEditorStore, initializeEditorServices } from './state/store';
 import type { Workspace } from './state/models';
 import { Brand, Button, IconButton, timecode } from './components/ui';
@@ -31,10 +32,12 @@ function EditorStatus() {
   return <><span className="media-link-status">{ready?'All media linked':'Media processing'}</span><span className="timeline-counts muted">{clips} clips · {tracks} tracks</span><span className="statusbar-range mono">IN {timecode(rangeIn)} / OUT {timecode(rangeOut)}</span></>;
 }
 function Editor({onHome}:{onHome:()=>void}) {
-  const presence=useEditorStore(s=>s.presence);
-  const currentUserId=useEditorStore(s=>s.currentUserId);
+  // Every presence packet is a new array; select only what the toolbar shows so the shell (and everything under it)
+  // does not re-render several times a second.
+  const people=useEditorStore(useShallow(s=>s.presence.filter(p=>p.online&&p.projectId===s.projectId&&p.userId!==s.currentUserId).map(p=>`${p.userId}\n${p.activity}`)));
+  const online=useEditorStore(s=>s.presence.filter(p=>p.online).length);
+  const presenter=useEditorStore(s=>s.presence.find(p=>p.online&&p.presenting)?.userId);
   const syncConflict=useEditorStore(s=>s.syncConflict);
-  const presenter=presence.find(p=>p.online&&p.presenting);
   const project=useEditorStore(s=>s.projects.find(p=>p.id===s.projectId));
   const workspace=useEditorStore(s=>s.workspace);
   const sidePanel=useEditorStore(s=>s.sidePanel);
@@ -64,10 +67,10 @@ function Editor({onHome}:{onHome:()=>void}) {
   const rightPanel=sidePanel==='people'?<PeoplePanel/>:sidePanel==='history'?<HistoryPanel/>:sidePanel==='comments'?<CommentsPanel/>:<Inspector/>;
   return <div className="editor-app">
     <header className="app-toolbar"><div className="project-navigation"><IconButton label="Back to projects" onClick={onHome}><ChevronLeft size={17}/></IconButton><button className="brand-home" aria-label="SharedCut dashboard" onClick={onHome}><Brand compact/></button><span className="project-divider"/><div className="project-title"><b>{project?.name??'Project'}</b><span><i className="status-dot"/>{project?.shared?'Class project':(project?.members.length ?? 0)>1?'Shared project':'Private project'}</span></div></div>
-      <nav className="workspace-nav" aria-label="Editor workspaces">{workspaceItems.map(w=><button key={w.id} className={workspace===w.id?'active':''} aria-label={w.name} aria-current={workspace===w.id?'page':undefined} onClick={()=>s().setWorkspace(w.id)}><w.icon size={15}/>{w.name}<span className="workspace-people">{presence.filter(p=>p.online&&p.projectId===project?.id&&p.userId!==currentUserId&&p.activity===w.id).map(p=>{const user=users.find(u=>u.id===p.userId);return <i key={p.userId} style={{background:user?.color}} title={`${user?.name??'Collaborator'} is in ${w.name}`}/>;})}</span></button>)}</nav>
+      <nav className="workspace-nav" aria-label="Editor workspaces">{workspaceItems.map(w=><button key={w.id} className={workspace===w.id?'active':''} aria-label={w.name} aria-current={workspace===w.id?'page':undefined} onClick={()=>s().setWorkspace(w.id)}><w.icon size={15}/>{w.name}<span className="workspace-people">{people.map(p=>p.split('\n')).filter(([,activity])=>activity===w.id).map(([userId])=>{const user=users.find(u=>u.id===userId);return <i key={userId} style={{background:user?.color}} title={`${user?.name??'Collaborator'} is in ${w.name}`}/>;})}</span></button>)}</nav>
       <div className="toolbar-right">
         <IconButton label={mediaVisible?'Hide media':'Show media'} className={mediaVisible?'active':''} onClick={()=>{if(window.innerWidth<=760)s().setSidePanel(null);setMediaVisible(!mediaVisible);s().setWorkspace('edit');}}><PanelLeft size={15}/></IconButton>
-        <div className="live-controls">{liveMode==='independent'?<button className="live-join" aria-label="Join Live Playback" disabled={!presenter} title={presenter?'Follow the presenter':'No one is presenting'} onClick={()=>presenter&&s().setLiveMode('following',presenter.userId)}><span className="live-pulse"/><Radio size={13}/><span>Join Live Playback</span><ChevronDown size={11}/></button>:<button className="live-join is-live" onClick={()=>s().setLiveMode('independent')}><Radio size={13}/><b>LIVE</b>{liveMode==='following'?`Following ${users.find(u=>u.id===followUserId)?.name??'Ashley'}`:`Presenting · ${presence.filter(p=>p.online).length} online`}<X size={12}/></button>}<IconButton label={liveMode==='presenting'?'Stop presenting':'Present Project'} onClick={()=>s().setLiveMode(liveMode==='presenting'?'independent':'presenting')}><MonitorPlay size={15}/></IconButton></div>
+        <div className="live-controls">{liveMode==='independent'?<button className="live-join" aria-label="Join Live Playback" disabled={!presenter} title={presenter?'Follow the presenter':'No one is presenting'} onClick={()=>presenter&&s().setLiveMode('following',presenter)}><span className="live-pulse"/><Radio size={13}/><span>Join Live Playback</span><ChevronDown size={11}/></button>:<button className="live-join is-live" onClick={()=>s().setLiveMode('independent')}><Radio size={13}/><b>LIVE</b>{liveMode==='following'?`Following ${users.find(u=>u.id===followUserId)?.name??'Ashley'}`:`Presenting · ${online} online`}<X size={12}/></button>}<IconButton label={liveMode==='presenting'?'Stop presenting':'Present Project'} onClick={()=>s().setLiveMode(liveMode==='presenting'?'independent':'presenting')}><MonitorPlay size={15}/></IconButton></div>
         <IconButton label="Save snapshot" onClick={()=>s().setModal('snapshot')}><Camera size={15}/></IconButton>
         <IconButton label="History" className={sidePanel==='history'?'active':''} onClick={()=>togglePanel('history')}><History size={15}/></IconButton>
         <IconButton label="People" className={sidePanel==='people'?'active':''} onClick={()=>togglePanel('people')}><Users size={15}/></IconButton>

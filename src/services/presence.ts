@@ -1,6 +1,8 @@
 import type { Presence, PresenceCursor } from '../state/models.ts';
 
-export function receivedPresence(people: Presence[], serverTime: number | undefined, now: number): Presence[] {
+export function receivedPresence(people: Presence[], serverTime: number | undefined, now: number, previous?: Presence[]): Presence[] {
+  // Alone in a project every reply is empty; keeping the old list spares every presence subscriber a re-render.
+  if (!people.length && previous && !previous.length) return previous;
   // Measure packet age on the server's clock, then expire locally on the monotonic clock.
   return people.map(person => ({ ...person, receivedAt: now - Math.max(0, (serverTime ?? person.updatedAt) - person.updatedAt) }));
 }
@@ -61,6 +63,8 @@ export function advanceCursor(m: CursorMotion | undefined, x: number, y: number,
 // 20Hz is for a pointer in motion. Standing still, a heartbeat a second keeps the editor present and
 // leaves the server free to move everyone's edits instead of re-answering an identical question.
 export const PRESENCE_HEARTBEAT = 900;
-export function presenceDue(signature: string, published: string, since: number) {
-  return signature !== published || since >= PRESENCE_HEARTBEAT;
+// While playing the playhead changes every tick; followers extrapolate it (advancePlayhead), so 4 Hz is plenty.
+export const PLAYING_PRESENCE_INTERVAL = 250;
+export function presenceDue(signature: string, published: string, since: number, playing = false) {
+  return since >= PRESENCE_HEARTBEAT || signature !== published && (!playing || since >= PLAYING_PRESENCE_INTERVAL);
 }

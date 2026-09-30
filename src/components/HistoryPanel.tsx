@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Camera, Clock3, Film, GitBranch, History, RotateCcw, Search, ShieldCheck, Star, Users } from 'lucide-react';
+import { useShallow } from 'zustand/react/shallow';
 import { useEditorStore } from '../state/store';
 import type { Operation, Snapshot } from '../state/models';
 import { Avatar, Button, Modal } from './ui';
@@ -16,7 +17,9 @@ function dateLabel(timestamp: number) {
 const operationLabels: Record<string, string> = { ClipMoved: 'Clip moves', ClipTrimmed: 'Trimming', ClipDeleted: 'Deletions', ClipAdded: 'Added media', PropertyChanged: 'Properties', EffectAdded: 'Effects', GradeNodeAdded: 'Color', GradeNodeChanged: 'Color', TrackCreated: 'Tracks', TrackChanged: 'Tracks', CommentAdded: 'Comments', CommentChanged: 'Comments', SnapshotRestored: 'Restores' };
 
 export default function HistoryPanel() {
-  const { projectId, projects, users, currentUserId, operations, snapshots, timelines, clips, setModal, restoreSnapshot } = useEditorStore();
+  // Named fields only: the whole store changes on every playback frame, and this panel lists thousands of operations.
+  const { projectId, projects, users, currentUserId, operations, snapshots, timelines, clips } = useEditorStore(useShallow(s => ({ projectId: s.projectId, projects: s.projects, users: s.users, currentUserId: s.currentUserId, operations: s.operations, snapshots: s.snapshots, timelines: s.timelines, clips: s.clips })));
+  const { setModal, restoreSnapshot } = useEditorStore.getState();
   const [tab, setTab] = useState('All activity');
   const [person, setPerson] = useState('all');
   const [type, setType] = useState('all');
@@ -45,7 +48,7 @@ export default function HistoryPanel() {
 }
 
 export function SnapshotDialog() {
-  const { modal, setModal, saveSnapshot } = useEditorStore();
+  const modal = useEditorStore(s => s.modal), { setModal, saveSnapshot } = useEditorStore.getState();
   const [name, setName] = useState('');
   const [note, setNote] = useState('');
   if (modal !== 'snapshot') return null;

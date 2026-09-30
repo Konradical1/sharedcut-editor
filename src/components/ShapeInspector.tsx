@@ -1,13 +1,13 @@
 import { useEffect, useRef } from 'react';
 import { ChevronLeft, ChevronRight, Diamond } from 'lucide-react';
-import { useEditorStore } from '../state/store';
+import { useEditorStore, usePanelPlayhead } from '../state/store';
 import { evaluateClip } from '../services/animation';
 import { getShape, isShape, type ShapeDocument } from '../services/shapes';
 import { Property, MotionBlurControl } from './Inspector';
 import { NumberInput } from './ui';
 import './shapes.css';
 export default function ShapeInspector(){
-  const clip=useEditorStore(s=>s.clips.find(c=>c.id===s.selectedClipId)),playhead=useEditorStore(s=>s.playhead),locks=useEditorStore(s=>s.locks),currentUserId=useEditorStore(s=>s.currentUserId),tracks=useEditorStore(s=>s.tracks);
+  const clip=useEditorStore(s=>s.clips.find(c=>c.id===s.selectedClipId)),playhead=usePanelPlayhead(Object.keys(clip?.keyframes??{}).length>0),locks=useEditorStore(s=>s.locks),currentUserId=useEditorStore(s=>s.currentUserId),tracks=useEditorStore(s=>s.tracks);
   const gesture=useRef(''),lease=useRef<ReturnType<typeof setInterval>|undefined>(undefined),s=useEditorStore.getState;
   useEffect(()=>()=>{clearInterval(lease.current);if(clip)s().releaseLock(clip.id,'shapeDocument');},[clip?.id]);
   if(!clip||!isShape(clip))return null;

@@ -1411,6 +1411,15 @@ export const useEditorStore = create<EditorStore>((set, get) => {
   };
 });
 
+// Panels that only display playhead-dependent values (animated properties, a comment's time) would otherwise
+// re-render on every playback frame; while playing they follow the playhead in quarter-second steps.
+export const PANEL_PLAYHEAD_STEP = .25;
+export const panelPlayhead = (s: Pick<EditorStore, 'playing' | 'playhead'>) => s.playing ? Math.floor(s.playhead / PANEL_PLAYHEAD_STEP) * PANEL_PLAYHEAD_STEP : s.playhead;
+/** `needed` false (nothing keyframed) subscribes to nothing that moves. */
+export const usePanelPlayhead = (needed = true) => useEditorStore(s => needed ? panelPlayhead(s) : 0);
+/** Editing overlays hide while playing, so they never need the moving playhead. */
+export const usePausedPlayhead = () => useEditorStore(s => s.playing ? -1 : s.playhead);
+
 // ponytail: localStorage has a small size ceiling; use the server database for large projects.
 export const persistedKeys = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs', 'users', 'currentUserId', 'settings'] as const;
 export const persistentState = (state: EditorStore): PersistedState => Object.fromEntries(persistedKeys.map(key => [key, state[key]])) as unknown as PersistedState;

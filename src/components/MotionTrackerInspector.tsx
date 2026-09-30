@@ -9,7 +9,8 @@ import {attachLayer,followCamera,loadSourceTimes,openTrackerEditor,refreshLinks,
 import './motionTracker.css';
 
 export default function MotionTrackerInspector({clip}:{clip:Clip}){
-  const s=useEditorStore(),[capability,setCapability]=useState<TrackerCapabilities|null>(null);
+  // Actions from getState and narrow selectors: a whole-store subscription re-rendered this on every playback frame.
+  const s=useEditorStore.getState(),[capability,setCapability]=useState<TrackerCapabilities|null>(null);
   useEffect(()=>{let live=true;void trackerCapabilities().then(value=>{if(live)setCapability(value);});return()=>{live=false;};},[]);
   const trackers=clip.motionTrackers??[],root=useRef<HTMLDivElement>(null);
   // A clip's first frame table read scans the whole original (about 20 s for 4K). Start it once Tracking is open, so
@@ -19,7 +20,7 @@ export default function MotionTrackerInspector({clip}:{clip:Clip}){
     const warm=()=>{if(section.open)void loadSourceTimes(clip).catch(()=>{});};
     warm();section.addEventListener('toggle',warm);return()=>section.removeEventListener('toggle',warm);
   },[capability?.available,clip.id,clip.mediaId]);
-  const locked=!!s.tracks.find(t=>t.id===clip.trackId)?.locked||s.locks.some(l=>l.targetId===clip.id&&l.userId!==s.currentUserId&&l.expiresAt>Date.now()&&['*','motionTrackers'].includes(l.field));
+  const locked=useEditorStore(s=>!!s.tracks.find(t=>t.id===clip.trackId)?.locked||s.locks.some(l=>l.targetId===clip.id&&l.userId!==s.currentUserId&&l.expiresAt>Date.now()&&['*','motionTrackers'].includes(l.field)));
   const add=()=>{const id=s.addMotionTracker(clip.id);if(id)openTrackerEditor(clip.id,id);};
   return <div className="motion-trackers" ref={root}>
     {capability&&!capability.available&&<p className="motion-tracker-warning" role="status">{capability.reason} Trackers and their points are saved.</p>}
@@ -30,7 +31,7 @@ export default function MotionTrackerInspector({clip}:{clip:Clip}){
 }
 
 function TrackerCard({clip,tracker,locked,available}:{clip:Clip;tracker:MotionTracker;locked:boolean;available:boolean}){
-  const s=useEditorStore(),editor=useTrackerEditor(),samples=useTrackerSamples(clip.projectId,tracker.result?.key);
+  const s=useEditorStore.getState(),clips=useEditorStore(s=>s.clips),editor=useTrackerEditor(),samples=useTrackerSamples(clip.projectId,tracker.result?.key);
   const [panel,setPanel]=useState<'layer'|'camera'|null>(null),[busy,setBusy]=useState(false);
   const path=useMemo(()=>trackerPath(tracker,samples),[tracker,samples]);
   const job=editor.job?.clipId===clip.id&&editor.job.trackerIds.includes(tracker.id)?editor.job:null,running=!!job&&['starting','queued','running'].includes(job.status);
@@ -38,7 +39,7 @@ function TrackerCard({clip,tracker,locked,available}:{clip:Clip;tracker:MotionTr
   const tracked=path.filter(p=>p.flag!==1).length;
   const summary=!path.length?'Not placed yet.':`${tracked} frame${tracked===1?'':'s'} tracked · ${tracker.keys.length} placed${bridged?` · ${bridged} bridged`:''}${doubtful?` · ${doubtful} doubtful`:''}`;
   const quick=(direction:1|-1)=>{openTrackerEditor(clip.id,tracker.id);void runTracker([tracker.id],direction);};
-  const links=(tracker.links??[]).filter(link=>linkApplies(clip,link,s.clips));
+  const links=(tracker.links??[]).filter(link=>linkApplies(clip,link,clips));
   const run=async(action:()=>Promise<unknown>)=>{setBusy(true);try{await action();}finally{setBusy(false);}};
   return <div className="motion-tracker-card" style={{'--tracker':tracker.color} as CSSProperties}>
     <div className="motion-tracker-card-head"><Crosshair size={13} color={tracker.color}/><input aria-label="Tracker name" value={tracker.name} disabled={locked} onChange={e=>{if(e.target.value.trim())s.updateMotionTracker(clip.id,tracker.id,{name:e.target.value.slice(0,80)},`rename-${tracker.id}`);}}/>
@@ -49,7 +50,7 @@ function TrackerCard({clip,tracker,locked,available}:{clip:Clip;tracker:MotionTr
     <div className="motion-tracker-apply"><button aria-pressed={panel==='layer'} disabled={!path.length} onClick={()=>setPanel(panel==='layer'?null:'layer')}><Link2 size={13}/>Attach layer</button><button aria-pressed={panel==='camera'} disabled={!path.length} onClick={()=>setPanel(panel==='camera'?null:'camera')}><Video size={13}/>Camera follow</button></div>
     {panel==='layer'&&<LayerForm clip={clip} tracker={tracker} busy={busy} run={run}/>}
     {panel==='camera'&&<CameraForm clip={clip} tracker={tracker} busy={busy} run={run}/>}
-    {links.length>0&&<ul className="motion-tracker-links" aria-label={`Layers ${tracker.name} moves`}>{links.map(link=>{const target=s.clips.find(c=>c.id===link.clipId)!;return <li key={link.clipId}><span title={target.name}>{link.target==='camera'?'This clip · camera follow':`${target.name} · attached`}</span>
+    {links.length>0&&<ul className="motion-tracker-links" aria-label={`Layers ${tracker.name} moves`}>{links.map(link=>{const target=clips.find(c=>c.id===link.clipId)!;return <li key={link.clipId}><span title={target.name}>{link.target==='camera'?'This clip · camera follow':`${target.name} · attached`}</span>
       <button disabled={busy||locked} title="Apply the current track again" onClick={()=>void run(()=>link.target==='camera'?followCamera(clip.id,tracker.id,link.camera!):attachLayer(clip.id,tracker.id,link.clipId,link.layer!))}>Update</button>
       <button disabled={busy||locked} title="Stop following the track; the keyframes stay" onClick={()=>unlink(clip.id,tracker.id,link.clipId)}>Unlink</button></li>;})}</ul>}
     {links.length>1&&<button disabled={busy||locked} onClick={()=>void run(()=>refreshLinks(clip.id,tracker.id))}>Update all linked layers</button>}
@@ -58,15 +59,14 @@ function TrackerCard({clip,tracker,locked,available}:{clip:Clip;tracker:MotionTr
 
 /** Layers that are on screen while the tracked clip plays, text and shapes first. */
 function useTargets(clip:Clip){
-  const s=useEditorStore(),graphic=(c:Clip)=>Number(c.mediaId==='frameline-title'||c.mediaId==='frameline-shape');
-  return s.clips.filter(c=>c.id!==clip.id&&c.timelineId===clip.timelineId&&!isCaption(c)&&s.tracks.find(t=>t.id===c.trackId)?.kind==='video'&&c.start<clip.start+clip.duration&&c.start+c.duration>clip.start)
+  const clips=useEditorStore(s=>s.clips),tracks=useEditorStore(s=>s.tracks),graphic=(c:Clip)=>Number(c.mediaId==='frameline-title'||c.mediaId==='frameline-shape');
+  return clips.filter(c=>c.id!==clip.id&&c.timelineId===clip.timelineId&&!isCaption(c)&&tracks.find(t=>t.id===c.trackId)?.kind==='video'&&c.start<clip.start+clip.duration&&c.start+c.duration>clip.start)
     .sort((a,b)=>graphic(b)-graphic(a)||a.start-b.start);
 }
 
 function LayerForm({clip,tracker,busy,run}:{clip:Clip;tracker:MotionTracker;busy:boolean;run:(action:()=>Promise<unknown>)=>Promise<void>}){
-  const s=useEditorStore(),targets=useTargets(clip);
-  const playhead=s.playhead,atPlayhead=targets.find(c=>c.start<=playhead&&c.start+c.duration>playhead);
-  const [targetId,setTargetId]=useState(()=>atPlayhead?.id??targets[0]?.id??'');
+  const targets=useTargets(clip);
+  const [targetId,setTargetId]=useState(()=>{const playhead=useEditorStore.getState().playhead;return targets.find(c=>c.start<=playhead&&c.start+c.duration>playhead)?.id??targets[0]?.id??'';});
   const link=tracker.links?.find(l=>l.clipId===targetId&&l.target==='layer');
   const [options,setOptions]=useState<MotionTrackerLayerOptions>(()=>link?.layer??defaultLayerOptions);
   useEffect(()=>{setOptions(tracker.links?.find(l=>l.clipId===targetId&&l.target==='layer')?.layer??defaultLayerOptions);},[targetId]);
