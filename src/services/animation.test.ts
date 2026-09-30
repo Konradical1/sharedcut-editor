@@ -27,7 +27,7 @@ test('animation evaluation, text/effect discovery, Bézier handles, holds and sp
  const cut={...reversing,...trimAnimation(reversing,11,3),start:11,duration:3};
  assert.ok(Math.abs(cut.sourceIn+animatedSourceOffset(cut,1)-reversing.sourceIn-animatedSourceOffset(reversing,2))<1e-6);
  assert.equal(fadeLevel({...clip,properties:{fadeIn:4,fadeOut:4}},12),.25);
- assert.throws(()=>validateKeyframes({'properties.opacity':[{...keys(0,1)[0],curve:[1,0,0,1]}]}));
+ assert.throws(()=>validateKeyframes({'properties.opacity':[{...keys(0,1)[0],curve:[1,0,1.2,1]}]}));
  assert.throws(()=>validateKeyframes({'properties.__proto__.x':keys(0,1)}));
  assert.throws(()=>validateKeyframes({'properties.opacity':[keys(0,1)[0],keys(0,1)[0]]}));
  store.setState({clips:s().clips.map(c=>c.id===clip.id?clip:c),playhead:11});s().updateProperty(clip.id,'opacity',25);
@@ -69,4 +69,17 @@ test('gap deletion is track-only, atomic, undoable and respects locks; timing an
  assert.ok(Math.abs(picture.duration-1.25)<1e-6);assert.ok(Math.abs(audio.duration-1.25)<1e-6);
  s().setKeyframes(a.id,'properties.speed',[]);assert.equal(s().clips.find(c=>c.id===partner.id)!.keyframes?.['properties.speed'],undefined);
  } finally {store.setState(baseline,true);}
+});
+
+test('easeInOutCubic and easeOutBack handles validate, keep time monotonic and overshoot where drawn',()=>{
+ for(const curve of [[.65,0,.35,1],[.68,-.6,.32,1.6],[.34,1.56,.64,1]] as [number,number,number,number][]) {
+  assert.doesNotThrow(()=>validateKeyframes({'properties.zoom':[{id:'a',time:0,value:100,interpolation:'bezier',curve},{id:'b',time:1,value:120,interpolation:'linear'}]}));
+  const x=(t:number)=>3*(1-t)**2*t*curve[0]+3*(1-t)*t*t*curve[2]+t**3;
+  for(let i=1;i<=100;i++)assert.ok(x(i/100)>=x((i-1)/100)-1e-12,'time never runs backwards');
+  assert.ok(Math.abs(ease(0,curve))<1e-6&&Math.abs(ease(1,curve)-1)<1e-6);
+ }
+ const inOut=Array.from({length:101},(_,i)=>ease(i/100,[.65,0,.35,1]));
+ assert.ok(inOut.every((v,i)=>!i||v>=inOut[i-1]-1e-9),'easeInOutCubic is monotonic');
+ assert.ok(Array.from({length:99},(_,i)=>ease((i+1)/100,[.34,1.56,.64,1])).some(v=>v>1.02),'easeOutBack overshoots');
+ assert.throws(()=>validateKeyframes({'properties.zoom':[{id:'a',time:0,value:1,interpolation:'bezier',curve:[1.2,0,.5,1]},{id:'b',time:1,value:2,interpolation:'linear'}]}));
 });

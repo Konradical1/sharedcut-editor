@@ -35,7 +35,7 @@ export function validateKeyframes(channels: unknown): asserts channels is NonNul
     let previous = -Infinity; const ids = new Set();
     for (const key of keys) {
       if (++count > 20000 || !key || typeof key.id !== 'string' || key.id.length > 160 || ids.has(key.id) || !Number.isFinite(key.time) || Math.abs(key.time) > 86400 || key.time <= previous || !['number','string','boolean'].includes(typeof key.value) || typeof key.value === 'number' && (!Number.isFinite(key.value) || Math.abs(key.value) > 1e9) || typeof key.value === 'string' && key.value.length > 10000 || !['linear','hold','bezier'].includes(key.interpolation)) throw new Error('Invalid keyframe.');
-      if (key.curve !== undefined && (!Array.isArray(key.curve) || key.curve.length !== 4 || key.curve.some((n: unknown) => typeof n !== 'number' || !Number.isFinite(n) || Math.abs(n) > 10) || key.curve[0] < 0 || key.curve[0] > 1 || key.curve[2] < 0 || key.curve[2] > 1 || key.curve[0] > key.curve[2])) throw new Error('Invalid Bézier handles.');
+      if (key.curve !== undefined && (!Array.isArray(key.curve) || key.curve.length !== 4 || key.curve.some((n: unknown) => typeof n !== 'number' || !Number.isFinite(n) || Math.abs(n) > 10) || key.curve[0] < 0 || key.curve[0] > 1 || key.curve[2] < 0 || key.curve[2] > 1)) throw new Error('Invalid Bézier handles.');
       ids.add(key.id); previous = key.time;
     }
   }

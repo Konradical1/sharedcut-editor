@@ -41,7 +41,8 @@ export default function KeyframeLanes({ clips, pixels, width, visibleStart, visi
     } else {
       const next=keys[g.index+1];if(!next||typeof key.value!=='number'||typeof next.value!=='number')return;
       const curve=[...(key.curve??linearCurve)] as [number,number,number,number],index=g.kind==='out'?0:2;
-      curve[index]=Math.max(index===0?0:curve[0],Math.min(index===0?curve[2]:1,curve[index]+dx/((next.time-key.time)*pixels)));
+      // Time handles only need [0,1] to keep x(t) monotonic; crossing them is how easeInOut/Back curves are drawn.
+      curve[index]=Math.max(0,Math.min(1,curve[index]+dx/((next.time-key.time)*pixels)));
       curve[index+1]=Math.max(-10,Math.min(10,curve[index+1]-dy/110*g.range/(next.value-key.value||g.range)));
       key.interpolation='bezier';key.curve=curve;
     }
