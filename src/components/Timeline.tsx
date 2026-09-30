@@ -65,11 +65,18 @@ function TimelineTime({ fps, color }: { fps?: number; color: string }) {
   return <span className="timeline-time mono" style={{ color }}>{label}</span>;
 }
 
-function TimelinePlayheads({ pixels, color, scrub, scrubMove }: { pixels: number; color: string; scrub: (e: PointerEvent<HTMLDivElement>) => void; scrubMove: (e: PointerEvent<HTMLDivElement>) => void }) {
-  const s = useEditorStore(useShallow(s => ({ playhead: s.playhead, presence: s.presence, users: s.users, timelineId: s.timelineId, projectId: s.projectId, workspace: s.workspace, currentUserId: s.currentUserId, showPlayheads: s.settings.showPlayheads !== false })));
+type PlayheadProps = { pixels: number; color: string; scrub: (e: PointerEvent<HTMLDivElement>) => void; scrubMove: (e: PointerEvent<HTMLDivElement>) => void };
+// Only the local playhead follows every playback frame; remote playheads re-render on presence changes.
+function LocalPlayhead({ pixels, color, scrub, scrubMove }: PlayheadProps) {
+  const playhead = useEditorStore(s => s.playhead);
+  return <div className="local-playhead" onPointerDown={scrub} onPointerMove={scrubMove} style={{ left: 164, transform: `translateX(${playhead * pixels}px)`, '--user-color': color } as CSSProperties}><span/></div>;
+}
+function TimelinePlayheads(props: PlayheadProps) {
+  const { pixels } = props;
+  const s = useEditorStore(useShallow(s => ({ presence: s.presence, users: s.users, timelineId: s.timelineId, projectId: s.projectId, workspace: s.workspace, currentUserId: s.currentUserId, showPlayheads: s.settings.showPlayheads !== false })));
   return <>
     {s.showPlayheads && s.presence.filter(p => p.activity === s.workspace && p.projectId === s.projectId && (!p.timelineId || p.timelineId === s.timelineId) && p.userId !== s.currentUserId && p.online).map(p => { const user = s.users.find(u => u.id === p.userId); return <RemotePlayhead key={`${p.userId}:${s.timelineId}`} person={p} pixels={pixels} color={user?.color} name={user?.name}/>; })}
-    <div className="local-playhead" onPointerDown={scrub} onPointerMove={scrubMove} style={{ left: 164, transform: `translateX(${s.playhead * pixels}px)`, '--user-color': color } as CSSProperties}><span/></div>
+    <LocalPlayhead {...props}/>
   </>;
 }
 

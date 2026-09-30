@@ -17,6 +17,9 @@ function ShapeOverlay(){
   const [editing,setEditing]=useState<string|null>(null),[selectedPoint,setSelectedPoint]=useState<number|null>(null),[draft,setDraft]=useState<ShapeDocument|null>(null),[pen,setPen]=useState<ShapePoint[]>([]),[guides,setGuides]=useState<SnapGuide[]>([]);
   const root=useRef<SVGSVGElement>(null),drag=useRef<Drag|null>(null),penRef=useRef<ShapePoint[]>([]),s=useEditorStore.getState;
   const [width,height]=projectSize(project?.resolution??'1920 × 1080');
+  // Handles are sized from the on-screen canvas width at render; memoized, so re-measure when the canvas resizes or the viewer zooms (a transform on the frame).
+  const [,remeasure]=useState(0);
+  useEffect(()=>{const el=root.current;if(!el)return;const bump=()=>remeasure(n=>n+1),resize=new ResizeObserver(bump),zoom=new MutationObserver(bump),frame=el.closest('.viewer-frame');resize.observe(el);if(frame)zoom.observe(frame,{attributes:true,attributeFilter:['style']});return()=>{resize.disconnect();zoom.disconnect();};},[]);
   const selectedShape=clips.find(c=>c.id===selectedId&&isShape(c));
   const visible=clips.filter(c=>c.timelineId===timelineId&&isShape(c)&&!c.disabled&&c.start<=playhead&&c.start+c.duration>playhead&&!tracks.find(t=>t.id===c.trackId)?.hidden).sort((a,b)=>(tracks.find(t=>t.id===b.trackId)?.number??0)-(tracks.find(t=>t.id===a.trackId)?.number??0));
   const framePoint=(e:{clientX:number;clientY:number}):XY=>{const p=root.current!.createSVGPoint();p.x=e.clientX;p.y=e.clientY;const q=p.matrixTransform(root.current!.getScreenCTM()!.inverse());return{x:q.x/width,y:q.y/height};};

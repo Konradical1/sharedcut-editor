@@ -30,6 +30,9 @@ function TextOverlay() {
   };
   useEffect(()=>{const key=(e:KeyboardEvent)=>{if(e.key==='Escape'){finish(true);setEditing(null);useEditorStore.setState({textTool:false});}};window.addEventListener('keydown',key);return()=>window.removeEventListener('keydown',key);});
   useEffect(()=>{setEditing(null);return()=>{const d=drag.current;if(d?.id)s().releaseLock(d.id,'textDocument');useEditorStore.setState({textPreview:[]});};},[timelineId]);
+  // The popover unmounts while playing (no paused playhead); remounting on pause would focus and select-all its text,
+  // so the next Space would overwrite the title. Playing ends the edit instead.
+  useEffect(()=>{if(playing)setEditing(null);},[playing]);
   const begin = (e:PointerEvent, id?: string, mode='move') => {
     if(e.button!==0||playing||shapeTool)return;
     e.preventDefault();e.stopPropagation();const evaluated=id?evaluateClip(clips.find(c=>c.id===id)!,playhead):undefined,frame=point(e),p=evaluated?textLocalPoint(frame,evaluated.properties,projectWidth,projectHeight):{x:Math.max(0,Math.min(1,frame.x)),y:Math.max(0,Math.min(1,frame.y))};

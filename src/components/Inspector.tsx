@@ -101,7 +101,9 @@ export function Property({ name, label, initial=0, min, max, step=1, suffix, eff
       const fps=store().projects.find(p=>p.id===clip.projectId)?.fps??24,time=frameTime(Math.max(0,Math.min(clip.duration-1/fps,store().playhead-clip.start)),fps),keys=clip.keyframes[path],existing=keys.find(k=>Math.abs(k.time-time)<.5/fps);
       useEditorStore.setState({clipPreview:{...clip,keyframes:{...clip.keyframes,[path]:[...keys.filter(k=>k!==existing),{id:existing?.id??'preview',time,value:current.next,interpolation:existing?.interpolation??'linear',...(existing?.curve?{curve:existing.curve}:{})}].sort((a,b)=>a.time-b.time)}}});return;
     }
-    useEditorStore.setState({clipPreview:effectId?{...evaluated,keyframes:undefined,effects:evaluated.effects.map(e=>e.id===effectId?{...e,...(name==='amount'?{amount:current.next}:{parameters:{...e.parameters,[name]:current.next}})}:e)}:{...evaluated,keyframes:undefined,properties:{...evaluated.properties,[name]:current.next}}});
+    // `playhead` is a constant 0 for an unkeyframed property; the frozen preview must pose the clip's other animation at the real playhead.
+    const live=evaluateClip(clip,store().playhead);
+    useEditorStore.setState({clipPreview:effectId?{...live,keyframes:undefined,effects:live.effects.map(e=>e.id===effectId?{...e,...(name==='amount'?{amount:current.next}:{parameters:{...e.parameters,[name]:current.next}})}:e)}:{...live,keyframes:undefined,properties:{...live.properties,[name]:current.next}}});
   };
   const finish = (e: PointerEvent<HTMLElement>) => {
     if(!drag.current)return;move(e);const moved=drag.current.moved;end(true);
