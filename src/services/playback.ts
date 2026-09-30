@@ -695,7 +695,10 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if (!sourceWidth || !sourceHeight) continue;
       layerContext.clearRect(0, 0, width, height);
       const fit = Math.min(width / sourceWidth, height / sourceHeight);
+      // Mirrored before the transform, like the export's hflip ahead of crop and zoom.
+      if (clip.properties.flipH) { layerContext.save(); layerContext.translate(width, 0); layerContext.scale(-1, 1); }
       layerContext.drawImage(queuedFrame??element, (width - sourceWidth * fit) / 2, (height - sourceHeight * fit) / 2, sourceWidth * fit, sourceHeight * fit);
+      if (clip.properties.flipH) layerContext.restore();
       if (options.compare) draw(referenceTarget, clip, width, height, projectWidth, projectHeight,time);
       // While the analysis runs, hold the original at the crop the solve will apply so the framing never jumps.
       const framed = stabilizeFx && !stabilizeSolveFor ? {...clip, properties:{...clip.properties, zoom: Number(clip.properties.zoom ?? 100) * stabilizeZoom(stabilizeSettings(original, stabilizeFx))}} : clip;

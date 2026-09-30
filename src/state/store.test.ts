@@ -914,3 +914,10 @@ test('Use ACES 2 output snapshots the grade and switches only the clipping displ
   assert.equal(state().snapshots.length, snapshots + 1); assert.equal(state().snapshots[0].name, `Before ACES output: ${clip().name}`);
   state().useAcesOutput('c3'); assert.equal(state().snapshots.length, snapshots + 1, 'nothing left to upgrade');
 });
+
+test('horizontal flip is an undoable clip property', () => {
+  state().updateProperty('c3', 'flipH', true);
+  assert.equal(clip().properties.flipH, true);
+  state().undo();
+  assert.ok(!clip().properties.flipH);
+});
