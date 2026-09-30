@@ -21,3 +21,6 @@ __pycache__/
 .venv-stabilize/
 
 .venv-flow/
+
+# agent session cookies (scripts/agent/agent-session.mjs)
+cookie.txt
