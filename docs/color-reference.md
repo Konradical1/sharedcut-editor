@@ -1,5 +1,27 @@
 # Color pipeline investigation and validation — September 13, 2026
 
+## Update — September 26, 2026: camera metadata, YUV matrix, missing tone mapping
+
+Report: Sony ZV-E10M2 S-Log3 clips (FischMedia2026Reel C0518, C0539) looked washed out and too bright.
+
+- **Detection missed the Sony profile.** Import scanned only the first 2 MB; some Sony clips write their NonRealTimeMeta XML at the end. C0518, C0539, C0363 and C0181 were labelled untagged. (C0363 was recorded below as having no identifier; its XML says `s-log3-cine`.) All 120 Sony clips record S-Log3 / S-Gamut3.Cine / rec709 matrix.
+- **Wrong YUV matrix.** Untagged streams fell back to BT.601. The grading proxy baked in a 601→709 conversion (proxy luma depended on chroma: `Y' = 0.859Y − 0.102Cb − 0.183Cr + 210`), and export decoded with BT.601. Greens came out brighter and yellower.
+- **No tone mapping.** With the source labelled Rec.709, "Start wide-gamut grade" chose a technical Output CST. After the Input CST was set to S-Log3 by hand, 21–27% of each frame clipped at scene linear 1.0.
+- **Canon was guessed, not read.** Canon Log 3 was assumed from the container brand. It is now read from maker-note LogInfo (tag 0x4026). All 170 Canon clips (95 EOS R6 Mark II, 75 EOS R6) record Canon Log 3 / Cinema Gamut / Neutral, so no grade changes.
+
+Fix: `server/cameraMetadata.ts` reads Sony XML (start or end of the file) and Canon maker notes, and never guesses. Existing assets are re-checked once on startup; an asset whose matrix was `auto` gets `bt709` and a rebuilt grading proxy. A log input that ends in an untone-mapped Rec.709 output shows **Use ACES 2 output** (snapshot first).
+
+Evidence (`artifacts/qa/color-camera-2026-09-26/`): independent reference = own YUV decoder + OpenColorIO 2.5.2 camera transforms + ACES 2.0 SDR, mean absolute error on 40×40 block means in 8-bit codes.
+
+| Frame | Before | After |
+|---|---|---|
+| C0518 preview vs ACES 2 reference | 43.3 (mean luma 187 vs 139, 27.5% clipped) | 0.73 (p99 2.7), luma 139 |
+| C0518 export | 1.71 vs BT.709 reference, 0.41 vs BT.601 | 0.36 (p99 0.9) |
+| C0539 preview / export | — | 0.66 / 0.24 |
+| Canon R6 7V5A6057 preview / export vs Canon IDT (D55) + ACES 2 | 0.73 / 0.29 (already correct) | unchanged |
+
+Nominal-D65 Cinema Gamut matches Canon's own D55 IDT to under one code on this frame. Displays: the preview converts ACES Gamma 2.4 output to sRGB for the monitor; exports carry Rec.709 / Gamma 2.4 values, which some computer players show with lifted shadows.
+
 The reported problems were reproduced from the original media and existing grades before modifying the pipeline. Screenshots alone cannot establish a camera transfer function, HDR format, or correct white balance.
 
 ## Findings

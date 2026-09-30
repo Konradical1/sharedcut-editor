@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Clip, MediaAsset, Track } from '../state/models.ts';
 import { gradeValues } from './grade.ts';
-import { efficientPlayback, gradePixels, playbackLayers, playbackUrl, projectSize, sourceTime } from './playback.ts';
+import { efficientPlayback, focusClip, gradePixels, playbackLayers, playbackUrl, projectSize, sourceTime } from './playback.ts';
 
 test('preview quality selects a smaller stream, audio selects its own stream, and old imports fall back', () => {
   const asset = { sourceUrl: '/original', proxyUrl: '/full', proxyVariants: { '1/2': '/half', '1/4': '/quarter' }, audioProxyUrl: '/audio' } as unknown as MediaAsset;
@@ -98,7 +98,7 @@ test('scrubbing retains decoded pictures and reuses decoders while coalescing se
     state.playhead = 2; nextFrame(); state.playhead = 3; nextFrame();
     assert.equal(canvas.paints, painted, 'A seek must leave the last completed picture intact.');
     assert.deepEqual(videos[0].seeks, [1+.5/24], 'A pending decode is not repeatedly canceled.');
-    assert.deepEqual(statuses.at(-1), { title: 'Loading picture…', detail: 'Test video · Seeking frame', loading: true }, 'A pending decode reports the blocking clip while retaining its last picture.');
+    assert.equal(statuses.at(-1), null, 'A quick paused seek is a scrub, not buffering: the viewer stays clean.');
     now += 701; nextFrame(); assert.deepEqual(statuses.at(-1), { title: 'Loading picture…', detail: 'Test video · Seeking frame', loading: true }, 'A slow decode continues to report the blocking clip.');
     videos[0].finishSeek(); nextFrame();
     assert.equal(canvas.paints, painted + 1, 'Paint the completed frame before seeking again.');
@@ -196,4 +196,19 @@ test('a fractional-frame cut selects the incoming picture on the cut, without re
   const state={projectId:'p',timelineId:'t',playhead:360/(24000/1001),clips:[clip,incoming],tracks:[{id:'v',timelineId:'t',kind:'video',number:1}] as Track[],media:[{id:'m',kind:'video'}] as MediaAsset[]};
   assert.deepEqual(playbackLayers(state,24000/1001).map(l=>l.clip.id),['in']);
   assert.deepEqual(playbackLayers({...state,playhead:state.playhead-1/(24000/1001)},24000/1001).map(l=>l.clip.id),['out']);
+});
+
+test("a frame editor reads its clip untransformed at any source second, playing through at the clip's own rate", () => {
+  const asset = { duration: 20, fps: 60 } as MediaAsset;
+  const clip = { id: 'c', projectId: 'p', timelineId: 't', trackId: 'v1', mediaId: 'm', start: 10, duration: 4, sourceIn: 3, disabled: true, properties: { speed: 50, x: 300, zoom: 180 }, effects: [{ name: 'Smart Mask' }], keyframes: { 'properties.x': [] } } as unknown as Clip;
+  // The engine asks for source second t at timeline second t·100/speed.
+  const focus = focusClip(clip, asset), at = (source: number) => sourceTime(focus, source * 100 / Number(focus.properties.speed), 60, asset.duration);
+  for (const source of [0, 1 / 60, 7.25, 19.9]) assert.ok(Math.abs(at(source) - source) < 1e-9, `source ${source} reads itself`);
+  assert.equal(focus.properties.speed, 50, 'a constant speed keeps its rate so playback runs through without seeking');
+  assert.deepEqual([focus.effects, focus.keyframes, focus.disabled, focus.properties.x], [[], undefined, false, 300]);
+  for (const properties of [{ speed: 50, reverse: true }, { speed: 300, freeze: true }] as Clip['properties'][]) assert.equal(focusClip({ ...clip, properties }, asset).properties.speed, 100, 'reversed or frozen clips read forward at 100%');
+  assert.equal(focusClip({ ...clip, keyframes: { 'properties.speed': [] } } as unknown as Clip, asset).properties.speed, 100, 'a speed ramp reads at 100%');
+  const ramp = focusClip({ ...clip, keyframes: { 'properties.speed': [] } } as unknown as Clip, asset, 400);
+  assert.equal(ramp.properties.speed, 400, 'playing a ramp, the rate it has reached drives the decoder');
+  assert.ok(Math.abs(sourceTime(ramp, 7.25 * 100 / 400, 60, asset.duration) - 7.25) < 1e-9, 'and still reads the asked source second');
 });

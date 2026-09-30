@@ -1,0 +1,48 @@
+/* A frame editor (motion tracker, Smart Mask) open in the viewer: one bar above the picture, one strip below it. */
+.viewer-focus-bar:empty,.viewer-focus-strip:empty{display:none}
+/* The status line rides just above the strip, over the bottom of the picture, so a zoomed picture never scrolls it away. */
+.viewer-focus-strip{position:relative;z-index:30}
+.focus-bar,.focus-strip-row{display:flex;align-items:center;gap:6px;padding:4px 8px;font-size:10px;color:#b9c6cb;flex-shrink:0}
+.focus-bar{min-height:34px;background:#1d2326;border-bottom:1px solid #2b3438;flex-wrap:wrap;position:relative;z-index:40}
+.focus-strip-row{min-height:26px;background:#171b1d;border-top:1px solid #252d31}
+.focus-bar button,.focus-strip-row button,.focus-more>summary{display:inline-flex;align-items:center;justify-content:center;gap:4px;height:26px;min-width:26px;padding:0 7px;background:#293135;color:#dfe9eb;border:1px solid #3a4448;border-radius:4px;font-size:10px;white-space:nowrap;cursor:pointer}
+.focus-strip-row button{height:22px;padding:0 6px}
+.focus-bar button:hover:not(:disabled),.focus-strip-row button:hover:not(:disabled),.focus-more>summary:hover{background:#323c41}
+.focus-bar button:disabled,.focus-strip-row button:disabled{opacity:.38;cursor:not-allowed}
+.focus-bar button:focus-visible,.focus-strip-row button:focus-visible,.focus-more>summary:focus-visible{outline:2px solid #8eefca;outline-offset:1px}
+.focus-bar select{font-size:10px;height:26px;background:#20272b;border:1px solid #3a4448;border-radius:4px;padding:0 5px;color:#e0e9ec;max-width:190px}
+.focus-title{display:inline-flex;align-items:center;gap:6px;min-width:0}
+.focus-title strong{font-size:11px;color:#e8f0f2;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.focus-group{display:inline-flex;background:#14181a;border:1px solid #30393d;border-radius:6px;padding:2px;gap:1px}
+.focus-bar .focus-group button{height:24px;min-width:28px;border:0;background:transparent;color:#b3c0c5;padding:0 6px}
+.focus-bar .focus-group button:hover:not(:disabled){background:#283034;color:#f0f6f7}
+.focus-bar .focus-group button[aria-pressed=true]{background:#2f3a40;color:var(--tool,#f2fbf8);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--tool,#8be0c0) 55%,transparent)}
+.focus-bar progress{width:80px;height:5px;accent-color:#8be0c0}
+.focus-bar .focus-done{background:#265a4c;border-color:#3f8b75;color:#e6fff6;padding:0 10px}
+.focus-bar .focus-done:hover:not(:disabled){background:#2e6b5a}
+.focus-more{position:relative}
+.focus-more>summary{list-style:none}
+.focus-more>summary::-webkit-details-marker{display:none}
+.focus-more[open]>summary{background:#323c41;border-color:#57656a}
+.focus-popover{position:absolute;top:calc(100% + 6px);left:0;z-index:60;min-width:230px;display:flex;flex-direction:column;gap:10px;padding:10px 12px;background:#1f272b;border:1px solid #3a4448;border-radius:6px;box-shadow:0 10px 28px #000a;font-size:11px}
+.focus-popover label{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.focus-popover input[type=range]{flex:1;min-width:80px;accent-color:var(--tracker,#8be0c0)}
+.focus-popover output{font-variant-numeric:tabular-nums;min-width:30px;text-align:right;color:#dfe9eb}
+.focus-popover select{font-size:10px;height:24px;background:#20272b;border:1px solid #3a4448;border-radius:4px;color:#e0e9ec}
+.focus-strip{flex:1;min-width:40px;height:14px;border-radius:3px;cursor:pointer;display:block;touch-action:none}
+.focus-strip:focus-visible{outline:2px solid #8eefca;outline-offset:2px}
+.focus-bar .smart-mask-analyze .smart-mask-go{color:#cff5e9}
+.focus-frame{font-variant-numeric:tabular-nums;color:#a9b8bd;white-space:nowrap}
+
+/* Over the picture, in source pixels: the paused still when zoomed, the matte, then the marks and a status line. */
+.focus-still,.focus-matte,.focus-marks{position:absolute;inset:0;width:100%;height:100%;display:block}
+.focus-still[hidden]{display:none}
+.focus-still,.focus-matte{pointer-events:none}
+.focus-still{z-index:3}.focus-matte{z-index:4}.focus-marks{z-index:5;outline:none}
+.focus-marks:focus-visible{outline:2px solid #8eefca;outline-offset:-2px}
+.focus-status{position:absolute;left:50%;bottom:calc(100% + 8px);transform:translateX(-50%);z-index:6;margin:0;max-width:86%;padding:4px 9px;background:#11161acc;color:#dfe8ea;font-size:10.5px;line-height:1.4;border-radius:4px;border:1px solid #2f393e;text-align:center;pointer-events:none}
+.focus-status.busy::before{content:'';display:inline-block;width:7px;height:7px;margin-right:6px;border-radius:50%;border:1.5px solid #8be0c0;border-top-color:transparent;animation:focus-spin .8s linear infinite;vertical-align:-1px}
+.focus-status.warning{color:#ffd7a8;border-color:#7a5a2e}
+@keyframes focus-spin{to{transform:rotate(360deg)}}
+.viewer-stage.focus-zoomed{overflow:auto;overscroll-behavior:contain;justify-content:safe center;align-items:safe center}
+.viewer-stage.focus-zoomed .viewer-frame{max-width:none;max-height:none;flex:none;margin:auto}

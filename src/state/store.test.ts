@@ -5,6 +5,7 @@ import { createDemoProject } from './demo.ts';
 import { defaultShape, getShape } from '../services/shapes.ts';
 import { evaluateClip } from '../services/animation.ts';
 import type { Keyframe } from './models.ts';
+import { neutralBalance, neutralLook, type LookOption } from '../services/colorAssistant.ts';
 import { LOCK_TTL, mediaService, projectService, renderService, STORAGE_KEY } from '../services/index.ts';
 
 const baseline = store.getState();
@@ -866,4 +867,50 @@ test('a speed keyframe ramp resizes the clip, stopping at the next clip on the t
   assert.ok(Math.abs(clip('lone').duration - 5) < 1e-6, `slowed clip grows only up to the next clip (${clip('lone').duration})`);
   store.setState({ clips: state().clips.filter(c => c.id !== 'next') });
   state().updateProperty('lone', 'speed', 100);
+});
+
+test('Color Assistant apply is one snapshot and one undo across shots; extras are replaced and restored; CSTs and other clips stay untouched', () => {
+  const video = state().clips.filter(c => c.projectId === clip().projectId && c.id !== 'c3' && state().tracks.find(t => t.id === c.trackId)?.kind === 'video');
+  const [a, b, legacy] = [clip('c3'), video[0], video[1]], graded = [a.id, b.id];
+  store.setState({ media: state().media.map(m => [a.mediaId, b.mediaId].includes(m.id) ? { ...m, cameraMetadataVersion: 2, inputProfile: 'S-Log3', inputGamut: 'S-Gamut3.Cine' } : m) });
+  for (const id of graded) { state().updateProperty(id, 'inputProfile', 'S-Log3'); state().updateProperty(id, 'inputGamut', 'S-Gamut3.Cine'); state().initializeColorGrade(id); }
+  const sorted = <T extends { id: string }>(items: T[]) => [...items].sort((x, y) => x.id.localeCompare(y.id));
+  const option = (name: string, contrast: number, extras: number): LookOption => ({ name, intensity: 'bold', description: '', shots: [],
+    look: { ...neutralLook(), contrast, curves: { ...neutralLook().curves, rgb: [{ x: 0, y: 0 }, { x: .5, y: .6 }, { x: 1, y: 1 }] } }, extraNodes: Array.from({ length: extras }, () => ({ ...neutralLook(), saturation: 140 })) });
+  const result = { mode: 'looks' as const, looks: [option('Clean', 1.2, 2), option('Neon', 1.5, 1), option('Bleach', 2, 0)] }, ids = [...graded, legacy.id];
+  const before = structuredClone({ clips: state().clips, nodes: state().nodes }), transforms = () => sorted(state().nodes.filter(n => n.effects?.length));
+  store.setState({ currentUserId: 'non-editor' }); assert.equal(state().applyColorAssistant(result, 0, ids), 0); store.setState({ currentUserId: baseline.currentUserId });
+  assert.equal(state().applyColorAssistant(result, 0, ids), 2, 'the legacy-pipeline shot is skipped');
+  const first = structuredClone({ clips: state().clips, nodes: state().nodes }), snapshots = state().snapshots.length, operations = state().operations.length;
+  assert.equal(state().applyColorAssistant(result, 1, ids), 2);
+  assert.equal(state().snapshots.length, snapshots + 1); assert.equal(state().snapshots[0].name, 'Before Color Assistant: Neon');
+  assert.equal(state().operations.length, operations + 1, 'every shot and node change is one undo entry');
+  for (const id of graded) {
+    const nodes = state().nodes.filter(n => n.clipId === id).sort((x, y) => x.order! - y.order!);
+    assert.deepEqual(nodes.map(n => n.name), ['Input CST', 'Balance', 'Look', 'Look 2', 'Output CST']);
+    assert.equal(nodes[2].parameters.contrast, 1.5); assert.equal(nodes[2].curves!.RGB!.points.length, 3); assert.equal(nodes[3].parameters.saturation, 140); assert.ok(nodes[3].id.startsWith('ai-look-'));
+  }
+  assert.deepEqual(transforms(), sorted(before.nodes.filter(n => n.effects?.length)), 'CST nodes are never written');
+  assert.deepEqual(state().clips, first.clips); assert.deepEqual(sorted(state().nodes.filter(n => !graded.includes(n.clipId))), sorted(before.nodes.filter(n => !graded.includes(n.clipId))));
+  state().undo();
+  assert.deepEqual(sorted(state().nodes), sorted(first.nodes), 'one undo restores the removed extras and removes the new one');
+  state().undo();
+  assert.deepEqual(sorted(state().nodes), sorted(before.nodes)); assert.deepEqual(state().clips, before.clips);
+  const balance = { ...neutralBalance(), exposure: .5, temperature: -300 };
+  assert.equal(state().applyColorAssistant({ mode: 'balance', shots: [{ clipId: a.id, confidence: 1, warnings: [], rationale: '', balance }] }), 1);
+  const node = state().nodes.find(n => n.clipId === a.id && n.name === 'Balance')!;
+  assert.equal(node.parameters.exposure, .5); assert.equal(node.parameters.temperature, -300); assert.equal(state().snapshots[0].name, 'Before Color Assistant: Balance shots');
+  assert.deepEqual(state().nodes.filter(n => n.clipId === b.id), before.nodes.filter(n => n.clipId === b.id));
+});
+
+test('Use ACES 2 output snapshots the grade and switches only the clipping display transform', () => {
+  state().updateProperty('c3', 'inputProfile', 'S-Log3'); state().initializeColorGrade('c3');
+  const output = state().nodes.find(n => n.clipId === 'c3' && n.name === 'Output CST')!;
+  state().updateNode(output.id, { effects: output.effects!.map(e => e.type === 'cst' ? { ...e, toneMapping: 'shoulder' as const, gamutMapping: 'compress' as const } : e) });
+  const snapshots = state().snapshots.length;
+  state().useAcesOutput('c3');
+  const effect = state().nodes.find(n => n.id === output.id)!.effects![0];
+  assert.equal(effect.type === 'cst' && effect.toneMapping, 'aces2'); assert.equal(effect.type === 'cst' && effect.gamutMapping, 'none');
+  assert.equal(state().snapshots.length, snapshots + 1); assert.equal(state().snapshots[0].name, `Before ACES output: ${clip().name}`);
+  state().useAcesOutput('c3'); assert.equal(state().snapshots.length, snapshots + 1, 'nothing left to upgrade');
 });

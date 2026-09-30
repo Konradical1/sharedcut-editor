@@ -40,8 +40,21 @@ FFMPEG_PATH and FFPROBE_PATH.
 | Optical flow | OpenCV bidirectional dense motion estimation | Exact requested timestamps, freezes, reverse, direction changes, 1% speed; native 16-bit processing and 10-bit export |
 | Smart Mask | SAM 2.1 Large on NVIDIA | Interactive preview, forward/backward tracking, local repairs, clip and color-node masks, tracked-selection export |
 | Stabilization | OpenCV + SciPy | Analysis, cached previews and original-media export |
+| Motion tracking | OpenCV pattern tracker (feature box + search box) | Tracks points on the original frames, forward/backward/one frame at a time; attaches layers or makes the camera follow as keyframes |
 | Color | OpenColorIO 2.5.2 | Existing reference color pipeline and masked export |
 | Link imports | yt-dlp + spotDL | Installed locally; provider/network availability still applies |
+| Export | FFmpeg; NVENC and NVDEC when present | Renders in parallel parts, then joins them losslessly; CPU encoders when no NVIDIA GPU is found |
+
+Exports split the timeline into parts that each decode only the clips on screen in
+their own range, render up to four at once, mix the sound over the whole range in
+one pass, and join the parts without re-encoding. One graph holding every clip used
+to open every 4K decoder at once (32 GB on this 32 GB PC) and overflowed Windows'
+32,767-character command line (`spawn ENAMETOOLONG`). H.264 and H.265 encode on
+NVENC when a probe encode succeeds; `FRAME_LINE_HWENC=off` keeps them on libx264
+and libx265. `FRAME_LINE_EXPORT_JOBS` overrides how many parts run at once. The
+RTX 4070 cannot decode 4:2:2 footage, so Sony 4:2:2 decodes on the CPU here; the
+Lenovo's Blackwell GPU decodes it. Optical flow bakes at the project's canvas size
+and is reused when the same export runs again before the server restarts.
 
 Optical flow runs on the CPU and uses bounded motion-estimation resolution; it
 does not require NVIDIA hardware. It is an offline preparation step, not a
@@ -56,8 +69,14 @@ frame-rate masked exports and combining masks with optical-flow retiming still
 have the existing explicit restrictions; convert to constant frame rate or
 bake the mask first. No restricted matting model was enabled.
 
+Motion tracking reads the original footage (decoded at up to 1920 wide for speed,
+full resolution when the feature box is small) and needs no GPU: pattern matching is
+cheap and decoding is the cost, so NVDEC is used when it can decode the file. On this
+Dell a 4K 10-bit 4:2:2 HEVC shot tracks at about 20–40 frames a second. Tracks are
+content-addressed sample files in `data/motion-trackers/` and travel with project bundles.
+
 `npm run doctor` checks each local worker. Individual installers are
-`setup:captions`, `setup:flow`, `setup:masks`, `setup:stabilize`, `setup:color`, and
+`setup:captions`, `setup:flow`, `setup:masks`, `setup:stabilize`, `setup:tracker`, `setup:color`, and
 `setup:imports`. Each has a FRAME_LINE_*_PYTHON override; optical flow uses
 FRAME_LINE_FLOW_PYTHON. FRAME_LINE_CAPTION_DEVICE accepts auto (default), cpu,
 or cuda (GPU required, useful for tests). The default caption model is large-v3;
@@ -78,6 +97,8 @@ npm run test:masks
 npm run test:masks:inference
 npm run test:masks:browser
 npm run test:stabilize
+npm run test:tracker
+npm run test:tracker:browser
 ```
 
 The inference check uses the real installed SAM model and checks subject pixels,

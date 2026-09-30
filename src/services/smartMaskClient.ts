@@ -1,7 +1,8 @@
 import { create } from 'zustand';
 import { api, connection } from './api';
 import { useEditorStore } from '../state/store';
-import { smartMaskSignature, smartMaskSourceTime, type SmartMaskJob as MaskJob } from './smartMask';
+import { smartMaskSignature, type SmartMaskJob as MaskJob } from './smartMask';
+import { pictureTimeAt } from './motionTracker';
 export type { SmartMaskJob as MaskJob, SmartMaskCapabilities as MaskCapabilities } from './smartMask';
 
 export type MaskTool = 'include' | 'exclude' | 'foreground' | 'background' | 'unknown';
@@ -10,7 +11,7 @@ export const useMaskEditor=create<{clipId:string|null;maskId:string|null;time:nu
 export function openMaskEditor(clipId:string,maskId:string){
   const state=useEditorStore.getState(),clip=state.clips.find(c=>c.id===clipId),asset=state.media.find(m=>m.id===clip?.mediaId),mask=clip?.smartMasks?.find(m=>m.id===maskId);if(!clip||!asset||!mask)return;
   state.setPlaying(false);
-  useMaskEditor.setState({clipId,maskId,time:Math.max(mask.range.start,Math.min(mask.range.end-1/mask.source.fps,smartMaskSourceTime(clip,state.playhead,asset)))});
+  useMaskEditor.setState({clipId,maskId,time:Math.max(mask.range.start,Math.min(mask.range.end-1/mask.source.fps,pictureTimeAt(clip,asset,Math.max(clip.start,Math.min(clip.start+clip.duration-1e-6,state.playhead)),state.projects.find(p=>p.id===clip.projectId)?.fps||24)))});
 }
 export function maskAssetUrl(key:string,projectId:string,suffix:string){return `/api/smart-masks/${encodeURIComponent(key)}/${suffix}?projectId=${encodeURIComponent(projectId)}`;}
 export async function analyzeMask(clipId:string,maskId:string,direction:'forward'|'backward'|'both',anchorTime:number){

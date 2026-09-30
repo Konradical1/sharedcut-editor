@@ -798,8 +798,10 @@ export function bloomFilters(context: TransitionPlanContext, peak: number): stri
   // Screen only means "brighten" on RGB. Blended on the window's YUV frames it also lifted both chroma
   // planes, which is why a white flash exported pink. Alpha (c3) keeps the picture's own coverage.
   const glow = [0, 1, 2].map(c => `c${c}_mode=screen:c${c}_opacity=${amount.toFixed(3)}`).join(':');
-  return [`[IN]format=gbrap16le,split=2[bla${context.tag}][blb${context.tag}]`,
-    `[blb${context.tag}]format=gbrp,lutrgb=r='${lift}':g='${lift}':b='${lift}',gblur=sigma=${sigma},format=gbrap16le[blc${context.tag}]`,
+  // Float, not 16-bit: FFmpeg 8.1's 16-bit screen overflows once both sides are dark (20% over black came out
+  // 80%, 45% came out 5%), which flashed a black frame into the middle of a camera flash at 23.976.
+  return [`[IN]format=gbrapf32le,split=2[bla${context.tag}][blb${context.tag}]`,
+    `[blb${context.tag}]format=gbrp,lutrgb=r='${lift}':g='${lift}':b='${lift}',gblur=sigma=${sigma},format=gbrapf32le[blc${context.tag}]`,
     `[bla${context.tag}][blc${context.tag}]blend=${glow}:c3_opacity=0[OUT]`];
 }
 

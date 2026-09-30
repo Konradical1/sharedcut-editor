@@ -28,3 +28,5 @@
 @media(max-width:520px){.color-workspace.color-overhaul{grid-template-rows:minmax(0,1fr) 60px minmax(0,40%) 18px}.color-main{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1.4fr) minmax(0,1fr) 60px}.color-overhaul .color-bottom{overflow:auto;grid-template-columns:minmax(360px,1fr) 4px 200px}.color-overhaul .color-viewer{order:0;grid-column:1;grid-row:1}.color-overhaul .node-panel{grid-column:1;grid-row:2}.color-overhaul .shot-browser{grid-column:1;grid-row:3}.color-overhaul .color-wheel{width:76px}.color-overhaul .color-status>span:last-child{display:none}.color-effects-panel{width:min(310px,calc(100% - 12px))}.scrub-clip-name{max-width:75px}}
 
 .color-overhaul .inspector-tabs>.icon-button{align-self:center;flex:0 0 25px;margin-right:5px;padding:0;border:0}
+.color-overhaul .inspector-tabs{padding-inline:6px;gap:2px}.color-overhaul .inspector-tabs button{padding-inline:6px;font-size:13px}
+.color-overhaul .shot-card.picked{border-color:#b98476;border-style:dashed;background:#2e2829;color:#e3c8c1}

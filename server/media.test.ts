@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { animatedWindows, retimeSchedule, getMediaCapabilities, prepareMedia, probeMedia, renderTimeline } from './media.ts';
+import { animatedWindows, cachedLut, releaseLuts, retimeSchedule, getMediaCapabilities, prepareMedia, probeMedia, renderPasses, renderTimeline } from './media.ts';
 import type { RenderRequest } from './media.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
@@ -265,5 +265,90 @@ test('a speed-ramped clip exports continuous sound, not per-frame chops',async()
   const levels=[...stdout.matchAll(/RMS_level=(-?[\d.]+|-inf)/g)].map(m=>Number(m[1]==='-inf'?-200:m[1]));
   assert.ok(levels.length>100,'measured the tone');
   assert.ok(Math.min(...levels)>Math.max(...levels)-6,`tone level stays within 6 dB (min ${Math.min(...levels)}, max ${Math.max(...levels)})`);
+ } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('the LUT cache never deletes a table a running render still holds',async()=>{
+  const held:string[]=[],table=await cachedLut(['held-table-check',0],async file=>{await writeFile(file,'LUT_3D_SIZE 2\n');},held);
+  for(let i=1;i<=70;i++){const claim:string[]=[];await cachedLut(['held-table-check',i],async file=>{await writeFile(file,'x');},claim);releaseLuts(claim);}
+  await new Promise(resolve=>setTimeout(resolve,50));
+  assert.ok((await stat(table.file)).size>0,'the held table outlives seventy newer ones');
+  releaseLuts(held);
+});
+
+test('an export splits at its own cuts, never inside a transition, with few pictures per pass',()=>{
+  const shots=Array.from({length:30},(_,i)=>({from:i*29,to:(i+1)*29})),held=(pass:{from:number;to:number})=>shots.filter(s=>s.from<pass.to&&s.to>pass.from).length;
+  const passes=renderPasses(shots,[],870,6);
+  assert.deepEqual(passes.map(p=>p.from),[0,174,348,522,696],'six shots to a pass, cut on the edit');
+  assert.equal(passes.at(-1)!.to,870);assert.ok(passes.every(p=>held(p)<=6));
+  assert.ok(renderPasses(shots,[{from:170,to:180}],870,6).every(p=>!(p.from>170&&p.from<180)),'no pass starts inside a transition window');
+  assert.deepEqual(renderPasses([{from:0,to:1000}],[],1000,6,240).map(p=>p.from),[0,240,480,720,960],'one long shot still renders side by side');
+  assert.deepEqual(renderPasses([{from:0,to:1000}],[{from:230,to:250}],1000,6,240).map(p=>p.from).slice(0,2),[0,250],'a split lands after the window it would cut');
+  assert.deepEqual(renderPasses(Array.from({length:10},()=>({from:0,to:100})),[],100,6),[{from:0,to:100}],'stacked layers stay one pass');
+});
+
+test('a split export joins its parts frame for frame and mixes one continuous sound',{timeout:120000},async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'frameline-split-'));
+ try {
+  const colors=['red','lime','blue','yellow','magenta','cyan','white','gray'],expected=[[255,0,0],[0,255,0],[0,0,255],[255,255,0],[255,0,255],[0,255,255],[255,255,255],[128,128,128]];
+  const images=await Promise.all(colors.map(async color=>{const file=path.join(dir,`${color}.png`);await ff(['-f','lavfi','-i',`color=${color}:s=64x64`,'-frames:v','1',file]);return file;}));
+  const tone=path.join(dir,'tone.wav');await ff(['-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=3','-ac','2',tone]);
+  const video={id:'v',timelineId:'tl',name:'Video',kind:'video',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0} as any,sound={...video,id:'a',name:'Audio',kind:'audio'};
+  const asset=(id:string,kind:string,duration:number)=>({id,projectId:'p',name:id,kind,duration,status:'ready',progress:100,binId:'',thumbnail:'',fps:24,resolution:'64 × 64',size:'',hasAudio:kind==='audio'} as any);
+  const clip=(id:string,trackId:string,mediaId:string,start:number,duration:number)=>({id,projectId:'p',timelineId:'tl',trackId,mediaId,name:id,start,duration,sourceIn:0,color:'#fff',disabled:false,properties:{},effects:[]} as any);
+  // Eight quarter-second shots: more pictures than one pass holds, under one tone that spans the seam.
+  const stages:string[]=[],output=path.join(dir,'split.mov');
+  await renderTimeline({project:{id:'p',name:'Split',resolution:'64 × 64',fps:24} as any,timeline:{id:'tl',projectId:'p',name:'Main',duration:2},tracks:[video,sound],nodes:[],
+   clips:[...colors.map((color,i)=>clip(`c${i}`,'v',color,i*.25,.25)),clip('music','a','tone',0,2)],
+   assets:[...colors.map((color,i)=>({asset:asset(color,'image',10),path:images[i]})),{asset:asset('tone','audio',3),path:tone}],
+   settings:{resolution:'64 × 64',fps:'24',codec:'Apple ProRes 422 HQ',audio:'Linear PCM · 24-bit · 48 kHz'},outputPath:output,onStage:stage=>stages.push(stage)});
+  assert.ok(stages.includes('Rendering video · 0/2 parts'),`rendered in two parts: ${stages.join(' | ')}`);
+  const pixels=(await exec(ffmpeg,['-v','error','-i',output,'-f','rawvideo','-pix_fmt','rgb24','-'],{encoding:'buffer',maxBuffer:8e6})).stdout;
+  assert.equal(pixels.length,48*64*64*3,'the joined picture is exactly the range');
+  for(let f=0;f<48;f++){const at=(f*64*64+32*64+32)*3,want=expected[Math.floor(f/6)];assert.ok(want.every((v,c)=>Math.abs(pixels[at+c]-v)<24),`frame ${f} shows shot ${Math.floor(f/6)}, got ${[...pixels.subarray(at,at+3)]}`);}
+  const {stdout}=await exec(ffmpeg,['-v','error','-i',output,'-af','atrim=start=0.02:end=1.98,asetnsamples=n=480:p=0,astats=metadata=1:reset=1:measure_perchannel=none:measure_overall=RMS_level,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-','-f','null','-']);
+  const levels=[...stdout.matchAll(/RMS_level=(-?[\d.]+|-inf)/g)].map(m=>Number(m[1]==='-inf'?-200:m[1]));
+  assert.ok(levels.length>150&&Math.min(...levels)>Math.max(...levels)-1,`tone stays level across the join (min ${Math.min(...levels)}, max ${Math.max(...levels)})`);
+ } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('keyframes on a clip nobody can hear do not force a render per frame',async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'frameline-unseen-'));
+ try {
+  const still=path.join(dir,'still.png'),tone=path.join(dir,'tone.wav');
+  await ff(['-f','lavfi','-i','color=blue:s=64x64','-frames:v','1',still]);await ff(['-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=2','-ac','2',tone]);
+  const video={id:'v',timelineId:'tl',name:'Video',kind:'video',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0} as any,muted={...video,id:'a',name:'Audio',kind:'audio',muted:true};
+  const ramp={'properties.speed':[{id:'k0',time:0,value:100,interpolation:'linear'},{id:'k1',time:1,value:50,interpolation:'linear'}]};
+  const stages:string[]=[];
+  await renderTimeline({project:{id:'p',name:'Unseen',resolution:'64 × 64',fps:24} as any,timeline:{id:'tl',projectId:'p',name:'Main',duration:1},tracks:[video,muted],nodes:[],
+   clips:[{id:'s',projectId:'p',timelineId:'tl',trackId:'v',mediaId:'still',name:'Still',start:0,duration:1,sourceIn:0,color:'#fff',disabled:false,properties:{},effects:[]},
+    {id:'r',projectId:'p',timelineId:'tl',trackId:'a',mediaId:'tone',name:'Ramp',start:0,duration:1,sourceIn:0,color:'#fff',disabled:false,properties:{},effects:[],keyframes:ramp}] as any,
+   assets:[{asset:{id:'still',projectId:'p',name:'still',kind:'image',duration:10,status:'ready',progress:100,binId:'',thumbnail:'',fps:24,resolution:'64 × 64',size:''} as any,path:still},{asset:{id:'tone',projectId:'p',name:'tone',kind:'audio',duration:2,hasAudio:true,status:'ready',progress:100,binId:'',thumbnail:'',fps:0,resolution:'',size:''} as any,path:tone}],
+   settings:{resolution:'64 × 64',fps:'24',codec:'Apple ProRes 422 HQ',audio:'Linear PCM · 24-bit · 48 kHz'},outputPath:path.join(dir,'out.mov'),onStage:stage=>stages.push(stage)});
+  assert.ok(!stages.some(stage=>stage.startsWith('Rendering animation')),`a muted ramp renders in one pass: ${stages.join(' | ')}`);
+ } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('a keyframed clip exports the same source frames as the plain clip, with its sound once',{timeout:180000},async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'frameline-frame-rule-'));
+ try {
+  // Every source frame has its own brightness, so the picture says which frame the export chose.
+  const source=path.join(dir,'numbered.mp4');
+  await ff(['-f','lavfi','-i','color=black:s=64x64:r=24:d=3,format=gray,geq=lum=16+N*4','-f','lavfi','-i','sine=frequency=440:sample_rate=48000:duration=3','-map','0:v','-map','1:a','-c:v','libx264','-qp','0','-pix_fmt','yuv420p','-c:a','aac',source]);
+  const asset={id:'n',projectId:'p',name:'numbered',kind:'video',duration:3,fps:24,resolution:'64 × 64',hasAudio:true,status:'ready',progress:100,binId:'',thumbnail:'',size:''} as MediaAsset;
+  const track:Track={id:'t',timelineId:'tl',name:'Video',kind:'video',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0};
+  const read=async(file:string)=>({picture:[...(await ff(['-i',file,'-vf','scale=1:1,format=gray','-f','rawvideo','-pix_fmt','gray','pipe:1'])).stdout],sound:(await ff(['-i',file,'-map','0:a:0','-ac','1','-f','f32le','pipe:1'])).stdout});
+  const loudness=(pcm:Buffer)=>Math.sqrt(Array.from({length:pcm.length/4},(_,i)=>pcm.readFloatLE(i*4)**2).reduce((a,b)=>a+b,0)/(pcm.length/4));
+  for(const speed of [100,50]) {
+   const clip:Clip={id:'c',projectId:'p',timelineId:'tl',trackId:'t',mediaId:'n',name:'Numbered',start:0,duration:20/30,sourceIn:.1,color:'#fff',disabled:false,properties:{...defaultProperties,speed},effects:[]};
+   const request=(clips:Clip[],name:string):RenderRequest=>({project:{id:'p',resolution:'64 × 64',fps:30} as Project,timeline:{id:'tl',projectId:'p',name:'Main',duration:20/30},tracks:[track],clips,nodes:[],assets:[{asset,path:source}],settings:{resolution:'64 × 64',fps:'30',codec:'Apple ProRes 422 HQ',audio:'Linear PCM · 24-bit · 48 kHz',rangeIn:'0',rangeOut:String(20/30)},outputPath:path.join(dir,`${name}-${speed}.mov`)});
+   const still=request([clip],'plain'),moving=request([{...clip,keyframes:{'properties.opacity':[{id:'a',time:0,value:100,interpolation:'linear'},{id:'b',time:.5,value:100,interpolation:'linear'}]}}],'keyed');
+   await renderTimeline(still);await renderTimeline(moving);
+   const plain=await read(still.outputPath),keyed=await read(moving.outputPath);
+   assert.equal(keyed.picture.length,20);
+   assert.deepEqual(keyed.picture.map(v=>Math.round(v/4)),plain.picture.map(v=>Math.round(v/4)),`${speed}%: every keyed frame shows the plain export's source frame`);
+   const ratio=loudness(keyed.sound)/loudness(plain.sound);
+   assert.ok(ratio>.8&&ratio<1.25,`${speed}%: the sound plays once, got ${ratio.toFixed(2)}× the plain export`);
+  }
  } finally {await rm(dir,{recursive:true,force:true});}
 });

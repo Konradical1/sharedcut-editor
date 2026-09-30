@@ -1,4 +1,5 @@
 import SmartMaskInspector from './SmartMaskInspector';
+import MotionTrackerInspector from './MotionTrackerInspector';
 import { PanelTabPresence, usePanelTabPresence } from './PanelTabPresence';
 import CaptionInspector from './CaptionInspector';
 import { isCaption } from '../services/captions';
@@ -11,7 +12,7 @@ import ShapeInspector from './ShapeInspector';
 import { isShape } from '../services/shapes';
 import { isTitle } from '../services/text';
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode, type PointerEvent } from 'react';
-import { Shapes, Type, SlidersHorizontal, ChevronDown, ChevronLeft, ChevronRight, RotateCcw, Diamond, Plus, Film, Crop, Gauge, WandSparkles, Volume2, Layers, LockKeyhole, Info, X, Trash2, ArrowUp, ArrowDown } from 'lucide-react';
+import { Shapes, Type, SlidersHorizontal, ChevronDown, ChevronLeft, ChevronRight, RotateCcw, Diamond, Plus, Film, Crop, Gauge, WandSparkles, Volume2, Layers, LockKeyhole, Info, X, Trash2, ArrowUp, ArrowDown, Crosshair } from 'lucide-react';
 import { useEditorStore } from '../state/store';
 import { effectDefinitions, effectValue, effectEnabled, acceptsEffect } from '../services/effects';
 import { IconButton, EmptyState, NumberInput, durationLabel, fpsLabel } from './ui';
@@ -156,6 +157,7 @@ export default function Inspector() {
       {tab==='Shape'&&<ShapeInspector/>}
       {tab==='Video'&&<>
         <Section title="Transform" icon={<SlidersHorizontal size={12}/>}><Property name="x" label="Position X" suffix="px"/><Property name="y" label="Position Y" suffix="px"/><Property name="zoom" label="Zoom" initial={100} min={1} max={800} suffix="%"/><Property name="rotation" label="Rotation" min={-360} max={360} suffix="°"/><Property name="anchorX" label="Anchor X" suffix="px"/><Property name="anchorY" label="Anchor Y" suffix="px"/><MotionBlurControl/></Section>
+        {asset?.kind==='video'&&!isComposition(selected)&&<Section title="Tracking" icon={<Crosshair size={12}/>} open={!!selected.motionTrackers?.length}><MotionTrackerInspector clip={selected}/></Section>}
         <Section title="Crop" icon={<Crop size={12}/>} open={false}>{['Left','Right','Top','Bottom'].map(side=><Property key={side} name={`crop${side}`} label={side} min={0} max={1920} suffix="px"/>)}</Section>
         <Section title="Composite" icon={<Layers size={12}/>}><Property name="opacity" label="Opacity" initial={100} min={0} max={100} suffix="%"/><Property name="fadeIn" label="Fade in" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><Property name="fadeOut" label="Fade out" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><label className="inspector-select-row"><span>Blend mode</span><select data-cursor-anchor="blend-mode" aria-label="Blend mode" value={String(selected.properties.blendMode??'Normal')} onChange={e=>s().updateProperty(selected.id,'blendMode',e.target.value)}>{['Normal'].map(x=><option key={x}>{x}</option>)}</select></label></Section>
         <Section title="Speed" icon={<Gauge size={12}/>}><Property name="speed" label="Speed" initial={100} min={1} max={800} suffix="%"/>

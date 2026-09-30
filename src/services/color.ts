@@ -168,6 +168,16 @@ export function starterGrade(clip:Clip,asset:MediaAsset|undefined,id:()=>string)
   const {profile,gamut}=interpretation(clip,asset);
   return ['Input CST','Balance','Look','Output CST'].map((name,i)=>({id:id(),clipId:clip.id,projectId:clip.projectId,name,kind:'serial',enabled:true,order:i+1,position:{x:60+i*170,y:80},parameters:{...primaryDefaults},effects:i===0?[defaultCST(id(),profile,gamut)]:i===3?[{...defaultCST(id(),'DaVinci Intermediate','DaVinci Wide Gamut','Gamma 2.4','Rec.709'),toneMapping:'shoulder',gamutMapping:'compress'}]:[]}));
 }
+/** A nodes-v2 grade whose display output still clips highlights, and that node's effects with ACES 2 output instead. */
+export function acesOutputUpgrade(clip:Clip,nodes:GradeNode[]):{node:GradeNode;effects:ColorEffect[]}|undefined{
+  if(clip.properties.colorPipeline!=='nodes-v2')return;
+  const own=nodes.filter(n=>n.clipId===clip.id).sort((a,b)=>(a.order??0)-(b.order??0)),input=own.filter(n=>n.enabled).flatMap(n=>n.effects??[]).find(e=>e.enabled&&e.type==='cst');
+  // A log input that ends in a technical Rec.709 conversion hard-clips everything above scene linear 1.0.
+  const log=input?.type==='cst'&&!['Rec.709','Gamma 2.4'].includes(input.inputGamma);
+  const unmapped=(e:ColorEffect)=>e.enabled&&e.type==='cst'&&e.outputGamma==='Gamma 2.4'&&e.outputGamut==='Rec.709'&&(e.toneMapping==='shoulder'||e.toneMapping==='none'&&log);
+  const node=[...own].reverse().find(n=>n.enabled&&n.effects?.some(unmapped));
+  return node&&{node,effects:node.effects!.map(e=>unmapped(e)?{...e,toneMapping:'aces2' as const,gamutMapping:'none' as const}:e)};
+}
 export function identityCurve():ColorCurve{return {mode:'smooth',points:[{id:'black',x:0,y:0},{id:'white',x:1,y:1}]};}
 export function curveSlope(curve:ColorCurve,i:number){
   const points=curve.points,p=points[i];if(p.slope!==undefined)return p.slope;

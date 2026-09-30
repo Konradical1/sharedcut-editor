@@ -1,5 +1,7 @@
 import { createSmartMask, validateSmartMask, smartMaskSignature, type SmartMaskDocument } from '../services/smartMask.ts';
-import { starterGrade, primaryDefaults, interpretation, validateGradeNode } from '../services/color.ts';
+import { createMotionTracker, MAX_TRACKERS, validateMotionTracker, type MotionTracker, type MotionTrackerLink } from '../services/motionTracker.ts';
+import { starterGrade, primaryDefaults, interpretation, validateGradeNode, acesOutputUpgrade } from '../services/color.ts';
+import { eligibility, proposedNodes, type AssistantMode, type BalanceValues, type LookOption, type ShotNote } from '../services/colorAssistant.ts';
 import { captionDocument, captionPreset, groupCaptionWords, isCaption, validateCaption, type CaptionJob, type CaptionSet, type CaptionWord } from '../services/captions.ts';
 import { isComposition, retimeTitleClip, validateCompositions } from '../services/compositions.ts';
 import { defaultShape, getShape, isShape, validateShape, type ShapeDocument } from '../services/shapes.ts';
@@ -79,9 +81,17 @@ export interface EditorStore extends PersistedState {
   addSmartMask(clipId:string,nodeId?:string):void;
   updateSmartMask(clipId:string,maskId:string,patch:Partial<SmartMaskDocument>,gesture?:string):void;
   attachSmartMask(clipId:string,maskId:string,targetId:string):void;
+  addMotionTracker(clipId:string,at?:{x:number;y:number;time:number}):string|undefined;
+  updateMotionTracker(clipId:string,trackerId:string,patch:Partial<MotionTracker>,gesture?:string):void;
+  deleteMotionTracker(clipId:string,trackerId:string):void;
+  /** Write keyframes a track produced onto `targetId` and record the link, as one undoable edit. */
+  applyMotionTracker(clipId:string,trackerId:string,targetId:string,channels:Record<string,Keyframe[]>,link:MotionTrackerLink):boolean;
   addEffect(clipId: string, name: string): void; updateEffect(clipId: string, effectId: string, patch: { enabled?: boolean; amount?: number; parameters?: Record<string, number> } | null, gesture?: string): void; reorderEffect(clipId: string, effectId: string, direction: number): void; addNode(name: string, parameters?: Record<string, number>): void;
   removeNode(id: string): void; reorderNode(id: string, direction: number): void;
   gradeClipboard: {clip:Clip;nodes:GradeNode[]} | null; copyGrade(clipId:string):void; pasteGrade(clipId:string):void;
+  /** Color Assistant proposal as normal node values on every eligible shot: one snapshot, one undo. Returns the number of shots changed. */
+  applyColorAssistant(result:{mode:AssistantMode;looks?:LookOption[];shots?:(ShotNote&{balance:BalanceValues})[]},option?:number,clipIds?:string[]):number;
+  useAcesOutput(clipId:string):void;
   restoreResolveGrade(clipId:string):void; initializeColorGrade(clipId:string):void; arrangeColorNodes(clipId:string):void; moveColorNode(id:string,beforeId:string|null,position?:{x:number;y:number}):void;
   updateNode(id: string, patch: Partial<GradeNode>, gesture?: string): void; applyGrade(nodes: { name: string; parameters: Record<string, number> }[]): void;
   undo(): void; saveSnapshot(name: string, note: string): void; restoreSnapshot(id: string): void;
@@ -1046,6 +1056,42 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if(node){if(!editableClip(clipId,'grade')||!available(node.id,'*'))return;commit('GradeNodeChanged',node.id,'changed node mask',[{collection:'nodes',id:node.id,value:{mask:{id:maskId,enabled:true,invert:false,amount:100}}}]);}
       else if(clip.effects.some(e=>e.id===targetId&&e.name==='Smart Mask')&&editableClip(clipId,'effects'))commit('PropertyChanged',clipId,'changed clip mask',[{collection:'clips',id:clipId,value:{effects:clip.effects.map(e=>e.id===targetId?{...e,maskId}:e)}}]);
     },
+    addMotionTracker(clipId,at) {
+      const state=get(),clip=editableClip(clipId,'motionTrackers'),asset=state.media.find(m=>m.id===clip?.mediaId);
+      if(!clip||!asset||asset.kind!=='video'||isTitle(clip)||isShape(clip)||isComposition(clip))return;
+      const existing=clip.motionTrackers??[];
+      if(existing.length>=MAX_TRACKERS){state.notify(`A clip supports up to ${MAX_TRACKERS} trackers`,'info');return;}
+      // Names and colours carry on from the highest one in use, so a deleted tracker never leaves a duplicate.
+      const index=Math.max(existing.length,...existing.map(t=>Number(/^Track (\d+)$/.exec(t.name)?.[1]??0)));
+      const tracker=createMotionTracker(asset,createId('tracker'),index,at);
+      commit('PropertyChanged',clipId,`added ${tracker.name} to ${clip.name}`,[{collection:'clips',id:clipId,value:{motionTrackers:[...existing,tracker]}}]);
+      return tracker.id;
+    },
+    updateMotionTracker(clipId,trackerId,patch,gesture) {
+      const clip=editableClip(clipId,'motionTrackers'),original=clip?.motionTrackers?.find(t=>t.id===trackerId);if(!clip||!original)return;
+      const tracker:MotionTracker={...structuredClone(original),...structuredClone(patch),id:original.id,source:original.source};
+      for(const key of ['result','links'] as const)if(key in patch&&patch[key]===undefined)delete tracker[key];
+      try{validateMotionTracker(tracker);}catch(error){get().notify((error as Error).message,'error');return;}
+      commit('PropertyChanged',clipId,`updated ${tracker.name}`,[{collection:'clips',id:clipId,value:{motionTrackers:clip.motionTrackers!.map(t=>t.id===trackerId?tracker:t)}}],gesture);
+    },
+    deleteMotionTracker(clipId,trackerId) {
+      const clip=editableClip(clipId,'motionTrackers'),tracker=clip?.motionTrackers?.find(t=>t.id===trackerId);if(!clip||!tracker)return;
+      const rest=clip.motionTrackers!.filter(t=>t.id!==trackerId);
+      commit('PropertyChanged',clipId,`removed ${tracker.name}`,[{collection:'clips',id:clipId,value:rest.length?{motionTrackers:rest}:{},...(rest.length?{}:{unset:['motionTrackers']})}]);
+    },
+    applyMotionTracker(clipId,trackerId,targetId,channels,link) {
+      const clip=editableClip(clipId,'motionTrackers'),tracker=clip?.motionTrackers?.find(t=>t.id===trackerId);if(!clip||!tracker)return false;
+      const target=targetId===clipId?clip:editableClip(targetId,'*');if(!target)return false;
+      if(targetId===clipId&&!available(clipId,'*'))return false;
+      const keyframes={...target.keyframes,...channels};
+      try{validateKeyframes(keyframes);}catch(error){get().notify(`The track could not be applied: ${(error as Error).message}`,'error');return false;}
+      const updated:MotionTracker={...structuredClone(tracker),links:[...(tracker.links??[]).filter(l=>l.clipId!==targetId),link]};
+      try{validateMotionTracker(updated);}catch(error){get().notify((error as Error).message,'error');return false;}
+      const trackers=clip.motionTrackers!.map(t=>t.id===trackerId?updated:t);
+      const changes:Change[]=targetId===clipId?[{collection:'clips',id:clipId,value:{keyframes,motionTrackers:trackers}}]:[{collection:'clips',id:targetId,value:{keyframes}},{collection:'clips',id:clipId,value:{motionTrackers:trackers}}];
+      commit('PropertyChanged',targetId,link.target==='camera'?`made ${clip.name} follow ${tracker.name}`:`attached ${target.name} to ${tracker.name}`,changes);
+      return true;
+    },
     addEffect(clipId, name) {
       if(name==='Smart Mask'){get().addSmartMask(clipId);return;}
       const clip = editableClip(clipId, 'effects');
@@ -1154,6 +1200,33 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         {collection:'clips',id:clipId,value:{'properties.colorPipeline':'nodes-v2','properties.inputProfile':source.profile,'properties.inputGamut':source.gamut,keyframes}},
         ...nodes.map(n=>({collection:'nodes' as const,id:n.id,value:record(n),replace:true})),
       ]);set({selectedNodeId:nodes[1].id,selectedClipId:clipId});
+    },
+    applyColorAssistant(result,option,clipIds=[]) {
+      const state=get();if(!writable())return 0;
+      const choice=result.mode==='looks'?result.looks?.[option??-1]:undefined;
+      const targets=new Map<string,Parameters<typeof proposedNodes>[2]>(result.mode==='looks'?choice?clipIds.map(id=>[id,{look:{look:choice.look,extraNodes:choice.extraNodes}}]):[]:(result.shots??[]).map(shot=>[shot.clipId,{balance:shot.balance}]));
+      const changes:Change[]=[],applied:string[]=[],skipped:string[]=[];
+      try{
+        for(const [id,change] of targets){
+          const clip=state.clips.find(c=>c.id===id&&c.projectId===state.projectId);
+          if(!clip||!eligibility(clip,state.media.find(m=>m.id===clip.mediaId),state.nodes).ok||!editableClip(id,'grade')){skipped.push(clip?.name??id);continue;}
+          const proposal=proposedNodes(clip,state.nodes,change,prefix=>createId(prefix)).changes,existing=(id:string)=>state.nodes.some(n=>n.id===id);
+          if(proposal.some(c=>existing(c.id)&&!available(c.id,'*'))){skipped.push(clip.name);continue;}
+          for(const {id,value} of proposal){if(value)validateGradeNode(value);changes.push(value&&existing(id)?{collection:'nodes',id,value:{parameters:value.parameters,...(value.curves?{curves:value.curves}:{})}}:{collection:'nodes',id,value:value&&record(value),replace:true});}
+          applied.push(clip.name);
+        }
+      }catch(error){state.notify((error as Error).message,'error');return 0;}
+      if(!applied.length){state.notify('No shot could take this Color Assistant result','info',skipped.join(', ')||undefined);return 0;}
+      const label=choice?.name??(result.mode==='balance'?'Balance shots':'Match to reference'),count=`${applied.length} shot${applied.length===1?'':'s'}`;
+      state.saveSnapshot(`Before Color Assistant: ${label}`,'Preserved before applying a Color Assistant proposal.');
+      commit('GradeNodeChanged',[...targets.keys()][0],`applied Color Assistant “${label}” to ${count}`,changes);
+      state.notify(`Applied ${label} to ${count}`,'success',skipped.length?`Skipped: ${skipped.join(', ')}`:undefined);
+      return applied.length;
+    },
+    useAcesOutput(clipId) {
+      const state=get(),clip=state.clips.find(c=>c.id===clipId&&c.projectId===state.projectId);if(!clip)return;
+      const upgrade=acesOutputUpgrade(clip,state.nodes);if(!upgrade)return;
+      state.saveSnapshot(`Before ACES output: ${clip.name}`,'Preserved the existing grade before replacing its display rendering.');state.updateNode(upgrade.node.id,{effects:upgrade.effects});
     },
     arrangeColorNodes(clipId) {
       if(!editableClip(clipId,'grade'))return;

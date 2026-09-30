@@ -27,5 +27,5 @@ Canon Log curves are IRE formulas. Canon puts 0 IRE at code 64 and 100 IRE at co
 black is code 128 and Canon Log 3 peaks at 109 IRE (code 1020, which is why full-range Canon files hit 1023).
 SharedCut was feeding the full-range normalised value straight into the IRE formula, so black landed at
 0.125 instead of 0.073, lifting shadows by ~2% linear, adding a third of a stop, and flattening contrast by 14%.
-The fix converts code to IRE first, the same convention the ACES Canon IDTs use. Canon MP4s (CAEP brand,
-10-bit, untagged transfer) are now auto-detected as Canon Log 3 / Cinema Gamut on import.
+The fix converts code to IRE first, the same convention the ACES Canon IDTs use. Canon Log and gamut are read from
+the camera's maker notes (see color-reference.md); all 170 clips here record Canon Log 3 / Cinema Gamut / Neutral.

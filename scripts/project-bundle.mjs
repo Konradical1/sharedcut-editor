@@ -50,6 +50,12 @@ function exportProject(needle, outDir) {
   // DaVinci provenance for imported projects; harmless when absent.
   const resolveDir = join(DATA, 'resolve', project.id);
   if (existsSync(resolveDir)) cpSync(resolveDir, join(outDir, 'resolve'), { recursive: true });
+  // Motion tracks live beside the workspace as content-addressed sample files, named by the clips (and snapshots) that use them.
+  const trackKeys = new Set([...bundle.clips, ...bundle.snapshots.flatMap(snapshot => snapshot.state?.clips ?? [])].flatMap(clip => (clip.motionTrackers ?? []).map(tracker => tracker.result?.key)).filter(key => /^[a-f0-9]{64}$/.test(key ?? '')));
+  for (const key of trackKeys) {
+    const from = join(DATA, 'motion-trackers', `${key}.json`);
+    if (existsSync(from)) cpSync(from, join(outDir, 'motion-trackers', `${key}.json`)); else console.warn(`  ! missing motion track ${key}; that tracker will need tracking again`);
+  }
 
   writeFileSync(join(outDir, 'project.json'), JSON.stringify(bundle, null, 1));
   console.log(`Exported ${JSON.stringify(project.name)} to ${outDir}`);
@@ -75,6 +81,7 @@ function importProject(inDir) {
     cpSync(from, join(DATA, 'media', asset.id), { recursive: true });
   }
   if (existsSync(join(inDir, 'resolve'))) cpSync(join(inDir, 'resolve'), join(DATA, 'resolve', bundle.project.id), { recursive: true });
+  if (existsSync(join(inDir, 'motion-trackers'))) cpSync(join(inDir, 'motion-trackers'), join(DATA, 'motion-trackers'), { recursive: true });
 
   const next = {
     ...state,

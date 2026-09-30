@@ -66,48 +66,49 @@ export function createSmartMaskPreview(onReady:()=>void){
     const r=await fetch(url,{signal,credentials:'same-origin'});
     if(!r.ok){const body=await r.json().catch(()=>null);throw Error(typeof body?.error==='string'?body.error:`Smart Mask download failed (${r.status}).`);}return r;
   };
+  /** One mask's matte at source second `time`: `empty` outside its range, `unanalyzedSmartMask` where it has none yet. */
+  const readDoc=(clip:Clip,doc:SmartMaskDocument,time:number,asset?:Pick<MediaAsset,'inputProfile'|'inputGamut'|'colorMatrix'>):SmartMaskPixels=>{
+    // The frame showing at range.start carries a timestamp up to one frame earlier; the manifest decides.
+    if(time<doc.range.start-1/doc.source.fps||time>=doc.range.end-1e-7)return empty;
+    if(!doc.result)return unanalyzedSmartMask;
+    // Edited since its analysis: keep showing that analysis until the new one lands. Its pixels are immutable,
+    // so the historical manifest is served without the current-intent check.
+    const current=doc.result.signature===smartMaskSignature(doc);
+    const key=doc.result.key,query=`?projectId=${encodeURIComponent(clip.projectId)}`,base=`/api/smart-masks/${key}`;
+    const context=current?smartMaskPreviewContext(clip,asset):'historical';
+    const manifest=get(manifests,`${key}:${context}`,async signal=>{
+      const value=await(await response(current?`${base}/manifest${query}&clipId=${encodeURIComponent(clip.id)}&context=${encodeURIComponent(context)}`:`${base}/manifest${query}`,signal)).json() as SmartMaskManifest;
+      if(value.key!==key||value.signature!==doc.result!.signature||value.mediaId!==clip.mediaId||!Array.isArray(value.frames))throw Error('Smart Mask revision does not match this clip.');return value;
+    },32);
+    const index=smartMaskFrame(time,doc.source,manifest.sourceTimes);
+    let indices=indexSets.get(manifest);if(!indices){indices=new Set(manifest.frames.map(f=>f.index));indexSets.set(manifest,indices);}
+    if(!indices.has(index))return time<doc.range.start-1e-7?empty:unanalyzedSmartMask;
+    const load=(frameIndex:number)=>async(signal:AbortSignal)=>{
+      // Playback reads the 8-bit playback-size matte when the analysis wrote one; the lossless 16-bit PNG remains authoritative for export.
+      const blob=await(await response(`${base}/${manifest.preview?'preview':'frames'}/${frameIndex}.png${query}`,signal)).blob(),bitmap=await createImageBitmap(blob,{colorSpaceConversion:'none'});
+      try{
+        const scale=Math.min(1,1920/bitmap.width,1080/bitmap.height),width=Math.max(1,Math.round(bitmap.width*scale)),height=Math.max(1,Math.round(bitmap.height*scale));
+        const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
+        const context=canvas.getContext('2d',{willReadFrequently:true})!;context.drawImage(bitmap,0,0,width,height);
+        return lazyPixels(canvas,`${key}:${frameIndex}`);
+      }finally{bitmap.close();}
+    };
+    // Keep the next frames in flight so 60 fps playback is not a network round trip per frame.
+    for(const ahead of PREFETCH){const next=index+ahead;if(indices.has(next)&&!frames.has(`${key}:${next}`))try{get(frames,`${key}:${next}`,load(next),64);}catch{/* Pending, by design. */}}
+    let pixels:SmartMaskPixels|undefined;
+    try{pixels=get(frames,`${key}:${index}`,load(index),64);}
+    catch(pending){
+      if(!(pending instanceof SmartMaskPending))throw pending;
+      for(const near of NEARBY){const value=frames.get(`${key}:${index+near}`)?.value;if(value){pixels=value;break;}}
+      if(!pixels)throw pending;
+    }
+    return pixels;
+  };
   return {
     read(clip:Clip,nodes:GradeNode[],time:number,asset?:Pick<MediaAsset,'inputProfile'|'inputGamut'|'colorMatrix'>):Map<string,SmartMaskPixels>{
-      const result=new Map<string,SmartMaskPixels>();
-      for(const doc of activeSmartMasks(clip,nodes)){
-        // The frame showing at range.start carries a timestamp up to one frame earlier; the manifest decides.
-        if(time<doc.range.start-1/doc.source.fps||time>=doc.range.end-1e-7){result.set(doc.id,empty);continue;}
-        if(!doc.result){result.set(doc.id,unanalyzedSmartMask);continue;}
-        // Edited since its analysis: keep showing that analysis until the new one lands. Its pixels are immutable,
-        // so the historical manifest is served without the current-intent check.
-        const current=doc.result.signature===smartMaskSignature(doc);
-        const key=doc.result.key,query=`?projectId=${encodeURIComponent(clip.projectId)}`,base=`/api/smart-masks/${key}`;
-        const context=current?smartMaskPreviewContext(clip,asset):'historical';
-        const manifest=get(manifests,`${key}:${context}`,async signal=>{
-          const value=await(await response(current?`${base}/manifest${query}&clipId=${encodeURIComponent(clip.id)}&context=${encodeURIComponent(context)}`:`${base}/manifest${query}`,signal)).json() as SmartMaskManifest;
-          if(value.key!==key||value.signature!==doc.result!.signature||value.mediaId!==clip.mediaId||!Array.isArray(value.frames))throw Error('Smart Mask revision does not match this clip.');return value;
-        },32);
-        const index=smartMaskFrame(time,doc.source,manifest.sourceTimes);
-        let indices=indexSets.get(manifest);if(!indices){indices=new Set(manifest.frames.map(f=>f.index));indexSets.set(manifest,indices);}
-        if(!indices.has(index)){result.set(doc.id,time<doc.range.start-1e-7?empty:unanalyzedSmartMask);continue;}
-        const load=(frameIndex:number)=>async(signal:AbortSignal)=>{
-          // Playback reads the 8-bit playback-size matte when the analysis wrote one; the lossless 16-bit PNG remains authoritative for export.
-          const blob=await(await response(`${base}/${manifest.preview?'preview':'frames'}/${frameIndex}.png${query}`,signal)).blob(),bitmap=await createImageBitmap(blob,{colorSpaceConversion:'none'});
-          try{
-            const scale=Math.min(1,1920/bitmap.width,1080/bitmap.height),width=Math.max(1,Math.round(bitmap.width*scale)),height=Math.max(1,Math.round(bitmap.height*scale));
-            const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
-            const context=canvas.getContext('2d',{willReadFrequently:true})!;context.drawImage(bitmap,0,0,width,height);
-            return lazyPixels(canvas,`${key}:${frameIndex}`);
-          }finally{bitmap.close();}
-        };
-        // Keep the next frames in flight so 60 fps playback is not a network round trip per frame.
-        for(const ahead of PREFETCH){const next=index+ahead;if(indices.has(next)&&!frames.has(`${key}:${next}`))try{get(frames,`${key}:${next}`,load(next),64);}catch{/* Pending, by design. */}}
-        let pixels:SmartMaskPixels|undefined;
-        try{pixels=get(frames,`${key}:${index}`,load(index),64);}
-        catch(pending){
-          if(!(pending instanceof SmartMaskPending))throw pending;
-          for(const near of NEARBY){const value=frames.get(`${key}:${index+near}`)?.value;if(value){pixels=value;break;}}
-          if(!pixels)throw pending;
-        }
-        result.set(doc.id,pixels);
-      }
-      return result;
+      return new Map(activeSmartMasks(clip,nodes).map(doc=>[doc.id,readDoc(clip,doc,time,asset)] as const));
     },
+    readDoc,
     dispose(){disposed=true;for(const cache of [manifests,frames]){for(const entry of cache.values())entry.controller.abort();cache.clear();}},
   };
 }

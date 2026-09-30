@@ -36,6 +36,16 @@ def probe(job):
 def render(job):
     times, stream = probe(job)
     width, height = stream['width'], stream['height']
+    # An export fits every source into its canvas first, so its bake need be no larger than that box.
+    resize = ''
+    if job.get('fit'):
+        scale = min(1, job['fit'][0] / width, job['fit'][1] / height)
+        if scale < 1:
+            width, height = max(2, round(width * scale / 2) * 2), max(2, round(height * scale / 2) * 2)
+            resize = f',scale={width}:{height}'
+    # Previews run in the background on two threads; an export bake is the only work its export waits on.
+    threads = str(job.get('threads', 2))
+    cv2.setNumThreads(max(4, int(threads)))
     directory = Path(job['output']).parent / 'decoded'
     directory.mkdir()
     schedule = []
@@ -51,10 +61,11 @@ def render(job):
     # A script avoids Windows command-line length and quoting limits. Frame numbers
     # come from decoded presentation order, including variable-frame-rate footage.
     graph = directory / 'select.filter'
-    graph.write_text("select='" + '+'.join(f'eq(n\\,{i})' for i in needed) + "'")
-    subprocess.run([job['ffmpeg'], '-v', 'error', '-nostdin', '-y', '-i', job['input'],
+    graph.write_text("select='" + '+'.join(f'eq(n\\,{i})' for i in needed) + "'" + resize)
+    subprocess.run([job['ffmpeg'], '-v', 'error', '-nostdin', '-y', '-threads', threads, '-i', job['input'],
                     '-filter_script:v', str(graph), '-frames:v', str(len(needed)),
-                    '-fps_mode', 'passthrough', '-pix_fmt', 'rgb48be', '-threads', '2',
+                    # Fastest deflate: still lossless, half the read time of the default level on 4K 16-bit frames.
+                    '-fps_mode', 'passthrough', '-pix_fmt', 'rgb48be', '-threads', threads, '-compression_level', '1',
                     '-start_number', '0', str(directory / '%d.png')], check=True)
     positions = {index: position for position, index in enumerate(needed)}
 
@@ -101,7 +112,7 @@ def render(job):
         encoder = subprocess.Popen([job['ffmpeg'], '-v', 'error', '-nostdin', '-y',
                                     '-f', 'rawvideo', '-pix_fmt', 'bgr48le', '-s', f'{width}x{height}',
                                     '-r', str(job['fps']), '-i', 'pipe:0', '-an', '-c:v', 'prores_ks',
-                                    '-profile:v', '3', '-pix_fmt', 'yuv422p10le', '-threads', '2',
+                                    '-profile:v', '3', '-pix_fmt', 'yuv422p10le', '-threads', threads,
                                     job['output']], stdin=subprocess.PIPE, stderr=errors)
         try:
             for number, (left, right, fraction) in enumerate(schedule):

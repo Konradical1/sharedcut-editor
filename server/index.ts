@@ -36,6 +36,10 @@ import { exportResolveTimeline, importResolve } from './resolve.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
 import { validateSmartMask, validateSmartMaskBindings } from '../src/services/smartMask.ts';
+import { motionTrackerCapabilities, motionTrackerService } from './motionTracker.ts';
+import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } from './colorAssistant.ts';
+import { validateMotionTrackers } from '../src/services/motionTracker.ts';
+import { readCameraColor } from './cameraMetadata.ts';
 import { FILMSTRIP_VERSION, MEDIA_CONCURRENCY, SKIP_COLOR_PROXY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, prepareColorProxy, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, preparePreviewVariants, prepareWaveform, renderTimeline, renderSoundEffect } from './media.ts';
 
 const scrypt = promisify(scryptCallback);
@@ -190,6 +194,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const queue = workQueue(MEDIA_CONCURRENCY); let closed = false;
   const flowDirectory = join(dataDir, 'optical-flow');
   const masks = smartMaskService(join(dataDir, 'smart-masks'));
+  const motionTrackers = motionTrackerService(join(dataDir, 'motion-trackers'));
+  const colorAssistant = colorAssistantService(dataDir);
   const flowJobs = new Map<string, FlowPreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
   let flowQueue = Promise.resolve();
   const stabilizeDirectory = join(dataDir, 'stabilize');
@@ -319,6 +325,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       for (const asset of bundle.media ?? []) rmSync(mediaDir(asset.id), { recursive: true, force: true });
       for (const job of bundle.renderJobs ?? []) for (const extension of ['.mp4', '.mov']) rmSync(join(dataDir, 'renders', `${job.id}${extension}`), { force: true });
       db.prepare('DELETE FROM caption_jobs WHERE projectId=?').run(row.id);
+      try { colorAssistant.purge(row.id); } catch { /* A still being served; its folder outlives the purge. */ }
       db.prepare('DELETE FROM deleted_projects WHERE id=?').run(row.id);
     }
   };
@@ -401,7 +408,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       for (const field of ['duration', 'start', 'sourceIn', 'time']) if (item[field] !== undefined) numberField(item[field], 0, 86400 * 7);
       if (key === 'tracks' && item.captionSets!==undefined) {try{validateCaptionSets(item.captionSets);}catch(error){fail(400,(error as Error).message);}}
       if (key === 'timelines' && item.composition!==undefined && typeof item.composition!=='boolean') fail(400,'Invalid composition timeline.');
-      if (key === 'clips') { try { validateTransition(item as any); validateMotionBlur(item as any); } catch (error) { fail(400, (error as Error).message); } if (isLeakMedia(String(item.mediaId)) && !leakIdOf(String(item.mediaId))) fail(400, 'Invalid overlay reference.'); if(isShape(item as any)){try{validateShape(JSON.parse(String(item.properties.shapeDocument)));}catch{fail(400,'Invalid shape document.');}} if(item.keyframes!==undefined) {try {validateKeyframes(item.keyframes);} catch(error){fail(400,(error as Error).message);}} if (isTitle(item as any)) { try { if(isCaption(item as any)&&!getText(item as any).caption)throw new Error('Missing caption data');validateText(getText(item as any)); } catch { fail(400, 'Invalid text document.'); } } if (!item.duration) fail(400, 'Clips must have a positive duration.'); for (const value of Object.values(item.properties)) if (!['string', 'number', 'boolean'].includes(typeof value)) fail(400, 'Invalid clip property.'); for (const effect of item.effects) { object(effect); if (!idIsValid(effect.id) || typeof effect.enabled !== 'boolean') fail(400, 'Invalid effect.'); textField(effect.name, 80, true); numberField(effect.amount, 0, 100); if (effect.parameters !== undefined) { object(effect.parameters); for (const value of Object.values(effect.parameters)) numberField(value); } } }
+      if (key === 'clips') { try { validateTransition(item as any); validateMotionBlur(item as any); } catch (error) { fail(400, (error as Error).message); } if (isLeakMedia(String(item.mediaId)) && !leakIdOf(String(item.mediaId))) fail(400, 'Invalid overlay reference.'); if(isShape(item as any)){try{validateShape(JSON.parse(String(item.properties.shapeDocument)));}catch{fail(400,'Invalid shape document.');}} if(item.keyframes!==undefined) {try {validateKeyframes(item.keyframes);} catch(error){fail(400,(error as Error).message);}} if(item.motionTrackers!==undefined){try{validateMotionTrackers(item as any);}catch(error){fail(400,(error as Error).message);}} if (isTitle(item as any)) { try { if(isCaption(item as any)&&!getText(item as any).caption)throw new Error('Missing caption data');validateText(getText(item as any)); } catch { fail(400, 'Invalid text document.'); } } if (!item.duration) fail(400, 'Clips must have a positive duration.'); for (const value of Object.values(item.properties)) if (!['string', 'number', 'boolean'].includes(typeof value)) fail(400, 'Invalid clip property.'); for (const effect of item.effects) { object(effect); if (!idIsValid(effect.id) || typeof effect.enabled !== 'boolean') fail(400, 'Invalid effect.'); textField(effect.name, 80, true); numberField(effect.amount, 0, 100); if (effect.parameters !== undefined) { object(effect.parameters); for (const value of Object.values(effect.parameters)) numberField(value); } } }
       if (key === 'tracks') { if (!['video', 'audio'].includes(item.kind)) fail(400, 'Invalid track kind.'); numberField(item.number, 0, 1024); numberField(item.gain, -120, 60); numberField(item.pan, -100, 100); if (item.height !== undefined) numberField(item.height, 24, 200); }
       if (key === 'nodes') {for (const value of Object.values(item.parameters)) numberField(value);try{validateGradeNode(item);}catch(error){fail(400,(error as Error).message);}}
       if (key === 'comments') { textField(item.text, 5000, true); if (item.range !== undefined && (!Array.isArray(item.range) || item.range.length !== 2 || item.range.some((value: unknown) => typeof value !== 'number' || value < 0))) fail(400, 'Invalid comment range.'); for (const reply of item.replies) { object(reply); if (!idIsValid(reply.id) || !idIsValid(reply.userId)) fail(400, 'Invalid reply.'); textField(reply.text, 5000, true); numberField(reply.timestamp, 0, 1e15); } }
@@ -1118,6 +1125,61 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const file=timelinePreviews.file(timelinePreviewRoute[1],projectId)??fail(404,'Preview not found.');
           streamFile(req,res,file,'video/mp4',undefined,true);return;
         }
+        if (path === '/api/motion-trackers/capabilities' && method === 'GET') { send(res, 200, await motionTrackerCapabilities()); return; }
+        if (path.startsWith('/api/motion-trackers/')) {
+          // Every tracker call names a clip or a project it belongs to; nothing is authorized by a key on its own.
+          const trackedClip = (id: unknown, write: boolean) => {
+            const clip = state.clips.find(item => item.id === textField(id, 160, true)) ?? fail(404, 'Clip not found.');
+            requireProject(clip.projectId, userId, write);
+            const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId) ?? fail(404, 'Media not found.');
+            if (asset.kind !== 'video' || !existsSync(originalPath(asset.id))) fail(409, 'Tracking reads the original video, which is not on this server.');
+            return { clip, asset };
+          };
+          const tracker = (clip: typeof state.clips[number], id: unknown) => clip.motionTrackers?.find(item => item.id === textField(id, 160, true)) ?? fail(409, 'This tracker is still saving. Try again in a moment.');
+          if (path === '/api/motion-trackers/source-times' && method === 'GET') {
+            const { clip, asset } = trackedClip(url.searchParams.get('clipId'), false);
+            send(res, 200, { sourceTimes: await masks.sourceTimes(clip, asset, originalPath(asset.id)) }); return;
+          }
+          if (path === '/api/motion-trackers/track' && method === 'POST') {
+            const body = await jsonBody(req), { clip, asset } = trackedClip(body.clipId, true);
+            if (!Array.isArray(body.trackerIds) || !body.trackerIds.length || body.trackerIds.length > 16) fail(400, 'Choose which trackers to track.');
+            if (body.direction !== 'forward' && body.direction !== 'backward') fail(400, 'Track forward or backward.');
+            const frames = body.frames === undefined ? undefined : numberField(body.frames, 1, 1_000_000);
+            const job = await motionTrackers.start({ projectId: clip.projectId, clip: structuredClone(clip), asset, sourcePath: originalPath(asset.id), times: await masks.sourceTimes(clip, asset, originalPath(asset.id)), trackers: body.trackerIds.map((id: unknown) => structuredClone(tracker(clip, id))), time: numberField(body.time, 0, 86400), direction: body.direction === 'forward' ? 1 : -1, frames });
+            send(res, 202, job); return;
+          }
+          if (path === '/api/motion-trackers/clear' && method === 'POST') {
+            const body = await jsonBody(req), { clip, asset } = trackedClip(body.clipId, true);
+            const key = await motionTrackers.clear(tracker(clip, body.trackerId), await masks.sourceTimes(clip, asset, originalPath(asset.id)), numberField(body.from, 0, 86400), numberField(body.to, 0, 86400));
+            send(res, 200, { key }); return;
+          }
+          const jobRoute = /^\/api\/motion-trackers\/jobs\/([a-f0-9-]{36})$/.exec(path);
+          if (jobRoute && ['GET', 'DELETE'].includes(method)) {
+            const projectId = textField(url.searchParams.get('projectId'), 160, true); requireProject(projectId, userId, method === 'DELETE');
+            if (method === 'DELETE') { motionTrackers.cancel(projectId, jobRoute[1]); send(res, 200, { ok: true }); return; }
+            send(res, 200, motionTrackers.get(projectId, jobRoute[1], Number(url.searchParams.get('after') ?? 0))); return;
+          }
+          const samplesRoute = /^\/api\/motion-trackers\/samples\/([a-f0-9]{64})$/.exec(path);
+          if (samplesRoute && method === 'GET') {
+            const projectId = textField(url.searchParams.get('projectId'), 160, true); requireProject(projectId, userId);
+            const samples = await motionTrackers.read(samplesRoute[1]);
+            if (!state.media.some(item => item.id === samples.mediaId && item.projectId === projectId)) fail(404, 'Tracking result not found.');
+            send(res, 200, samples); return;
+          }
+        }
+        if (path === '/api/color-assistant/capabilities' && method === 'GET') { send(res, 200, colorAssistantCapabilities(account.user.id)); return; }
+        const assistantRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)\/color-assistant(?:\/([a-f0-9-]{36})(?:\/stills\/([^/]+))?)?$/.exec(path);
+        if (assistantRoute) {
+          // Every call can spend the allow-listed owner's Codex quota or show its results: allow-list first, then an editor role.
+          if (!aiColorAllowed(account.user.id)) fail(403, 'The Color Assistant is not enabled for this account.');
+          const [, projectId, jobId, file] = assistantRoute; requireProject(projectId, userId, true);
+          if (file !== undefined && ['GET', 'HEAD'].includes(method)) { streamFile(req, res, colorAssistant.still(projectId, jobId!, file), 'image/jpeg', undefined, true); return; }
+          if (file === undefined && jobId && method === 'GET') { send(res, 200, colorAssistant.get(projectId, jobId)); return; }
+          if (file === undefined && jobId && method === 'DELETE') { colorAssistant.cancel(projectId, jobId); send(res, 200, { ok: true }); return; }
+          if (!jobId && method === 'GET') { send(res, 200, colorAssistant.latest(projectId)); return; }
+          if (!jobId && method === 'POST') { const body = await jsonBody(req); send(res, 202, colorAssistant.start({ projectId, body, clips: state.clips, media: state.media, nodes: state.nodes, source: originalPath })); return; }
+          fail(405, 'Method not allowed.');
+        }
         if (path === '/api/stabilize/capabilities' && method === 'GET') { send(res,200,await stabilizeCapabilities()); return; }
         if (path === '/api/stabilize' && method === 'POST') {
           const body = await jsonBody(req), clip = state.clips.find(c => c.id === textField(body.clipId,160,true)) ?? fail(404,'Clip not found.');
@@ -1222,7 +1284,25 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       } catch (error) { if (!signal.aborted) console.error(`Preview upgrade failed for ${asset.name}:`, error); }
     });
   }
-  for(const asset of state.media) if(!SKIP_COLOR_PROXY&&asset.kind==='video'&&asset.status==='ready'&&!asset.colorProxyUrl&&existsSync(originalPath(asset.id))) {
+  // Imports before version 2 read only the file's first 2 MB (Sony can write its profile at the end) and guessed Canon Log 3.
+  // An untagged stream then fell back to a BT.601 matrix, which the grading proxy baked in, so that proxy is rebuilt.
+  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && asset.cameraMetadataVersion !== 2 && existsSync(originalPath(asset.id))) addWork(`camera-${asset.id}`, async signal => {
+    try {
+      const found = await readCameraColor(originalPath(asset.id), statSync(originalPath(asset.id)).size), current = state.media.find(m => m.id === asset.id);
+      if (!current || signal.aborted || closed) return;
+      const stale = current.colorMatrix === 'auto' ? found?.colorMatrix : undefined;
+      let matrix = stale;
+      // Windows refuses to delete a proxy that FFmpeg or a player still holds: keep it and retry on the next start.
+      if (matrix) try { rmSync(join(mediaDir(asset.id), 'prepared', 'color-v1.mp4'), { force: true }); } catch (error) { matrix = undefined; console.error(`${asset.name}: stale grading proxy in use, rebuilt on the next start.`, error); }
+      // Positive camera metadata corrects a label. A missing tag never removes one, but says so when import only assumed it.
+      const assumed = !found?.inputProfile && current.inputProfile && current.colorEvidence?.startsWith('Canon container (CAEP)') ? `; ${current.inputProfile} was assumed at import, not verified` : '';
+      updateAsset(asset.id, { ...(stale === matrix && { cameraMetadataVersion: 2 }), ...(found && { colorEvidence: found.colorEvidence + assumed }), ...(found?.inputProfile && { inputProfile: found.inputProfile, inputGamut: found.inputGamut ?? current.inputGamut }), ...(matrix && { colorMatrix: matrix, colorProxyUrl: undefined }) });
+      if (SKIP_COLOR_PROXY || !matrix && current.colorProxyUrl) return;
+      const preview = await prepareColorProxy({ inputPath: originalPath(asset.id), outputDir: join(mediaDir(asset.id), 'prepared'), baseUrl: `/api/media/${asset.id}/files`, signal }); if (!signal.aborted && !closed) updateAsset(asset.id, preview);
+    } catch (error) { if (!signal.aborted) console.error(`Camera metadata check failed for ${asset.name}:`, error); }
+  });
+  // Assets still due a camera check get their grading proxy from that check, after any matrix correction.
+  for(const asset of state.media) if(!SKIP_COLOR_PROXY&&asset.kind==='video'&&asset.status==='ready'&&asset.cameraMetadataVersion===2&&!asset.colorProxyUrl&&existsSync(originalPath(asset.id))) {
     if(existsSync(join(mediaDir(asset.id),'prepared','color-v1.mp4'))){updateAsset(asset.id,{colorProxyUrl:`/api/media/${asset.id}/files/color-v1.mp4`});continue;}
     addWork(`color-${asset.id}`,async signal=>{
       try{const preview=await prepareColorProxy({inputPath:originalPath(asset.id),outputDir:join(mediaDir(asset.id),'prepared'),baseUrl:`/api/media/${asset.id}/files`,signal});if(!signal.aborted&&!closed)updateAsset(asset.id,preview);}
@@ -1247,7 +1327,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   for (const sound of sounds.list()) if (sound.status === 'ready' && sound.waveformVersion !== 2) addWork(`waveform-${sound.id}`, async signal => {
     try { await sounds.upgradeWaveform(sound.id, signal); } catch (error) { if (!signal.aborted) console.error(`Waveform upgrade failed for ${sound.name}:`, error); }
   });
-  return { server, dataDir, async close() { closed = true; await masks.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); db.close(); } };
+  return { server, dataDir, async close() { closed = true; await masks.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); db.close(); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

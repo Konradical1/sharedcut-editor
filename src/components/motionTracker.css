@@ -1,0 +1,33 @@
+
+.motion-tracker-icon{color:var(--tracker)}
+.motion-tracker-feature{cursor:move}
+.motion-tracker-handle{cursor:nwse-resize}
+.motion-tracker-other{cursor:pointer}
+
+.motion-trackers{display:flex;flex-direction:column;gap:10px;min-width:0}
+.motion-trackers button{display:inline-flex;align-items:center;justify-content:center;gap:5px;border:1px solid #43484c;border-radius:5px;padding:6px 7px;background:#2d3237;color:#dde5e8;font-size:11px}
+.motion-trackers button:disabled{opacity:.4;cursor:not-allowed}
+.motion-trackers .motion-tracker-add{background:#4a4222;border-color:#8a7a3d;color:#fff1c2;min-height:32px}
+.motion-trackers .motion-tracker-add:hover:not(:disabled){background:#5a5029}
+.motion-tracker-card{border:1px solid #3a4045;border-left:3px solid var(--tracker);border-radius:5px;padding:8px;display:flex;flex-direction:column;gap:8px;background:#23282c}
+.motion-tracker-card-head{display:flex;align-items:center;gap:6px;min-width:0}
+.motion-tracker-card-head input{flex:1;min-width:0;background:#1c2024;border:1px solid #3a3f45;border-radius:4px;padding:5px 6px;color:#e2e9ec;font-size:11px}
+.motion-tracker-card-head button{padding:5px}
+.motion-tracker-summary{font-size:10px;color:#9aa7ae;line-height:1.5;margin:0}
+.motion-tracker-row{display:grid;grid-template-columns:30px 1fr 30px;gap:4px}
+.motion-tracker-apply{display:grid;grid-template-columns:1fr 1fr;gap:4px}
+.motion-tracker-apply button[aria-pressed=true]{background:#3b4a53;border-color:var(--tracker);color:#fff}
+.motion-tracker-form{display:flex;flex-direction:column;gap:7px;padding:8px;border:1px solid #394146;border-radius:5px;background:#1d2226}
+.motion-tracker-form .inspector-select-row{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11px}
+.motion-tracker-form select,.motion-tracker-form input[type=number]{max-width:150px;min-width:0;background:#202328;border:1px solid #3a3f45;border-radius:4px;padding:5px;color:#e2e9ec;font-size:11px}
+.motion-tracker-form input[type=number]{width:72px}
+.motion-tracker-form input[type=range]{width:110px;accent-color:var(--tracker)}
+.motion-tracker-form .motion-tracker-go{background:#4a4222;border-color:#8a7a3d;color:#fff1c2}
+.motion-tracker-form .inspector-note{margin:0;line-height:1.5}
+.motion-tracker-links{display:flex;flex-direction:column;gap:4px;margin:0;padding:0;list-style:none}
+.motion-tracker-links li{display:flex;align-items:center;gap:6px;font-size:10px;color:#c8d3d8}
+.motion-tracker-links li span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.motion-tracker-links li button{padding:3px 6px;font-size:10px}
+.motion-tracker-warning{font-size:11px;line-height:1.55;margin:0;padding:8px;border:1px solid #625233;border-radius:5px;background:#352f24;color:#dfc997}
+
+.motion-tracker-overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:2;overflow:visible}

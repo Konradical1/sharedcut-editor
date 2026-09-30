@@ -59,5 +59,11 @@ test('optical flow synthesizes motion, caches atomically, preserves duration and
     assert.ok(Array.from({length:sound.length/4},(_,i)=>Math.abs(sound.readFloatLE(i*4))).some(v=>v>.02),'Retimed export retains audible source sound.');
     const cancelled=new AbortController();cancelled.abort();
     await assert.rejects(renderOpticalFlow({...options,from:0,duration:1,signal:cancelled.signal}));
+    // An export bakes no larger than its canvas, under its own key; the unfitted bake above is untouched.
+    if(process.platform!=='darwin'){
+      const fitted=await renderOpticalFlow({...options,fit:[160,90],threads:4});
+      assert.notEqual(fitted.key,first.key);
+      const size=await probeMedia(fitted.output);assert.equal(size.width,160);assert.equal(size.height,90);
+    }
   }finally{await rm(directory,{recursive:true,force:true});}
 });

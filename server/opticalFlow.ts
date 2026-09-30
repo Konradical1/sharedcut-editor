@@ -43,15 +43,21 @@ export async function flowWorker(): Promise<string> {
 /** What the inspector shows next to the Optical flow toggle. */
 export const flowEngineLabel = () => process.platform === 'darwin' ? 'Apple VideoToolbox · quality priority' : 'OpenCV · bidirectional motion compensation';
 
-export async function flowIdentity(clip: Clip, input: string, fps: number, from: number, duration: number, preview: boolean) {
+export async function flowIdentity(clip: Clip, input: string, fps: number, from: number, duration: number, preview: boolean, fit?: [number, number]) {
   const file = await stat(input);
-  return hash(['color-precision-v2',await flowWorker(), flowTiming(clip), input, file.size, file.mtimeMs, fps, from, duration, preview]);
+  return hash(['color-precision-v2',await flowWorker(), flowTiming(clip), input, file.size, file.mtimeMs, fps, from, duration, preview, ...(fit ? [fit] : [])]);
 }
 
-export async function renderOpticalFlow(options: { clip: Clip; asset: MediaAsset; input: string; directory: string; fps: number; from?: number; duration?: number; preview?: boolean; signal?: AbortSignal; onProgress?: (value: number) => void }) {
-  const { clip, asset, input, directory, fps, signal, onProgress, preview = false, from = 0, duration = clip.duration } = options;
+/**
+ * `fit`: bake no larger than this box. An export fits every source into its canvas before anything else touches
+ * it, so interpolating a 4K source for a 1080p export spent four times the pixels on detail the export drops.
+ * Only the portable engine takes it; the VideoToolbox worker bakes at source size, and its key says so.
+ */
+export async function renderOpticalFlow(options: { clip: Clip; asset: MediaAsset; input: string; directory: string; fps: number; from?: number; duration?: number; preview?: boolean; fit?: [number, number]; threads?: number; signal?: AbortSignal; onProgress?: (value: number) => void }) {
+  const { clip, asset, input, directory, fps, signal, onProgress, preview = false, from = 0, duration = clip.duration, threads = 2 } = options;
   if (signal?.aborted) throw new Error('Optical flow cancelled.');
-  const key = await flowIdentity(clip, input, fps, from, duration, preview);
+  const fit = process.platform === 'darwin' ? undefined : options.fit;
+  const key = await flowIdentity(clip, input, fps, from, duration, preview, fit);
   const output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   if (existsSync(output)) { onProgress?.(100); return { key, output }; }
@@ -75,7 +81,7 @@ export async function renderOpticalFlow(options: { clip: Clip; asset: MediaAsset
     } else {
       await flowWorker();
       const spec = join(temporary, 'job.json');
-      await writeFile(spec, JSON.stringify({ input: resolve(input), output: movie, fps, frames, ffmpeg: ffmpeg(), ffprobe: process.env.FFPROBE_PATH || 'ffprobe' }));
+      await writeFile(spec, JSON.stringify({ input: resolve(input), output: movie, fps, frames, ffmpeg: ffmpeg(), ffprobe: process.env.FFPROBE_PATH || 'ffprobe', threads, ...(fit ? { fit } : {}) }));
       const job = nativeQueue.then(() => runWorkerProcess(flowPython(), [portableSource, spec], signal, progress, 'Optical flow'));
       nativeQueue = job.then(() => {}, () => {}); await job;
     }
@@ -90,9 +96,9 @@ export async function renderOpticalFlow(options: { clip: Clip; asset: MediaAsset
   } finally { await rm(temporary, { recursive: true, force: true }); }
 }
 
-// Evict only finished previews, never source media or a worker's temporary directory.
-export async function trimFlowCache(directory: string, keep: Set<string>, limit = 2 * 1024 ** 3) {
-  const files = await Promise.all((await readdir(directory).catch(() => [])).filter(name => /^[a-f0-9]{64}\.mp4$/.test(name)).map(async name => ({ name, ...await stat(join(directory, name)) })));
+// Evict only finished bakes (previews are .mp4, export bakes .mov), never source media or a worker's temporary directory.
+export async function trimFlowCache(directory: string, keep: Set<string>, limit = 2 * 1024 ** 3, extension = 'mp4') {
+  const files = await Promise.all((await readdir(directory).catch(() => [])).filter(name => new RegExp(`^[a-f0-9]{64}\\.${extension}$`).test(name)).map(async name => ({ name, ...await stat(join(directory, name)) })));
   let bytes = files.reduce((sum, file) => sum + file.size, 0);
   for (const file of files.sort((a,b) => a.mtimeMs - b.mtimeMs)) {
     if (bytes <= limit) break;
