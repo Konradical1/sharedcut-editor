@@ -42,7 +42,7 @@ def fail(message):
 
 def probe(job):
     result = subprocess.run([job["ffprobe"], "-v", "error", "-protocol_whitelist", "file,pipe", "-select_streams", "v:0",
-                             "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,color_space,color_range,color_primaries,color_transfer",
+                             "-show_entries", "stream=width,height,avg_frame_rate,r_frame_rate,color_space,color_range,color_primaries,color_transfer:stream_side_data=rotation",
                              "-of", "json", job["input"]], check=True, capture_output=True, text=True)
     streams = json.loads(result.stdout).get("streams") or []
     if not streams:
@@ -53,8 +53,12 @@ def probe(job):
     fps = float(numerator) / float(denominator or 1) if float(denominator or 1) else 24.0
     if not (1 <= fps <= 240):
         fps = 24.0
+    # FFmpeg decodes phone footage upright; the coded size is sideways when the display matrix rotates 90.
+    rotation = next((d["rotation"] for d in stream.get("side_data_list", []) if "rotation" in d), 0)
+    if abs(int(rotation)) % 180 == 90:
+        stream = {**stream, "width": stream["height"], "height": stream["width"]}
     return {"width": int(stream["width"]), "height": int(stream["height"]), "fps": fps,
-            "matrix": stream.get("color_space") or ("bt709" if stream["height"] >= 720 else "bt601"),
+            "matrix": stream.get("color_space") or ("bt709" if min(stream["width"], stream["height"]) >= 720 else "bt601"),
             "range": "pc" if stream.get("color_range") == "pc" else "tv",
             "primaries": stream.get("color_primaries") or "bt709", "transfer": stream.get("color_transfer") or "bt709"}
 

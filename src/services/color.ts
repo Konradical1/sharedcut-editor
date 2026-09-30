@@ -150,6 +150,29 @@ export function cubeText(cube: Cube) {
   return lines.join('\n')+'\n';
 }
 
+export const isHdrTransfer = (transfer?: string) => transfer === 'arib-std-b67' || transfer === 'smpte2084';
+/**
+ * BT.2020 HLG/PQ R'G'B' to Rec.709 SDR R'G'B', the same math as FFmpeg's
+ * `zscale=t=linear:npl → zscale=p=bt709 → tonemap=hable:desat=0 → zscale=t=bt709` chain, sampled
+ * into a LUT so it runs on FFmpeg builds without zimg (Homebrew has none). `npl` is the nits that
+ * map to linear 1.0: 100 is brighter, 203 puts HLG reference white at 1.0.
+ */
+export function hdrToSdr(transfer: string, npl = 100) {
+  const hlg = transfer === 'arib-std-b67', matrix = gamutTo709('Rec.2020'), peak = 1000 / npl;
+  const hable = (x: number) => (x*(.15*x+.05)+.004)/(x*(.15*x+.5)+.06)-.02/.3, white = hable(peak);
+  const hlgScene = (v: number) => v <= .5 ? v*v/3 : (Math.exp((v-.55991073)/.17883277)+.28466892)/12;
+  const pqNits = (v: number) => { const p = Math.max(0, v)**(1/78.84375); return 10000*(Math.max(p-.8359375, 0)/(18.8515625-18.6875*p))**(1/.1593017578125); };
+  const oetf = (v: number) => v < .018 ? 4.5*v : 1.099*v**.45-.099;
+  return (input: number[]): number[] => {
+    let nits: number[];
+    if (hlg) { const scene = input.map(v => hlgScene(clamp(v))), y = .2627*scene[0]+.678*scene[1]+.0593*scene[2]; nits = scene.map(v => 1000*y**.2*v); }
+    else nits = input.map(pqNits);
+    const linear = multiply(matrix, nits.map(v => v/npl)).map(v => Math.max(0, v)), signal = Math.max(...linear, 1e-6);
+    const scale = hable(signal)/white/signal;
+    return linear.map(v => clamp(oetf(clamp(v*scale))));
+  };
+}
+
 export const transferFunctions = profiles.filter(p=>p!=='Rec.709');
 export const primaryDefaults:Record<string,number>={exposure:0,temperature:0,tint:0,contrast:1,pivot:.336043,saturation:100,lift:0,gamma:0,gain:1,offset:0};
 export function gamutMatrix(input:string,output:string){const source=rgbToXYZ(input),target=inverse(rgbToXYZ(output));return target.map(row=>[0,1,2].map(c=>row.reduce((v,x,i)=>v+x*source[i][c],0)));}

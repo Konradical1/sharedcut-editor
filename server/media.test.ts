@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { animatedWindows, cachedLut, releaseLuts, retimeSchedule, getMediaCapabilities, prepareMedia, probeMedia, renderPasses, renderTimeline } from './media.ts';
+import { animatedWindows, cachedLut, isAnimated, releaseLuts, retimeSchedule, getMediaCapabilities, prepareMedia, probeMedia, renderPasses, renderTimeline } from './media.ts';
 import type { RenderRequest } from './media.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
@@ -350,5 +350,79 @@ test('a keyframed clip exports the same source frames as the plain clip, with it
    const ratio=loudness(keyed.sound)/loudness(plain.sound);
    assert.ok(ratio>.8&&ratio<1.25,`${speed}%: the sound plays once, got ${ratio.toFixed(2)}× the plain export`);
   }
+ } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('vertical reels: rotated probes, portrait stills, flips, aspect guard and HLG tone mapping',{timeout:120000},async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'frameline-vertical-'));
+ try {
+  const coded=path.join(dir,'coded.mp4'),rotated=path.join(dir,'rotated.mp4');
+  await ff(['-f','lavfi','-i','testsrc=s=320x180:r=24:d=0.5','-c:v','libx264','-pix_fmt','yuv420p',coded]);
+  await ff(['-display_rotation','90','-i',coded,'-c','copy',rotated]);
+  const upright=await probeMedia(rotated);
+  assert.equal(upright.resolution,'180 × 320','a phone clip reports the size FFmpeg decodes');assert.deepEqual([upright.width,upright.height],[180,320]);
+
+  const still=path.join(dir,'tall.png');await ff(['-f','lavfi','-i','color=red:s=400x1200','-frames:v','1',still]);
+  await prepareMedia({inputPath:still,outputDir:path.join(dir,'still'),baseUrl:'/f'});
+  assert.equal((await probeMedia(path.join(dir,'still','image-v2.png'))).height,1920,'portrait stills are proxied at full height');
+
+  const split=path.join(dir,'split.png');
+  await ff(['-f','lavfi','-i','color=red:s=32x64','-f','lavfi','-i','color=blue:s=32x64','-filter_complex','[0][1]hstack','-frames:v','1',split]);
+  const project={id:'p',name:'Reel',description:'',shared:false,thumbnail:'',modifiedAt:0,duration:.25,resolution:'64 × 64',fps:24,status:'In progress',members:[]} as any;
+  const track={id:'t',timelineId:'tl',name:'Video',kind:'video',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0} as any;
+  const image={id:'a',projectId:'p',name:'Split',kind:'image',duration:1,status:'ready',progress:100,binId:'',thumbnail:'',fps:24,resolution:'64 × 64',size:''} as any;
+  const clip={id:'c',projectId:'p',timelineId:'tl',trackId:'t',mediaId:'a',name:'Selfie',start:0,duration:.25,sourceIn:0,color:'#fff',disabled:false,properties:{flipH:true},effects:[]} as any;
+  const request={project,timeline:{id:'tl',projectId:'p',name:'Main',duration:.25},tracks:[track],clips:[clip],assets:[{asset:image,path:split}],nodes:[],settings:{audio:'Disabled',codec:'H.264',resolution:'64 × 64',fps:'24'},outputPath:path.join(dir,'flip.mp4')};
+  await renderTimeline(request);
+  const first=(await ff(['-i',request.outputPath,'-frames:v','1','-f','rawvideo','-pix_fmt','rgb24','pipe:1'])).stdout;
+  const at=(x:number)=>[...first.subarray((32*64+x)*3,(32*64+x)*3+3)];
+  assert.ok(at(4)[2]>200&&at(4)[0]<60,`flipped: blue on the left, got ${at(4)}`);assert.ok(at(60)[0]>200&&at(60)[2]<60,`red on the right, got ${at(60)}`);
+  await assert.rejects(renderTimeline({...request,settings:{...request.settings,resolution:'128 × 64'}}),/stretch/,'a squashed export is refused');
+
+  const hlg=path.join(dir,'hlg.mp4');
+  await ff(['-f','lavfi','-i','testsrc2=s=128x72:r=24:d=0.25','-vf','setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc','-pix_fmt','yuv420p10le','-c:v','libx264','-color_primaries','bt2020','-color_trc','arib-std-b67','-colorspace','bt2020nc',hlg]);
+  const hdr=await probeMedia(hlg);assert.equal(hdr.colorTransfer,'arib-std-b67');
+  const proxied=await prepareMedia({inputPath:hlg,outputDir:path.join(dir,'hlg'),baseUrl:'/f'});
+  assert.ok('colorProxyUrl' in proxied&&proxied.colorProxyUrl,'the grading proxy is tone-mapped too');assert.equal((await probeMedia(path.join(dir,'hlg','proxy.mp4'))).colorTransfer,'bt709','previews are SDR');
+  assert.equal((await probeMedia(path.join(dir,'hlg','color-v1.mp4'))).colorTransfer,'bt709','the grading proxy is not tagged HLG, or the browser tone-maps it again');
+  const video=(tags:object)=>({id:'v',projectId:'p',name:'HLG',kind:'video',duration:hdr.duration,status:'ready',progress:100,binId:'',thumbnail:'',fps:24,resolution:'128 × 72',size:'',colorMatrix:'bt2020nc',...tags}) as any;
+  const wide={...project,resolution:'128 × 72'},shot={...clip,mediaId:'v',properties:{},duration:.25};
+  const stats=async(tags:object,name:string)=>{
+   const out=path.join(dir,name);
+   await renderTimeline({...request,project:wide,clips:[shot],assets:[{asset:video(tags),path:hlg}],settings:{...request.settings,resolution:'128 × 72'},outputPath:out});
+   const px=(await ff(['-i',out,'-frames:v','1','-f','rawvideo','-pix_fmt','rgb24','pipe:1'])).stdout;let luma=0,sat=0;
+   for(let i=0;i<px.length;i+=3){luma+=.2126*px[i]+.7152*px[i+1]+.0722*px[i+2];const high=Math.max(px[i],px[i+1],px[i+2]);sat+=high?100*(high-Math.min(px[i],px[i+1],px[i+2]))/high:0;}
+   return {luma:luma/(px.length/3),sat:sat/(px.length/3)};
+  };
+  const [mapped,raw]=await Promise.all([stats({colorTransfer:'arib-std-b67'},'mapped.mp4'),stats({colorTransfer:'bt709'},'raw.mp4')]);
+  assert.ok(Math.abs(mapped.luma-raw.luma)>4,`tone mapping changes brightness (${mapped.luma} vs ${raw.luma})`);
+  assert.ok(Math.abs(mapped.sat-raw.sat)>4,`and saturation (${mapped.sat} vs ${raw.sat})`);
+ } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('gain keys stay in the static pass and a keyed graphic no longer chops the sound',{timeout:120000},async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'frameline-duck-'));
+ try {
+  const gain={'properties.gain':[{id:'g0',time:0,value:0,interpolation:'linear'},{id:'g1',time:1.5,value:-6,interpolation:'bezier',curve:[.65,0,.35,1]},{id:'g2',time:2,value:-6,interpolation:'linear'}]};
+  const fade={'properties.opacity':[{id:'o0',time:0,value:0,interpolation:'linear'},{id:'o1',time:.5,value:100,interpolation:'linear'}]};
+  const clip=(id:string,mediaId:string,trackId:string,keyframes:object)=>({id,projectId:'p',timelineId:'tl',trackId,mediaId,name:id,start:0,duration:2,sourceIn:0,color:'#fff',disabled:false,properties:{},effects:[],keyframes} as any);
+  assert.equal(isAnimated(clip('a','tone','ta',gain)),false,'gain-only automation never reaches the per-frame bake');
+  assert.equal(isAnimated(clip('g','white','tv',fade)),true);
+  const tone=path.join(dir,'tone.wav'),white=path.join(dir,'white.png');
+  await ff(['-f','lavfi','-i','sine=frequency=1000:sample_rate=48000:duration=3','-ac','2',tone]);
+  await ff(['-f','lavfi','-i','color=white:s=64x64','-frames:v','1',white]);
+  const project={id:'p',name:'Duck',description:'',shared:false,thumbnail:'',modifiedAt:0,duration:2,resolution:'64 × 64',fps:24,status:'In progress',members:[]} as any;
+  const tracks=[{id:'tv',timelineId:'tl',name:'Video',kind:'video',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0},{id:'ta',timelineId:'tl',name:'Audio',kind:'audio',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0}] as any;
+  const assets=[{asset:{id:'tone',projectId:'p',name:'tone',kind:'audio',duration:3,status:'ready',progress:100,binId:'',thumbnail:'',fps:0,resolution:'',size:'',hasAudio:true},path:tone},{asset:{id:'white',projectId:'p',name:'white',kind:'image',duration:3,status:'ready',progress:100,binId:'',thumbnail:'',fps:24,resolution:'64 × 64',size:''},path:white}] as any;
+  const out=path.join(dir,'duck.mov');
+  await renderTimeline({project,timeline:{id:'tl',projectId:'p',name:'Main',duration:2},tracks,clips:[clip('g','white','tv',fade),clip('a','tone','ta',gain)],assets,nodes:[],settings:{codec:'Apple ProRes 422 HQ',audio:'Linear PCM · 24-bit · 48 kHz',resolution:'64 × 64',fps:'24'},outputPath:out});
+  const data=(await ff(['-i',out,'-map','0:a','-f','f32le','-ac','1','-'])).stdout,samples=new Float32Array(data.buffer.slice(data.byteOffset,data.byteOffset+data.byteLength));
+  assert.ok(samples.length>=48000*1.99,'the whole range has sound');
+  const rms=(from:number,n:number)=>Math.sqrt(samples.slice(from,from+n).reduce((s,v)=>s+v*v,0)/n);
+  const peak=rms(0,4800)*Math.SQRT2,step=2*Math.PI*1000/48000*peak;
+  let worst=0;for(let i=1;i<samples.length-480;i++)worst=Math.max(worst,Math.abs(samples[i]-samples[i-1]));
+  assert.ok(worst<step*1.3,`no clicks at frame boundaries (max step ${worst.toFixed(4)}, a clean 1 kHz tone steps ${step.toFixed(4)})`);
+  const ratio=20*Math.log10(rms(84000,4800)/rms(0,4800));
+  assert.ok(Math.abs(ratio+6)<.5,`the keyed duck lands at -6 dB, got ${ratio.toFixed(2)}`);
  } finally {await rm(dir,{recursive:true,force:true});}
 });

@@ -24,13 +24,18 @@ def emit(progress):
 
 def probe(job):
     result = subprocess.run([job['ffprobe'], '-v', 'error', '-select_streams', 'v:0',
-                             '-show_entries', 'frame=best_effort_timestamp_time:stream=width,height',
+                             '-show_entries', 'frame=best_effort_timestamp_time:stream=width,height:stream_side_data=rotation',
                              '-of', 'json', job['input']], capture_output=True, check=True, text=True)
     data = json.loads(result.stdout)
     timestamps = [float(f['best_effort_timestamp_time']) for f in data['frames']]
     if not timestamps or any(b <= a for a, b in zip(timestamps, timestamps[1:])):
         raise ValueError('Optical flow requires ordered source frame timestamps.')
-    return [t - timestamps[0] for t in timestamps], data['streams'][0]
+    stream = data['streams'][0]
+    # FFmpeg decodes phone footage upright; the coded size is sideways when the display matrix rotates 90.
+    rotation = next((d['rotation'] for d in stream.get('side_data_list', []) if 'rotation' in d), 0)
+    if abs(int(rotation)) % 180 == 90:
+        stream = {**stream, 'width': stream['height'], 'height': stream['width']}
+    return [t - timestamps[0] for t in timestamps], stream
 
 
 def render(job):

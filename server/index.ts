@@ -40,7 +40,7 @@ import { motionTrackerCapabilities, motionTrackerService } from './motionTracker
 import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } from './colorAssistant.ts';
 import { validateMotionTrackers } from '../src/services/motionTracker.ts';
 import { readCameraColor } from './cameraMetadata.ts';
-import { FILMSTRIP_VERSION, MEDIA_CONCURRENCY, SKIP_COLOR_PROXY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, prepareColorProxy, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, preparePreviewVariants, prepareWaveform, renderTimeline, renderSoundEffect } from './media.ts';
+import { FILMSTRIP_VERSION, MEDIA_CONCURRENCY, SKIP_COLOR_PROXY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, exportAspect, PROBE_VERSION, prepareColorProxy, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, preparePreviewVariants, prepareWaveform, renderTimeline, renderSoundEffect } from './media.ts';
 
 const scrypt = promisify(scryptCallback);
 const DEFAULT_SETTINGS = { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false, snapping: true, mediaWidth: 278, inspectorWidth: 292, timelineHeight: 294 };
@@ -353,7 +353,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     }, true);
   };
 
-  const processAsset = (id: string) => addWork(id, async signal => {
+  const processAsset = (id: string, refresh = false) => addWork(id, async signal => {
     try {
       const asset = state.media.find(item => item.id === id);
       if (!asset) return;
@@ -369,7 +369,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         const { size, ...metadata } = result;
         updateAsset(id, { ...metadata, ...(asset.importLink ? { thumbnail: state.media.find(item => item.id === id)?.thumbnail || metadata.thumbnail } : {}), size: size >= 1e9 ? `${(size / 1e9).toFixed(1)} GB` : `${(size / 1e6).toFixed(1)} MB`, sourceUrl: `/api/media/${id}/original`, status: 'ready', progress: 100 });
       };
-      const result = await prepareMedia({ inputPath: originalPath(id), outputDir: join(mediaDir(id), 'prepared'), baseUrl: `/api/media/${id}/files`, signal,
+      const result = await prepareMedia({ inputPath: originalPath(id), outputDir: join(mediaDir(id), 'prepared'), baseUrl: `/api/media/${id}/files`, signal, refresh,
         onStage: preparationStage => { if (!signal.aborted) updateAsset(id, { preparationStage }); },
         onPlayable: result => { if (!signal.aborted) publish(result); },
         onThumbnail: thumbnail => { if (!asset.importLink) updateAsset(id, { thumbnail }); },
@@ -1226,7 +1226,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (path === '/api/renders' && method === 'POST') {
           const body = await jsonBody(req); const project = requireProject(textField(body.projectId, 160, true), userId, true); object(body.settings);
           for (const value of Object.values(body.settings)) textField(value, 255);
-          const settings = body.settings as Record<string, string>; const timeline = state.timelines.find(item => item.projectId === project.id && (!settings.timelineId || item.id === settings.timelineId)) ?? fail(400, 'Create a timeline before exporting.');
+          const settings = body.settings as Record<string, string>; try { exportAspect(settings.resolution, project.resolution); } catch (error) { fail(400, (error as Error).message); } const timeline = state.timelines.find(item => item.projectId === project.id && (!settings.timelineId || item.id === settings.timelineId)) ?? fail(400, 'Create a timeline before exporting.');
           const clips = state.clips.filter(clip => clip.timelineId === timeline.id); if (!clips.some(clip => !clip.disabled)) fail(400, 'Add a clip to the timeline before exporting.');
           if (state.renderJobs.filter(job => ['waiting', 'rendering'].includes(job.status)).length >= 20) fail(429, 'The render queue is full.');
           const job: RenderJob = { id: `render-${randomUUID()}`, projectId: project.id, name: textField(body.name, 160, true).trim(), preset: textField(body.preset, 80, true), status: 'waiting', progress: 0, remaining: 'Waiting', settings };
@@ -1307,6 +1307,18 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     addWork(`color-${asset.id}`,async signal=>{
       try{const preview=await prepareColorProxy({inputPath:originalPath(asset.id),outputDir:join(mediaDir(asset.id),'prepared'),baseUrl:`/api/media/${asset.id}/files`,signal});if(!signal.aborted&&!closed)updateAsset(asset.id,preview);}
       catch(error){if(!signal.aborted)console.error(`Color preview failed for ${asset.name}:`,error);}
+    });
+  }
+  // Older probes missed display rotation (portrait phone clips read as landscape) and HDR transfer.
+  // Re-probing is cheap; an HDR clip then prepares again so its previews are tone-mapped.
+  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && asset.probeVersion !== PROBE_VERSION && existsSync(originalPath(asset.id))) {
+    addWork(`probe-${asset.id}`, async signal => {
+      try {
+        const { resolution, width, height, colorTransfer, colorMatrix, probeVersion } = await probeMedia(originalPath(asset.id), signal);
+        if (signal.aborted || closed) return;
+        updateAsset(asset.id, { resolution, width, height, colorTransfer, colorMatrix, probeVersion } as Partial<Asset>);
+        if (colorTransfer === 'arib-std-b67' || colorTransfer === 'smpte2084') processAsset(asset.id, true);
+      } catch (error) { if (!signal.aborted) console.error(`Re-probe failed for ${asset.name}:`, error); }
     });
   }
   // Media imported before filmstrips existed still shows one repeated still until this lands.

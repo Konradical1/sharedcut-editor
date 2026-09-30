@@ -10,7 +10,7 @@ import { renderCaptionTimeline } from './captionRender.ts';
 import { bakeAnimatedGraphics, streamableGraphic } from './graphicsRender.ts';
 import { shownSourceTime } from '../src/services/motionTracker.ts';
 import { isCaption } from '../src/services/captions.ts';
-import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, validateKeyframes } from '../src/services/animation.ts';
+import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, sampleKeyframes, validateKeyframes } from '../src/services/animation.ts';
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { isTitle, getText, drawText, validateText } from '../src/services/text.ts';
 import { isShape, getShape, drawShape, validateShape } from '../src/services/shapes.ts';
@@ -24,7 +24,7 @@ import { mkdir, rm, stat, readFile, writeFile, mkdtemp, rename } from 'node:fs/p
 import { existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import type { Clip, GradeNode, MediaAsset, Project, Timeline, Track } from '../src/state/models.ts';
-import { colorTransform, cubeText, makeCube, parseCube, hasACES, interpretation, processingStages, type Cube } from '../src/services/color.ts';
+import { colorTransform, cubeText, makeCube, parseCube, hasACES, interpretation, processingStages, hdrToSdr, isHdrTransfer, type Cube } from '../src/services/color.ts';
 import { tmpdir, cpus, setPriority, totalmem } from 'node:os';
 import { renderOpticalFlow, trimFlowCache } from './opticalFlow.ts';
 import { renderStabilized, stabilizeWarpMattes } from './stabilize.ts';
@@ -105,11 +105,30 @@ function dimensions(value: string): [number, number] {
   return [width, height];
 }
 
+/** Bump to re-probe every ready video at startup (v2: display rotation, transfer). */
+export const PROBE_VERSION = 2;
+// ponytail: tone-mapping knob; compare 100 against 203 on real footage and set FRAME_LINE_HDR_NPL.
+const hdrNpl = () => Number(process.env.FRAME_LINE_HDR_NPL) || 100;
+/** The HDR-to-SDR table as a transform, or undefined for SDR sources. */
+export const hdrTransform = (transfer?: string) => isHdrTransfer(transfer) ? hdrToSdr(transfer!, hdrNpl()) : undefined;
+/**
+ * Appended right after a `scale=…:in_color_matrix=bt2020nc` fragment: the scale converts to RGB, the LUT
+ * tone-maps, and a second scale returns to Rec.709 video levels. Empty for SDR sources.
+ */
+async function toneMap(transfer: string | undefined, directory: string, outRange = 'tv') {
+  const transform = hdrTransform(transfer);
+  if (!transform) return '';
+  const file = path.join(directory, `hdr-${transfer}-${hdrNpl()}.cube`);
+  if (!existsSync(file)) await writeFile(file, cubeText(makeCube(transform, 65)));
+  // Retag as Rec.709: encoders copy the frame's HLG tag otherwise, and the browser would tone-map the proxy a second time.
+  return `,format=gbrpf32le,lut3d=file=${quotedFilterPath(file)}:interp=tetrahedral,scale=out_color_matrix=bt709:out_range=${outRange}:flags=accurate_rnd+full_chroma_int,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709`;
+}
+
 export async function probeMedia(inputPath: string, signal?: AbortSignal) {
   const file = await stat(inputPath);
   if (!file.isFile()) throw new Error('Media source is not a file.');
   const data = JSON.parse((await run(ffprobe(), ['-v', 'error', ...safeInput, '-show_streams', '-show_format', '-of', 'json', inputPath], { signal })).toString()) as {
-    streams: { codec_type: string; codec_name?: string; color_range?: string; color_space?: string; color_primaries?: string; color_transfer?: string; pix_fmt?: string; width?: number; height?: number; avg_frame_rate?: string; duration?: string; sample_rate?: string; channels?: number; disposition?: { attached_pic?: number } }[];
+    streams: { codec_type: string; codec_name?: string; color_range?: string; color_space?: string; color_primaries?: string; color_transfer?: string; pix_fmt?: string; width?: number; height?: number; avg_frame_rate?: string; duration?: string; sample_rate?: string; channels?: number; disposition?: { attached_pic?: number }; side_data_list?: { rotation?: number }[] }[];
     format: { duration?: string; format_name?: string };
   };
   const video = data.streams.find(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic);
@@ -119,8 +138,11 @@ export async function probeMedia(inputPath: string, signal?: AbortSignal) {
   const duration = image ? 10 : finite(data.format.duration || video?.duration || audio?.duration, 'Source duration (seconds)', .001, 86400);
   const fps = video && !image ? finite(ratio(video.avg_frame_rate), 'Source frame rate', .01, 1000) : 0;
   if (video) { finite(video.width, 'Source width', 1, 16384); finite(video.height, 'Source height', 1, 16384); }
+  // Phones store portrait as landscape plus a display matrix. FFmpeg decodes it upright, so report it that way.
+  const rotation = Number(video?.side_data_list?.find(d => d.rotation !== undefined)?.rotation ?? 0);
+  const [width, height] = Math.abs(rotation) % 180 === 90 ? [video?.height, video?.width] : [video?.width, video?.height];
   const color: CameraColor = (video && await readCameraColor(inputPath, file.size)) || { colorEvidence: video?.color_transfer ? 'Stream transfer tag: '+video.color_transfer+'; verify camera profile' : 'Camera profile untagged; set input manually for log footage' };
-  return { ...color, cameraMetadataVersion: 2, colorRange: video?.color_range || 'unknown', colorMatrix: video?.color_space || color.colorMatrix || 'auto', frameRate: video?.avg_frame_rate, kind: image ? 'image' as const : video ? 'video' as const : 'audio' as const, duration, fps, hasAudio: Boolean(audio), resolution: video ? `${video.width} × ${video.height}` : `${Math.round(Number(audio?.sample_rate || 48000) / 1000)} kHz · ${audio?.channels === 1 ? 'Mono' : 'Stereo'}`, width: video?.width, height: video?.height, size: file.size };
+  return { ...color, cameraMetadataVersion: 2, colorRange: video?.color_range || 'unknown', colorMatrix: video?.color_space || color.colorMatrix || 'auto', frameRate: video?.avg_frame_rate, kind: image ? 'image' as const : video ? 'video' as const : 'audio' as const, duration, fps, hasAudio: Boolean(audio), resolution: video ? `${width} × ${height}` : `${Math.round(Number(audio?.sample_rate || 48000) / 1000)} kHz · ${audio?.channels === 1 ? 'Mono' : 'Stereo'}`, width, height, colorTransfer: video?.color_transfer, probeVersion: PROBE_VERSION, size: file.size };
 }
 
 /**
@@ -306,7 +328,7 @@ async function inParallel<T>(items: T[], limit: number, signal: AbortSignal | un
   if (signal?.aborted) throw new Error('Canceled by you');
 }
 /** Scrubbing proxies (all-intra) and two streaming sizes; publish only complete files. */
-export async function preparePreviewVariants(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; onProgress?: (percent: number) => void }) {
+export async function preparePreviewVariants(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; onProgress?: (percent: number) => void; refresh?: boolean }) {
   const { inputPath, outputDir, baseUrl, signal } = options;
   const metadata = await probeMedia(inputPath, signal);
   if (metadata.kind !== 'video') throw new Error('Preview variants require a prepared video.');
@@ -324,7 +346,7 @@ export async function preparePreviewVariants(options: { inputPath: string; outpu
   const audioName = 'audio-v1.m4a';
   // An upgrade pass only owes the variants that are missing; re-encoding what is already on disk
   // is a full FFmpeg run of pure waste per asset in the library.
-  const pending = Object.values(variants).filter(variant => !existsSync(path.join(outputDir, variant.name)));
+  const pending = Object.values(variants).filter(variant => options.refresh || !existsSync(path.join(outputDir, variant.name)));
   const wantAudio = metadata.hasAudio && !existsSync(path.join(outputDir, audioName));
   const written: string[] = [];
   const args = [...common, ...await decodeAccel(), ...safeInput, '-i', inputPath];
@@ -343,19 +365,20 @@ export async function preparePreviewVariants(options: { inputPath: string; outpu
   } finally { await rm(temp, { recursive: true, force: true }); }
 }
 
-export async function prepareMediaThumbnail(inputPath: string, outputDir: string, signal?: AbortSignal) {
+export async function prepareMediaThumbnail(inputPath: string, outputDir: string, signal?: AbortSignal, transfer?: string) {
   await mkdir(outputDir, { recursive: true });
   const temporary = await mkdtemp(path.join(outputDir, '.thumbnail-'));
   try {
-    await run(ffmpeg(), [...common, ...safeInput, '-i', inputPath, '-vf', 'thumbnail=12,scale=480:-2', '-frames:v', '1', path.join(temporary, 'thumbnail.jpg')], { signal });
+    const tone = await toneMap(transfer, temporary);
+    await run(ffmpeg(), [...common, ...safeInput, '-i', inputPath, '-vf', `thumbnail=12,scale=480:-2${tone ? ':in_color_matrix=bt2020nc' + tone : ''}`, '-frames:v', '1', path.join(temporary, 'thumbnail.jpg')], { signal });
     await rename(path.join(temporary, 'thumbnail.jpg'), path.join(outputDir, 'thumbnail.jpg'));
   } finally { await rm(temporary, { recursive: true, force: true }); }
 }
 
 /** Grading proxy: one generation from the original, 10-bit 4:2:2, explicit video levels. */
-export async function prepareColorProxy(options:{inputPath:string;outputDir:string;baseUrl:string;signal?:AbortSignal}){
+export async function prepareColorProxy(options:{inputPath:string;outputDir:string;baseUrl:string;signal?:AbortSignal;refresh?:boolean}){
   const {inputPath,outputDir,baseUrl,signal}=options,name='color-v1.mp4',output=path.join(outputDir,name);
-  if(existsSync(output))return {colorProxyUrl:`${baseUrl}/${name}`};
+  if(existsSync(output)&&!options.refresh)return {colorProxyUrl:`${baseUrl}/${name}`};
   const metadata=await probeMedia(inputPath,signal);
   if(metadata.kind!=='video')throw Error('Color preview requires video.');
   await mkdir(outputDir,{recursive:true});const temp=await mkdtemp(path.join(outputDir,'.color-'));
@@ -364,7 +387,7 @@ export async function prepareColorProxy(options:{inputPath:string;outputDir:stri
     // `-qp 0` made this file lossless: 3.7 GB from a 232 MB source, 150 Mbit/s, and 84% of everything
     // the media directory held. CRF 14 in the same 10-bit 4:2:2 all-intra format keeps the grading
     // headroom that matters here and lands ~12x smaller. Raise toward 10 if banding shows on a push.
-    await run(ffmpeg(),[...common,...await decodeAccel(),...safeInput,'-i',inputPath,'-map','0:v:0','-an','-vf',`scale=w='min(1920,iw)':h=-2:in_color_matrix=${matrix}:out_color_matrix=bt709:in_range=${metadata.colorRange==='pc'?'pc':metadata.colorRange==='tv'?'tv':'auto'}:out_range=tv:flags=lanczos+accurate_rnd+full_chroma_int,setsar=1`,'-c:v','libx264','-preset','veryfast','-crf','14','-g','1','-pix_fmt','yuv422p10le','-color_range','tv','-colorspace','bt709','-color_primaries','unknown','-color_trc','unknown','-movflags','+faststart',path.join(temp,name)],{signal});
+    await run(ffmpeg(),[...common,...await decodeAccel(),...safeInput,'-i',inputPath,'-map','0:v:0','-an','-vf',`scale=w='min(1920,iw)':h=-2:in_color_matrix=${matrix}:out_color_matrix=bt709:in_range=${metadata.colorRange==='pc'?'pc':metadata.colorRange==='tv'?'tv':'auto'}:out_range=tv:flags=lanczos+accurate_rnd+full_chroma_int${await toneMap(metadata.colorTransfer,temp)},setsar=1`,'-c:v','libx264','-preset','veryfast','-crf','14','-g','1','-pix_fmt','yuv422p10le','-color_range','tv','-colorspace','bt709','-color_primaries','unknown','-color_trc','unknown','-movflags','+faststart',path.join(temp,name)],{signal});
     await rename(path.join(temp,name),output);return {colorProxyUrl:`${baseUrl}/${name}`};
   }finally{await rm(temp,{recursive:true,force:true});}
 }
@@ -409,12 +432,13 @@ export async function prepareWaveform(inputPath: string, duration: number, signa
   return { waveform, waveformVersion: 2 };
 }
 
-export async function prepareMedia(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; onProgress?: (percent: number) => void; onThumbnail?: (url: string) => void; onStage?: (stage: string) => void; onPlayable?: (asset: Awaited<ReturnType<typeof probeMedia>> & {proxyUrl: string; thumbnail: string}) => void }) {
+export async function prepareMedia(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; refresh?: boolean; onProgress?: (percent: number) => void; onThumbnail?: (url: string) => void; onStage?: (stage: string) => void; onPlayable?: (asset: Awaited<ReturnType<typeof probeMedia>> & {proxyUrl: string; thumbnail: string}) => void }) {
   const { inputPath, outputDir, baseUrl, signal, onProgress, onThumbnail, onStage, onPlayable } = options;
   onStage?.('Reading camera metadata');
   const metadata = await probeMedia(inputPath, signal);
   await mkdir(outputDir, { recursive: true });
-  const proxyName = metadata.kind === 'audio' ? 'audio.m4a' : metadata.kind === 'image' ? 'image.png' : 'proxy.mp4';
+  // image-v2: portrait stills fit a 1920 square instead of a 1080-high landscape box.
+  const proxyName = metadata.kind === 'audio' ? 'audio.m4a' : metadata.kind === 'image' ? 'image-v2.png' : 'proxy.mp4';
   const proxy = path.join(outputDir, proxyName), thumb = path.join(outputDir, 'thumbnail.jpg');
   const input = [...await decodeAccel(), ...safeInput, '-i', inputPath];
   let filmstripFrames = 0, published = false;
@@ -422,14 +446,14 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
   try {
     if (metadata.kind !== 'audio') {
       onStage?.('Creating thumbnail');
-      await prepareMediaThumbnail(inputPath, outputDir, signal);
+      await prepareMediaThumbnail(inputPath, outputDir, signal, metadata.colorTransfer);
       onThumbnail?.(`${baseUrl}/thumbnail.jpg`);
     }
     onStage?.('Creating playable preview');
     if (metadata.kind === 'image') {
-      await run(ffmpeg(), [...common, ...input, '-vf', 'scale=w=1920:h=1080:force_original_aspect_ratio=decrease', '-frames:v', '1', proxy], { signal });
+      await run(ffmpeg(), [...common, ...input, '-vf', 'scale=w=1920:h=1920:force_original_aspect_ratio=decrease', '-frames:v', '1', proxy], { signal });
     } else {
-      const video = metadata.kind === 'video' ? ['-map', '0:v:0', '-vf', `scale=w='min(1920,iw)':h=-2:in_color_matrix=${["bt709","bt470bg","smpte170m","bt2020nc"].includes(metadata.colorMatrix)?metadata.colorMatrix:"auto"}:in_range=${metadata.colorRange==="pc"?"pc":metadata.colorRange==="tv"?"tv":"auto"}:out_range=${metadata.colorRange==="pc"?"pc":"tv"}:out_color_matrix=bt709:flags=lanczos+accurate_rnd+full_chroma_int,setsar=1,setparams=range=${metadata.colorRange==="pc"?"full":"limited"}:color_primaries=bt709:color_trc=bt709:colorspace=bt709`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '16', '-g', '1', '-pix_fmt', metadata.colorRange==='pc'?'yuvj420p':'yuv420p', '-color_range', metadata.colorRange==='pc'?'pc':'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'] : ['-vn'];
+      const video = metadata.kind === 'video' ? ['-map', '0:v:0', '-vf', `scale=w='min(1920,iw)':h=-2:in_color_matrix=${["bt709","bt470bg","smpte170m","bt2020nc"].includes(metadata.colorMatrix)?metadata.colorMatrix:"auto"}:in_range=${metadata.colorRange==="pc"?"pc":metadata.colorRange==="tv"?"tv":"auto"}:out_range=${metadata.colorRange==="pc"?"pc":"tv"}:out_color_matrix=bt709:flags=lanczos+accurate_rnd+full_chroma_int${await toneMap(metadata.colorTransfer,outputDir,metadata.colorRange==="pc"?"pc":"tv")},setsar=1,setparams=range=${metadata.colorRange==="pc"?"full":"limited"}:color_primaries=bt709:color_trc=bt709:colorspace=bt709`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '16', '-g', '1', '-pix_fmt', metadata.colorRange==='pc'?'yuvj420p':'yuv420p', '-color_range', metadata.colorRange==='pc'?'pc':'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'] : ['-vn'];
       await run(ffmpeg(), [...common, ...input, ...video, '-map', '0:a:0?', '-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '128k', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', proxy], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7) });
     }
     onProgress?.(80);
@@ -438,13 +462,13 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
     onPlayable?.({ ...metadata, ...peaks, proxyUrl: `${baseUrl}/${proxyName}`, thumbnail: metadata.kind === 'audio' ? '' : `${baseUrl}/thumbnail.jpg` });
     published = Boolean(onPlayable);
     if (metadata.kind === 'video') onStage?.('Creating smaller playback previews');
-    const previews: Pick<MediaAsset, 'proxyVariants' | 'audioProxyUrl'> = metadata.kind === 'video' ? await preparePreviewVariants({ inputPath: proxy, outputDir, baseUrl, signal, onProgress: value => onProgress?.(80 + value * .19) }) : {};
+    const previews: Pick<MediaAsset, 'proxyVariants' | 'audioProxyUrl'> = metadata.kind === 'video' ? await preparePreviewVariants({ inputPath: proxy, outputDir, baseUrl, signal, refresh: options.refresh, onProgress: value => onProgress?.(80 + value * .19) }) : {};
     // After the variants, so the strip is tiled from the 480px proxy rather than the 4K original.
     if (metadata.kind === 'video') onStage?.('Creating timeline thumbnails');
     if (metadata.kind === 'video') filmstripFrames = await prepareMediaFilmstrip(inputPath, outputDir, metadata.duration, signal);
     if (onPlayable) onPlayable({ ...metadata, ...peaks, ...previews, proxyUrl: `${baseUrl}/${proxyName}`, thumbnail: metadata.kind === 'audio' ? '' : `${baseUrl}/thumbnail.jpg`, ...(filmstripFrames ? { filmstrip: `${baseUrl}/filmstrip.jpg`, filmstripFrames, filmstripVersion: FILMSTRIP_VERSION } : {}) });
     if (metadata.kind === 'video' && !SKIP_COLOR_PROXY) onStage?.('Creating high-precision color preview');
-    const colorPreview=metadata.kind==='video'&&!SKIP_COLOR_PROXY?await prepareColorProxy({inputPath,outputDir,baseUrl,signal}):{};
+    const colorPreview=metadata.kind==='video'&&!SKIP_COLOR_PROXY?await prepareColorProxy({inputPath,outputDir,baseUrl,signal,refresh:options.refresh}):{};
     onProgress?.(100);
     return { ...metadata, ...previews, ...colorPreview, proxyUrl: `${baseUrl}/${proxyName}`, thumbnail: metadata.kind === 'audio' ? '' : `${baseUrl}/thumbnail.jpg`, ...(filmstripFrames ? { filmstrip: `${baseUrl}/filmstrip.jpg`, filmstripFrames, filmstripVersion: FILMSTRIP_VERSION } : {}), ...peaks };
   } catch (error) { if (!published) await rm(proxy, { force: true }); throw error; }
@@ -500,7 +524,31 @@ function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset
 }
 
 /** A clip whose own span changes over time, and so cannot be composited in a single pass. */
-export const isAnimated = (clip: Clip) => Boolean(Object.keys(clip.keyframes ?? {}).length || isTitle(clip) && getText(clip).typingEnabled);
+export const isAnimated = (clip: Clip) => Boolean(Object.keys(clip.keyframes ?? {}).some(key => key !== 'properties.gain') || isTitle(clip) && getText(clip).typingEnabled);
+
+/**
+ * Keyed gain as one `volume` expression in clip time (T = t + `from`), so ducking renders in the single
+ * static pass. Linear and hold segments are exact; Bézier segments are sampled every 1/16 of their span.
+ */
+export function gainExpression(clip: Clip, from: number, trackGain: number) {
+  const keys = clip.keyframes?.['properties.gain'];
+  if (!keys?.length) return undefined;
+  const db = (time: number) => Math.max(-60, Math.min(12, Number(sampleKeyframes(keys, time)))) + trackGain;
+  const points: [number, number][] = [[keys[0].time, db(keys[0].time)]];
+  for (let i = 1; i < keys.length; i++) {
+    const a = keys[i - 1], b = keys[i];
+    if (a.interpolation === 'hold') points.push([b.time - 1e-6, db(a.time)]);
+    else if (a.interpolation === 'bezier') for (let n = 1; n < 16; n++) { const t = a.time + (b.time - a.time) * n / 16; points.push([t, db(t)]); }
+    points.push([b.time, db(b.time)]);
+  }
+  const T = `(t+${from.toFixed(6)})`, f = (n: number) => n.toFixed(6);
+  const terms = [`lt(${T},${f(points[0][0])})*${f(points[0][1])}`, `gte(${T},${f(points.at(-1)![0])})*${f(points.at(-1)![1])}`];
+  for (let i = 1; i < points.length; i++) {
+    const [t0, v0] = points[i - 1], [t1, v1] = points[i];
+    if (t1 - t0 > 1e-9) terms.push(`gte(${T},${f(t0)})*lt(${T},${f(t1)})*(${f(v0)}+(${f(v1 - v0)})*(${T}-${f(t0)})/${f(t1 - t0)})`);
+  }
+  return `volume='pow(10,(${terms.join('+')})/20)':eval=frame`;
+}
 
 export interface RenderRequest {
   project: Project; timeline: Timeline; timelines?: Timeline[]; clips: Clip[]; tracks: Track[]; nodes: GradeNode[];
@@ -583,7 +631,15 @@ function unseen(clip: Clip, request: RenderRequest) {
 }
 const animationWork = (request: RenderRequest) => request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && isAnimated(c) && !unseen(c, request));
 
+/** A vertical project exported at 1920 × 1080 is squashed, not letterboxed; refuse it up front. */
+export function exportAspect(resolution: string | undefined, projectResolution: string) {
+  if (!resolution) return;
+  const [w, h] = dimensions(resolution), [pw, ph] = dimensions(projectResolution);
+  if (Math.abs(w / h - pw / ph) > .01) throw new Error(`Export at ${projectResolution.replace('x', '×')} or another size with the same shape. ${resolution} would stretch the picture.`);
+}
+
 export async function renderTimeline(request: RenderRequest): Promise<void> {
+  exportAspect(request.settings.resolution, request.project.resolution);
   if (!request.pass) {
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&isCaption(c)))return renderCaptionTimeline(request);
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&c.mediaId==='frameline-composition'&&!c.disabled))return renderCompositions(request);
@@ -870,7 +926,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         });
         const times=masks[0]?.sourceTimes,renderSeek=times?.filter(t=>t<=seek+1e-7).at(-1)??seek;
         const frameTimes=times?.filter(t=>t>=renderSeek-1e-7&&t<renderSeek+decoded-1e-7);
-        const inputCube=clip.properties.colorPipeline!=='nodes-v2'?makeCube(colorTransform(clip,source.asset,[],base),65):undefined;
+        const hdr=hdrTransform(source.asset.colorTransfer),camera=clip.properties.colorPipeline!=='nodes-v2'?colorTransform(clip,source.asset,[],base):undefined;
+        const inputCube=camera||hdr?makeCube(rgb=>{const sdr=hdr?hdr(rgb):rgb;return camera?camera(sdr):sdr;},65):undefined;
         const job={input:source.path,output,ffmpeg:ffmpeg(),image:source.asset.kind==='image',seek:renderSeek,duration:decoded,width:metadata.width,height:metadata.height,fps:source.asset.kind==='image'?fps:metadata.frameRate||metadata.fps,numericFps:metadata.fps||fps,threads:Number(exportThreads),frames:frameTimes?.length??Math.ceil(decoded*(metadata.fps||fps)),frameTimes,masks,alpha:masks.length>0,managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)};
         await writeFile(jobPath,JSON.stringify(job));
         const python=process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color');
@@ -908,9 +965,12 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       }
       let lutPath = acesCube;
       if (!exactColor) {
-        const size = clip.properties.colorPipeline==='nodes-v2'||request.nodes.some(n=>n.clipId===clip.id&&(n.curves||n.effects?.length))?65:base?.size ?? 33;
-        const table = await cachedLut(['look-v1', size, lookId ?? null, colorInputs(clip, source.asset, request.nodes)], async file => {
-          const cube = makeCube(colorTransform(clip, source.asset, request.nodes, base), size);
+        // HDR sources tone-map inside the same table, so the grade sees the SDR picture the preview shows.
+        const hdr = hdrTransform(source.asset.colorTransfer);
+        const size = hdr||clip.properties.colorPipeline==='nodes-v2'||request.nodes.some(n=>n.clipId===clip.id&&(n.curves||n.effects?.length))?65:base?.size ?? 33;
+        const table = await cachedLut(['look-v1', size, lookId ?? null, colorInputs(clip, source.asset, request.nodes), hdr ? [source.asset.colorTransfer, hdrNpl()] : null], async file => {
+          const grade = colorTransform(clip, source.asset, request.nodes, base);
+          const cube = makeCube(hdr ? rgb => grade(hdr(rgb)) : grade, size);
           if (isIdentity(cube)) return true;
           await writeFile(file, cubeText(cube));
         }, tables);
@@ -922,6 +982,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       const fit = `w=${projectWidth}:h=${projectHeight}:force_original_aspect_ratio=decrease`;
       const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && !['EQ', 'Compressor', 'Limiter', 'Stabilize'].includes(e.name));
       video.push(`fps=${fps}`, `trim=duration=${length}`, 'setsar=1', ...videoFilters(clip, lutPath, source.asset, maskStreams, videoIndex === index, fitFirst ? fit : undefined));
+      // After grade and matte (both in source orientation), before crop (measured on what the viewer sees).
+      if (p.flipH && !isTitle(clip) && !isShape(clip)) video.push('hflip');
       const zoom = property('zoom', 100, 1, 800) / 100;
       const left = property('cropLeft', 0, 0, 16384), right = property('cropRight', 0, 0, 16384), top = property('cropTop', 0, 0, 16384), bottom = property('cropBottom', 0, 0, 16384);
       // Crop is measured on the fitted project canvas, preserving the original framing.
@@ -991,7 +1053,9 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       const lead = Math.max(0, audioOffset - offset);
       if (lead > 1e-9) sound.push(`atrim=start=${lead}`, 'asetpts=PTS-STARTPTS');
       if(fadeIn||fadeOut) {sound.push(`asetpts=PTS-STARTPTS+${audioStart+fadeOrigin}/TB`);if(fadeIn)sound.push(`afade=t=in:st=0:d=${fadeIn}`);if(fadeOut)sound.push(`afade=t=out:st=${fadeDuration-fadeOut}:d=${fadeOut}`);sound.push('asetpts=PTS-STARTPTS');}
-      sound.push(`volume=${gain}dB`, `pan=stereo|c0=${pan > 0 ? cosine : 1}*c0+${pan < 0 ? sine : 0}*c1|c1=${pan > 0 ? sine : 0}*c0+${pan < 0 ? cosine : 1}*c1`, `atrim=duration=${audioLength}`, `adelay=${Math.round(audioOffset * 48000)}S:all=1`);
+      const keyed = gainExpression(clip, audioStart, finite(track.gain, `${track.name} gain`, -60, 12));
+      // Small frames keep a keyed ramp smooth: eval=frame steps the gain once per frame.
+      sound.push(...(keyed ? ['asetnsamples=n=240:p=0', keyed] : [`volume=${gain}dB`]), `pan=stereo|c0=${pan > 0 ? cosine : 1}*c0+${pan < 0 ? sine : 0}*c1|c1=${pan > 0 ? sine : 0}*c0+${pan < 0 ? cosine : 1}*c1`, `atrim=duration=${audioLength}`, `adelay=${Math.round(audioOffset * 48000)}S:all=1`);
       filters.push(`[${index}:a:0]${sound.join(',')}[clipa${index}]`); audioLabels.push(`[clipa${index}]`);
     }
   }
@@ -1304,7 +1368,34 @@ async function bakeRetimedAudio(request: RenderRequest, directory: string): Prom
   return { ...request, clips, assets, tracks };
 }
 
+/**
+ * A per-frame bake chops sound into 1/fps pieces, which clicks and breaks fades, ducking and EQ. So the
+ * picture is baked silent and the sound is rendered once, statically, then the two are muxed.
+ */
+async function renderAnimatedSplit(request: RenderRequest) {
+  const directory=await mkdtemp(path.join(tmpdir(),'frameline-animation-split-'));
+  try {
+    const isProRes=request.settings.codec?.includes('ProRes'),picture=path.join(directory,isProRes?'picture.mov':'picture.mp4'),sound=path.join(directory,'sound.mov');
+    await renderAnimatedTimeline({...request,outputPath:picture,settings:{...request.settings,audio:'Disabled'},onProgress:p=>request.onProgress?.(p*.85)});
+    const own=(c:Clip)=>c.timelineId===request.timeline.id;
+    // Graphics carry no sound; captions would route the audio pass into the caption renderer.
+    const audible=await bakeRetimedAudio({...request,clips:request.clips.filter(c=>!(own(c)&&(isTitle(c)||isShape(c))))},directory);
+    // Only sound keys survive. Gain renders statically; keyed pan or audio fades still take the per-frame sound path
+    // (the sound pass hides every picture track, so it cannot split again).
+    // ponytail: pan/afade as expressions would keep those static too; add when a reel needs them.
+    const soundKeys=['properties.gain','properties.pan','properties.audioFadeIn','properties.audioFadeOut'];
+    const clips=audible.clips.map(c=>{if(!own(c)||!c.keyframes)return c;const kept=Object.fromEntries(Object.entries(c.keyframes).filter(([key])=>soundKeys.includes(key)));return {...c,keyframes:Object.keys(kept).length?kept:undefined};});
+    await renderTimeline({...audible,clips,tracks:audible.tracks.map(t=>t.kind==='video'?{...t,hidden:true}:t),project:{...request.project,resolution:'16 × 16'},outputPath:sound,
+      settings:{...request.settings,resolution:'16 × 16',codec:'Apple ProRes 4444'},onStage:undefined,onProgress:p=>request.onProgress?.(85+p*.13)});
+    await mkdir(path.dirname(request.outputPath),{recursive:true});
+    await run(ffmpeg(),[...common,'-i',picture,'-i',sound,'-map','0:v:0','-map','1:a:0','-c','copy',...(request.settings.codec?.startsWith('H.265')?['-tag:v','hvc1']:[]),'-movflags','+faststart',request.outputPath],{signal:request.signal});
+    request.onProgress?.(100);
+  } finally {await rm(directory,{recursive:true,force:true});}
+}
+
 async function renderAnimatedTimeline(request: RenderRequest) {
+  // A sound-only pass (every picture track hidden, as the optical-flow path does) has no picture to protect.
+  if(request.settings.audio!=='Disabled'&&!request.sampledFrame&&request.tracks.some(t=>t.kind==='video'&&!t.hidden))return renderAnimatedSplit(request);
   const fps=finite(request.settings.fps||request.project.fps,'Frame rate',1,120);
   const start=finite(request.settings.rangeIn??0,'Range in',0,request.timeline.duration);
   const end=finite(request.settings.rangeOut??request.timeline.duration,'Range out',start+1/fps-1e-8,request.timeline.duration);
