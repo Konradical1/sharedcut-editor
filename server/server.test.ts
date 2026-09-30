@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -234,6 +234,12 @@ test('real upload, authenticated range playback, locks, export download and medi
     assert.match(cached.headers.get('cache-control')!, /immutable/); const tag = cached.headers.get('etag')!;
     assert.ok(tag && !tag.startsWith('W/'), 'A weak validator cannot satisfy If-Range.');
     assert.equal((await fetch(`${base}${asset.proxyUrl}`, { headers: { cookie, 'if-none-match': tag } })).status, 304);
+    // Graphics with alpha preview as VP9 WebM; a 404 here froze every timeline that used one.
+    await writeFile(join(dataDir, 'media', 'source', 'prepared', 'proxy-half-alpha-v1.webm'), Buffer.alloc(64, 1));
+    const alpha = await fetch(`${base}/api/media/source/files/proxy-half-alpha-v1.webm?v=abc`, { headers: { cookie, range: 'bytes=0-15' } });
+    assert.equal(alpha.status, 206); assert.equal(alpha.headers.get('content-type'), 'video/webm'); assert.equal((await alpha.arrayBuffer()).byteLength, 16);
+    // cloudflared keeps idle origin connections for 90 s; closing them sooner resets requests mid-flight.
+    assert.ok(app.server.keepAliveTimeout > 90_000 && app.server.headersTimeout > app.server.keepAliveTimeout);
     data = (await request('/state')).data; data.state.projects[0].shared = false; assert.equal((await request('/state', 'PUT', data)).status, 200);
     assert.equal((await fetch(`${base}${asset.proxyUrl}`, { headers: { cookie: editorCookie } })).status, 404); assert.equal((await fetch(`${base}${job.outputUrl}`, { headers: { cookie: editorCookie } })).status, 404);
     assert.equal((await request('/media/source/retry', 'POST', undefined, editorCookie)).status, 404); assert.equal((await request('/media/source', 'DELETE', undefined, editorCookie)).status, 404);

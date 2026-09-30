@@ -930,7 +930,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             streamFile(req, res, originalPath(id), type, url.searchParams.has('download') || type === 'application/octet-stream' ? asset.name : undefined); return;
           }
           if (['GET', 'HEAD'].includes(method) && suffix?.startsWith('files/')) {
-            const filename = suffix.slice(6); if (!/^[a-zA-Z0-9_-]+\.(mp4|m4a|jpg|jpeg|png|json|webp)$/.test(filename)) fail(404, 'File not found.');
+            const filename = suffix.slice(6); if (!/^[a-zA-Z0-9_-]+\.(mp4|webm|m4a|jpg|jpeg|png|json|webp)$/.test(filename)) fail(404, 'File not found.');
             streamFile(req, res, join(mediaDir(id), 'prepared', filename), undefined, undefined, true); return;
           }
           if (method === 'PATCH' && !suffix) {
@@ -1263,7 +1263,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       if (!(error instanceof Error && 'status' in error)) console.error('Request failed:', error);
     }
   });
-  server.requestTimeout = 60 * 60_000; server.headersTimeout = 30_000;
+  // cloudflared pools idle origin connections for 90 s. Node's 5 s default closed them under it and reset requests.
+  server.requestTimeout = 60 * 60_000; server.keepAliveTimeout = 120_000; server.headersTimeout = 121_000;
   const housekeeping = setInterval(() => { expired(); purgeExpiredProjects(); const now = Date.now(); for (const [key, value] of authAttempts) if (value.reset < now) authAttempts.delete(key); for (const [res, subscriber] of subscribers) { if (!db.prepare('SELECT token FROM sessions WHERE token=? AND expiresAt>?').get(subscriber.session, now)) { res.end(); subscribers.delete(res); } else res.write(': heartbeat\n\n'); } }, 10_000); housekeeping.unref();
   purgeExpiredProjects();
   for (const job of state.renderJobs) if (job.status === 'rendering' || job.status === 'waiting') {
