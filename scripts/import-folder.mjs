@@ -1,6 +1,10 @@
 // Import a folder of footage into a running SharedCut project.
 //
 //   node scripts/import-folder.mjs ~/Desktop/Soccer --project "Girls Soccer" --access class
+//   FRAME_LINE_COOKIE='frameline_session=…' node scripts/import-folder.mjs --name "fisch.builds Part 1" <folder>
+//
+// Defaults to a vertical 1080 × 1920, 30 fps project. FRAME_LINE_COOKIE skips the sign-in prompt, so an
+// agent can run it; copy the cookie from a signed-in browser. An existing project with the same name is reused.
 //
 // Re-running resumes: media IDs are derived from each file's path, so a finished file is skipped
 // and a half-sent one continues from the server's offset. Safe to interrupt with Ctrl-C.
@@ -11,17 +15,18 @@
 import { createHash } from 'node:crypto';
 import { readdir, stat, open } from 'node:fs/promises';
 import { join, relative, basename, extname, resolve as resolvePath } from 'node:path';
+import { agentCookie, patchState } from './state-patch.mjs';
 
 for (const event of ['uncaughtException', 'unhandledRejection']) process.on(event, error => { console.error('\n' + (error?.message ?? error)); process.exit(1); });
 
 const args = process.argv.slice(2);
 const flag = name => { const i = args.indexOf(name); return i < 0 ? undefined : args.splice(i, 2)[1]; };
 const server = (flag('--server') ?? process.env.FRAME_LINE_URL ?? 'http://127.0.0.1:4310').replace(/\/$/, '');
-const projectName = flag('--project') ?? 'Imported footage';
+const projectName = flag('--name') ?? flag('--project') ?? 'Imported footage';
 const access = flag('--access') ?? 'private';           // private | people | class
 const classRole = flag('--class-role') ?? 'Editor';     // Viewer | Editor
-const resolution = flag('--resolution') ?? '3840 × 2160';
-const fps = Number(flag('--fps') ?? 59.94);
+const resolution = flag('--resolution') ?? '1080 × 1920';
+const fps = Number(flag('--fps') ?? 30);
 if (!args[0]) throw new Error('Pass the folder holding the footage.');
 if (!['private', 'people', 'class'].includes(access)) throw new Error('--access must be private, people, or class.');
 const root = resolvePath(args[0]);
@@ -54,7 +59,7 @@ const ask = (label, hidden) => new Promise(done => {
   input.on('data', read);
 });
 
-let cookie = '';
+let cookie = agentCookie();
 async function call(path, init = {}) {
   const response = await fetch(server + path, { ...init, headers: { ...(typeof init.body === 'string' ? { 'content-type': 'application/json' } : {}), ...(cookie && { cookie }), ...init.headers } });
   const set = response.headers.getSetCookie?.()[0]; if (set) cookie = set.split(';')[0];
@@ -85,23 +90,33 @@ const nameFor = f => counts.get(basename(f)) > 1 ? relative(root, f).replaceAll(
 console.log(`${files.length} files, ${gb(total)} from ${root}`);
 console.log(`Server ${server}\n`);
 
-await call('/api/auth/login', { method: 'POST', body: JSON.stringify({ email: await ask(`Email for ${server}: `), password: await ask('Password: ', true) }) });
+if (!cookie) await call('/api/auth/login', { method: 'POST', body: JSON.stringify({ email: await ask(`Email for ${server}: `), password: await ask('Password: ', true) }) });
 const me = (await call('/api/auth/me')).user;
+if (!me) throw new Error('Not signed in. Check FRAME_LINE_COOKIE or sign in again.');
 console.log(`Signed in as ${me.name || me.email}\n`);
 
 // --- project ------------------------------------------------------------------------------------
-const projectId = id('project', `${me.id}:${projectName}`);
-const timelineId = id('timeline', projectId);
-let view = await call('/api/state');
-if (!view.state.projects.some(p => p.id === projectId)) {
-  const next = structuredClone(view.state);
-  next.projects = [{ id: projectId, name: projectName, description: '', thumbnail: '', modifiedAt: Date.now(), duration: 0, resolution, fps, shared: false, status: 'In progress', members: [] }, ...next.projects];
-  next.timelines = [...next.timelines, { id: timelineId, projectId, name: projectName, duration: 0 }];
-  next.tracks = [...next.tracks, ...[['v2', 'B-roll', 'video', 2], ['v1', 'Main picture', 'video', 1], ['a1', 'Dialogue', 'audio', 1], ['a2', 'Music', 'audio', 2]]
-    .map(([slug, name, kind, number]) => ({ id: id('track', `${timelineId}:${slug}`), timelineId, name, kind, number, muted: false, solo: false, locked: false, hidden: false, gain: kind === 'audio' && number !== 1 ? -12 : 0, pan: 0 }))];
-  view = await call('/api/state', { method: 'PUT', body: JSON.stringify({ revision: view.revision, state: next }) });
-  console.log(`Created project "${projectName}" (you are Owner)`);
-} else console.log(`Project "${projectName}" already exists — resuming`);
+// A project made in the browser has a random id; reuse it by name instead of creating a twin.
+const existing = (await call('/api/state')).state.projects.find(p => p.name === projectName);
+const projectId = existing?.id ?? id('project', `${me.id}:${projectName}`);
+let created = false;
+await patchState(call, state => {
+  const project = state.projects.find(p => p.id === projectId);
+  if (project) {
+    // Room for a ~60 s reel even when the project was made with an empty timeline.
+    const short = state.timelines.filter(t => t.projectId === projectId && t.duration < 60);
+    return short.length ? { timelines: { upsert: short.map(t => ({ ...t, duration: 60 })), remove: [] } } : null;
+  }
+  created = true;
+  const timelineId = id('timeline', projectId);
+  return {
+    projects: { upsert: [{ id: projectId, name: projectName, description: '', thumbnail: '', modifiedAt: Date.now(), duration: 0, resolution, fps, shared: false, status: 'In progress', members: [] }], remove: [] },
+    timelines: { upsert: [{ id: timelineId, projectId, name: projectName, duration: 60 }], remove: [] },
+    tracks: { upsert: [['v2', 'B-roll', 'video', 2], ['v1', 'Main picture', 'video', 1], ['a1', 'Dialogue', 'audio', 1], ['a2', 'Music', 'audio', 2]]
+      .map(([slug, name, kind, number]) => ({ id: id('track', `${timelineId}:${slug}`), timelineId, name, kind, number, muted: false, solo: false, locked: false, hidden: false, gain: kind === 'audio' && number !== 1 ? -12 : 0, pan: 0 })), remove: [] },
+  };
+});
+console.log(created ? `Created project "${projectName}" ${resolution} ${fps} fps (you are Owner)` : `Project "${projectName}" already exists — resuming`);
 
 if (access !== 'private') {
   await call(`/api/projects/${projectId}`, { method: 'PATCH', body: JSON.stringify({ access, ...(access === 'class' ? { classRole } : {}) }) });
@@ -115,14 +130,20 @@ let sent = 0, done = 0, skipped = 0;
 const rate = () => { const s = (Date.now() - started) / 1000; return s > 0 ? `${(sent / 1024 ** 2 / s).toFixed(0)} MB/s` : '-'; };
 
 for (const file of files) {
-  const size = sizes.get(file), name = nameFor(file), mediaId = id('media', relative(root, file));
+  const size = sizes.get(file), name = nameFor(file), mediaId = id('media', `${projectId}:${relative(root, file)}`);   // per project: one folder can feed two reels
   const { mtimeMs } = await stat(file);
   const fingerprint = `${name}:${size}:${Math.floor(mtimeMs)}`;
   done++;
   const label = `[${String(done).padStart(3)}/${files.length}] ${name}`;
 
-  await call(`/api/media?${new URLSearchParams({ projectId, id: mediaId, name, placeholder: '1' })}`, { method: 'POST' })
-    .catch(error => { if (error.status !== 409) throw error; });   // 409 = already created by an earlier run
+  for (let attempt = 1; ; attempt++) {
+    try { await call(`/api/media?${new URLSearchParams({ projectId, id: mediaId, name, placeholder: '1' })}`, { method: 'POST' }); break; }
+    catch (error) {
+      if (error.status === 409) break;   // already created by an earlier run
+      if (error.status !== 429 || attempt >= ATTEMPTS * 2) throw error;
+      await new Promise(r => setTimeout(r, Math.min(15000, 500 * 2 ** attempt)));
+    }
+  }
 
   const state = await call(`/api/media/${mediaId}/upload`, { method: 'POST', body: JSON.stringify({ size, fingerprint }) });
   if (state.complete) { skipped++; sent += size; console.log(`${label} - already uploaded`); continue; }
