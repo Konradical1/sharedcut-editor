@@ -1,4 +1,4 @@
-// Browser regression: playback must not write to the page's layout every frame (LiveTimecode, LocalPlayhead).
+// Browser regression: playback must not write to the page's layout every frame (LiveTimecode, LocalPlayhead, RemotePlayhead).
 // A per-frame text or style change re-ran layout, hover hit testing and compositing for the whole page.
 // Run: node --experimental-strip-types --test src/components/playbackPaint.browser.test.ts
 // DIST=<built dist> skips the build; PLAYWRIGHT_CHROME_PATH picks a Chrome binary (default: installed Chrome).
@@ -9,7 +9,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { chromium, type Browser } from 'playwright';
+import { chromium, request, type Browser, type BrowserContext } from 'playwright';
 import { createFrameLineServer } from '../../server/index.ts';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
@@ -22,13 +22,14 @@ before(async () => {
 });
 after(async () => { await browser?.close(); if (built) await rm(built, { recursive: true, force: true }); });
 
-async function openProject(t: { after: (fn: () => Promise<void>) => void }) {
+async function openProject(t: { after: (fn: () => Promise<void>) => void }, prepare?: (context: BrowserContext, url: string) => Promise<void>) {
   const temp = await mkdtemp(join(tmpdir(), 'frameline-paint-'));
   const app = createFrameLineServer({ dataDir: join(temp, 'data'), distDir: dist });
   await new Promise<void>(r => app.server.listen(0, '127.0.0.1', r));
   const url = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } }), page = await context.newPage();
   t.after(async () => { await context.close(); await app.close(); await rm(temp, { recursive: true, force: true }); });
+  await prepare?.(context, url);
   await page.goto(url);
   await page.getByRole('button', { name: 'Create account', exact: true }).click();
   await page.getByRole('textbox', { name: 'Your name' }).fill('Paint Tester');
@@ -43,6 +44,8 @@ async function openProject(t: { after: (fn: () => Promise<void>) => void }) {
   return page;
 }
 const seconds = (text: string | null) => { const [h, m, s, f] = (text ?? '').split(':').map(Number); return h * 3600 + m * 60 + s + f / 30; };
+/** Whether a canvas holds no pixels at all. */
+const blank = (e: Element) => { const c = e as HTMLCanvasElement; return c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data.every((v, i) => i % 4 !== 3 || v === 0); };
 
 test('playing moves the playhead and both timecodes without per-frame DOM writes, and pausing restores plain text', async t => {
   const page = await openProject(t);
@@ -108,7 +111,111 @@ test('zoomed in, the playing playhead stops drawing once it leaves the view', as
   assert.ok(time > 2.4, `still playing (${time} s)`);
   assert.equal(await draws(), before, 'no drawing while the playhead is off screen');
   assert.equal(await page.locator('.local-playhead-canvas').evaluate(e => (e as HTMLElement).style.left), left, 'the strip holds still');
-  assert.ok(await page.locator('.local-playhead-canvas').evaluate(e => { const c = e as HTMLCanvasElement; return c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data.every((v, i) => i % 4 !== 3 || v === 0); }), 'the strip is left empty');
+  assert.ok(await page.locator('.local-playhead-canvas').evaluate(blank), 'the strip is left empty');
+});
+
+type Remote = { userId: string; projectId: string; timelineId: string; from: number; startedAt: number; playing: boolean; sentStill?: boolean };
+/** Plays a collaborator in this page alone: the presence the server relays (event stream and replies) gains `window.remote`. */
+function fakeCollaborator() {
+  const w = window as unknown as { remote?: Remote };
+  let real: { userId: string }[] = [], listener: ((event: MessageEvent) => void) | undefined;
+  const person = (r: Remote) => ({ userId: r.userId, projectId: r.projectId, timelineId: r.timelineId, cursor: null, activity: 'edit', online: true, updatedAt: Date.now(), playing: r.playing,
+    playhead: r.from + (r.playing ? (Date.now() - r.startedAt) / 1000 : 0) });
+  const relay = (data: { presence: { userId: string }[] }) => { real = data.presence.filter(p => p.userId !== w.remote?.userId); return w.remote ? { ...data, presence: [...real, person(w.remote)] } : data; };
+  const add = EventSource.prototype.addEventListener;
+  EventSource.prototype.addEventListener = function (this: EventSource, type: string, fn: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) {
+    if (type !== 'presence') return add.call(this, type, fn, options);
+    listener = fn as (event: MessageEvent) => void;
+    add.call(this, type, (e: Event) => listener!(new MessageEvent(type, { data: JSON.stringify(relay(JSON.parse((e as MessageEvent).data))) })), options);
+  } as typeof add;
+  // A playing collaborator publishes at 4 Hz, a still one once.
+  setInterval(() => { const r = w.remote; if (r && listener && (r.playing || !r.sentStill)) { r.sentStill = !r.playing; listener(new MessageEvent('presence', { data: JSON.stringify({ projectId: r.projectId, presence: [...real, person(r)], serverTime: Date.now() }) })); } }, 250);
+  const fetch = window.fetch;
+  window.fetch = async (input, init) => {
+    const response = await fetch(input, init);
+    if (!String(input instanceof Request ? input.url : input).includes('/api/presence') || !response.ok) return response;
+    const body = await response.clone().json();
+    return Array.isArray(body?.presence) ? new Response(JSON.stringify(relay(body)), { status: response.status, headers: response.headers }) : response;
+  };
+}
+
+/** A project with a second account, Remote Player, fed to the page as a collaborator (fakeCollaborator); `play(from)` starts them playing. */
+async function openWithCollaborator(t: { after: (fn: () => Promise<void>) => void }) {
+  let userId = '';
+  const page = await openProject(t, async (context, url) => {
+    const other = await request.newContext({ baseURL: url });
+    userId = (await (await other.post('/api/auth/signup', { data: { name: 'Remote Player', email: 'remote@example.test', password: 'Remote-test-password-2026' } })).json()).user.id;
+    await other.dispose();
+    await context.addInitScript(fakeCollaborator);
+  });
+  const projectId = decodeURIComponent(new URL(page.url()).pathname.split('/').pop()!);
+  const timelineId = (await (await page.request.get(new URL('/api/state', page.url()).href)).json()).state.timelines.find((t: { projectId: string }) => t.projectId === projectId).id;
+  const play = (from: number) => page.evaluate(remote => { (window as unknown as { remote: Remote }).remote = { ...remote, startedAt: Date.now() }; }, { userId, projectId, timelineId, from, startedAt: 0, playing: true });
+  return { page, play };
+}
+
+test('a collaborator playing is drawn into a canvas, not moved element by element, and their still playhead is the element again', async t => {
+  const { page, play } = await openWithCollaborator(t);
+  await play(.5);
+  const strip = page.locator('.remote-playhead-canvas:not([hidden])');
+  await strip.waitFor();
+  const before = await strip.screenshot();
+  await page.evaluate(() => {
+    const w = window as unknown as { writes: string[] }; w.writes = [];
+    new MutationObserver(list => { for (const m of list) if (m.target instanceof Element && m.target.closest('.remote-playhead,.remote-playhead-canvas')) w.writes.push(`${m.attributeName}:${m.target.className}`); })
+      .observe(document.body, { subtree: true, attributes: true, attributeFilter: ['style', 'class', 'hidden'] });
+  });
+  await page.waitForTimeout(1200);
+  assert.deepEqual(await page.evaluate(() => (window as unknown as { writes: string[] }).writes), [], 'no per-frame style writes while the collaborator plays');
+  assert.ok(!before.equals(await strip.screenshot()), 'the drawn line moves');
+  assert.equal(await page.locator('.remote-playhead').evaluate(el => getComputedStyle(el).visibility), 'hidden');
+
+  // They stop: the line settles and the element takes over where it stopped.
+  const stopped = await page.evaluate(() => { const r = (window as unknown as { remote: Remote }).remote; r.from += (Date.now() - r.startedAt) / 1000; r.playing = false; return r.from; });
+  await page.waitForFunction(() => !document.querySelector('.remote-playhead-canvas:not([hidden])') && getComputedStyle(document.querySelector('.remote-playhead')!).visibility === 'visible');
+  const x = await page.locator('.remote-playhead').evaluate(el => new DOMMatrix(getComputedStyle(el).transform).m41);
+  // The default zoom is 6 px a second.
+  assert.ok(Math.abs(x - stopped * 6) <= 1, `still at ${x}px for ${stopped}s`);
+  // A hidden strip keeps nothing: drawn again elsewhere (they play on, or scroll), an old line and tag showed there too.
+  assert.ok(await page.locator('.remote-playhead-canvas').evaluate(blank), 'the hidden strip holds no old line');
+});
+
+test('a collaborator’s name tag is drawn whole, however near its strip’s edge the line comes', async t => {
+  const { page, play } = await openWithCollaborator(t);
+  // Zoomed to 60 frames across, the line moves several pixels a frame and crosses its strip in under half a second.
+  await page.locator('.timeline-zoom button', { hasText: '60f' }).click();
+  type Drawn = { overhang: number[]; strips: Set<string> };
+  await page.evaluate(() => {
+    const w = window as unknown as Drawn, roundRect = CanvasRenderingContext2D.prototype.roundRect; w.overhang = []; w.strips = new Set();
+    // The tag is the strip's only rounded rectangle: how far past the strip's right edge it reaches, each time it is drawn.
+    CanvasRenderingContext2D.prototype.roundRect = function (x, y, width, height, radii) {
+      if (this.canvas.classList.contains('remote-playhead-canvas')) { w.overhang.push(x + width - parseFloat(this.canvas.style.width)); w.strips.add(this.canvas.style.left); }
+      return roundRect.call(this, x, y, width, height, radii);
+    };
+  });
+  await play(.5);
+  // Once the strip has jumped ahead, the line has been everywhere in it up to its edge.
+  await page.waitForFunction(() => (window as unknown as Drawn).strips.size >= 2);
+  const overhang = Math.max(...await page.evaluate(() => (window as unknown as Drawn).overhang));
+  assert.ok(overhang <= 0, `the name tag reaches ${overhang} px past its strip`);
+});
+
+test('the dashboard’s "minutes ago" labels move on while nothing in the store changes', async t => {
+  // The store clock's no-op update 30 times a second re-rendered the dashboard; a still store no longer does.
+  const page = await openProject(t, context => context.clock.install());
+  await page.getByRole('button', { name: 'Back to projects', exact: true }).click();
+  await page.getByRole('button', { name: 'Recent activity', exact: true }).click();
+  const label = page.locator('.dash-activity-list small').first();
+  await label.waitFor();
+  // Quiet the store: the once-a-second state poll's reply also re-rendered the whole dashboard. Held, it changes nothing.
+  await page.route('**/api/state**', () => {});
+  await page.waitForTimeout(1500);
+  // Let whatever was still settling (toasts, saves) settle, then let only time pass.
+  await page.clock.fastForward('02:00'); await page.waitForTimeout(500);
+  const before = await label.innerText();
+  await page.clock.fastForward('05:00');
+  await page.waitForFunction(text => document.querySelector('.dash-activity-list small')?.textContent !== text, before, { polling: 100, timeout: 3000 });
+  assert.match(await label.innerText(), /^\d+ minutes ago$/);
 });
 
 type Counts = { reads: number; pictures: number; scrubText: number; scrubAttributes: number };

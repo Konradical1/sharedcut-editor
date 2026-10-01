@@ -24,9 +24,9 @@ try {
   await page.getByRole('tab',{name:'Shapes',exact:true}).click();await page.getByRole('button',{name:'Add Rectangle shape',exact:true}).click();await saved();
   assert.equal((await state()).clips.length,3);
   const rows=await page.locator('.timeline-track.video .track-lane').all(),top=await rows[0].boundingBox(),bottom=await rows[2].boundingBox();
-  const beforeTime=await page.locator('.transport-time').innerText();
+  const beforeTime=await page.locator('.transport-time').textContent();
   await page.mouse.move(top.x+70,top.y+4);await page.mouse.down();await page.mouse.move(top.x+1,bottom.y+bottom.height-3,{steps:12});assert.equal(await page.locator('.selection-marquee').count(),1);await page.mouse.up();
-  assert.equal(await page.locator('.timeline-clip.selected').count(),3);assert.equal(await page.locator('.transport-time').innerText(),beforeTime);
+  assert.equal(await page.locator('.timeline-clip.selected').count(),3);assert.equal(await page.locator('.transport-time').textContent(),beforeTime);
   // Shift toggles selection on every clip type, independent of text formatting selection.
   const selected=page.locator('.timeline-clip').first();await selected.click({modifiers:['Shift']});assert.equal(await page.locator('.timeline-clip.selected').count(),2);await selected.click({modifiers:['Shift']});assert.equal(await page.locator('.timeline-clip.selected').count(),3);
   await selected.click({button:'right'});await page.getByRole('menuitem',{name:'Create composition',exact:true}).click();await saved();
@@ -55,8 +55,8 @@ try {
   const animated=(await state()).clips.filter(c=>c.mediaId==='frameline-title'&&c.timelineId===parent.timelineId).at(-1);assert.ok(animated?.keyframes);
   const row=page.locator('.timeline-track').filter({has:page.locator(`[data-clip="${animated.id}"]`)});await row.getByRole('button',{name:/Expand keyframes/}).click();
   await page.locator('.animation-rows').waitFor();const lanes=page.locator('.animation-rows .animation-lane').filter({has:page.locator('.animation-diamond')});const kr=await lanes.first().boundingBox(),ke=await lanes.last().boundingBox();
-  const time=await page.locator('.transport-time').innerText();await page.mouse.move(kr.x+60,kr.y+3);await page.mouse.down();await page.mouse.move(kr.x+1,ke.y+ke.height-2,{steps:10});await page.mouse.up();
-  const keys=await page.locator('.animation-rows .animation-diamond.selected').count();assert.ok(keys>=4);assert.equal(await page.locator('.transport-time').innerText(),time);assert.equal(await page.locator('.timeline-clip.selected').count(),1);
+  const time=await page.locator('.transport-time').textContent();await page.mouse.move(kr.x+60,kr.y+3);await page.mouse.down();await page.mouse.move(kr.x+1,ke.y+ke.height-2,{steps:10});await page.mouse.up();
+  const keys=await page.locator('.animation-rows .animation-diamond.selected').count();assert.ok(keys>=4);assert.equal(await page.locator('.transport-time').textContent(),time);assert.equal(await page.locator('.timeline-clip.selected').count(),1);
   await page.screenshot({path:join(out,'compositions-selection.png')});
   const point=page.locator('.animation-rows .animation-diamond.selected').first(),pr=await point.boundingBox();await page.mouse.move(pr.x+pr.width/2,pr.y+pr.height/2);await page.mouse.down();await page.mouse.move(pr.x+pr.width/2+4,pr.y+pr.height/2,{steps:5});await page.mouse.up();await saved();
   await point.focus();await page.keyboard.press('Backspace');await saved();assert.equal(await page.locator(`[data-clip="${animated.id}"]`).count(),1);assert.equal(Object.keys((await state()).clips.find(c=>c.id===animated.id).keyframes).length,0);

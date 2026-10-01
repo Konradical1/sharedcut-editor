@@ -234,10 +234,12 @@ type AudioRoute = {
 type Decoder = AudioRoute & {
   url: string; element: HTMLMediaElement | HTMLImageElement; image: boolean; pending: boolean; blocked: boolean;
   frames?: ReturnType<typeof createVideoFrames>; framesFailed?: boolean; lastUsed: number; waitingSince?: number; error?: string; audioOnly: boolean; videoCallback?: number;
+  /** Opened on StreamLow by the automatic rule, not asked for by name (an alpha graphic's 1/4 file is also its StreamLow). */
+  automaticLow?: boolean;
 };
 
 /** The timeline consumes prepared frames; native media remains the audio/compatibility path. */
-export function attachPlayback(canvas: HTMLCanvasElement, getState: () => PlaybackState, getOptions: () => PreviewOptions, onStatus: (status: PlaybackStatus) => void) {
+export function attachPlayback(canvas: HTMLCanvasElement, getState: () => PlaybackState, getOptions: () => PreviewOptions, onStatus: (status: PlaybackStatus) => void, preferLowStream = footageCache.preferLowStream) {
   const output = canvas.getContext('2d', { alpha: false })!;
   const composite = document.createElement('canvas');
   const context = composite.getContext('2d', { alpha: false })!;
@@ -333,10 +335,15 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     decoder.source?.disconnect(); decoder.filters.forEach(node => node.disconnect()); decoder.gain?.disconnect(); decoder.pan?.disconnect(); decoder.analyser?.disconnect();
   };
   const decoderFor = (clip: Clip, asset: MediaAsset, visual: boolean, options: PreviewOptions) => {
-    const requestedUrl = playbackUrl(asset, options, visual);
-    // Pick at decoder creation, not on each throughput sample: no quality oscillation mid-shot.
-    if(visual&&!options.original&&options.quality==='Stream'&&!decoders.has(clip.id)&&asset.proxyVariants?.StreamLow&&requestedUrl&&![...decoders.values()].some(decoder=>decoder.url===requestedUrl&&!decoder.audioOnly)&&footageCache.preferLowStream(requestedUrl))automaticStreams.set(asset.id,asset.proxyVariants.StreamLow);
-    const url = selectedUrl(asset, options, visual), audioOnly = !visual || asset.kind === 'audio';
+    const requestedUrl = playbackUrl(asset, options, visual), low = asset.proxyVariants?.StreamLow, open = decoders.get(clip.id);
+    const automatic = visual && !options.original && options.quality === 'Stream' && !!low && !!requestedUrl && low !== requestedUrl && !streamFallbacks.has(requestedUrl);
+    // Every picture decoder asks as it opens, never on a throughput sample, and keeps its stream until it closes: no
+    // quality change mid-shot; only its own stall moves it (tick). So a clip of a file a sibling already plays on Stream
+    // still opens low on a slow line, and the asset is back on Stream at its next decoder once the background fill has
+    // saved what that one reads. While nothing measures the line (no answer: cache off, no controlling footage worker, no
+    // rate yet) a stall's low stream stands.
+    if (automatic && !open) { const slow = preferLowStream(requestedUrl); if (slow) automaticStreams.set(asset.id, low); else if (slow === false) automaticStreams.delete(asset.id); }
+    const url = automatic && (open?.url === requestedUrl || open?.url === low && open.automaticLow) ? open!.url : selectedUrl(asset, options, visual), audioOnly = !visual || asset.kind === 'audio';
     const fallback = !url && visual && asset.thumbnail;
     if (!url && !fallback) return;
       let decoder = decoders.get(clip.id);
@@ -344,7 +351,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if (!decoder) {
         const image = asset.kind === 'image' || !!fallback;
         const element = image ? new Image() : document.createElement(audioOnly ? 'audio' : 'video');
-        decoder = { url: String(url || fallback), element, image, audioOnly, pending: false, blocked: false, filters: [], lastUsed: performance.now() };
+        decoder = { url: String(url || fallback), element, image, audioOnly, pending: false, blocked: false, filters: [], lastUsed: performance.now(), automaticLow: automatic && url === low };
         const current = decoder;
         element.crossOrigin = 'anonymous'; element.onerror = () => {
           const stream = byId(getState().media).get(asset.id)?.proxyVariants?.Stream, media = image ? undefined : element as HTMLMediaElement;
@@ -724,10 +731,11 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         for(const frame of frames.prepare(pictureTime,Math.max(.001,rate*Number(clip.properties.speed??100)/100)/previewFps))color?.prepare(media,frame);
         if(!queuedFrame){
           decoder.waitingSince??=performance.now();
-          // Only a slow link is a reason for the smaller file; a slow decode of a cached Stream file would only move
-          // playback onto a file that is not cached. An uncached file keeps the plain 1.2 s fallback, the only
-          // signal there is when no rate has been measured (cache off, no service worker yet).
-          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow&&(footageCache.preferLowStream(decoder.url)||!footageCache.clipCached(clip.id))){automaticStreams.set(asset.id,asset.proxyVariants.StreamLow);dirty=true;}
+          // Only a link too slow for the file is a reason for the smaller one (preferLowStream knows the line and what is
+          // saved). A slow decode, or a cold start on a fast line, would trade quality for nothing: that wait used to drop
+          // any not-yet-cached clip to the low stream. While nothing measures the line (no answer: cache off, no controlling
+          // footage worker, no rate yet) the wait is the signal.
+          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow&&preferLowStream(decoder.url)!==false){automaticStreams.set(asset.id,asset.proxyVariants.StreamLow);cleanup(decoder);decoders.delete(decoderId);dirty=true;holdLayer();continue;}
           // Failed codecs switch through buffered() immediately. A network timeout remains visible.
           if(performance.now()-decoder.waitingSince>30000){decoder.framesFailed=true;frames.dispose();decoder.frames=undefined;dirty=true;}
           holdLayer();footageCache.setDecoderStatus(clip.id,decoder.url,`${asset.name} · ${frames.ahead?'Decoding requested frame':'Buffering video'}`);continue;
@@ -1025,7 +1033,10 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       window.dispatchEvent(new CustomEvent('frameline:meters', { detail: { tracks: trackLevels, master: rms } }));
     }
     const blocker = loading ? [...activeIds].map(id => footageCache.clipFootageStatus(id)).map(item => item.playback).find(Boolean) : undefined;
-    const automaticLow=[...activeIds].some(id=>{const decoder=decoders.get(id);return decoder&&[...automaticStreams.values()].includes(decoder.url);});
+    // Only a picture the automatic rule moved, by the clip's own asset (a decoder keeps its low stream to the end of its
+    // shot after the asset is back on Stream). An alpha graphic's StreamLow is its 1/4 file, which it may be asked for by name.
+    const clipById=byId(state.clips);
+    const automaticLow=options.quality==='Stream'&&!options.original&&[...activeIds].some(id=>{const decoder=decoders.get(id),asset=mediaById.get(clipById.get(id)?.mediaId??''),low=asset?.proxyVariants?.StreamLow;return !!decoder?.automaticLow&&!!low&&decoder.url===low&&playbackUrl(asset!,options,true)!==low;});
     const fallbackActive = [...activeIds].some(id => { const decoder = decoders.get(id); return decoder && [...streamFallbacks.values()].includes(decoder.url); });
     loadingSince = loading ? loadingSince ?? performance.now() : undefined;
     // A paused seek that lands within a moment is a scrub, not buffering: hold the last picture quietly.

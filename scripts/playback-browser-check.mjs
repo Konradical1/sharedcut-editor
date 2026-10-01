@@ -106,7 +106,11 @@ try {
         const pixels = () => { const lane = document.querySelector('.track-lane'); return lane.getBoundingClientRect().width / Number(lane.dataset.timeSpan); };
         const setPlayhead = time => { const ruler = document.querySelector('.timeline-ruler'), box = ruler.getBoundingClientRect(); ruler.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 1, button: 0, buttons: 1, clientX: box.left + time * pixels(), clientY: box.top + 5 })); window.dispatchEvent(new PointerEvent('pointerup',{pointerId:1})); };
         const setPlaying = playing => document.querySelector(`button[aria-label="${playing ? 'Play' : 'Pause'} playback"]`)?.click();
-        const store = production ? { getState: () => ({ clips: fixture.clips, media: fixture.media, timelineId: fixture.timelines[0].id, playhead: Number(document.querySelector('.local-playhead').style.transform.match(/translateX\(([-.\d]+)/)?.[1] || 0) / pixels(), setPlayhead, setPlaying }) } : (await import('/src/state/store.ts')).useEditorStore;
+        // Playing, the timeline draws its playhead into a canvas and .local-playhead holds still: the engine reports the
+        // playhead of every picture it presents.
+        let enginePlayhead = 0; const presented = event => { enginePlayhead = event.detail.playhead; };
+        window.addEventListener('frameline:playback-health', presented);
+        const store = production ? { getState: () => ({ clips: fixture.clips, media: fixture.media, timelineId: fixture.timelines[0].id, playhead: enginePlayhead, setPlayhead, setPlaying }) } : (await import('/src/state/store.ts')).useEditorStore;
         const wait = ms => new Promise(r => setTimeout(r, ms));
         store.getState().setPlaying(false); store.getState().setPlayhead(0); await wait(1500);
         const canvas = document.querySelector('.viewer-frame canvas');
@@ -135,7 +139,7 @@ try {
           while (performance.now() - start < 5000) { await wait(5); if (canvas.dataset.sourceClip === clip.id && Math.abs(Number(canvas.dataset.sourceTimestamp) - expected) < .002) break; }
           latencies.push(performance.now() - start);
         }
-        window.removeEventListener('frameline:frame', painted);
+        window.removeEventListener('frameline:frame', painted); window.removeEventListener('frameline:playback-health', presented);
         return { workspace, quality, gpu, playback, scrub, randomSeek: { p95Ms: percentile(latencies, .95), maxMs: Math.max(...latencies) }, media: window.qaMedia.filter(m => m.src).map(m => ({ tag: m.tagName, width: m.videoWidth, url: m.src.split('/').at(-1) })) };
       }, { workspace, quality, production, fixture: imported });
       await page.mouse.up();

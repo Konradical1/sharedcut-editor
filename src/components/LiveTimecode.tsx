@@ -13,6 +13,58 @@ export function onPicture(listener: (playhead: number) => void) {
   return () => window.removeEventListener('frameline:playback-health', presented);
 }
 
+/** How far a moving playhead's line travels across its canvas strip, and the least room it keeps from the strip's edges, in CSS pixels. */
+const STRIP_TRAVEL = 224, STRIP_MARGIN = 16;
+/**
+ * A moving playhead line, drawn into a canvas strip instead of moving an element: any per-frame change to an element in the
+ * timeline re-layerized the whole page (~13 ms a frame on a fast laptop, ~75 ms at 4x CPU slowdown), will-change or not.
+ * The strip is as tall as what the scroller shows, so each draw redraws and composites little; horizontal scrolling carries
+ * it along with the content, and it jumps ahead (one layout) only when the line nears its edge. Off screen it is left blank
+ * and still: zoomed in, the line leaves the view within a second, and redrawing the unseen strip every picture stalled the
+ * GPU process ~100 ms every few seconds. `draw(at)` takes the line's left edge in the track area's coordinates (where the
+ * paused element sits); `paint` draws it at x with the track area's top at y, in CSS pixels
+ * (the context is scaled to device pixels by `scale`). `reach` is how far right of x the drawing goes (a collaborator's name
+ * tag hangs to the right of their line); the strip keeps that much room on its right so nothing is cut off.
+ * The canvas starts and ends blank: one canvas serves strip after strip, and an old line left in it showed up again.
+ */
+export function playheadStrip(surface: HTMLCanvasElement, scroll: HTMLElement, area: HTMLElement, paint: (context: CanvasRenderingContext2D, x: number, y: number, scale: number) => void, reach = STRIP_MARGIN) {
+  const context = surface.getContext('2d'), after = Math.max(STRIP_MARGIN, Math.ceil(reach)), stripWidth = STRIP_MARGIN + STRIP_TRAVEL + after;
+  let left = NaN, top = 0, scale = 1, shown = NaN, at = NaN, blank = false;
+  const clear = () => {
+    if (blank || !context) return;
+    context.setTransform(1, 0, 0, 1, 0, 0); context.clearRect(0, 0, surface.width, surface.height); blank = true; shown = NaN;
+  };
+  const draw = (next: number) => {
+    at = next;
+    if (!context) return;
+    const view = scroll.scrollLeft - area.offsetLeft;
+    if (at + after < view || at - STRIP_MARGIN > view + scroll.clientWidth) { clear(); return; }
+    if (!(at - STRIP_MARGIN >= left && at + after <= left + stripWidth)) { left = Math.floor(at - STRIP_MARGIN); surface.style.left = `${left}px`; shown = NaN; }
+    const x = at - left;
+    if (x === shown) return;
+    shown = x; blank = false;
+    context.setTransform(1, 0, 0, 1, 0, 0); context.clearRect(0, 0, surface.width, surface.height);
+    context.setTransform(scale, 0, 0, scale, 0, 0);
+    paint(context, x, -top, scale);
+  };
+  const place = () => {
+    top = scroll.scrollTop - area.offsetTop;
+    scale = (scroll.offsetWidth ? scroll.getBoundingClientRect().width / scroll.offsetWidth : 1) * devicePixelRatio;
+    Object.assign(surface.style, { top: `${top}px`, width: `${stripWidth}px`, height: `${scroll.clientHeight}px` });
+    // Resizing a canvas reallocates it; scrolling alone only moves it.
+    const width = Math.max(1, Math.round(stripWidth * scale)), height = Math.max(1, Math.round(scroll.clientHeight * scale));
+    if (surface.width !== width || surface.height !== height) { surface.width = width; surface.height = height; }
+    shown = NaN; if (at === at) draw(at);
+  };
+  place(); clear();
+  const resize = new ResizeObserver(place);
+  resize.observe(scroll);
+  let scrolledTop = scroll.scrollTop;
+  const scrolled = () => { if (scroll.scrollTop !== scrolledTop) { scrolledTop = scroll.scrollTop; place(); } };
+  scroll.addEventListener('scroll', scrolled, { passive: true });
+  return { draw, dispose: () => { resize.disconnect(); scroll.removeEventListener('scroll', scrolled); clear(); } };
+}
+
 /** The first background behind an element if it is a plain opaque colour; undefined for any transparency or image. */
 export function opaqueBackdrop(element: Element): string | undefined {
   for (let node: Element | null = element; node; node = node.parentElement) {

@@ -321,7 +321,8 @@
 .clip-cache:before{content:"";position:absolute;left:0;top:0;bottom:0;width:100%;transform-origin:left;scale:var(--progress) 1;background:var(--cache-color);opacity:.6;transition:scale .3s}
 .clip-cache>span{position:relative;text-shadow:0 1px 2px #000}
 .clip-cache.blue{--cache-color:#559ef0}.clip-cache.green{--cache-color:#4cc26a}.clip-cache.yellow{--cache-color:#e0b93f}.clip-cache.red{--cache-color:#e0524a}
-/* While playing, the playhead and the timecodes are canvases: per-frame element changes re-layerize the whole page. */
+/* While playing, the playheads (a collaborator's too) and the timecodes are canvases: per-frame element changes re-layerize the whole page. */
 .local-playhead-canvas{position:absolute;z-index:9;pointer-events:none}
+.remote-playhead-canvas{position:absolute;z-index:4;pointer-events:none;opacity:.52}
 .timeline-scroll[data-playing] .clip-cache:before,.timeline-scroll[data-playing] .clip-preparing:before{transition:none}
 .live-timecode{position:relative}.live-timecode-held::after{content:attr(data-text);visibility:hidden}.live-timecode-origin{display:inline-block;width:0;height:0}.live-timecode-canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;image-rendering:pixelated}

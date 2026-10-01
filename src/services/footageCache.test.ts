@@ -7,13 +7,13 @@ import ts from 'typescript';
 
 const CHUNK = 1 << 20;
 const pathOf = (key: string | Request) => { const url = new URL(typeof key === 'string' ? key : key.url, 'https://sharedcut.test'); return url.pathname + url.search; };
-function harness({ badIndex = false, quota = false, status = 206, registrationFails = false, timedRanges = false, count = 4, failing = /$^/ } = {}) {
+function harness({ badIndex = false, quota = false, status = 206, registrationFails = false, timedRanges = false, count = 4, failing = /$^/, controlled = true } = {}) {
   const cache = new Map<string, Response>(), pending: { url: string; resolve: () => void; aborted: boolean }[] = [];
   const requests: { url: string; start: number }[] = [], ranges: [number, number][] = [], delays: number[] = [];
   let now = 1000, peak = 0, active = 0, calls = 0;
   const timers = new Map<number, () => void>(); let timer = 0;
   const handlers:Record<string,(event:any)=>void>={};
-  const worker = { register: async () => { if (registrationFails) throw new Error('Worker blocked'); return {}; }, controller: {}, addEventListener(type:string,handler:(event:any)=>void) {handlers[type]=handler;} };
+  const worker = { register: async () => { if (registrationFails) throw new Error('Worker blocked'); return {}; }, controller: controlled ? {} : null, addEventListener(type:string,handler:(event:any)=>void) {handlers[type]=handler;} };
   const sandbox: any = {
     window: { caches: {} }, navigator: { serviceWorker: worker }, performance: { now: () => now },
     caches: { open: async () => ({ keys: async () => [...cache.keys()].map(key=>new Request(new URL(key,'https://sharedcut.test'))), match: async (key: string | Request) => cache.get(pathOf(key))?.clone(), delete: async (key: string | Request) => cache.delete(pathOf(key)) }), delete: async () => { cache.clear(); } },
@@ -46,7 +46,7 @@ function harness({ badIndex = false, quota = false, status = 206, registrationFa
     tracks: [{ id: 'v', kind: 'video', timelineId: 't' }, { id: 'a', kind: 'audio', timelineId: 't' }] as any[],
     media: Array.from({ length: count }, (_, i) => ({ id: `m${i}`, name: `Clip ${i}`, kind: 'video', status: 'ready', proxyUrl: `/api/media/m${i}/files/stream.mp4` } as Record<string, unknown>)) };
   // Playback's selectedUrl: the picture file, or the separate sound file when asked for sound.
-  const update = () => { now += 500; sandbox.api.update(state, { original: false, quality: 'Stream' }, (asset: any, visual: boolean) => visual ? asset.proxyUrl : asset.audioProxyUrl ?? asset.proxyUrl); };
+  const update = (ms = 500) => { now += ms; sandbox.api.update(state, { original: false, quality: 'Stream' }, (asset: any, visual: boolean) => visual ? asset.proxyUrl : asset.audioProxyUrl ?? asset.proxyUrl); };
   const drain = async (rounds = 12) => { for (let i = 0; i < rounds; i++) { pending.splice(0).forEach(job => job.resolve()); await flush(); } };
   const subscribe = (listener: () => void) => { sandbox.subscribed = [listener]; sandbox.api.useFootageVersion(); sandbox.subscribed = undefined; };
   const tick = () => { const due = [...timers.values()]; timers.clear(); due.forEach(fn => fn()); };
@@ -148,7 +148,7 @@ test('worker initialization failure is visible and a manual retry recovers', asy
 });
 
 test('automatic quality reacts to measured transfer capacity rather than cache-read speed',()=>{
-  const h=harness();assert.equal(h.preferLowStream('/unknown.mp4'),false);
+  const h=harness();assert.equal(h.preferLowStream('/unknown.mp4'),undefined,'no answer before any measurement');
   h.transfer(CHUNK,4000);assert.equal(h.preferLowStream('/unknown.mp4'),true);
   h.transfer(CHUNK,1);assert.equal(h.preferLowStream('/unknown.mp4'),true,'An almost instantaneous response is not evidence of Internet throughput.');
   h.advance(25000);
@@ -436,6 +436,40 @@ test('a chunk whose save outlasted the 20 s measuring window does not break the 
   assert.equal(h.preferLowStream('/unknown.mp4'), true);
 });
 
+test('with no controlling worker or the cache off a line that carries Stream is no answer, and playback\'s stall rule decides', async () => {
+  const S = '/api/media/m0/files/stream.mp4';
+  const page = (seconds: number) => {
+    const h = harness({ count: 1, controlled: false }); lowStreams(h); h.sandbox.location = { origin: 'https://sharedcut.test' };
+    h.sandbox.performance.getEntriesByType = () => [{ name: 'https://sharedcut.test/api/state', transferSize: 5e6, encodedBodySize: 5e6, responseStart: 100, responseEnd: 100 + seconds * 1000 }];
+    return h;
+  };
+  // Worker registration blocked or not yet in control: no footage crosses it, so nothing confirms the line keeps up.
+  const blocked = page(.4); await flush(); blocked.update();
+  assert.equal(blocked.preferLowStream(S), undefined, 'a 100 Mbit/s page load says nothing about footage');
+  const slow = page(4); await flush(); slow.update();
+  assert.equal(slow.preferLowStream(S), true, 'a 10 Mbit/s page load is still a reason for the low stream');
+  const off = harness({ count: 1 }); lowStreams(off); off.state.settings = { footageCache: false };
+  for (let i = 0; i < 4; i++) off.transfer(CHUNK, 100);
+  off.update();
+  assert.equal(off.preferLowStream(S), undefined, 'with the cache off an earlier fast measurement is no answer either');
+});
+
+test('a decoder opened just after a seek is answered for the new playhead, not the plan of up to 400 ms before', async () => {
+  const h = harness({ count: 1 }), S = '/api/media/m0/files/stream.mp4'; lowStreams(h);
+  h.state.clips[0].duration = 100;
+  h.sandbox.parseMp4Index = () => ({ moovEnd: 16, tracks: [{ times: [0, 100], sizes: [150e6] }] });
+  // Chunk 1 holds source 0-20 s, chunk 2 the rest; an earlier visit saved the rest.
+  h.sandbox.byteRange = (_: unknown, from: number) => from < 20 ? { start: CHUNK, end: 2 * CHUNK } : { start: 2 * CHUNK, end: 3 * CHUNK };
+  await flush(); h.update(); await flush();
+  h.pending.splice(0).forEach(job => job.resolve()); await flush();
+  h.saved(S, 0); h.saved(S, 2); h.transfer(CHUNK, 4000); h.update();
+  assert.equal(h.preferLowStream(S), true, 'at 0 s the bytes ahead are not saved and the line cannot carry them');
+  h.state.playhead = 30; h.update(100);
+  assert.equal(h.preferLowStream(S), false, 'the seek lands in saved bytes: the decoder opened there plays Stream');
+  h.state.playhead = 5; h.update(100);
+  assert.equal(h.preferLowStream(S), true, 'and a seek back is answered for where it lands too');
+});
+
 test('a fast line, or Stream bytes saved before, keeps the Stream file planned', async () => {
   const fast = harness({ count: 1 }); lowStreams(fast);
   for (let i = 0; i < 4; i++) fast.transfer(CHUNK, 100);
@@ -470,7 +504,7 @@ test('before any footage, the page\'s own large downloads say how fast the line 
   assert.equal(page([[5e6, 4]]).preferLowStream('/unknown.mp4'), true);
   assert.equal(page([[5e6, 4], [1e6, .01]]).preferLowStream('/unknown.mp4'), true, 'a body that arrived at once is not the line');
   assert.equal(page([[5e6, .5]]).preferLowStream('/unknown.mp4'), false, '80 Mbit/s');
-  assert.equal(page([[600_000, 4]]).preferLowStream('/unknown.mp4'), false, 'a small page proves nothing');
+  assert.equal(page([[600_000, 4]]).preferLowStream('/unknown.mp4'), undefined, 'a small page proves nothing: no answer');
   const h = page([[5e6, .5]]);
   for (let i = 0; i < 15; i++) { h.advance(1000); h.transfer(CHUNK, 1000); }
   assert.equal(h.preferLowStream('/unknown.mp4'), false, 'a few slow chunks can be the page still loading beside them');

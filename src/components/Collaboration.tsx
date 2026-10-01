@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type RefObject } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Users, Radio, ArrowUpRight, Play, X, MessageSquare, Check, Send, CornerDownRight, Clock3 } from 'lucide-react';
 import { useEditorStore, usePanelPlayhead } from '../state/store';
@@ -6,6 +6,7 @@ import type { Presence, PresenceCursor } from '../state/models';
 import { advanceCursor, type CursorMotion, advancePlayhead, playheadMotion, cursorPosition, presenceCursor } from '../services/presence';
 import { api, connection } from '../services/api';
 import { Avatar, Badge, IconButton, Button, timecode, EmptyState } from './ui';
+import { playheadStrip } from './LiveTimecode';
 
 // Stable content anchors cover controls and whitespace without tying cursors to viewport pixels.
 function cursorRoot(hit: Element | null) { return hit?.closest<HTMLElement>('[data-cursor-surface],.panel') ?? null; }
@@ -141,27 +142,61 @@ export function RemoteCursors() {
   })}</div>;
 }
 
-export function RemotePlayhead({ person, pixels, color, name }: { person: Presence; pixels: number; color?: string; name?: string }) {
-  const element = useRef<HTMLDivElement>(null);
+/**
+ * A collaborator's playhead. Still, it is this element. Moving (they play, scrub, or it is easing to a new spot) the element
+ * hides and the line and name tag are drawn into a canvas strip instead (playheadStrip): moving the element re-layerized the
+ * whole page every time it reached the next pixel, so watching someone play cost this machine more than playing itself.
+ */
+export function RemotePlayhead({ person, pixels, color, name, scroller }: { person: Presence; pixels: number; color?: string; name?: string; scroller: RefObject<HTMLDivElement | null> }) {
+  const element = useRef<HTMLDivElement>(null), canvas = useRef<HTMLCanvasElement>(null);
   const latest = useRef({ person, pixels }); latest.current = { person, pixels };
   const reducedMotion = useEditorStore(s => s.settings.reducedMotion);
   useEffect(() => {
-    let frame = 0, shown = NaN;
+    const line = element.current, label = line?.firstElementChild as HTMLElement | null, surface = canvas.current, scroll = scroller.current;
+    if (!line || !label || !surface || !scroll) return;
+    let frame = 0, shown = NaN, origin = 0, strip: ReturnType<typeof playheadStrip> | undefined;
     const motion = playheadMotion(latest.current.person, performance.now());
     const preference = window.matchMedia('(prefers-reduced-motion: reduce)');
+    // The element's own box and name tag (border-radius 3px 3px 3px 0), styled and laid out as it is now: the tag is as
+    // narrow as its longest word, so a name wraps a word to a line, and each line is drawn where layout put it.
+    const painter = () => {
+      const css = getComputedStyle(label), fill = css.backgroundColor, ink = css.color, font = `${css.fontWeight} ${css.fontSize} ${css.fontFamily}`;
+      const text = label.firstChild, box = label.getBoundingClientRect(), zoom = box.width / (label.offsetWidth || 1), range = document.createRange(), lines: [string, number, number][] = [];
+      for (const word of text?.textContent?.matchAll(/\S+/g) ?? []) {
+        range.setStart(text!, word.index); range.setEnd(text!, word.index + word[0].length);
+        const r = range.getBoundingClientRect(), y = (r.top + r.height / 2 - box.top) / zoom, last = lines.at(-1);
+        if (last && Math.abs(last[2] - y) < 1) last[0] += ` ${word[0]}`; else lines.push([word[0], (r.left - box.left) / zoom, y]);
+      }
+      return (context: CanvasRenderingContext2D, x: number, top: number) => {
+        const y = top + line.offsetTop, lx = x + label.offsetLeft, ly = y + label.offsetTop;
+        context.fillStyle = fill; context.fillRect(x, y, line.offsetWidth, line.offsetHeight);
+        context.beginPath(); context.roundRect(lx, ly, label.offsetWidth, label.offsetHeight, [3, 3, 3, 0]); context.fill();
+        context.fillStyle = ink; context.font = font; context.textBaseline = 'middle';
+        for (const [words, wx, wy] of lines) context.fillText(words, lx + wx, ly + wy);
+      };
+    };
     const draw = () => {
       const { person, pixels } = latest.current;
-      const position = advancePlayhead(motion, person, performance.now());
-      // Each move re-layerizes the whole timeline, so it moves only when it reaches the next device pixel: at the default
-      // zoom a playing collaborator's line advances a pixel every few frames, not every display frame.
-      const x = Math.round((reducedMotion || preference.matches ? person.playhead : position) * pixels * devicePixelRatio) / devicePixelRatio;
-      if (element.current && x !== shown) { shown = x; element.current.style.visibility = 'visible'; element.current.style.transform = `translateX(${x}px)`; }
+      const position = advancePlayhead(motion, person, performance.now()), reduced = reducedMotion || preference.matches;
+      // On whole device pixels, so a slow line redraws only when it visibly moves.
+      const x = Math.round((reduced ? person.playhead : position) * pixels * devicePixelRatio) / devicePixelRatio;
+      if (person.playing || !reduced && (motion.velocity !== 0 || motion.position !== motion.target)) {
+        // The strip keeps room on the right for the name tag (and a pixel for its anti-aliased edge).
+        if (!strip) { line.style.visibility = 'hidden'; surface.hidden = false; strip = playheadStrip(surface, scroll, line.offsetParent as HTMLElement, painter(), label.offsetLeft + label.offsetWidth + 1); origin = line.offsetLeft; shown = NaN; }
+        strip.draw(origin + x);
+      } else {
+        if (strip) { strip.dispose(); strip = undefined; surface.hidden = true; }
+        if (x !== shown) { shown = x; line.style.visibility = 'visible'; line.style.transform = `translateX(${x}px)`; }
+      }
       frame = requestAnimationFrame(draw);
     };
     frame = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(frame);
-  }, [reducedMotion]);
-  return <div ref={element} className="remote-playhead" style={{left:164,visibility:'hidden','--user-color':color} as CSSProperties}><span>{name}</span></div>;
+    return () => { cancelAnimationFrame(frame); strip?.dispose(); surface.hidden = true; };
+  }, [reducedMotion, scroller]);
+  return <>
+    <div ref={element} className="remote-playhead" style={{left:164,visibility:'hidden','--user-color':color} as CSSProperties}><span>{name}</span></div>
+    <canvas ref={canvas} className="remote-playhead-canvas" hidden aria-hidden="true"/>
+  </>;
 }
 export function PeoplePanel() {
   const presence=useEditorStore(s=>s.presence);

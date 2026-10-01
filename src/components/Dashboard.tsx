@@ -85,6 +85,9 @@ export default function Dashboard({ onOpenProject, onOpenAuth }: { onOpenProject
   const user = users.find(item => item.id === currentUserId) ?? users[0];
   const changeSection = (value: string) => setSection(value);
   const closeCreate = () => { setNewProject(false); setName(''); setDescription(''); setShared(preferences.defaultSharing !== 'Private'); };
+  // "N minutes ago" moves on with time alone: nothing in the store changes for it.
+  const [, setNow] = useState(0);
+  useEffect(() => { if (!activity) return; const timer = window.setInterval(() => setNow(Date.now()), 30_000); return () => window.clearInterval(timer); }, [activity]);
   useEffect(() => { if (!deletedProject) return; const timer = window.setTimeout(() => setDeletedProject(null), Math.max(0, deletedProject.expiresAt - Date.now())); return () => window.clearTimeout(timer); }, [deletedProject]);
   const undoDelete = async () => { if (!deletedProject) return; try { await api(`/projects/${deletedProject.id}/restore`, { method: 'POST', body: '{}' }); await refreshState(); setDeletedProject(null); } catch (error) { useEditorStore.getState().notify((error as Error).message, 'error'); } };
 

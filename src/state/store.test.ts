@@ -930,3 +930,60 @@ test('panels read the playhead exactly while paused and in quarter-second steps 
   const steps = new Set(Array.from({ length: 30 }, (_, frame) => panelPlayhead({ playing: true, playhead: 10 + frame / 30 })));
   assert.equal(steps.size, Math.round(1 / PANEL_PLAYHEAD_STEP));
 });
+
+test('the clock tells subscribers only of real changes: nothing while paused, the playhead once per picture while playing', async () => {
+  const { connection } = await import('../services/api.ts');
+  const was = connection.enabled; connection.enabled = true;
+  let notified = 0;
+  const stop = store.subscribe(() => notified++);
+  try {
+    const fps = state().projects.find(p => p.id === state().projectId)!.fps, end = Math.max(...state().clips.filter(c => c.timelineId === state().timelineId).map(c => c.start + c.duration));
+    let now = Date.now() + 3_600_000;
+    const run = (seconds: number, hz = 120) => { for (let i = 0; i < Math.round(seconds * hz); i++) state().tick(now += 1000 / hz); };
+    state().setPlayhead(1); run(.1);
+    notified = 0; run(1, 30);
+    assert.equal(notified, 0, 'paused, a tick that changes nothing notifies nobody');
+
+    const pictures: number[] = [], watch = store.subscribe((next, previous) => { if (next.playhead !== previous.playhead) pictures.push(Math.floor(next.playhead * fps + 1e-6)); });
+    state().setPlaying(true); notified = 0; pictures.length = 0;
+    run(1); watch();
+    assert.ok(Math.abs(notified - fps) <= 1, `${notified} notifications in a second of ${fps} fps playback on a 120 Hz display`);
+    assert.ok(pictures.every((frame, i) => !i || frame === pictures[i - 1] + 1), `the store playhead steps one picture at a time: ${pictures}`);
+    assert.ok(state().playhead > 2 - 1 / fps - 1e-9 && state().playhead <= 2, `${state().playhead} after a second from 1`);
+
+    // A seek while playing (the ruler, a marker, the arrow keys) restarts the clock from there.
+    state().setPlayhead(5); run(.5);
+    assert.ok(state().playhead > 5.5 - 1 / fps - 1e-9 && state().playhead <= 5.5, `${state().playhead} half a second after seeking to 5`);
+    // Pausing keeps the picture on screen.
+    const held = state().playhead; state().setPlaying(false); run(.2);
+    assert.equal(state().playhead, held);
+    // Playing again continues from it, not from where the clock had run on to.
+    state().setPlaying(true); run(.5);
+    assert.ok(state().playhead > held + .5 - 1 / fps - .02 && state().playhead <= held + .5 + 1e-9, `${state().playhead} half a second after resuming at ${held}`);
+
+    // The end of the timeline stops playback exactly there.
+    state().setPlayhead(end - .3); run(1);
+    assert.equal(state().playing, false); assert.equal(state().playhead, end);
+  } finally { stop(); connection.enabled = was; state().setPlaying(false); }
+});
+
+test('a buffering stall holds the exact clock: playback resumes where it stopped, not at the picture shown', async () => {
+  const { connection } = await import('../services/api.ts');
+  const was = connection.enabled; connection.enabled = true;
+  try {
+    // Whole milliseconds a tick, so the clock adds up exactly and the stall lands where it is meant to.
+    let now = Date.now() + 7_200_000;
+    const run = (seconds: number) => { for (let i = 0; i < Math.round(seconds * 100); i++) state().tick(now += 10); };
+    // A second of playback from 1 s at 24 fps, with or without a fifth of a second of buffering at 1.57 s: the picture
+    // shown (from 1.5417 s) went up on the 1.55 s tick, so the store's playhead is 0.02 s behind the clock.
+    const play = (stall: boolean) => {
+      state().setPlaying(false); state().setPlayhead(1); run(.1);
+      state().setPlaying(true); run(.57);
+      if (stall) { store.setState({ playbackBuffering: true }); run(.2); store.setState({ playbackBuffering: false }); }
+      run(.43);
+      return state().playhead;
+    };
+    const straight = play(false), stalled = play(true);
+    assert.ok(Math.abs(stalled - straight) < 1e-6, `${stalled} after a stall, ${straight} without`);
+  } finally { connection.enabled = was; state().setPlaying(false); store.setState({ playbackBuffering: false }); }
+});

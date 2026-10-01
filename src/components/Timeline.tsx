@@ -21,7 +21,7 @@ import { ContextMenu, IconButton, timecode, Badge, fpsLabel } from './ui';
 import { companionAudioTrack, edgeScrollVelocity, rulerStep, timelineZoom, uncoveredParts, trackGap, filmstripTiles } from '../services/timeline';
 import { snapTime, SNAP_PIXELS } from '../services/snapping';
 import { RemotePlayhead } from './Collaboration';
-import { LiveTimecode, onPicture } from './LiveTimecode';
+import { LiveTimecode, onPicture, playheadStrip } from './LiveTimecode';
 import { acceptsEffect } from '../services/effects';
 import { useClipActivity, watchSmartMaskJobs, useActivityVersion } from '../services/clipStatus';
 import { clipFootageStatus } from '../services/footageCache';
@@ -80,38 +80,17 @@ function LocalPlayhead({ pixels, color, scrub, scrubMove, scroller }: PlayheadPr
     {playing && <MovingPlayhead pixels={pixels} color={color} line={line} scroller={scroller}/>}
   </>;
 }
-/** Width of the moving playhead's canvas and the room its line keeps from the edges, in CSS pixels. */
-const PLAYHEAD_PAGE = 256, PLAYHEAD_MARGIN = 16;
-/**
- * The playing playhead: the paused element's own box, glow and head, drawn at each presented picture's playhead. The canvas
- * is a strip as tall as the visible timeline rather than all of it, so each frame redraws and composites little; it jumps
- * ahead (one layout) only when the line nears its edge.
- */
+/** The playing playhead: the paused element's own box, glow and head, drawn into a strip (playheadStrip) at each presented picture's playhead. */
 function MovingPlayhead({ pixels, color, line, scroller }: { pixels: number; color: string; line: RefObject<HTMLDivElement | null>; scroller: RefObject<HTMLDivElement | null> }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   useLayoutEffect(() => {
-    const surface = canvas.current, scroll = scroller.current, element = line.current, head = element?.firstElementChild as HTMLElement | null, context = surface?.getContext('2d');
-    if (!surface || !scroll || !element || !head || !context) return;
-    const area = element.offsetParent as HTMLElement;
+    const surface = canvas.current, scroll = scroller.current, element = line.current, head = element?.firstElementChild as HTMLElement | null;
+    if (!surface || !scroll || !element || !head) return;
     // `0 0 6px #eb7d7340`: a canvas shadow of the same blur and colour is the same Gaussian glow.
     const glow = /^(rgba?\([^)]*\)|#\w+)\s+0px\s+0px\s+([\d.]+)px/.exec(getComputedStyle(element).boxShadow);
-    let left = NaN, top = 0, scale = 1, shown = NaN;
-    const draw = (playhead: number) => {
-      // In the track area's coordinates, like the paused element.
-      const at = element.offsetLeft + playhead * pixels, view = scroll.scrollLeft - area.offsetLeft;
-      // Off screen it is left blank and still. Zoomed in, the line leaves the view within a second, and redrawing the unseen
-      // strip every picture stalled the GPU process ~100 ms every few seconds (measured at 30 frames across the view).
-      if (at + PLAYHEAD_MARGIN < view || at - PLAYHEAD_MARGIN > view + scroll.clientWidth) {
-        if (shown === shown) { context.setTransform(1, 0, 0, 1, 0, 0); context.clearRect(0, 0, surface.width, surface.height); shown = NaN; }
-        return;
-      }
-      if (!(at - PLAYHEAD_MARGIN >= left && at + PLAYHEAD_MARGIN <= left + PLAYHEAD_PAGE)) { left = Math.floor(at - PLAYHEAD_MARGIN); surface.style.left = `${left}px`; shown = NaN; }
-      const x = at - left;
-      if (x === shown) return;
-      shown = x;
-      context.setTransform(1, 0, 0, 1, 0, 0); context.clearRect(0, 0, surface.width, surface.height);
-      context.setTransform(scale, 0, 0, scale, 0, 0); context.fillStyle = color;
-      const y = element.offsetTop - top;
+    const strip = playheadStrip(surface, scroll, element.offsetParent as HTMLElement, (context, x, top, scale) => {
+      const y = element.offsetTop + top;
+      context.fillStyle = color;
       context.save();
       if (glow) { context.shadowColor = glow[1]; context.shadowBlur = Number(glow[2]) * scale; }
       context.fillRect(x, y, element.offsetWidth, element.offsetHeight);
@@ -119,34 +98,20 @@ function MovingPlayhead({ pixels, color, line, scroller }: { pixels: number; col
       // The head's clip-path: polygon(0 0, 100% 0, 100% 65%, 50% 100%, 0 65%).
       const hx = x + head.offsetLeft, hy = y + head.offsetTop, w = head.offsetWidth, h = head.offsetHeight;
       context.beginPath(); context.moveTo(hx, hy); context.lineTo(hx + w, hy); context.lineTo(hx + w, hy + h * .65); context.lineTo(hx + w / 2, hy + h); context.lineTo(hx, hy + h * .65); context.closePath(); context.fill();
-    };
-    // As tall as what the scroller shows; horizontal scrolling carries it along with the content.
-    const place = () => {
-      top = scroll.scrollTop - area.offsetTop;
-      scale = (scroll.offsetWidth ? scroll.getBoundingClientRect().width / scroll.offsetWidth : 1) * devicePixelRatio;
-      Object.assign(surface.style, { top: `${top}px`, width: `${PLAYHEAD_PAGE}px`, height: `${scroll.clientHeight}px` });
-      // Resizing a canvas reallocates it; scrolling alone only moves it.
-      const width = Math.max(1, Math.round(PLAYHEAD_PAGE * scale)), height = Math.max(1, Math.round(scroll.clientHeight * scale));
-      if (surface.width !== width || surface.height !== height) { surface.width = width; surface.height = height; }
-      shown = NaN; draw(useEditorStore.getState().playhead);
-    };
-    place();
-    const resize = new ResizeObserver(place);
-    resize.observe(scroll);
-    let scrolledTop = scroll.scrollTop;
-    const scrolled = () => { if (scroll.scrollTop !== scrolledTop) { scrolledTop = scroll.scrollTop; place(); } };
-    scroll.addEventListener('scroll', scrolled, { passive: true });
+    });
+    const draw = (playhead: number) => strip.draw(element.offsetLeft + playhead * pixels);
+    draw(useEditorStore.getState().playhead);
     // Steps with the picture (onPicture), one frame of the timeline at a time.
     const unsubscribe = onPicture(draw);
-    return () => { unsubscribe(); resize.disconnect(); scroll.removeEventListener('scroll', scrolled); };
+    return () => { unsubscribe(); strip.dispose(); };
   }, [pixels, color, line, scroller]);
   return <canvas ref={canvas} className="local-playhead-canvas" aria-hidden="true"/>;
 }
 function TimelinePlayheads(props: PlayheadProps) {
-  const { pixels } = props;
+  const { pixels, scroller } = props;
   const s = useEditorStore(useShallow(s => ({ presence: s.presence, users: s.users, timelineId: s.timelineId, projectId: s.projectId, workspace: s.workspace, currentUserId: s.currentUserId, showPlayheads: s.settings.showPlayheads !== false })));
   return <>
-    {s.showPlayheads && s.presence.filter(p => p.activity === s.workspace && p.projectId === s.projectId && (!p.timelineId || p.timelineId === s.timelineId) && p.userId !== s.currentUserId && p.online).map(p => { const user = s.users.find(u => u.id === p.userId); return <RemotePlayhead key={`${p.userId}:${s.timelineId}`} person={p} pixels={pixels} color={user?.color} name={user?.name}/>; })}
+    {s.showPlayheads && s.presence.filter(p => p.activity === s.workspace && p.projectId === s.projectId && (!p.timelineId || p.timelineId === s.timelineId) && p.userId !== s.currentUserId && p.online).map(p => { const user = s.users.find(u => u.id === p.userId); return <RemotePlayhead key={`${p.userId}:${s.timelineId}`} person={p} pixels={pixels} color={user?.color} name={user?.name} scroller={scroller}/>; })}
     <LocalPlayhead {...props}/>
   </>;
 }
