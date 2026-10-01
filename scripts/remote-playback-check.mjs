@@ -40,7 +40,7 @@ await context.addInitScript(() => {
   window.qaReset = () => { window.qa = { frames: [], health: [] }; };
   window.qaReset();
   window.addEventListener('frameline:frame', (e) => window.qa.frames.push([performance.now(), e.detail?.dataset?.sourceTimestamp]));
-  window.addEventListener('frameline:playback-health', (e) => { const d = e.detail; if (d.playing) window.qa.health.push([performance.now(), d.loading, d.engine, d.loading ? d.reason : '', d.error ?? '']); });
+  window.addEventListener('frameline:playback-health', (e) => { const d = e.detail; if (d.playing) window.qa.health.push([performance.now(), d.loading, d.engine, d.loading ? d.reason : '', d.error ?? '', d.playhead]); });
 });
 const page = await context.newPage();
 const t0 = Date.now(), consoleErrors = [], failed = [];
@@ -73,8 +73,11 @@ for (let pass = 0; pass < PASSES; pass++) {
   const metrics = await page.evaluate(() => {
     const f = window.qa.frames, h = window.qa.health;
     let distinct = 0, last, lastAt = f[0]?.[0] ?? 0; const gaps = [];
-    for (const [at, ts] of f) if (ts !== last) { if (last !== undefined) gaps.push(at - lastAt); distinct++; last = ts; lastAt = at; }
-    gaps.sort((a, b) => b - a);
+    for (const [at, ts] of f) if (ts !== last) { if (last !== undefined) gaps.push([at - lastAt, lastAt]); distinct++; last = ts; lastAt = at; }
+    gaps.sort((a, b) => b[0] - a[0]);
+    // Where on the timeline each long freeze began, so a genuine gap in the edit is not mistaken for a stall.
+    const playheadAt = (at) => h.find((x) => x[0] >= at)?.[5];
+    const freezesAt = gaps.filter(([ms]) => ms > 250).slice(0, 5).map(([ms, at]) => `${Math.round(ms)}ms@${Number(playheadAt(at)).toFixed(2)}s`);
     let loadingMs = 0, run = 0; const runs = [], reasons = {}, errors = new Set();
     for (let i = 1; i < h.length; i++) {
       const dt = h[i][0] - h[i - 1][0];
@@ -83,7 +86,7 @@ for (let pass = 0; pass < PASSES; pass++) {
     }
     if (run) runs.push(run);
     const span = h.length > 1 ? h.at(-1)[0] - h[0][0] : 1;
-    return { renderedPerSec: +(f.length / (span / 1000)).toFixed(1), picturesPerSec: +(distinct / (span / 1000)).toFixed(1), worstFreezesMs: gaps.slice(0, 5).map(Math.round),
+    return { renderedPerSec: +(f.length / (span / 1000)).toFixed(1), picturesPerSec: +(distinct / (span / 1000)).toFixed(1), worstFreezesMs: gaps.slice(0, 5).map(([ms]) => Math.round(ms)), freezesAt,
       loadingPct: +(100 * loadingMs / span).toFixed(1), longestLoadingMs: Math.round(Math.max(0, ...runs)), engines: [...new Set(h.map((x) => x[2]).filter(Boolean))], errors: [...errors].slice(0, 5),
       loadingReasonsMs: Object.fromEntries(Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => [k, Math.round(v)])) };
   });
