@@ -269,7 +269,7 @@ test('warm-up opens the next cuts on every layer within the horizon, soonest fir
 });
 
 /** attachPlayback against fake media elements, a manual clock and a manual frame pump. */
-async function fakeBrowser(state: Record<string, any>, quality = 'Full', extraGlobals: Record<string, unknown> = {}) {
+async function fakeBrowser(state: Record<string, any>, quality = 'Full', extraGlobals: Record<string, unknown> = {}, preferLowStream?: (url: string) => boolean) {
   const { attachPlayback } = await import('./playback.ts');
   class Media extends EventTarget {
     readyState = 2; seeking = false; paused = true; duration = 10; videoWidth = 320; videoHeight = 180; preload = '';
@@ -291,7 +291,7 @@ async function fakeBrowser(state: Record<string, any>, quality = 'Full', extraGl
   const originals = Object.keys(replacements).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
   for (const [key, value] of Object.entries(replacements)) Object.defineProperty(globalThis, key, { configurable: true, value });
   (globalThis.window as EventTarget).addEventListener('frameline:playback-health', event => health.push((event as CustomEvent).detail));
-  const playback = attachPlayback(new Canvas() as unknown as HTMLCanvasElement, () => state as any, () => ({ original: false, quality, volume: 0, compare: false }), status => statuses.push(status));
+  const playback = attachPlayback(new Canvas() as unknown as HTMLCanvasElement, () => state as any, () => ({ original: false, quality, volume: 0, compare: false }), status => statuses.push(status), preferLowStream);
   const live = (src: string) => media.filter(element => element.src === src);
   const restore = () => { playback.dispose(); for (const [key, descriptor] of originals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); };
   return { playback, media, live, statuses, health, clock, restore, tick: (ms = 34) => { clock.now += ms; clock.frame(); } };
@@ -323,15 +323,76 @@ test('camera audio on a sound layer is warmed under the id that plays it, so the
   } finally { fake.restore(); }
 });
 
-test('Auto drops to the smaller stream after a long decoder wait when nothing says the Stream file is cached', async () => {
-  class Worker { onmessage = null; onerror = null; postMessage() {} terminate() {} }
+/** A WebCodecs decode worker that answers each seek with one picture covering any time, except in the `stalled` files. */
+const decodeWorker = (stalled: Set<string>) => class {
+  onmessage?: (event: { data: unknown }) => void; onerror = null; path = '';
+  postMessage(message: { type: string; url?: string; generation?: number }) {
+    if (message.type === 'open') this.path = new URL(message.url!).pathname;
+    else if (message.type === 'seek' && !stalled.has(this.path)) this.onmessage?.({ data: { type: 'frame', generation: message.generation, frame: { timestamp: 0, duration: 1e9, displayWidth: 320, displayHeight: 180, allocationSize: () => 1, close() {} } } });
+  }
+  terminate() {}
+};
+/** Two clips of one asset with a Stream file and its low stream, the second past the warm horizon at first. */
+async function streamChoice(settings: Record<string, unknown> = {}, stalled = new Set<string>()) {
   const shot = layerFixture('shot', 'Wide', 1, 'video', { proxyVariants: { Stream: '/stream.mp4', StreamLow: '/low.mp4' } });
-  const state = timelineState([shot], { playing: true });
-  const fake = await fakeBrowser(state, 'Stream', { VideoDecoder: class {}, Worker, location: { href: 'http://localhost/' } });
+  Object.assign(shot.clip, { duration: 8 });
+  const state = timelineState([shot], { playing: true, settings });
+  state.clips = [...state.clips, { ...shot.clip, id: 'shot-2', start: 8, duration: 2 }];
+  const answer = { slow: false };
+  const fake = await fakeBrowser(state, 'Stream', { VideoDecoder: class {}, Worker: decodeWorker(stalled), location: { href: 'http://localhost/' } }, () => answer.slow);
+  return { ...fake, state, answer, play: (to: number) => { state.playhead = to; fake.tick(); fake.tick(); } };
+}
+
+test('a long wait moves a Stream picture to the low stream only on a line too slow for it, or with the cache off', async () => {
+  const fake = await streamChoice({}, new Set(['/stream.mp4']));
   try {
-    fake.tick(); assert.equal(fake.live('/stream.mp4').length, 1);
-    fake.tick(1300); fake.tick(50);
-    assert.equal(fake.live('/low.mp4').length, 1, 'no transfer rate and no cached copy: the old 1.2 s fallback still applies');
+    fake.tick(); fake.tick(1300); fake.tick(50);
+    assert.deepEqual([fake.live('/stream.mp4').length, fake.live('/low.mp4').length], [1, 0], 'a cold start or slow decode on a line that carries the file is waited out at full quality');
+    fake.answer.slow = true; fake.tick(50); fake.tick(50);
+    assert.deepEqual([fake.live('/stream.mp4').length, fake.live('/low.mp4').length], [0, 1], 'too slow a line with unsaved bytes ahead: the stalled picture moves');
+    assert.equal(fake.statuses.at(-1)?.title, 'Auto preview · reduced bandwidth');
+  } finally { fake.restore(); }
+  const off = await streamChoice({ footageCache: false }, new Set(['/stream.mp4']));
+  try {
+    off.tick(); off.tick(1300); off.tick(50);
+    assert.equal(off.live('/low.mp4').length, 1, 'nothing measures the line with the cache off: the 1.2 s wait is the signal');
+    const [low] = off.live('/low.mp4');
+    off.play(4.5); off.play(8.5);
+    assert.deepEqual(off.live('/stream.mp4'), [], 'and its low stream stands for the next clip, rather than stalling on Stream again');
+    assert.equal(off.live('/low.mp4').length, 2); assert.ok(off.live('/low.mp4').includes(low));
+  } finally { off.restore(); }
+});
+
+test('an asset back from the low stream opens Stream at its next decoder, never mid-shot', async () => {
+  const fake = await streamChoice();
+  try {
+    fake.answer.slow = true; fake.play(0);
+    const [low] = fake.live('/low.mp4');
+    assert.ok(low && !fake.live('/stream.mp4').length, 'a slow line with nothing saved opens the low stream');
+    fake.answer.slow = false; fake.play(2); fake.play(4);
+    assert.deepEqual(fake.live('/low.mp4'), [low], 'the clip on screen keeps its stream when the background fill catches up');
+    assert.deepEqual(fake.live('/stream.mp4'), []);
+    assert.equal(fake.statuses.at(-1)?.title, 'Auto preview · reduced bandwidth');
+    fake.play(4.5);
+    assert.equal(fake.live('/stream.mp4').length, 1, 'the next clip of the asset asks again and opens Stream before its cut');
+    assert.deepEqual(fake.live('/low.mp4'), [low], 'while the shot on screen still plays the low stream');
+    fake.play(8.5);
+    assert.equal(fake.statuses.at(-1), null, 'full quality after the cut');
+  } finally { fake.restore(); }
+});
+
+test('a clip of a file another decoder plays on Stream still asks, and opens low without moving the one on screen', async () => {
+  const fake = await streamChoice();
+  try {
+    fake.play(0);
+    const [stream] = fake.live('/stream.mp4');
+    assert.ok(stream && !fake.live('/low.mp4').length);
+    fake.answer.slow = true; fake.play(4.5);
+    assert.equal(fake.live('/low.mp4').length, 1, 'the warmed next clip opens the low stream instead of freezing 1.2 s on unsaved Stream bytes');
+    assert.deepEqual(fake.live('/stream.mp4'), [stream], 'the shot on screen keeps Stream');
+    assert.equal(fake.statuses.at(-1), null);
+    fake.play(8.5);
+    assert.equal(fake.statuses.at(-1)?.title, 'Auto preview · reduced bandwidth');
   } finally { fake.restore(); }
 });
 
