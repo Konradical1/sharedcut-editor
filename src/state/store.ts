@@ -161,6 +161,13 @@ function applyChanges(state: ProjectState, changes: Change[]): ProjectState & {t
 const overlap = (a: Change, b: Change) => a.collection === b.collection && a.id === b.id && (a.replace || b.replace || [...Object.keys(a.value ?? {}), ...a.unset ?? []].some(key => [...Object.keys(b.value ?? {}), ...b.unset ?? []].some(other => key === other || key.startsWith(`${other}.`) || other.startsWith(`${key}.`))));
 const projectState = (state: EditorStore): ProjectState => ({ timelines: state.timelines.filter(t=>t.projectId===state.projectId), clips: state.clips.filter(item => item.projectId === state.projectId), tracks: state.tracks.filter(item => state.timelines.some(t => t.id === item.timelineId && t.projectId === state.projectId)), nodes: state.nodes.filter(item => item.projectId === state.projectId), comments: state.comments.filter(item => item.projectId === state.projectId) });
 const durationOf = (state: EditorStore) => state.timelines.find(t => t.id === state.timelineId)?.duration ?? 180;
+// Where playback stops: the end of the last clip on a server timeline. Remembered per clip list: the clock asks every tick.
+let endClips: Clip[] | null = null, endTimeline = '', endTime = 0;
+const playbackEndOf = (state: EditorStore) => {
+  if (!connection.enabled) return durationOf(state);
+  if (state.clips !== endClips || state.timelineId !== endTimeline) { endClips = state.clips; endTimeline = state.timelineId; endTime = Math.max(0, ...state.clips.filter(c => c.timelineId === state.timelineId).map(c => c.start + c.duration)); }
+  return endTime;
+};
 // In/Out is kept per timeline for this viewer. Held only in memory, any reload (a server restart reconnects the
 // page) turned "In / Out range" into 0 → timeline length, and a 180 s timeline holding 45 s of edit exported 3 min.
 const rangeKey = (timelineId: string) => `sharedcut-range-${timelineId}`;
@@ -187,6 +194,8 @@ let followedMotion: PlayheadMotion | null = null;
 let followedUser: string | null = null;
 let lastTick = Date.now();
 let lastProcessingTick = Date.now();
+// The playing clock (tick): its exact time, the playhead it last gave the store, and whether it was running then.
+let clockTime = 0, clockPublished = NaN, clockRunning = false;
 
 export const useEditorStore = create<EditorStore>((set, get) => {
   const writable = (comment = false) => {
@@ -611,7 +620,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       set(range);
       try { localStorage.setItem(rangeKey(get().timelineId), JSON.stringify([range.rangeIn, range.rangeOut])); } catch { /* In-memory only when storage is unavailable. */ }
     },
-    setPlaying(playing) { const state = get(); set({ playing, ...(playing && state.playhead >= (connection.enabled ? Math.max(0,...state.clips.filter(c=>c.timelineId===state.timelineId).map(c=>c.start+c.duration)) : durationOf(state)) ? { playhead: 0 } : {}) }); },
+    setPlaying(playing) { const state = get(); set({ playing, ...(playing && state.playhead >= playbackEndOf(state) ? { playhead: 0 } : {}) }); },
     setSidePanel(sidePanel) { set({ sidePanel }); }, setModal(modal) { set({ modal }); },
     setKeyframes(clipId, path, keys, gesture) {
       const clip = editableClip(clipId, '*'); if (!clip) return;
@@ -1382,12 +1391,28 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const state = get(); const elapsed = clamp((now - lastTick) / 1000, 0, 1); lastTick = now;
       const presence = connection.enabled ? state.presence : collaborationService.advancePresence(state.presence, now, durationOf(state));
       const follow = state.liveMode === 'following' ? presence.find(person => person.userId === state.followUserId && person.online) : null;
-      const playbackEnd = connection.enabled ? Math.max(0, ...state.clips.filter(c => c.timelineId === state.timelineId).map(c => c.start + c.duration)) : durationOf(state);
+      const playbackEnd = playbackEndOf(state);
       if (!follow) { followedMotion = null; followedUser = null; }
       if (follow && (!followedMotion || followedUser !== follow.userId)) { followedMotion = playheadMotion(follow, now); followedUser = follow.userId; }
       const remoteTime = follow && connection.enabled ? advancePlayhead(followedMotion!, follow, now) : follow?.playhead;
-      const playhead = follow ? Math.min(durationOf(state), remoteTime!) : state.playing && !state.playbackBuffering ? Math.min(playbackEnd, state.playhead + elapsed) : state.playhead;
-      const patch: Partial<EditorStore> = { presence, locks: collaborationService.expireLocks(state.locks, now), playhead, playing: playhead >= playbackEnd ? false : follow ? !!follow.playing : state.playing };
+      // The playing clock runs here at full precision; a playhead set from outside (a seek, a loop, pausing) restarts it.
+      const advancing = !follow && state.playing && !state.playbackBuffering;
+      const from = advancing && clockRunning && state.playhead === clockPublished ? clockTime : state.playhead;
+      const time = follow ? Math.min(durationOf(state), remoteTime!) : advancing ? Math.min(playbackEnd, from + elapsed) : state.playhead;
+      const playing = time >= playbackEnd ? false : follow ? !!follow.playing : state.playing;
+      // Every store change re-runs every subscriber's selector (~3 ms a tick at 4x CPU slowdown on a real timeline) and the
+      // display ticks two to five times per picture. The picture changes only on a frame boundary (playback.ts steps at this
+      // rate), so while playing the store's playhead moves once per picture: everything reading it sees the picture shown.
+      const rate = parseFloat(String(state.settings.playbackFrameRate)) || state.projects.find(p => p.id === state.projectId)?.fps || 24;
+      const playhead = playing && Math.floor(time * rate + 1e-6) === Math.floor(state.playhead * rate + 1e-6) ? state.playhead : time;
+      clockTime = time; clockPublished = playhead; clockRunning = advancing;
+      const locks = collaborationService.expireLocks(state.locks, now);
+      // A tick that changes nothing notifies nobody: paused, it ran every selector 30 times a second for nothing.
+      const patch: Partial<EditorStore> = {};
+      if (presence !== state.presence) patch.presence = presence;
+      if (locks !== state.locks) patch.locks = locks;
+      if (playhead !== state.playhead) patch.playhead = playhead;
+      if (playing !== state.playing) patch.playing = playing;
       if (state.liveMode === 'following' && !follow) { patch.liveMode = 'independent'; patch.followUserId = null; }
       if (now - lastProcessingTick >= 1000) {
         const processingElapsed = clamp((now - lastProcessingTick) / 1000, 0, 2); lastProcessingTick = now;
@@ -1404,7 +1429,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         const notifications = get().notifications, kept = notifications.filter(item => now - item.timestamp < 7_000);
         if (kept.length !== notifications.length) patch.notifications = kept;
       }
-      set(patch);
+      if (Object.keys(patch).length) set(patch);
     },
     setLiveMode(mode, userId) {
       const state = get();
