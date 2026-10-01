@@ -7,7 +7,8 @@ type Library = { folders: ProjectFolder[]; locations: Record<string, string> };
 const rank = { Viewer: 1, Commenter: 2, Editor: 3, Owner: 4 };
 const stronger = (a: Role | undefined, b: Role | undefined) => !a ? b : !b ? a : rank[a] >= rank[b] ? a : b;
 const denied = (status: number, message: string): never => { throw Object.assign(new Error(message), { status }); };
-export function projectLibrary(db: DatabaseSync, projects: () => Project[], users: () => User[], revision: () => number, persist: () => void) {
+// `commit` runs a write together with the workspace save, in one transaction.
+export function projectLibrary(db: DatabaseSync, projects: () => Project[], users: () => User[], revision: () => number, commit: (write: () => void) => void) {
   db.exec('CREATE TABLE IF NOT EXISTS library(id INTEGER PRIMARY KEY CHECK(id=1),data TEXT NOT NULL)');
   const saved = db.prepare('SELECT data FROM library WHERE id=1').get() as { data: string } | undefined;
   let library: Library = saved ? JSON.parse(saved.data) : { folders: [], locations: {} };
@@ -101,9 +102,8 @@ export function projectLibrary(db: DatabaseSync, projects: () => Project[], user
     // The global revision also covers account and direct project-sharing changes during confirmation.
     if (body.revision !== revision()) denied(409, 'The library changed. Review this action again.');
     const previous = library;
-    db.exec('BEGIN IMMEDIATE');
-    try { library = next; db.prepare('INSERT INTO library(id,data) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(JSON.stringify(next)); persist(); db.exec('COMMIT'); }
-    catch (error) { db.exec('ROLLBACK'); library = previous; throw error; }
+    try { commit(() => { library = next; db.prepare('INSERT INTO library(id,data) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(JSON.stringify(next)); }); }
+    catch (error) { library = previous; throw error; }
     return { id: targetId, ...view(userId) };
   };
   return { view, change, projectRole, hasLocation: (id: string) => Boolean(location(id)) };

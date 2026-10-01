@@ -65,3 +65,28 @@ test('word formatting keeps animated styles attached through split, merged, and 
     s().undo();assert.equal(textContent(getText(s().clips.find(c=>c.id===id)!)),'Hello world');
   } finally {store.setState(original,true);}
 });
+
+test('a caption holding its pose repaints its last composite instead of laying the words out again', async () => {
+  const { captionDocument } = await import('./captions.ts');
+  const words = [{ text: 'Hold', start: 0, end: .8 }, { text: 'still', start: .8, end: 1.6 }];
+  const doc = captionDocument(words, 'highlight', 2), canvas = createCanvas(320, 180), ctx = canvas.getContext('2d') as unknown as CanvasRenderingContext2D;
+  const paint = (d: typeof doc, time: number) => { ctx.clearRect(0, 0, 320, 180); drawText(ctx, d, 320, 180, 1920, 1080, time); return Buffer.from(canvas.getContext('2d').getImageData(0, 0, 320, 180).data).toString('base64'); };
+  const held = paint(doc, .5);
+  // The same document object in the same pose is not laid out again. The engine hands in a new document
+  // object whenever the text changes; an in-place edit (which nothing makes) is how this test sees the cache.
+  doc.caption!.words[0].text = 'Changed';
+  assert.equal(paint(doc, .6), held, 'same pose, same document object: the cached composite');
+  assert.notEqual(paint(structuredClone(doc), .6), held, 'a new document object is drawn from scratch');
+  doc.caption!.words[0].text = 'Hold';
+  assert.equal(paint(structuredClone(doc), .6), held, 'and matches the cached picture when its content is the same');
+  assert.notEqual(paint(doc, 1.2), held, 'the highlight moving to the next word is a new pose');
+  // Live playback draws a moving caption once, at the frame's own time; paused frames and exports keep the shutter.
+  const live = (d: typeof doc, time: number) => { ctx.clearRect(0, 0, 320, 180); drawText(ctx, d, 320, 180, 1920, 1080, time, undefined, false); return Buffer.from(canvas.getContext('2d').getImageData(0, 0, 320, 180).data).toString('base64'); };
+  const entering = structuredClone(doc);
+  assert.notEqual(live(entering, .08), paint(structuredClone(doc), .08), 'mid-entrance the shutter smears the motion');
+  assert.equal(live(structuredClone(doc), .5), held, 'a held pose is the same picture either way');
+  const popping = { ...doc, caption: { ...doc.caption!, wordPop: true } };
+  assert.notEqual(live(popping, .9), live(popping, .95), 'a word popping in is a new pose every frame, even drawn once');
+  const fresh = (d: typeof doc, time: number) => live(structuredClone(d), time);
+  assert.equal(live(popping, .97), fresh(popping, .97), 'and each one matches a drawing from scratch');
+});

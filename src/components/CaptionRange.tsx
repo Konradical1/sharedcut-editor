@@ -1,9 +1,11 @@
 import { useRef } from 'react';
+import { useShallow } from 'zustand/react/shallow';
 import { useEditorStore } from '../state/store';
 import { Button, Field, NumberInput } from './ui';
 
 export function CaptionRange({start,end,source,onChange}:{start:number;end:number;source:string;onChange:(start:number,end:number)=>void}) {
-  const state=useEditorStore(), rail=useRef<HTMLDivElement>(null), drag=useRef<{mode:string;x:number;start:number;end:number}|null>(null);
+  // Only the fields it draws: a whole-store subscription re-rendered it on every playback frame.
+  const state=useEditorStore(useShallow(s=>({clips:s.clips,media:s.media,projectId:s.projectId,projects:s.projects,rangeIn:s.rangeIn,rangeOut:s.rangeOut,timelineId:s.timelineId,tracks:s.tracks}))), rail=useRef<HTMLDivElement>(null), drag=useRef<{mode:string;x:number;start:number;end:number}|null>(null);
   const tracks=state.tracks.filter(t=>t.timelineId===state.timelineId&&!t.captionSets),clips=state.clips.filter(c=>c.timelineId===state.timelineId&&!c.properties.captionSet);
   const duration=Math.max(1,...clips.map(c=>c.start+c.duration)),minimum=1/(state.projects.find(t=>t.id===state.projectId)?.fps||24);
   const solo=tracks.some(t=>t.solo&&!t.muted&&(!source||source===t.id));

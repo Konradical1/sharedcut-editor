@@ -2,33 +2,56 @@
 import { useSyncExternalStore } from 'react';
 import { byteRange, moovExtent, parseMp4Index, type Mp4Index } from './mp4Index.ts';
 import { animatedSourceOffset } from './animation.ts';
-import { timelineTransitions } from './transitions.ts';
+import { timelineTransitions, type TransitionRecord } from './transitions.ts';
 import type { Clip, MediaAsset, Settings, Track } from '../state/models.ts';
 
-const CHUNK = 1 << 20, HANDLE = 2, CACHE = 'footage-v3';
+// PRE: slack before a range; byteRange already steps back to the sync sample a decoder starts from.
+// POST: B-frame reorder plus the WebCodecs decoder's half second of read-ahead past a clip's last frame.
+const CHUNK = 1 << 20, PRE = .5, POST = 1, CACHE = 'footage-v3';
 // ponytail: fixed 2 GiB ceiling; expose a budget if larger offline edits are needed.
 const CAP_BYTES = 2 * 1024 ** 3;
-type Wanted = { url: string; name: string; from: number; to: number; at: number; order: number };
+const CACHEABLE = /^\/api\/.+\.(mp4|m4a|mov|webm)(\?|$)/i, WEBM = /\.webm(\?|$)/i;
+// Alpha WebM graphics have no MP4 sample table to plan with. They are small (median 0.6 MB), so the whole file is the range.
+type Layout = Mp4Index | { size: number };
+type Wanted = { url: string; name: string; from: number; to: number; at: number; order: number; chunks?: number[] };
 type Failure = { attempts: number; next: number; error: string };
+type TimelineState = { clips: Clip[]; tracks: Track[]; media: MediaAsset[]; timelineId: string; projectId: string; playhead: number; playing?: boolean; settings: Settings };
 export type FootageStatus = { state: 'gray' | 'blue' | 'yellow' | 'green' | 'red'; detail: string; cached: number; total: number; progress: number; playback?: { detail: string; failed: boolean } };
-const stored = new Map<string, Map<number, number>>(), indexes = new Map<string, Mp4Index>();
-const wanted = new Map<string, Wanted>(), failures = new Map<string, Failure>();
+const stored = new Map<string, Map<number, number>>(), indexes = new Map<string, Layout>();
+// Per clip, every file playback opens for it: the picture and, beside a WebCodecs picture, the sound.
+const wanted = new Map<string, Wanted[]>(), failures = new Map<string, Failure>();
 const inFlight = new Map<string, AbortController>(), listeners = new Set<() => void>();
 const decoding = new Map<string, { url: string; detail: string; failed: boolean }>();
 let clearing = false, registrationError = '';
-let version = 0, registered = false, controlled = false, disabled = false, concurrency = 2;
+let version = 0, registered = false, controlled = false, disabled = false, concurrency = 6;
 let lastUpdate = -Infinity, lastEviction = 0, generation = 0, retryTimer: ReturnType<typeof setTimeout> | undefined;
 let transferred = 0, transferStart = 0, transferLast = 0, networkRate = 0;
-const notify = () => { version++; for (const listener of listeners) listener(); };
+let shown = '', notified = -Infinity, notifyTimer: ReturnType<typeof setTimeout> | undefined;
+/** Subscribers re-render at most four times a second, and only when something they show changed. */
+function notify() {
+  if (notifyTimer !== undefined || !listeners.size) return;
+  notifyTimer = setTimeout(() => {
+    notifyTimer = undefined; notified = performance.now();
+    const next = visible(); if (next === shown) return;
+    shown = next; version++; for (const listener of listeners) listener();
+  }, Math.max(0, notified + 250 - performance.now()));
+}
+const files = () => [...wanted.values()].flat();
 const supported = () => typeof window !== 'undefined' && typeof navigator !== 'undefined' && 'serviceWorker' in navigator && 'caches' in window;
 const keyOf = (request: Request) => { const url = new URL(request.url); const marker = url.searchParams.get('fc'); url.searchParams.delete('fc'); return { url: url.pathname + url.search, marker }; };
-const keyFor = (url: string, index: number) => `${url}${url.includes('?') ? '&' : '?'}fc=${index}`;
+const keyFor = (url: string, marker: number | string) => `${url}${url.includes('?') ? '&' : '?'}fc=${marker}`;
 const chunksOf = (range: { start: number; end: number }) => Array.from({ length: Math.ceil(range.end / CHUNK) - Math.floor(range.start / CHUNK) }, (_, i) => Math.floor(range.start / CHUNK) + i);
+/** Chunks this clip plays from this file, plus the MP4 header. Null until the file's layout is known. */
 function chunksFor(entry: Wanted) {
   const index = indexes.get(entry.url);
-  const range = index && byteRange(index, entry.from - HANDLE, entry.to + HANDLE);
-  return range && index ? [...new Set([...chunksOf({ start: 0, end: index.moovEnd }), ...chunksOf(range)])] : null;
+  if (!index) return null;
+  if (entry.chunks) return entry.chunks;
+  if ('size' in index) return entry.chunks = chunksOf({ start: 0, end: index.size });
+  const range = byteRange(index, entry.from - PRE, entry.to + POST);
+  return range ? entry.chunks = [...new Set([...chunksOf({ start: 0, end: index.moovEnd }), ...chunksOf(range)])] : null;
 }
+/** The next seconds from the playhead: downloaded first, never evicted. */
+const windowOf = (entry: Wanted, index: Layout) => 'size' in index ? { start: 0, end: index.size } : byteRange(index, entry.at - PRE, Math.min(entry.to + POST, entry.at + 10));
 function remember(url: string, index: number, size: number) {
   let chunks = stored.get(url); if (!chunks) { chunks = new Map(); stored.set(url, chunks); }
   chunks.set(index, size);
@@ -39,13 +62,10 @@ async function register() {
   try {
     await navigator.serviceWorker.register('/footage-worker.js');
     controlled = !!navigator.serviceWorker.controller;
-    const cache = await caches.open(CACHE);
-    for (const request of await cache.keys()) {
+    // One listing, no read per chunk: a file's short last chunk counts as whole until it is downloaded again.
+    for (const request of await (await caches.open(CACHE)).keys()) {
       const { url, marker } = keyOf(request);
-      if (marker && /^\d+$/.test(marker)) {
-        const response = await cache.match(request);
-        if (response) remember(url, Number(marker), Number(response.headers.get('Content-Length')) || CHUNK);
-      }
+      if (marker && /^\d+$/.test(marker) && !stored.get(url)?.has(Number(marker))) remember(url, Number(marker), CHUNK);
     }
     notify(); pump();
   } catch (error) { registrationError = `Local cache unavailable: ${error instanceof Error ? error.message : String(error)}`; notify(); }
@@ -75,37 +95,54 @@ export function sourceSpan(clip: Clip) {
   return { from: clip.sourceIn + Math.min(...offsets), to: clip.sourceIn + Math.max(...offsets) };
 }
 
-export function update(state: { clips: Clip[]; tracks: Track[]; media: MediaAsset[]; timelineId: string; projectId: string; playhead: number; playing?: boolean; settings: Settings }, options: { original: boolean }, urlFor: (asset: MediaAsset, visual: boolean) => string | undefined) {
+export function update(state: TimelineState, options: { original: boolean }, urlFor: (asset: MediaAsset, visual: boolean) => string | undefined) {
   const now = performance.now();
   if (now - lastUpdate < 400) return;
   lastUpdate = now;
   const nextDisabled = state.settings.footageCache === false;
   if (nextDisabled !== disabled && supported()) navigator.serviceWorker.controller?.postMessage?.({ type: 'footage-enabled', enabled: !nextDisabled });
   disabled = nextDisabled;
-  concurrency = state.playing ? 1 : 2;
+  concurrency = state.playing ? 4 : 6;
   wanted.clear();
-  const transitions = timelineTransitions(state.clips, state.timelineId, state.media);
-  if (!disabled) for (const clip of state.clips) {
-    if (clip.timelineId !== state.timelineId || clip.projectId !== state.projectId || clip.disabled) continue;
-    const track = state.tracks.find(t => t.id === clip.trackId), asset = state.media.find(m => m.id === clip.mediaId);
-    if (!track || !asset || asset.status !== 'ready' || asset.kind === 'image' || (track.kind === 'video' ? track.hidden : track.muted)) continue;
-    const url = urlFor(asset, track.kind === 'video' && asset.kind !== 'audio');
-    if (!url || !/^\/api\/.+\.(mp4|m4a|mov)(\?|$)/i.test(url)) continue;
-    const end = clip.start + clip.duration, span = sourceSpan(clip);
-    const handles = transitions.filter(t => t.incomingId === clip.id || t.outgoingId === clip.id);
-    // Reserve borrowed transition handles even when playback retimes them. This is a conservative
-    // byte range; unused handles cost bandwidth but can never falsely claim a missing frame cached.
-    const rate = Math.max(8, Number(clip.properties.speed ?? 100) / 100, ...(clip.keyframes?.['properties.speed'] ?? []).map(key => Number(key.value) / 100));
-    const lead = Math.max(0, ...handles.map(t => clip.start - t.start));
-    const tail = Math.max(0, ...handles.map(t => t.end - end));
-    span.from = Math.max(0, span.from - lead * rate); span.to += tail * rate;
-    wanted.set(clip.id, { url, name: asset.name, ...span, at: clip.sourceIn + animatedSourceOffset(clip, Math.max(0, Math.min(clip.duration, state.playhead - clip.start))), order: end > state.playhead && clip.start <= state.playhead ? 0 : clip.start > state.playhead ? clip.start - state.playhead : 1e6 + state.playhead - end });
-  }
-  const urls = new Set([...wanted.values()].map(entry => entry.url));
+  if (!disabled) plan(state, urlFor);
+  const urls = new Set(files().map(entry => entry.url));
   for (const [url, controller] of inFlight) if (!urls.has(url)) controller.abort();
   if (!disabled && supported()) { void register(); pump(); }
   notify();
   if (now - lastEviction > 30000) { lastEviction = now; void evict(); }
+}
+
+/** Mirrors playbackLayers and the decoders playback opens, so green means every file a clip plays from is local. */
+function plan(state: TimelineState, urlFor: (asset: MediaAsset, visual: boolean) => string | undefined) {
+  const clips = state.clips.filter(clip => clip.timelineId === state.timelineId && clip.projectId === state.projectId && !clip.disabled);
+  const tracks = new Map(state.tracks.map(track => [track.id, track])), media = new Map(state.media.map(asset => [asset.id, asset]));
+  const solo = state.tracks.some(track => track.timelineId === state.timelineId && track.solo && !track.muted);
+  const twin = (clip: Clip) => `${clip.mediaId}|${clip.start}|${clip.sourceIn}|${clip.duration}`;
+  const separated = new Set(clips.filter(clip => tracks.get(clip.trackId)?.kind === 'audio').map(twin));
+  const records = new Map<string, TransitionRecord[]>();
+  for (const record of timelineTransitions(state.clips, state.timelineId, state.media)) for (const id of [record.incomingId, record.outgoingId]) if (id) records.set(id, [...records.get(id) ?? [], record]);
+  for (const clip of clips) {
+    const track = tracks.get(clip.trackId), asset = media.get(clip.mediaId);
+    if (!track || !asset || asset.status !== 'ready' || asset.kind === 'image') continue;
+    const p = clip.properties, visual = track.kind === 'video' && !track.hidden && asset.kind !== 'audio';
+    const audible = (asset.kind === 'audio' || !!asset.hasAudio) && !p.freeze && !track.muted && (!solo || track.solo) && !(track.kind === 'video' && (p.audioDetached || separated.has(twin(clip))));
+    const picture = visual ? urlFor(asset, true) : undefined;
+    // A WebCodecs picture is silent and its sound plays from a second element; a native <video> carries its own.
+    const decoded = !!picture && /\.mp4(\?|$)/i.test(picture) && !p.reverse && !p.freeze && Number(p.speed ?? 100) <= 200;
+    const urls = [...new Set([picture, audible && (!visual || decoded) ? urlFor(asset, false) : undefined])].filter((url): url is string => !!url && CACHEABLE.test(url));
+    if (!urls.length) continue;
+    const span = sourceSpan(clip), own = records.get(clip.id) ?? [], end = clip.start + clip.duration;
+    // Transition handles come out of the unused source at the clip's speed; playback caps that at 8x.
+    const rate = Math.min(8, Math.max(.01, Number(p.speed ?? 100) / 100, ...(clip.keyframes?.['properties.speed'] ?? []).map(key => Number(key.value) / 100))) || 1;
+    const lead = Math.max(0, ...own.map(t => clip.start - t.start)), tail = Math.max(0, ...own.map(t => t.end - end));
+    // A reversed clip reads both handles past its source end; conservative when reverse is keyframed.
+    const reversed = !!p.reverse || !!clip.keyframes?.['properties.reverse']?.length;
+    span.from = Math.max(0, span.from - (reversed ? lead + tail : lead) * rate); span.to += (reversed ? lead + tail : tail) * rate;
+    const first = clip.start - lead, last = end + tail, playhead = state.playhead;
+    const at = clip.sourceIn + animatedSourceOffset(clip, Math.max(0, Math.min(clip.duration, playhead - clip.start)));
+    const order = last > playhead && first <= playhead ? 0 : first > playhead ? first - playhead : 1e6 + playhead - last;
+    wanted.set(clip.id, urls.map(url => ({ url, name: asset.name, ...span, at, order })));
+  }
 }
 
 export function setDecoderStatus(clipId: string, url: string, detail?: string, failed = false) {
@@ -115,20 +152,27 @@ export function setDecoderStatus(clipId: string, url: string, detail?: string, f
   decoding.set(clipId, { url, detail, failed }); notify();
 }
 export function clipFootageStatus(clipId: string): FootageStatus {
-  const entry = wanted.get(clipId), decoder = decoding.get(clipId);
-  const chunks = entry && chunksFor(entry), saved = entry && stored.get(entry.url);
-  const cached = chunks?.reduce((sum, i) => sum + (saved?.get(i) ?? 0), 0) ?? 0;
-  const total = chunks?.reduce((sum, i) => sum + (saved?.get(i) ?? CHUNK), 0) ?? 0;
+  const entries = wanted.get(clipId) ?? [], decoder = decoding.get(clipId);
+  let cached = 0, total = 0, complete = entries.length > 0;
+  for (const entry of entries) {
+    const chunks = chunksFor(entry), saved = stored.get(entry.url);
+    if (!chunks) { complete = false; continue; }
+    for (const i of chunks) { const size = saved?.get(i); cached += size ?? 0; total += size ?? CHUNK; if (size === undefined) complete = false; }
+  }
   const values = { cached, total, progress: total ? Math.floor(cached / total * 100) : 0, playback: decoder };
-  if (!disabled && controlled && chunks && chunks.every(i => saved?.has(i))) return { ...values, state: 'green', detail: 'Saved on this computer' };
-  const failure = entry && failures.get(entry.url);
+  if (!disabled && controlled && complete) return { ...values, state: 'green', detail: 'Saved on this computer' };
+  const failure = entries.reduce<Failure | undefined>((worst, entry) => { const next = failures.get(entry.url); return next && (!worst || next.attempts > worst.attempts) ? next : worst; }, undefined);
   if (failure) return { ...values, state: failure.attempts >= 3 ? 'red' : 'yellow', detail: `${failure.error}${failure.attempts < 3 ? ' · retrying shortly' : ''}` };
-  if (!entry || disabled || !controlled) return { ...values, state: registrationError ? 'red' : 'gray', detail: disabled ? 'Cache off · streaming' : registrationError || (!supported() ? 'Local cache requires HTTPS or localhost' : !controlled ? 'Starting local cache…' : 'Not cached on this computer') };
-  return { ...values, state: inFlight.has(entry.url) ? 'blue' : 'gray', detail: indexes.has(entry.url) ? `${values.progress}% cached on this computer` : inFlight.has(entry.url) ? 'Reading media index' : 'Queued' };
+  if (!entries.length || disabled || !controlled) return { ...values, state: registrationError ? 'red' : 'gray', detail: disabled ? 'Cache off · streaming' : registrationError || (!supported() ? 'Local cache requires HTTPS or localhost' : !controlled ? 'Starting local cache…' : 'Not cached on this computer') };
+  const busy = entries.some(entry => inFlight.has(entry.url));
+  return { ...values, state: busy ? 'blue' : 'gray', detail: entries.every(entry => indexes.has(entry.url)) ? `${values.progress}% cached on this computer` : busy ? 'Reading media index' : 'Queued' };
 }
 /** Select a smaller prepared stream before opening a decoder on a constrained connection. */
 export function preferLowStream(url: string) {
-  const index=indexes.get(url);
+  // Saved bytes play at disk speed whatever the connection does: never trade a cached Stream file away.
+  const uses = files().filter(entry => entry.url === url), saved = stored.get(url);
+  if (!disabled && controlled && uses.length && uses.every(entry => chunksFor(entry)?.every(i => saved?.has(i)))) return false;
+  const layout = indexes.get(url), index = layout && !('size' in layout) ? layout : undefined;
   if(!networkRate)return false;
   const duration=index?Math.max(...index.tracks.map(track=>track.times.at(-1)??0)):0;
   const bytes=index?index.tracks.reduce((sum,track)=>sum+track.sizes.reduce((n,size)=>n+size,0),0):0;
@@ -137,8 +181,13 @@ export function preferLowStream(url: string) {
 
 export const clipCached = (clipId: string) => clipFootageStatus(clipId).state === 'green';
 export function footageSummary() {
-  const entries = [...wanted].map(([id, entry]) => ({ id, name: entry.name, ...clipFootageStatus(id) }));
+  const entries = [...wanted].map(([id, uses]) => ({ id, name: uses[0].name, ...clipFootageStatus(id) }));
   return { entries, transferred, speed: transferStart && transferLast > transferStart ? transferred / ((transferLast - transferStart) / 1000) : 0, active: inFlight.size };
+}
+/** What the timeline and the footage panel draw, at the precision they draw it. */
+function visible() {
+  const { entries, transferred, speed, active } = footageSummary();
+  return JSON.stringify([registrationError, disabled, controlled, Math.round(transferred / 1e5), Math.round(speed / 1e5), active > 0, entries.map(entry => [entry.id, entry.state, entry.detail, entry.progress, Math.round(entry.cached / 1e5), Math.round(entry.total / 1e5), entry.playback?.detail, entry.playback?.failed])]);
 }
 export function useFootageVersion() {
   return useSyncExternalStore(listener => { listeners.add(listener); return () => { listeners.delete(listener); }; }, () => version, () => 0);
@@ -152,14 +201,16 @@ async function readRange(url: string, start: number, end: number, signal: AbortS
   if (!range || Number(range[1]) !== start || Number(range[2]) !== Math.min(end, Number(range[3]) - 1)) throw new Error('Invalid media range');
   const bytes = await response.arrayBuffer();
   if (bytes.byteLength !== Number(range[2]) - start + 1) throw new Error('Incomplete media download');
-  return bytes;
+  return { bytes, size: Number(range[3]) };
 }
-async function loadIndex(url: string, signal: AbortSignal) {
-  let head = await readRange(url, 0, CHUNK - 1, signal);
+async function loadLayout(url: string, signal: AbortSignal): Promise<Layout> {
+  const first = await readRange(url, 0, CHUNK - 1, signal);
+  if (WEBM.test(url)) return { size: first.size };
+  let head = first.bytes;
   const extent = moovExtent(head);
   if (!extent || extent > 32 * CHUNK) throw new Error('Media index unavailable');
   if (extent > head.byteLength) {
-    const rest = await readRange(url, head.byteLength, extent - 1, signal);
+    const rest = (await readRange(url, head.byteLength, extent - 1, signal)).bytes;
     const joined = new Uint8Array(head.byteLength + rest.byteLength); joined.set(new Uint8Array(head)); joined.set(new Uint8Array(rest), head.byteLength); head = joined.buffer;
   }
   const index = parseMp4Index(head); if (!index) throw new Error('Media index unavailable');
@@ -169,19 +220,20 @@ const storedBytes=()=>[...stored.values()].reduce((sum,chunks)=>sum+[...chunks.v
 function pump() {
   clearTimeout(retryTimer);
   if (disabled || clearing || !controlled) return;
-  const entries = [...wanted.values()].sort((a, b) => a.order - b.order);
+  const entries = files().sort((a, b) => a.order - b.order);
   // Fill the playhead and next cuts before downloading entire long clips (especially music).
   // Recompute after each chunk so a seek or an approaching cut can change the priority.
-  const tasks = entries.flatMap<{ entry: Wanted; index: Mp4Index | undefined; chunk: number | undefined; priority: number }>(entry => {
+  const tasks = entries.flatMap<{ entry: Wanted; index: Layout | undefined; chunk: number | undefined; priority: number }>(entry => {
     const index = indexes.get(entry.url), saved = stored.get(entry.url);
     if (!index) return [{ entry, index, chunk: undefined, priority: entry.order < 15 ? entry.order : 1e5 + entry.order }];
-    const urgent = entry.order < 15 && byteRange(index, entry.at - HANDLE, Math.min(entry.to + HANDLE, entry.at + 10));
+    const urgent = entry.order < 15 && windowOf(entry, index);
     const chunk = urgent ? chunksOf(urgent).find(i => !saved?.has(i)) : undefined;
     if (chunk !== undefined) return [{ entry, index, chunk, priority: entry.order }];
     const rest = chunksFor(entry)?.find(i => !saved?.has(i));
     return rest === undefined ? [] : [{ entry, index, chunk: rest, priority: 1e5 + entry.order }];
   }).sort((a, b) => a.priority - b.priority);
   const nearBudget=storedBytes()>=CAP_BYTES*.9;
+  // Several files at once, one request each: a dense multi-layer edit reaches every next cut in parallel.
   for (const { entry, index, chunk, priority } of tasks) {
     if(nearBudget&&priority>=1e5)continue;
     if (inFlight.size >= concurrency) break;
@@ -194,7 +246,7 @@ function pump() {
     const timeout = setTimeout(() => controller.abort(new Error('Media download timed out')), 30000);
     const run = async () => {
       if (!index) {
-        const parsed = await loadIndex(entry.url, controller.signal);
+        const parsed = await loadLayout(entry.url, controller.signal);
         if (epoch === generation && !controller.signal.aborted) indexes.set(entry.url, parsed);
       } else {
         await readRange(entry.url, chunk! * CHUNK, (chunk! + 1) * CHUNK - 1, controller.signal);
@@ -214,24 +266,29 @@ function pump() {
   const next = Math.min(...entries.map(e => failures.get(e.url)?.next ?? Infinity).filter(t => t > Date.now()));
   if (Number.isFinite(next)) retryTimer = setTimeout(pump, Math.max(1, next - Date.now()));
 }
+/** When the worker last served a file; it stamps `used` on the file's meta entry at most once a minute. */
+async function lastUsed(cache: Cache, url: string) {
+  try { return Number((await (await cache.match(keyFor(url, 'meta')))?.json())?.used) || 0; } catch { return 0; }
+}
 async function evict() {
   if (!supported()) return;
   try {
     const usage=storedBytes();
     if(usage<CAP_BYTES*.9)return;
-    const cache=await caches.open(CACHE),keys=await cache.keys();
-    const keep=new Map<string,Set<number>>();
-    for(const entry of wanted.values()){
+    const cache=await caches.open(CACHE),keep=new Map<string,Set<number>>(),used=new Map<string,number>();
+    for(const entry of files()){
       const index=indexes.get(entry.url);if(!index)continue;
       const pinned=keep.get(entry.url)??new Set<number>();keep.set(entry.url,pinned);
-      for(const chunk of chunksOf({start:0,end:index.moovEnd}))pinned.add(chunk);
-      if(entry.order<15){const range=byteRange(index,entry.at-HANDLE,Math.min(entry.to+HANDLE,entry.at+10));if(range)for(const chunk of chunksOf(range))pinned.add(chunk);}
+      if(!('size' in index))for(const chunk of chunksOf({start:0,end:index.moovEnd}))pinned.add(chunk);
+      const range=entry.order<15&&windowOf(entry,index);if(range)for(const chunk of chunksOf(range))pinned.add(chunk);
     }
+    for(const url of stored.keys())used.set(url,await lastUsed(cache,url));
+    // Longest unused file first; the current and next playable windows are never candidates.
+    const victims=[...stored].flatMap(([url,chunks])=>[...chunks.keys()].filter(i=>!keep.get(url)?.has(i)).map(i=>({url,i}))).sort((a,b)=>used.get(a.url)!-used.get(b.url)!||a.i-b.i);
     let excess=usage-CAP_BYTES*.8;
-    for(const request of keys){
+    for(const {url,i} of victims){
       if(excess<=0)break;
-      const {url,marker}=keyOf(request);if(!marker||!/^\d+$/.test(marker)||keep.get(url)?.has(Number(marker)))continue;
-      await cache.delete(request);const chunks=stored.get(url);excess-=chunks?.get(Number(marker))??CHUNK;chunks?.delete(Number(marker));
+      await cache.delete(keyFor(url,i));const chunks=stored.get(url);excess-=chunks?.get(i)??CHUNK;chunks?.delete(i);
       if(!chunks?.size)stored.delete(url);
     }
     notify();

@@ -9,6 +9,7 @@ import { createTitleTemplate } from '../services/titleTemplates.ts';
 import { animationProperties, boundedAnimationValue, copyAnimatedNodes, evaluateClip, evaluateNodes, frameTime, retimedDuration, setAnimatedValue, trimAnimation, validateKeyframes } from '../services/animation.ts';
 import type { Keyframe, KeyframeValue } from './models.ts';
 import { create } from 'zustand';
+import { useShallow } from 'zustand/react/shallow';
 import type { Clip, CollaborativeLock, Comment, GradeNode, MediaAsset, Notification, Operation, OperationType, Presence, Project, ProjectState, RenderJob, Settings, Snapshot, Timeline, Track, User, Workspace } from './models.ts';
 import { createDemoProject, defaultProperties, projects, users } from './demo.ts';
 import { authenticationService, collaborationService, colorService, createId, LOCK_TTL, lockConflict, mediaService, projectService, renderService } from '../services/index.ts';
@@ -1410,6 +1411,17 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     },
   };
 });
+
+// Panels that only display playhead-dependent values (animated properties, a comment's time) would otherwise
+// re-render on every playback frame; while playing they follow the playhead in quarter-second steps.
+export const PANEL_PLAYHEAD_STEP = .25;
+export const panelPlayhead = (s: Pick<EditorStore, 'playing' | 'playhead'>) => s.playing ? Math.floor(s.playhead / PANEL_PLAYHEAD_STEP) * PANEL_PLAYHEAD_STEP : s.playhead;
+/** `needed` false (nothing keyframed) subscribes to nothing that moves. */
+export const usePanelPlayhead = (needed = true) => useEditorStore(s => needed ? panelPlayhead(s) : 0);
+/** Editing overlays hide while playing, so they never need the moving playhead. */
+export const usePausedPlayhead = () => useEditorStore(s => s.playing ? -1 : s.playhead);
+/** The whole store minus the playhead, for broad panels written against `useEditorStore()`: they skip every playback frame. */
+export const useStoreWithoutPlayhead = (): Omit<EditorStore, 'playhead'> => useEditorStore(useShallow(({ playhead: _, ...rest }: EditorStore) => rest));
 
 // ponytail: localStorage has a small size ceiling; use the server database for large projects.
 export const persistedKeys = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs', 'users', 'currentUserId', 'settings'] as const;

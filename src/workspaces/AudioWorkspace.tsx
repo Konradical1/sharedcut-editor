@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { Activity, AudioLines, ChevronDown, Headphones, ListMusic, Plus, Power, RotateCcw, SlidersHorizontal, Volume2 } from 'lucide-react';
-import { useEditorStore } from '../state/store';
+import { useShallow } from 'zustand/react/shallow';
+import { useEditorStore, type EditorStore } from '../state/store';
 import type { Clip, Track } from '../state/models';
 import { Badge, Button, IconButton, NumberInput } from '../components/ui';
 import { Property } from '../components/Inspector';
@@ -39,8 +40,10 @@ function MasterLevel({ playing }: { playing: boolean }) {
   return <div className="master-loudness"><strong className="mono">{level > .00001 ? (20 * Math.log10(level)).toFixed(1) : '−∞'}</strong><span>dBFS · RMS</span></div>;
 }
 
+// Named fields only: the whole store changes on every playback frame.
+const mixerState = (s: EditorStore) => ({ clips: s.clips, playing: s.playing, selectedClipId: s.selectedClipId, settings: s.settings, timelineId: s.timelineId, tracks: s.tracks, addEffect: s.addEffect, selectClip: s.selectClip, setSettings: s.setSettings, updateEffect: s.updateEffect, updateProperty: s.updateProperty, updateTrack: s.updateTrack });
 function MixerStrip({ track, index, clip }: { track: Track; index: number; clip?: Clip }) {
-  const s = useEditorStore();
+  const s = useEditorStore(useShallow(mixerState));
   const color = trackColors[index % trackColors.length];
   const selected = clip?.id === s.selectedClipId;
   return <div className={`mixer-strip ${selected ? 'selected' : ''}`} style={{ '--channel-color': color } as CSSProperties}>
@@ -56,7 +59,7 @@ function MixerStrip({ track, index, clip }: { track: Track; index: number; clip?
 }
 
 export default function AudioWorkspace() {
-  const s = useEditorStore();
+  const s = useEditorStore(useShallow(mixerState));
   const [effect, setEffect] = useState('EQ');
   const masterGain = Number(s.settings.masterGain ?? 0);
   const masterMuted = Boolean(s.settings.masterMuted);

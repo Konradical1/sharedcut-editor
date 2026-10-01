@@ -5,6 +5,7 @@ import { mkdtemp, mkdir, rm, writeFile, readdir, cp, realpath } from 'node:fs/pr
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { readWorkspace } from './workspace-db.mjs';
 import { constants } from 'node:fs';
 import { createServer as httpServer, request as httpRequest } from 'node:http';
 import { Transform } from 'node:stream';
@@ -12,7 +13,7 @@ import { createFrameLineServer } from '../server/index.ts';
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const sourceData = resolve(process.argv[2] || 'data');
 const sourceDb = new DatabaseSync(join(sourceData, 'frameline.sqlite'), { readOnly: true });
-const source = JSON.parse(sourceDb.prepare('SELECT state FROM workspace WHERE id=1').get().state); sourceDb.close();
+const source = readWorkspace(sourceDb).state; sourceDb.close();
 const project = source.projects.find(p => p.name.toLowerCase() === 'newspaper');
 assert.ok(project, 'This benchmark needs the imported Newspaper footage.');
 const imported = { project, ...Object.fromEntries(['media', 'timelines', 'tracks', 'clips', 'nodes'].map(k => [k, source[k].filter(x => x.projectId === project.id || k === 'tracks' && source.timelines.some(t => t.projectId === project.id && t.id === x.timelineId))])) };

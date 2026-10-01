@@ -41,7 +41,17 @@ export function validateKeyframes(channels: unknown): asserts channels is NonNul
   }
 }
 export type AnimationProperty = { path: string; label: string; value: KeyframeValue };
+// Timeline lanes list every keyframed clip's properties on each playhead move; an unchanged pose
+// (evaluateClip returns the same object) with the same grade nodes lists them once.
+const listed = new WeakMap<Clip, { nodes: GradeNode[]; properties: AnimationProperty[] }>();
 export function animationProperties(clip: Clip, nodes: GradeNode[] = []): AnimationProperty[] {
+  const own = nodes.filter(n => n.clipId === clip.id), cached = listed.get(clip);
+  if (cached && cached.nodes.length === own.length && cached.nodes.every((node, i) => node === own[i])) return cached.properties;
+  const properties = listProperties(clip, own);
+  listed.set(clip, { nodes: own, properties });
+  return properties;
+}
+function listProperties(clip: Clip, nodes: GradeNode[]): AnimationProperty[] {
   if(clip.properties.captionSet)return [];
   const result: AnimationProperty[] = [];
   const flatten = (value: object, prefix: string, label = '') => {
@@ -87,14 +97,63 @@ export function setAnimatedValue(clip: Clip, path: string, value: KeyframeValue)
   if (parts[0] === 'shape') { try { validateShape(root); } catch { return clip; } next.properties.shapeDocument = JSON.stringify(root); }
   return next;
 }
+/**
+ * Every channel applied to one copy of the clip: only the objects on an animated path are copied, and the
+ * text or shape document is parsed and written once, where applying the channels one at a time deep-cloned
+ * the whole clip per channel on every frame. A text document that fails validation replays channel by
+ * channel so exactly the offending channel is dropped, as before.
+ */
+function applyChannels(clip: Clip, changes: [string, KeyframeValue][]): Clip {
+  const copies = new Set<object>();
+  const own = <T extends object>(value: T): T => { if (copies.has(value)) return value; const copy = (Array.isArray(value) ? [...value] : { ...value }) as T; copies.add(copy); return copy; };
+  const next: Clip = { ...clip, properties: own(clip.properties) };
+  let text: (TextDocument & object) | undefined, shape: ReturnType<typeof getShape> | undefined, textSet = false, shapeSet = false;
+  for (const [path, value] of changes) {
+    if (!safePath(path)) continue;
+    const parts = path.split('.');
+    let target: any;
+    if (parts[0] === 'properties') target = next.properties;
+    else if (parts[0] === 'effects') { const index = next.effects.findIndex(e => e.id === parts[1]); if (index < 0) continue; next.effects = own(next.effects); target = next.effects[index] = own(next.effects[index]); }
+    else if (parts[0] === 'text' && isTitle(next)) { text ??= getText(clip); target = text; }
+    else if (parts[0] === 'shape' && isShape(next)) { shape ??= getShape(clip); target = shape; }
+    else continue;
+    // A freshly parsed document is already this evaluation's own copy.
+    const parsed = target === text || target === shape;
+    let valid = true;
+    for (const part of parts.slice(parts[0] === 'effects' ? 2 : 1, -1)) {
+      if (!target || typeof target !== 'object') { valid = false; break; }
+      const child = target[part] ?? {};
+      target = target[part] = child && typeof child === 'object' && !parsed ? own(child) : child;
+    }
+    if (!valid || !target || typeof target !== 'object') continue;
+    target[parts.at(-1)!] = boundedAnimationValue(path, value);
+    if (path === 'properties.disabled') next.disabled = Boolean(value);
+    if (parts[0] === 'text') textSet = true;
+    if (parts[0] === 'shape') shapeSet = true;
+  }
+  const replay = () => changes.reduce((result, [path, value]) => setAnimatedValue(result, path, value), clip);
+  if (textSet) { try { validateText(text); } catch { return replay(); } next.properties.textDocument = JSON.stringify(text); }
+  if (shapeSet) { try { validateShape(shape); } catch { return replay(); } next.properties.shapeDocument = JSON.stringify(shape); }
+  return next;
+}
+const channelLists = new WeakMap<NonNullable<Clip['keyframes']>, [string, Keyframe[]][]>();
+// The last pose per stored clip: while no channel moves (outside its keys, on a hold) every caller gets the same object.
+const poses = new WeakMap<Clip, { values: KeyframeValue[]; keyframes: Clip['keyframes']; properties: Clip['properties']; clip: Clip }>();
 export function evaluateClip(clip: Clip, playhead: number, fps = 24): Clip {
-  if (!clip.keyframes || !Object.keys(clip.keyframes).length) return clip;
-  let next = clip;
-  for (const [path, keys] of Object.entries(clip.keyframes)) if (keys.length && !path.startsWith('nodes.')) next = setAnimatedValue(next, path, sampleKeyframes(keys, playhead-clip.start));
-  if (isTitle(clip) && ['typingSpeed','typingRandomness','typingSeed'].some(key=>clip.keyframes![`text.${key}`]?.length)) next = {...next,properties:{...next.properties,animationTypingCount:typingReveal(clip,getText(next),clip.sourceIn+animatedSourceOffset(clip,Math.max(0,playhead-clip.start),fps))}};
+  if (!clip.keyframes) return clip;
+  let channels = channelLists.get(clip.keyframes);
+  if (!channels) { channels = Object.entries(clip.keyframes).filter(([path, keys]) => keys.length && !path.startsWith('nodes.')); channelLists.set(clip.keyframes, channels); }
+  const typing = isTitle(clip) && ['typingSpeed','typingRandomness','typingSeed'].some(key=>clip.keyframes![`text.${key}`]?.length);
+  if (!channels.length && !typing) return clip;
+  const values = channels.map(([, keys]) => sampleKeyframes(keys, playhead - clip.start)), last = poses.get(clip);
+  if (!typing && last && last.keyframes === clip.keyframes && last.properties === clip.properties && last.values.every((value, i) => value === values[i])) return last.clip;
+  let next = channels.length ? applyChannels(clip, channels.map(([path], i) => [path, values[i]])) : clip;
+  if (typing) next = {...next,properties:{...next.properties,animationTypingCount:typingReveal(clip,getText(next),clip.sourceIn+animatedSourceOffset(clip,Math.max(0,playhead-clip.start),fps))}};
+  else poses.set(clip, { values, keyframes: clip.keyframes, properties: clip.properties, clip: next });
   return next;
 }
 export function evaluateNodes(nodes: GradeNode[], clip: Clip, playhead: number): GradeNode[] {
+  if (!Object.keys(clip.keyframes ?? {}).some(path => path.startsWith('nodes.'))) return [...nodes];
   return nodes.map(node => {
     let next = node;
     for (const [path, keys] of Object.entries(clip.keyframes ?? {})) {

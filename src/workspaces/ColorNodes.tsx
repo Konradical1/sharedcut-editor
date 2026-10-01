@@ -1,11 +1,11 @@
 import {useEffect,useRef,useState,type ReactNode,type PointerEvent} from 'react';
 import {Plus,Grid2X2,Scan,Minus,ChevronLeft,ChevronRight,Power,Trash2} from 'lucide-react';
 import type {GradeNode} from '../state/models';
-import {useEditorStore} from '../state/store';
+import {useStoreWithoutPlayhead} from '../state/store';
 import {IconButton,Button} from '../components/ui';
 import {createId} from '../services';
 export function ColorNodes({nodes,clipId,selected,thumbnail,onAdd,onEffect,toolbar}:{nodes:GradeNode[];clipId?:string;selected?:string;thumbnail:string;toolbar?:ReactNode;onAdd:()=>void;onEffect:(id:string,type:string)=>void}){
-  const s=useEditorStore(),view=useRef<HTMLDivElement>(null),[viewport,setViewport]=useState({zoom:.85,pan:{x:0,y:0}}),[moving,setMoving]=useState<{id:string;x:number;y:number}|null>(null),[context,setContext]=useState<{id:string;x:number;y:number}|null>(null),[insert,setInsert]=useState<string|null|undefined>(undefined);
+  const s=useStoreWithoutPlayhead(),view=useRef<HTMLDivElement>(null),[viewport,setViewport]=useState({zoom:.85,pan:{x:0,y:0}}),[moving,setMoving]=useState<{id:string;x:number;y:number}|null>(null),[context,setContext]=useState<{id:string;x:number;y:number}|null>(null),[insert,setInsert]=useState<string|null|undefined>(undefined);
   const clip=s.clips.find(c=>c.id===clipId),look=clip?.properties.resolveLookUrl;
   const lookActive=Boolean(look)&&clip?.properties.bypassResolveLook!==true&&clip?.properties.colorPipeline!=='nodes-v2';
   const {zoom,pan}=viewport;

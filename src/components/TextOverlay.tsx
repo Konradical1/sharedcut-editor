@@ -2,14 +2,16 @@ import { isCaption } from '../services/captions';
 import { projectSize } from '../services/playback';
 import type { Clip } from '../state/models';
 import { evaluateClip } from '../services/animation';
-import { useEffect, useRef, useState, type PointerEvent } from 'react';
-import { useEditorStore } from '../state/store';
+import { memo, useEffect, useRef, useState, type PointerEvent } from 'react';
+import { useEditorStore, usePausedPlayhead } from '../state/store';
 import { getText, isTitle, defaultTextStyle, textLocalPoint, type TextDocument } from '../services/text';
 import { lockedAxis, overlayBoxes, snapBox, textBox, SNAP_PIXELS, type SnapBox, type SnapGuide } from '../services/snapping';
 import { TextContentEditor } from './TextInspector';
 
-export default function TextOverlay() {
-  const timelineId = useEditorStore(s=>s.timelineId), clips = useEditorStore(s=>s.clips), tracks = useEditorStore(s=>s.tracks), playhead = useEditorStore(s=>s.playhead), tool = useEditorStore(s=>s.textTool), playing = useEditorStore(s=>s.playing), ids = useEditorStore(s=>s.selectedTextIds), preview = useEditorStore(s=>s.textPreview);
+// Memoized and off the moving playhead: the Viewer re-renders every playback frame, and text boxes hide while playing.
+export default memo(TextOverlay);
+function TextOverlay() {
+  const timelineId = useEditorStore(s=>s.timelineId), clips = useEditorStore(s=>s.clips), tracks = useEditorStore(s=>s.tracks), playhead = usePausedPlayhead(), tool = useEditorStore(s=>s.textTool), playing = useEditorStore(s=>s.playing), ids = useEditorStore(s=>s.selectedTextIds), preview = useEditorStore(s=>s.textPreview);
   const shapeTool=useEditorStore(s=>s.shapeTool), clipPreview=useEditorStore(s=>s.clipPreview), project=useEditorStore(s=>s.projects.find(p=>p.id===s.projectId));
   const [projectWidth,projectHeight]=projectSize(project?.resolution??'1920 × 1080');
   const [draft, setDraft] = useState<Partial<TextDocument>|null>(null), [editing, setEditing] = useState<string|null>(null), [guides, setGuides] = useState<SnapGuide[]>([]);
@@ -28,6 +30,9 @@ export default function TextOverlay() {
   };
   useEffect(()=>{const key=(e:KeyboardEvent)=>{if(e.key==='Escape'){finish(true);setEditing(null);useEditorStore.setState({textTool:false});}};window.addEventListener('keydown',key);return()=>window.removeEventListener('keydown',key);});
   useEffect(()=>{setEditing(null);return()=>{const d=drag.current;if(d?.id)s().releaseLock(d.id,'textDocument');useEditorStore.setState({textPreview:[]});};},[timelineId]);
+  // The popover unmounts while playing (no paused playhead); remounting on pause would focus and select-all its text,
+  // so the next Space would overwrite the title. Playing ends the edit instead.
+  useEffect(()=>{if(playing)setEditing(null);},[playing]);
   const begin = (e:PointerEvent, id?: string, mode='move') => {
     if(e.button!==0||playing||shapeTool)return;
     e.preventDefault();e.stopPropagation();const evaluated=id?evaluateClip(clips.find(c=>c.id===id)!,playhead):undefined,frame=point(e),p=evaluated?textLocalPoint(frame,evaluated.properties,projectWidth,projectHeight):{x:Math.max(0,Math.min(1,frame.x)),y:Math.max(0,Math.min(1,frame.y))};

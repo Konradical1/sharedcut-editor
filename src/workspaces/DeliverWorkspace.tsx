@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { motion } from 'motion/react';
 import { ArrowDownToLine, ArrowRight, Check, ChevronRight, CircleCheck, Clock3, Cpu, Download, Film, Folder, HardDrive, ListVideo, MonitorPlay, Plus, RotateCcw, Send, Server, Settings2, ShieldCheck, Sparkles, Subtitles, Volume2, X } from 'lucide-react';
-import { useEditorStore } from '../state/store';
+import { useStoreWithoutPlayhead } from '../state/store';
 import type { RenderJob } from '../state/models';
 import { Badge, Button, Field, IconButton, Modal, NumberInput, timecode } from '../components/ui';
 import Viewer from '../components/Viewer';
@@ -15,7 +15,7 @@ const presets = [
 ];
 
 function QueueItem({ job, onDetails }: { job: RenderJob; onDetails: () => void }) {
-  const s = useEditorStore();
+  const s = useStoreWithoutPlayhead();
   return <motion.div layout="position" initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className={`render-job ${job.status}`}><div className="render-job-top"><div className="render-job-icon">{job.status === 'complete' ? <CircleCheck size={17}/> : job.status === 'rendering' ? <Film size={17}/> : job.status === 'failed' ? <X size={17}/> : <Clock3 size={17}/>}</div><button onClick={onDetails}><strong>{job.name}</strong><span>{job.preset} · {job.settings.resolution || '1920 × 1080'}</span></button>{job.status === 'rendering' || job.status === 'waiting' ? <IconButton label={`Cancel ${job.name}`} onClick={() => { s.updateRender(job.id, { status: 'failed', remaining: 'Canceled by you' }); s.notify('Render canceled', 'info', job.name); }}><X size={13}/></IconButton> : <IconButton label={`View details for ${job.name}`} onClick={onDetails}><ChevronRight size={14}/></IconButton>}</div>
     {job.status === 'rendering' && <><div className="render-progress" role="progressbar" aria-label={`${job.name} render progress`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.floor(job.progress)} aria-valuetext={`${Math.floor(job.progress)}% · ${job.remaining}`}><motion.span animate={{ scaleX: job.progress / 100 }} initial={false} transition={{ duration: .6, ease: 'linear' }}/></div><div className="render-job-meta"><span><span className="tiny-dot"/> {s.serverOnline ? 'Rendering on the server' : 'Reconnecting — progress unavailable'}</span><strong className="mono">{Math.round(job.progress)}%</strong></div><div className="render-job-footer"><span>{job.remaining || 'Estimating…'}</span><span>{job.settings.codec || 'H.264'}</span></div></>}
     {job.status === 'waiting' && <div className="render-job-meta"><span><Clock3 size={11}/> {s.renderJobs.some(item => item.status === 'rendering') ? 'Queued behind another export' : 'Starting export…'}</span></div>}
@@ -25,7 +25,7 @@ function QueueItem({ job, onDetails }: { job: RenderJob; onDetails: () => void }
 }
 
 export default function DeliverWorkspace() {
-  const s = useEditorStore();
+  const s = useStoreWithoutPlayhead();
   const project = s.projects.find(p => p.id === s.projectId);
   const timeline = s.timelines.find(t => t.id === s.timelineId);
   const [preset, setPreset] = useState('Quick Export');

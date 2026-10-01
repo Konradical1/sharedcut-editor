@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { advanceCursor, advancePlayhead, playheadMotion, cursorPosition, presenceCursor, presenceDue, receivedPresence, PRESENCE_HEARTBEAT } from './presence.ts';
+import { advanceCursor, advancePlayhead, playheadMotion, cursorPosition, presenceCursor, presenceDue, receivedPresence, PRESENCE_HEARTBEAT, PLAYING_PRESENCE_INTERVAL } from './presence.ts';
 import type { Presence } from '../state/models.ts';
 import { collaborationService } from './index.ts';
 
@@ -110,4 +110,23 @@ test('presence publishes every change at once and idles down to a heartbeat', ()
   assert.equal(presenceDue(parked(1), parked(1), 50), false);
   assert.equal(presenceDue(parked(1), parked(1), PRESENCE_HEARTBEAT - 1), false);
   assert.equal(presenceDue(parked(1), parked(1), PRESENCE_HEARTBEAT), true, 'The server drops a client it has not heard from.');
+});
+
+test('a playing editor publishes its moving playhead a few times a second, not every tick', () => {
+  const playing = (playhead: number) => JSON.stringify([true, 'p', 't', null, playhead, null, 'edit', false, true]);
+  // Followers extrapolate a playing playhead, so a new position every tick is only traffic through the tunnel.
+  assert.equal(presenceDue(playing(1.05), playing(1), 50, true), false);
+  assert.equal(presenceDue(playing(1.25), playing(1), PLAYING_PRESENCE_INTERVAL - 1, true), false);
+  assert.equal(presenceDue(playing(1.25), playing(1), PLAYING_PRESENCE_INTERVAL, true), true);
+  assert.ok(1000 / PLAYING_PRESENCE_INTERVAL <= 4);
+  // Nothing changed still means nothing to send until the heartbeat.
+  assert.equal(presenceDue(playing(1), playing(1), PLAYING_PRESENCE_INTERVAL, true), false);
+  assert.equal(presenceDue(playing(1), playing(1), PRESENCE_HEARTBEAT, true), true);
+});
+
+test('an empty presence reply keeps the previous empty list so nothing re-renders', () => {
+  const none: Presence[] = [];
+  assert.equal(receivedPresence([], 10, 20, none), none);
+  assert.notEqual(receivedPresence([person()], 10, 20, none), none);
+  assert.equal(receivedPresence([], 10, 20, [person()]).length, 0);
 });

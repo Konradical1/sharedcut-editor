@@ -1,7 +1,8 @@
 import { createPreviewCache } from './previewCache.ts';
 import { validateMotionBlur } from '../src/services/motionBlur.ts';
 import { workQueue } from './workQueue.ts';
-import { stateDelta, applyStateDelta } from '../src/services/stateDelta.ts';
+import { stateDelta, applyStateDelta, stateEqual, shareState } from '../src/services/stateDelta.ts';
+import { COLLECTIONS, holdDataLock, workspaceStore } from './workspaceStore.ts';
 import { parseImportLink, downloadLink, youtubeThumbnail } from './linkImport.ts';
 import { soundLibrary } from './sfx.ts';
 import { projectLibrary } from './library.ts';
@@ -28,7 +29,7 @@ import { resolve, join, extname, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
 import { createGzip } from 'node:zlib';
-import { Transform } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { promisify, isDeepStrictEqual } from 'node:util';
 import { LOCK_TTL, MOVEMENT_FIELDS, lockConflict, type PersistedState } from '../src/services/index.ts';
 import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock } from '../src/state/models.ts';
@@ -44,7 +45,6 @@ import { FILMSTRIP_VERSION, MEDIA_CONCURRENCY, SKIP_COLOR_PROXY, STREAM_VARIANT,
 
 const scrypt = promisify(scryptCallback);
 const DEFAULT_SETTINGS = { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false, snapping: true, mediaWidth: 278, inspectorWidth: 292, timelineHeight: 294 };
-const COLLECTIONS = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'] as const;
 type Collection = typeof COLLECTIONS[number];
 type Asset = MediaAsset & { sourceUrl?: string; proxyUrl?: string; waveform?: unknown; hasAudio?: boolean; error?: string };
 type Account = { user: User; hash: string; salt: string; settings: PersistedState['settings'] };
@@ -52,7 +52,43 @@ type Entry = Record<string, any>;
 const emptyState = (): PersistedState => ({ projects: [], media: [], timelines: [], clips: [], tracks: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], users: [], currentUserId: '', settings: { ...DEFAULT_SETTINGS } });
 const idIsValid = (id: unknown): id is string => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id);
 const jsonValue = (value: unknown) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
-const same = (a: unknown, b: unknown) => a === b || isDeepStrictEqual(jsonValue(a), jsonValue(b));
+// Structural first: saved entities are shared by reference, so a 10 MB media list compares in
+// microseconds instead of two JSON round trips. The JSON pass keeps the old answer for the rest.
+const same = (a: unknown, b: unknown) => a === b || stateEqual(a, b) || isDeepStrictEqual(jsonValue(a), jsonValue(b));
+/**
+ * A list rebuilt from one caller's save of the entries they can see. Hidden entries keep their slots, so
+ * one user's save never moves another's rows. New entries at either end of the caller's list go to that
+ * end of the whole list, where the store has room: put next to the first hidden entry instead, history
+ * halved one gap until the store had to renumber every row.
+ */
+export function mergeVisible<T extends { id?: unknown }>(old: readonly T[], hidden: (item: T) => boolean, sent: readonly T[]) {
+  let merged: T[] = [], next = 0;
+  const emit = (to: number) => { while (next < to) merged.push(sent[next++]); };
+  // Usually the caller kept every entry they could see, in order, and added only at the ends; then each
+  // kept entry takes its old slot without indexing every id (10,000 history entries on each save).
+  const seen = old.find(item => !hidden(item)), lead = seen ? sent.findIndex(item => item.id === seen.id) : sent.length;
+  if (lead >= 0) {
+    emit(lead);
+    let inOrder = true;
+    for (const item of old) {
+      if (hidden(item)) merged.push(item);
+      else if (next < sent.length && sent[next].id === item.id) merged.push(sent[next++]);
+      else { inOrder = false; break; }
+    }
+    if (inOrder) { emit(sent.length); return merged; }
+    merged = []; next = 0;
+  }
+  const rank = new Map<unknown, number>();
+  for (let i = 0; i < sent.length; i++) rank.set(sent[i].id, i);
+  let first = sent.length;
+  for (const item of old) if (!hidden(item)) first = Math.min(first, rank.get(item.id) ?? first);
+  emit(first);
+  // Each kept entry takes its old slot, preceded by the new ones the caller put before it; one the caller
+  // moved earlier has already been placed.
+  for (const item of old) if (hidden(item)) merged.push(item); else emit((rank.get(item.id) ?? -1) + 1);
+  emit(sent.length);
+  return merged;
+}
 const initials = (name: string) => name.split(/\s+/).map(part => part[0]).slice(0, 2).join('').toUpperCase();
 class HttpError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status; } }
 const fail = (status: number, message: string): never => { throw new HttpError(status, message); };
@@ -90,12 +126,13 @@ async function binaryBody(req: IncomingMessage, max: number, onProgress?: (bytes
   if(!length)fail(400,'Empty upload.');return Buffer.concat(chunks);
 }
 
+const acceptsGzip = (req: IncomingMessage) => (req.headers['accept-encoding'] ?? '').split(',').some(item => {
+  const [name, ...params] = item.trim().split(';');
+  return name === 'gzip' && !params.some(p => /^q=0(?:\.0*)?$/.test(p.trim()));
+});
 function send(res: ServerResponse, status: number, body: unknown) {
   const json = JSON.stringify(body);
-  const gzip = json.length >= 4096 && (res.req.headers['accept-encoding'] ?? '').split(',').some(item => {
-    const [name, ...params] = item.trim().split(';');
-    return name === 'gzip' && !params.some(p => /^q=0(?:\.0*)?$/.test(p.trim()));
-  });
+  const gzip = json.length >= 4096 && acceptsGzip(res.req);
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', Vary: 'Accept-Encoding', ...(gzip ? { 'Content-Encoding': 'gzip' } : {}) });
   if (!gzip) { res.end(json); return; }
   const stream = createGzip({ level: 1 });
@@ -141,13 +178,17 @@ function streamFile(req: IncomingMessage, res: ServerResponse, path: string, typ
   if (gzip) void pipeline(stream, createGzip(), res).catch(() => res.destroy()); else stream.pipe(res);
 }
 
-export function createFrameLineServer(options: { dataDir?: string; distDir?: string; maxUploadBytes?: number } = {}) {
+export function createFrameLineServer(options: { dataDir?: string; distDir?: string; maxUploadBytes?: number; legacyEveryMs?: number } = {}) {
   const dataDir = resolve(options.dataDir ?? process.env.FRAME_LINE_DATA ?? 'data');
   const distDir = resolve(options.distDir ?? 'dist');
   const maxUploadBytes = options.maxUploadBytes ?? Number(process.env.FRAME_LINE_MAX_UPLOAD_BYTES ?? 10 * 1024 ** 3);
   if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes <= 0) throw new Error('FRAME_LINE_MAX_UPLOAD_BYTES must be a positive integer.');
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-  const db = new DatabaseSync(join(dataDir, 'frameline.sqlite'));
+  // Before anything is read or written: a second server (a double start, `npm start` beside the live
+  // one) stops here instead of saving its view of the workspace over the running server's.
+  const lock = holdDataLock(dataDir);
+  // The timeout waits out the backup worker's write lock instead of failing a save.
+  const db = new DatabaseSync(join(dataDir, 'frameline.sqlite'), { timeout: 5000 });
   db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT NOT NULL REFERENCES accounts(id),expiresAt INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS workspace(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL,state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS deleted_projects(id TEXT PRIMARY KEY,ownerId TEXT NOT NULL,expiresAt INTEGER NOT NULL,data TEXT NOT NULL);');
   for (const suffix of ['', '-wal', '-shm']) if (existsSync(join(dataDir, `frameline.sqlite${suffix}`))) chmodSync(join(dataDir, `frameline.sqlite${suffix}`), 0o600);
   db.exec('CREATE TABLE IF NOT EXISTS caption_jobs(id TEXT PRIMARY KEY,projectId TEXT NOT NULL,data TEXT NOT NULL)');
@@ -161,13 +202,27 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const transitionFavorites = (userId: string) => db.prepare('SELECT id FROM transition_favorites WHERE userId=?').all(userId).map(row => String(row.id));
 
   db.exec('CREATE TABLE IF NOT EXISTS render_snapshots(id TEXT PRIMARY KEY,data TEXT NOT NULL)');
-  const saved = db.prepare('SELECT revision,state FROM workspace WHERE id=1').get() as { revision: number; state: string } | undefined;
-  let state: PersistedState = saved ? JSON.parse(saved.state) : emptyState();
-  // Progress ticks bump the revision without rewriting the workspace row; this keeps the counter from going backwards on restart.
+  // Progress ticks bump the revision without saving the workspace; this keeps the counter from going backwards on restart.
   db.exec('CREATE TABLE IF NOT EXISTS workspace_revision(id INTEGER PRIMARY KEY,revision INTEGER NOT NULL)');
   const tickRevision = (db.prepare('SELECT revision FROM workspace_revision WHERE id=1').get() as { revision: number } | undefined)?.revision ?? 0;
+  const store = workspaceStore(db, join(dataDir, 'frameline.sqlite'), { legacyEveryMs: options.legacyEveryMs });
+  let state: PersistedState, revision: number;
   // +1: a client may already hold the last tick, and an offline project import must still look new to it.
-  let revision = Math.max(saved?.revision ?? 0, tickRevision + 1);
+  if (store.current()) { const loaded = store.load(); state = { ...emptyState(), ...loaded.state }; revision = Math.max(loaded.revision, tickRevision) + 1; }
+  else {
+    // First start on the item tables, or the legacy row was written by an older build or project-bundle.mjs.
+    const saved = db.prepare('SELECT revision,state FROM workspace WHERE id=1').get() as { revision: number; state: string } | undefined;
+    state = { ...emptyState(), ...(saved ? JSON.parse(saved.state) : {}) };
+    revision = Math.max(store.revision(), saved?.revision ?? 0, tickRevision) + 1;
+    // An older build started after a hard kill without scripts/sync-legacy-row.mjs read a row that
+    // lacked the last saves. As the latest writer its row wins, but the rows it replaces are kept.
+    const replaced = store.unsynced();
+    if (replaced) {
+      const file = join(dataDir, `workspace-replaced-${Date.now()}.json`); writeFileSync(file, replaced, { mode: 0o600 });
+      console.error(`Another program saved the workspace from a copy that lacked the latest saves. The workspace it replaced is in ${file}.`);
+    }
+    store.replace(state, revision);
+  }
   const presence = new Map<string, { person: Presence; session: string; active: boolean }>(); const locks = new Map<string, CollaborativeLock>();
   // Keep insertion order stable: simultaneous active devices must not trade ownership on every heartbeat.
   const visiblePresence = () => {
@@ -210,9 +265,25 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     next.started = true; stabilizeBusy = true;
     void next.run().finally(() => { stabilizeBusy = false; pumpStabilize(); });
   };
-  const accounts = () => (db.prepare('SELECT data FROM accounts').all() as { data: string }[]).map(row => JSON.parse(row.data) as Account);
-  const accountById = (id: string) => { const row = db.prepare('SELECT data FROM accounts WHERE id=?').get(id) as { data: string } | undefined; return row ? JSON.parse(row.data) as Account : undefined; };
-  const saveAccount = (account: Account) => db.prepare('INSERT INTO accounts(id,email,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,data=excluded.data').run(account.user.id, account.user.email, JSON.stringify(account));
+  // Accounts are read by every request and every view but rarely change. `data_version` moves when
+  // another connection commits (a script adding a session or account), which reloads them.
+  const dataVersion = db.prepare('PRAGMA data_version');
+  let accountCache: { version: number; byId: Map<string, Account>; users: User[] } | undefined;
+  const accountMap = () => {
+    const version = Number((dataVersion.get() as { data_version: number }).data_version);
+    if (accountCache?.version !== version) {
+      const byId = new Map((db.prepare('SELECT data FROM accounts').all() as { data: string }[]).map(row => { const account = JSON.parse(row.data) as Account; return [account.user.id, account] as const; }));
+      accountCache = { version, byId, users: Object.freeze([...byId.values()].map(item => item.user)) as User[] };
+    }
+    return accountCache;
+  };
+  const users = () => accountMap().users;
+  // A copy: handlers change their account and publish it with saveAccount().
+  const accountById = (id: string) => { const account = accountMap().byId.get(id); return account && { ...account }; };
+  const saveAccount = (account: Account) => {
+    db.prepare('INSERT INTO accounts(id,email,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET email=excluded.email,data=excluded.data').run(account.user.id, account.user.email, JSON.stringify(account));
+    const cache = accountMap(); cache.byId.set(account.user.id, { ...account }); cache.users = Object.freeze([...cache.byId.values()].map(item => item.user)) as User[];
+  };
   const expired = () => { const now = Date.now(); for (const [key, entry] of presence) if (now - entry.person.updatedAt > 15_000) presence.delete(key); for (const [key, lock] of locks) if (lock.expiresAt <= now) locks.delete(key); };
   const sessionHash = (req: IncomingMessage) => { const token = req.headers.cookie?.split(';').map(part => part.trim()).find(part => part.startsWith('frameline_session='))?.slice(18); return token ? createHash('sha256').update(token).digest('hex') : ''; };
   const authenticated = (req: IncomingMessage) => { const row = db.prepare('SELECT userId FROM sessions WHERE token=? AND expiresAt>?').get(sessionHash(req), Date.now()) as { userId: string } | undefined; return row ? accountById(row.userId) : undefined; };
@@ -224,23 +295,63 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     state.projects.some(item => item.id === targetId && item.id === projectId) ||
     state.tracks.some(item => item.id === targetId && state.timelines.some(timeline => timeline.id === item.timelineId && timeline.projectId === projectId)) ||
     (['timelines', 'clips', 'nodes', 'comments', 'media'] as const).some(key => (state[key] as Entry[]).some(item => item.id === targetId && item.projectId === projectId));
+  // An account's view keeps its filtered lists while the list and the visible projects are unchanged,
+  // so views share arrays with the state and a delta skips every collection nobody touched.
+  const viewLists = new Map<string, { scope: string; lists: Map<string, { source: readonly Entry[]; dependency?: unknown; list: readonly Entry[] }> }>();
   const view = (account: Account) => {
-    expired(); const userId = account.user.id; const allUsers = accounts().map(item => item.user);
-    const projects = state.projects.filter(project => visibleTo(project, userId)).map(project => ({ ...project, members: allUsers.flatMap(user => { const role = roleFor(project, user.id); return role ? [{ userId: user.id, role }] : []; }) }));
-    const ids = new Set(projects.map(project => project.id)); const timelines = state.timelines.filter(item => ids.has(item.projectId)); const timelineIds = new Set(timelines.map(item => item.id));
-    return { revision, lockRevision, state: { ...state, projects, timelines, tracks: state.tracks.filter(item => timelineIds.has(item.timelineId)), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, (state[key as Collection] as Entry[]).filter(item => ids.has(item.projectId))])), users: allUsers, currentUserId: userId, settings: account.settings }, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
+    expired(); const userId = account.user.id; const allUsers = users();
+    const visible = state.projects.filter(project => visibleTo(project, userId));
+    const projects = visible.map(project => ({ ...project, members: allUsers.flatMap(user => { const role = roleFor(project, user.id); return role ? [{ userId: user.id, role }] : []; }) }));
+    const ids = new Set(visible.map(project => project.id)), scope = [...ids].join('\n');
+    let memo = viewLists.get(userId); if (memo?.scope !== scope) viewLists.set(userId, memo = { scope, lists: new Map() });
+    const pick = <T extends Entry>(key: string, source: readonly T[], keep: (item: T) => boolean, dependency?: unknown) => {
+      const cached = memo!.lists.get(key); if (cached?.source === source && cached.dependency === dependency) return cached.list as T[];
+      const kept = source.filter(keep), list = kept.length === source.length ? source : kept;
+      memo!.lists.set(key, { source, dependency, list }); return list as T[];
+    };
+    const timelines = pick('timelines', state.timelines, item => ids.has(item.projectId)), timelineIds = new Set(timelines.map(item => item.id));
+    return { revision, lockRevision, state: { ...state, projects, timelines, tracks: pick('tracks', state.tracks, item => timelineIds.has(item.timelineId), timelines), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, pick(key, state[key as Collection] as Entry[], item => ids.has(item.projectId))])), users: allUsers, currentUserId: userId, settings: account.settings }, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
   };
-  // ponytail: four recent views per account, 32 accounts; older clients recover with a full snapshot.
+  // ponytail: sixteen recent views per account, 32 accounts; older clients recover with a full snapshot.
+  // The views share their entities with the state, so each costs a few arrays of references.
   const recentViews = new Map<string, { revision: number; state: PersistedState }[]>();
-  const stateView = (account: Account, since?: number) => {
+  const rememberView = (account: Account) => {
     const envelope = view(account), history = recentViews.get(account.user.id) ?? [];
-    const previous = history.find(item => item.revision === since);
     recentViews.delete(account.user.id);
-    recentViews.set(account.user.id, [...history.filter(item => item.revision !== revision), { revision, state: envelope.state }].slice(-4));
+    recentViews.set(account.user.id, [...history.filter(item => item.revision !== revision), { revision, state: envelope.state }].slice(-16));
     if (recentViews.size > 32) recentViews.delete(recentViews.keys().next().value!);
+    return envelope;
+  };
+  const stateView = (account: Account, since?: number) => {
+    const previous = recentViews.get(account.user.id)?.find(item => item.revision === since), envelope = rememberView(account);
     if (!previous) return { ...envelope, incremental: true };
     const { state: current, ...ephemeral } = envelope;
     return { ...ephemeral, incremental: true, baseRevision: previous.revision, delta: stateDelta(previous.state, current) };
+  };
+  // A full download is spliced from each entity's stored JSON and streamed in pieces behind the
+  // compressor, so the whole workspace is never serialised, encoded or compressed in one go.
+  const sendState = (res: ServerResponse, status: number, envelope: Entry) => {
+    const { state: body, ...rest } = envelope;
+    if (!body) { send(res, status, rest); return; }
+    const head = JSON.stringify(rest), gzip = acceptsGzip(res.req);
+    function* pieces() {
+      yield `${head.slice(0, -1)}${head.length > 2 ? ',' : ''}"state":{`;
+      let separator = '';
+      for (const [key, value] of Object.entries(body as Entry)) {
+        if (value === undefined) continue;
+        if (!Array.isArray(value)) { yield `${separator}${JSON.stringify(key)}:${JSON.stringify(value)}`; separator = ','; continue; }
+        let batch = `${separator}${JSON.stringify(key)}:[`; separator = ',';
+        for (let i = 0; i < value.length; i++) {
+          batch += `${i ? ',' : ''}${store.json(value[i]) ?? JSON.stringify(value[i]) ?? 'null'}`;
+          if (batch.length > 262_144) { yield batch; batch = ''; }
+        }
+        yield `${batch}]`;
+      }
+      yield '}}';
+    }
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', Vary: 'Accept-Encoding', ...(gzip ? { 'Content-Encoding': 'gzip' } : {}) });
+    const source = Readable.from(pieces());
+    void (gzip ? pipeline(source, createGzip({ level: 1 }), res) : pipeline(source, res)).catch(() => res.destroy());
   };
   const presenceProjects = new Set<string>();
   let presenceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -291,21 +402,18 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const lockChanged = () => { lockRevision++; broadcast(); };
   // Re-serialising the 31 MB workspace on every render tick starved the event loop, so ticks stay in memory.
   const touch = () => { revision++; db.prepare('INSERT INTO workspace_revision(id,revision) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision').run(revision); broadcast(); };
-  const persist = () => { const nextRevision = revision + 1; db.prepare('INSERT INTO workspace(id,revision,state) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,state=excluded.state').run(nextRevision, JSON.stringify(state)); revision = nextRevision; broadcast(); };
-  // A fresh install has no workspace row until something is edited, so `project-bundle.mjs import`
-  // found nothing to merge into and told you to start the server first — which by itself never
-  // created one. Writing the empty state once at boot makes that instruction true, and it is the
-  // first step of moving a project onto a new machine.
-  if (!saved) persist();
+  // Writes only the entities that changed since the last save; see workspaceStore.ts.
+  const persist = () => { const nextRevision = revision + 1; store.save(state, nextRevision); revision = nextRevision; broadcast(); };
+  // Other writes and a persist() in one SQLite transaction. A rollback leaves the account cache stale, so it is dropped.
+  const transaction = (work: () => void) => { try { store.transaction(work); } catch (error) { accountCache = undefined; throw error; } };
   const sounds = soundLibrary(dataDir); sounds.recover();
-  const library = projectLibrary(db, () => state.projects, () => accounts().map(a => a.user), () => revision, persist);
+  const library = projectLibrary(db, () => state.projects, users, () => revision, write => transaction(() => { write(); persist(); }));
   const roleFor = library.projectRole;
   const visibleTo = (project: Project, userId: string) => Boolean(roleFor(project, userId));
   const uploadLocks = new Set<string>();
-  // Last time an asset's transient progress was written. persist() serialises the WHOLE workspace
-  // (every asset, including 32k-sample waveforms) and writes it to SQLite, so progress updates must
-  // be rationed: at two per 8MB chunk this import would have done ~23,000 full-state writes, each
-  // one costlier than the last as assets completed. That is what made the upload decay.
+  // Last time an asset's transient progress was written. Each write once serialised the whole
+  // workspace, which is what made a 253-clip upload decay; saves are per entity now, but every one
+  // still sends every client to fetch state, so these callers keep their own five-second ration.
   const progressAt = new Map<string, number>();
   const resolveDir = (id:string) => join(dataDir,'resolve',id);
   const mediaDir = (id: string) => join(dataDir, 'media', id);
@@ -329,7 +437,23 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       db.prepare('DELETE FROM deleted_projects WHERE id=?').run(row.id);
     }
   };
-  const updateAsset = (id: string, patch: Partial<Asset>) => { if (!state.media.some(asset => asset.id === id)) return; const previous = state.media; state.media = state.media.map(asset => asset.id === id ? { ...asset, ...patch } : asset); try { persist(); } catch (error) { state.media = previous; throw error; } };
+  // Every revision wakes every client into fetching state, so progress alone saves at most once a second
+  // per asset; the latest value lands when the second is up, or sooner with any other change.
+  const progressSaves = new Map<string, { at: number; patch?: Partial<Asset>; timer?: ReturnType<typeof setTimeout> }>();
+  const updateAsset = (id: string, patch: Partial<Asset>) => {
+    if (!state.media.some(asset => asset.id === id)) { clearTimeout(progressSaves.get(id)?.timer); progressSaves.delete(id); return; }
+    const saved = progressSaves.get(id) ?? { at: 0 }; progressSaves.set(id, saved);
+    if (!closed && Object.keys(patch).every(key => key === 'progress') && Date.now() - saved.at < 1000) {
+      saved.patch = { ...saved.patch, ...patch };
+      saved.timer ??= setTimeout(() => { saved.timer = undefined; if (saved.patch) try { updateAsset(id, {}); } catch (error) { console.error('Progress save failed:', error); } }, saved.at + 1000 - Date.now());
+      return;
+    }
+    clearTimeout(saved.timer); saved.timer = undefined;
+    const merged = { ...saved.patch, ...patch }; saved.patch = undefined; if ('progress' in merged) saved.at = Date.now();
+    const previous = state.media; state.media = state.media.map(asset => asset.id === id ? { ...asset, ...merged } : asset);
+    try { persist(); } catch (error) { state.media = previous; throw error; }
+  };
+  const flushProgress = () => { for (const [id, saved] of progressSaves) if (saved.patch) updateAsset(id, {}); };
   const updateJob = (id: string, patch: Partial<RenderJob>, save = true) => { if (!state.renderJobs.some(job => job.id === id)) return; const previous = state.renderJobs; state.renderJobs = state.renderJobs.map(job => job.id === id ? { ...job, ...patch } : job); try { if (save) persist(); else touch(); } catch (error) { state.renderJobs = previous; throw error; } };
   const addWork = (id: string, work: (signal: AbortSignal) => Promise<void>, render = false) => {
     const controller = new AbortController(); aborters.set(id, controller);
@@ -342,12 +466,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     addWork(job.id, async signal => {
             updateJob(job.id, { status: 'rendering', progress: 0, remaining: 'Preparing export · 0s elapsed' }); const extension = job.settings.codec?.includes('ProRes') ? '.mov' : '.mp4'; const outputPath = join(dataDir, 'renders', `${job.id}${extension}`);
             const started = Date.now(); let progressValue = 0, stage = 'Preparing export', advancedAt = started, reportedAt = 0;
-            const report = () => { if (closed || signal.aborted) return; const elapsed = Math.floor((Date.now() - started) / 1000);
+            // At most one progress revision a second: each one sends every client to fetch state.
+            const report = () => { if (closed || signal.aborted || Date.now() - reportedAt < 1000) return; const elapsed = Math.floor((Date.now() - started) / 1000);
               reportedAt = Date.now();
               const quiet = Math.floor((Date.now() - advancedAt) / 1000);
               updateJob(job.id, { progress: progressValue, remaining: `${stage} · ${elapsed}s elapsed${quiet >= 30 ? ` · No new frames for ${quiet}s` : ''}` }, false); };
-            const heartbeat = setInterval(report, 1000);
-            try { let previous = -1; await renderTimeline({ ...snapshot, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { stage = next; advancedAt = Date.now(); if (Date.now() - reportedAt >= 250) report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); if (Date.now() - reportedAt >= 250) report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
+            const heartbeat = setInterval(report, 250);
+            try { let previous = -1; await renderTimeline({ ...snapshot, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { stage = next; advancedAt = Date.now(); report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
             catch (error) { rmSync(outputPath, { force: true }); if (!closed) updateJob(job.id, { status: 'failed', remaining: signal.aborted ? 'Cancelled' : 'Export failed', error: signal.aborted ? 'Cancelled by user.' : error instanceof Error ? error.message : 'Export failed.' }); }
             finally { clearInterval(heartbeat); if (!closed) db.prepare('DELETE FROM render_snapshots WHERE id=?').run(job.id); }
     }, true);
@@ -401,10 +526,14 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     operations: { id: 'string', projectId: 'string', userId: 'string', timestamp: 'number', targetId: 'string', type: 'string', description: 'string', oldState: 'array', newState: 'array' },
     snapshots: { id: 'string', projectId: 'string', name: 'string', note: 'string', userId: 'string', timestamp: 'number', state: 'object' },
   };
-  function validateCollection(items: unknown, key: string) {
+  // Entities the server already holds arrive as its own frozen objects (a delta leaves them alone; a PUT
+  // gets them back through shareState). They were validated when accepted, so only new ones are checked.
+  const holds = (key: string) => (item: unknown) => store.holds(key, item);
+  function validateCollection(items: unknown, key: string, known?: (item: Entry) => boolean) {
     if (!Array.isArray(items) || items.length > 100_000) fail(400, `Invalid ${key} collection.`);
     const ids = new Set<string>();
     for (const item of items as Entry[]) {
+      if (known?.(item)) { if (ids.has(item.id)) fail(400, `Invalid or duplicate ${key} ID.`); ids.add(item.id); continue; }
       object(item); if (!idIsValid(item.id) || ids.has(item.id)) fail(400, `Invalid or duplicate ${key} ID.`); ids.add(item.id);
       for (const [field, type] of Object.entries(schemas[key])) {
         if (type === 'array' ? !Array.isArray(item[field]) : type === 'object' ? !item[field] || typeof item[field] !== 'object' || Array.isArray(item[field]) : typeof item[field] !== type) fail(400, `Invalid ${key}.${field}.`);
@@ -424,33 +553,49 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       if (key === 'snapshots') for (const collection of ['clips', 'tracks', 'nodes', 'comments', ...(item.state.timelines?['timelines']:[])]) validateCollection(item.state[collection], collection);
     }
   }
+  // A saved snapshot's relations depend on its own frozen content plus the timelines' and media's ids,
+  // projects and composition flags; one that passed against the same of those still passes.
+  let snapshotsChecked = { against: '', valid: new WeakSet<object>() };
   function validateRelations(next: PersistedState) {
     const projects = new Set(next.projects.map(project => project.id)); const timelines = new Map(next.timelines.map(item => [item.id, item.projectId])); const tracks = new Map(next.tracks.map(item => [item.id, item.timelineId])); const media = new Map(next.media.map(item => [item.id, item.projectId]));
-    for (const key of ['media', 'timelines', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'] as const) for (const item of next[key]) if (!projects.has(item.projectId)) fail(400, 'An item references a missing project.');
+    // While no stored project is removed, an entity the server already holds still has its project.
+    const shrunk = (store.stored('projects') as Project[]).some(project => !projects.has(project.id));
+    for (const key of ['media', 'timelines', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'] as const) {
+      if (!shrunk && next[key] === store.stored(key)) continue;
+      for (const item of next[key]) if ((shrunk || !store.holds(key, item)) && !projects.has(item.projectId)) fail(400, 'An item references a missing project.');
+    }
     for (const track of next.tracks) if (!timelines.has(track.timelineId)) fail(400, 'A track references a missing timeline.');
-    const check = (document: PersistedState | PersistedState['snapshots'][number]['state'], projectId?: string) => {
+    const check = (document: PersistedState | PersistedState['snapshots'][number]['state'], projectId?: string, bound?: Set<string>) => {
       const localTimelines=new Map((document.timelines??next.timelines).map(t=>[t.id,t.projectId]));
       const localTracks = new Map(document.tracks.map(item => [item.id, item.timelineId])); const clips = new Map(document.clips.map(item => [item.id, item.projectId]));
       for (const clip of document.clips) if ((projectId && clip.projectId !== projectId) || localTimelines.get(clip.timelineId) !== clip.projectId || localTracks.get(clip.trackId) !== clip.timelineId || (!isTitle(clip) && !isShape(clip) && !isComposition(clip) && !isLeakMedia(clip.mediaId) && media.get(clip.mediaId) !== clip.projectId)) fail(400, 'A clip references missing or inaccessible media, track, or timeline.');
       for (const node of document.nodes) if ((projectId && node.projectId !== projectId) || clips.get(node.clipId) !== node.projectId) fail(400, 'A grade references a missing clip.');
-      try { for (const clip of document.clips) validateSmartMaskBindings(clip, document.nodes); } catch (error) { fail(400, (error as Error).message); }
+      // A mask binding involves one clip and its own grades; `bound` limits the check to clips whose side changed.
+      const grades = new Map<string, typeof document.nodes>(); for (const node of document.nodes) { let list = grades.get(node.clipId); if (!list) grades.set(node.clipId, list = []); list.push(node); }
+      try { for (const clip of document.clips) if (!bound || bound.has(clip.id)) validateSmartMaskBindings(clip, grades.get(clip.id) ?? []); } catch (error) { fail(400, (error as Error).message); }
       for (const comment of document.comments) if ((projectId && comment.projectId !== projectId) || (comment.clipId && clips.get(comment.clipId) !== comment.projectId)) fail(400, 'A comment references a missing clip.');
       try{validateCompositions(document.clips,document.timelines??next.timelines);}catch(error){fail(400,(error as Error).message);}
       if(projectId&&document.timelines?.some(t=>t.projectId!==projectId))fail(400,'A snapshot references another project.');
       if (projectId) for (const track of document.tracks) if (localTimelines.get(track.timelineId) !== projectId) fail(400, 'A snapshot references another project.');
     };
-    check(next); for (const snapshot of next.snapshots) check(snapshot.state, snapshot.projectId);
+    check(next, undefined, new Set([...next.clips.filter(clip => !store.holds('clips', clip)).map(clip => clip.id), ...next.nodes.filter(node => !store.holds('nodes', node)).map(node => node.clipId)]));
+    const against = JSON.stringify([next.timelines.map(t => [t.id, t.projectId, t.composition ?? null]), next.media.map(m => [m.id, m.projectId])]);
+    if (snapshotsChecked.against !== against) snapshotsChecked = { against, valid: new WeakSet() };
+    for (const snapshot of next.snapshots) if (!snapshotsChecked.valid.has(snapshot)) { check(snapshot.state, snapshot.projectId); snapshotsChecked.valid.add(snapshot); }
   }
-  function putState(body: Entry, account: Account) {
+  function putState(body: Entry, account: Account, delta?: { base: PersistedState }) {
     if (!Number.isSafeInteger(body.revision)) fail(400, 'A revision is required.');
     if (body.revision !== revision) return false;
-    object(body.state); const incoming = body.state as PersistedState; const currentView = view(account).state; const userId = account.user.id;
+    object(body.state); const userId = account.user.id, currentView = delta?.base ?? view(account).state;
+    // A PATCH already carries the server's own objects for everything its delta left alone.
+    let incoming = body.state as PersistedState; if (!delta) try { incoming = shareState(currentView, incoming); } catch { /* malformed; validation below rejects it */ }
+    const untouched = (key: keyof PersistedState) => incoming[key] === currentView[key];
     if (incoming.currentUserId !== userId || !same(incoming.users, currentView.users)) fail(403, 'Account identities cannot be changed through project state.');
-    for (const key of Object.keys(schemas)) validateCollection((incoming as unknown as Entry)[key], key);
+    for (const key of Object.keys(schemas) as Collection[]) if (!untouched(key)) validateCollection(incoming[key], key, holds(key));
     if (!same(incoming.media, currentView.media) || !same(incoming.renderJobs, currentView.renderJobs)) fail(400, 'Use the media and render endpoints to change files and jobs.');
     object(incoming.settings); for (const value of Object.values(incoming.settings)) if (!['string', 'number', 'boolean'].includes(typeof value)) fail(400, 'Invalid setting.');
     const existing = new Map(state.projects.map(project => [project.id, project])); const allowed = new Set(currentView.projects.map(project => project.id)); const nextProjectIds = new Set(incoming.projects.map(project => project.id));
-    for (const project of incoming.projects) {
+    const projects = incoming.projects.map(project => {
       const old = existing.get(project.id);
       if (!old && library.hasLocation(project.id)) fail(400, 'This project ID is reserved by a deleted project. Create a new project instead.');
       if (old && !allowed.has(project.id)) fail(403, 'Project is inaccessible.');
@@ -461,20 +606,29 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       }
       if (old && !same({ ...old, members: [], modifiedAt: 0 }, { ...project, members: [], modifiedAt: 0 })) for (const lock of locks.values()) if (lock.projectId === project.id && lock.targetId === project.id && lock.userId !== userId && lock.expiresAt > Date.now()) fail(423, 'A collaborator is editing this project.');
       textField(project.description, 5000); numberField(project.fps, 1, 240); if (!['In progress', 'In review', 'Complete'].includes(project.status)) fail(400, 'Invalid project status.');
-      project.members = old?.members ?? [{ userId, role: 'Owner' }];
-    }
+      // The view's copy carries every account's effective role; the stored project keeps its own list.
+      const kept = { ...project, members: old?.members ?? [{ userId, role: 'Owner' as const }] };
+      return old && same(kept, old) ? old : kept;
+    });
     for (const project of currentView.projects) if (!nextProjectIds.has(project.id) && roleFor(existing.get(project.id)!, userId) !== 'Owner') fail(403, 'Only the owner can delete a project.');
-    const next = { ...state }; next.projects = [...state.projects.filter(project => !allowed.has(project.id)), ...incoming.projects];
+    const removedProject = currentView.projects.some(project => !nextProjectIds.has(project.id));
+    const next = { ...state }; next.projects = mergeVisible(state.projects, project => !allowed.has(project.id), projects);
     const oldTimelines = new Map(state.timelines.map(item => [item.id, item.projectId])); const newTimelines = new Map(incoming.timelines.map(item => [item.id, item.projectId]));
     for (const key of ['timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots'] as const) {
       const oldItems = state[key] as unknown as Entry[]; const newItems = incoming[key] as unknown as Entry[];
-      const oldById = new Map(oldItems.map(item => [item.id, item])), newIds = new Set(newItems.map(item => item.id));
+      // A list the save left alone is the server's own: nothing to check, nothing to merge.
+      if (untouched(key) && !removedProject) continue;
       const itemProject = (item: Entry, fresh: boolean) => key === 'tracks' ? (fresh ? newTimelines : oldTimelines).get(item.timelineId) : item.projectId;
+      // A held entity is the server's unchanged object; only its project still needs to exist. Tracks are
+      // excluded: a held track changes project when its timeline does.
+      const known = key === 'tracks' ? undefined : holds(key);
+      let oldById: Map<unknown, Entry> | undefined, held = 0;
       for (const item of newItems) {
         const projectId = itemProject(item, true); if (!projectId || !nextProjectIds.has(projectId)) fail(403, 'An item references an inaccessible project.');
-        const oldItem = oldById.get(item.id); if (oldItem && itemProject(oldItem, false) !== projectId) fail(403, 'Items cannot be moved between projects.');
-        const project = existing.get(projectId); const role = project ? roleFor(project, userId) : 'Owner';
+        if (known?.(item)) { held++; continue; }
+        const oldItem = (oldById ??= new Map(oldItems.map(entry => [entry.id, entry]))).get(item.id); if (oldItem && itemProject(oldItem, false) !== projectId) fail(403, 'Items cannot be moved between projects.');
         if (!same(oldItem, item)) {
+          const project = existing.get(projectId); const role = project ? roleFor(project, userId) : 'Owner';
           if (!['Owner', 'Editor'].includes(role ?? '') && !(role === 'Commenter' && ['comments', 'operations'].includes(key))) fail(403, 'Editing this project is not allowed.');
           const restoredComment = key === 'comments' && state.snapshots.some(snapshot => snapshot.projectId === projectId && snapshot.state.comments.some(comment => same(comment, item)));
           if (['comments', 'operations', 'snapshots'].includes(key) && !restoredComment && (!oldItem ? item.userId !== userId : item.userId !== oldItem.userId)) fail(403, 'The author cannot be impersonated.');
@@ -496,19 +650,27 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           }
         }
       }
-      for (const oldItem of oldItems) if (allowed.has(itemProject(oldItem, false)) && nextProjectIds.has(itemProject(oldItem, false)) && !newIds.has(oldItem.id)) {
-        if (key === 'operations') fail(403, 'History cannot be deleted.');
-        const role = roleFor(existing.get(itemProject(oldItem, false))!, userId); if (!['Owner', 'Editor'].includes(role ?? '') && !(role === 'Commenter' && key === 'comments' && oldItem.userId === userId)) fail(403, 'Deleting this item is not allowed.');
-        if ([...locks.values()].some(lock => lock.targetId === oldItem.id && lock.projectId === itemProject(oldItem, false) && lock.userId !== userId && lock.expiresAt > Date.now())) fail(423, 'A collaborator has locked this item.');
+      const hidden = (item: Entry) => !allowed.has(itemProject(item, false));
+      let visible = 0, hiddenCount = 0;
+      for (const oldItem of oldItems) { const projectId = itemProject(oldItem, false); if (!allowed.has(projectId)) hiddenCount++; else if (nextProjectIds.has(projectId)) visible++; }
+      // Nothing was deleted when every entity the caller could see came back as the same object.
+      if (held !== visible) {
+        const newIds = new Set(newItems.map(item => item.id));
+        for (const oldItem of oldItems) if (allowed.has(itemProject(oldItem, false)) && nextProjectIds.has(itemProject(oldItem, false)) && !newIds.has(oldItem.id)) {
+          if (key === 'operations') fail(403, 'History cannot be deleted.');
+          const role = roleFor(existing.get(itemProject(oldItem, false))!, userId); if (!['Owner', 'Editor'].includes(role ?? '') && !(role === 'Commenter' && key === 'comments' && oldItem.userId === userId)) fail(403, 'Deleting this item is not allowed.');
+          if ([...locks.values()].some(lock => lock.targetId === oldItem.id && lock.projectId === itemProject(oldItem, false) && lock.userId !== userId && lock.expiresAt > Date.now())) fail(423, 'A collaborator has locked this item.');
+        }
       }
-      (next as unknown as Entry)[key] = [...oldItems.filter(item => !allowed.has(itemProject(item, false))), ...newItems];
+      (next as unknown as Entry)[key] = hiddenCount ? mergeVisible(oldItems, hidden, newItems) : newItems;
     }
-    const deleted = new Set([...allowed].filter(id => !nextProjectIds.has(id))); next.media = state.media.filter(item => !deleted.has(item.projectId)); next.renderJobs = state.renderJobs.filter(item => !deleted.has(item.projectId));
+    const deleted = new Set([...allowed].filter(id => !nextProjectIds.has(id)));
+    if (deleted.size) { next.media = state.media.filter(item => !deleted.has(item.projectId)); next.renderJobs = state.renderJobs.filter(item => !deleted.has(item.projectId)); }
     validateRelations(next);
     const previousState = state; const previousRevision = revision; const previousSettings = account.settings;
-    db.exec('BEGIN IMMEDIATE');
-    try { account.settings = { ...DEFAULT_SETTINGS, ...incoming.settings }; saveAccount(account); state = next; persist(); db.exec('COMMIT'); }
-    catch (error) { db.exec('ROLLBACK'); state = previousState; revision = previousRevision; account.settings = previousSettings; throw error; }
+    const settings = { ...DEFAULT_SETTINGS, ...incoming.settings };
+    try { transaction(() => { if (!same(settings, account.settings)) { account.settings = settings; saveAccount(account); } state = next; persist(); }); }
+    catch (error) { state = previousState; revision = previousRevision; account.settings = previousSettings; throw error; }
     const removedMedia = previousState.media.filter(asset => deleted.has(asset.projectId)); const removedJobs = previousState.renderJobs.filter(job => deleted.has(job.projectId));
     for (const item of [...removedMedia, ...removedJobs]) aborters.get(item.id)?.abort();
     if (deleted.size) void queue.drain().then(() => { for (const asset of removedMedia) rmSync(mediaDir(asset.id), { recursive: true, force: true }); for (const job of removedJobs) for (const extension of ['.mp4', '.mov']) rmSync(join(dataDir, 'renders', `${job.id}${extension}`), { force: true }); }).catch(error => console.error('File cleanup failed:', error));
@@ -599,7 +761,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             const mediaId = `media-sfx-${createHash('sha256').update(`${project.id}:${id}`).digest('hex').slice(0, 32)}`;
             let asset = state.media.find(a => a.id === mediaId);
             if (!asset) {
-              try { asset = sounds.importAsset(id, project.id, mediaId, mediaDir(mediaId)); state.media.unshift(asset); persist(); }
+              try { asset = sounds.importAsset(id, project.id, mediaId, mediaDir(mediaId)); state.media = [asset, ...state.media]; persist(); }
               catch (error) { state.media = state.media.filter(a => a.id !== mediaId); rmSync(mediaDir(mediaId), { recursive: true, force: true }); throw error; }
             }
             send(res, 200, { asset, revision }); return;
@@ -669,20 +831,23 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (path === '/api/state' && method === 'GET') {
           // A client that already holds this revision only needs the ephemeral half of the envelope.
           if (url.searchParams.get('since') === String(revision)) { send(res, 200, ephemeralView(account)); return; }
-          send(res, 200, stateView(account, url.searchParams.get('delta') === '1' ? Number(url.searchParams.get('since')) : undefined)); return;
+          sendState(res, 200, stateView(account, url.searchParams.get('delta') === '1' ? Number(url.searchParams.get('since')) : undefined)); return;
         }
         if (path === '/api/state' && method === 'PATCH') {
           const body = await jsonBody(req);
           if (!Number.isSafeInteger(body.revision)) fail(400, 'A revision is required.');
-          if (body.revision !== revision) { send(res, 409, stateView(account, body.revision)); return; }
+          if (body.revision !== revision) { sendState(res, 409, stateView(account, body.revision)); return; }
+          // One view before and one after: each is a full pass over the workspace.
+          const before = view(account).state;
           let incoming: PersistedState;
-          try { incoming = applyStateDelta(view(account).state, body.delta); } catch { fail(400, 'Invalid state delta.'); }
-          putState({ revision: body.revision, state: incoming! }, account);
-          stateView(account);
-          const { state: current, ...ephemeral } = view(account);
-          send(res, 200, { ...ephemeral, baseRevision: body.revision, delta: stateDelta(incoming!, current!) }); return;
+          try { incoming = applyStateDelta(before, body.delta); } catch { fail(400, 'Invalid state delta.'); }
+          putState({ revision: body.revision, state: incoming! }, account, { base: before });
+          const { state: current, ...ephemeral } = rememberView(account);
+          // A list saved exactly as sent is the same entities in a new array; hand the delta the sent array so it skips it.
+          const aligned = Object.fromEntries(Object.entries(current).map(([key, list]) => { const sent = (incoming! as unknown as Entry)[key]; return [key, Array.isArray(list) && Array.isArray(sent) && list.length === sent.length && list.every((item, i) => item === sent[i]) ? sent : list]; })) as unknown as PersistedState;
+          send(res, 200, { ...ephemeral, baseRevision: body.revision, delta: stateDelta(incoming!, aligned) }); return;
         }
-        if (path === '/api/state' && method === 'PUT') { const saved = putState(await jsonBody(req), account); send(res, saved ? 200 : 409, view(account)); return; }
+        if (path === '/api/state' && method === 'PUT') { const saved = putState(await jsonBody(req), account); sendState(res, saved ? 200 : 409, view(account)); return; }
         const restoreProjectRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)\/restore$/.exec(path);
         if (restoreProjectRoute && method === 'POST') {
           const row = db.prepare('SELECT ownerId,expiresAt,data FROM deleted_projects WHERE id=?').get(restoreProjectRoute[1]) as { ownerId: string; expiresAt: number; data: string } | undefined;
@@ -690,11 +855,12 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const bundle = JSON.parse(row!.data) as Record<Collection, Entry[]>;
           if (state.projects.some(project => project.id === restoreProjectRoute[1])) fail(409, 'A project with that ID already exists.');
           const previous = state, previousRevision = revision;
-          db.exec('BEGIN IMMEDIATE');
           try {
-            state = { ...state, ...Object.fromEntries(COLLECTIONS.map(key => [key, [...state[key], ...bundle[key]]])) };
-            validateRelations(state); persist(); db.prepare('DELETE FROM deleted_projects WHERE id=?').run(restoreProjectRoute[1]); db.exec('COMMIT');
-          } catch (error) { db.exec('ROLLBACK'); state = previous; revision = previousRevision; throw error; }
+            transaction(() => {
+              state = { ...state, ...Object.fromEntries(COLLECTIONS.map(key => [key, [...state[key], ...bundle[key]]])) };
+              validateRelations(state); persist(); db.prepare('DELETE FROM deleted_projects WHERE id=?').run(restoreProjectRoute[1]);
+            });
+          } catch (error) { state = previous; revision = previousRevision; throw error; }
           send(res, 200, { projectId: restoreProjectRoute[1] }); return;
         }
         const projectRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)$/.exec(path);
@@ -727,9 +893,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const project = requireProject(projectRoute[1], userId); if (roleFor(project, userId) !== 'Owner') fail(403, 'Only the project owner can delete this project.');
           const backup = projectBundle(project), expiresAt = Date.now() + 60_000, previous = state, previousRevision = revision;
           for (const item of [...backup.media, ...backup.renderJobs]) aborters.get(item.id)?.abort();
-          db.exec('BEGIN IMMEDIATE');
-          try { db.prepare('INSERT INTO deleted_projects(id,ownerId,expiresAt,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET ownerId=excluded.ownerId,expiresAt=excluded.expiresAt,data=excluded.data').run(project.id, userId, expiresAt, JSON.stringify(backup)); removeProject(project.id); persist(); db.exec('COMMIT'); }
-          catch (error) { db.exec('ROLLBACK'); state = previous; revision = previousRevision; throw error; }
+          try { transaction(() => { db.prepare('INSERT INTO deleted_projects(id,ownerId,expiresAt,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET ownerId=excluded.ownerId,expiresAt=excluded.expiresAt,data=excluded.data').run(project.id, userId, expiresAt, JSON.stringify(backup)); removeProject(project.id); persist(); }); }
+          catch (error) { state = previous; revision = previousRevision; throw error; }
           send(res, 200, { projectId: project.id, expiresAt }); return;
         }
         const memberRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)\/members\/([a-zA-Z0-9_-]+)$/.exec(path);
@@ -809,7 +974,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             send(res,200,{projectId:id,files:imported!.files,warnings:imported!.warnings,media:state.media.filter(m=>m.projectId===id)});return;
           }
           const next={...state,projects:[...state.projects,imported!.project],...Object.fromEntries(['media','timelines','tracks','clips','nodes'].map(k=>[k,[...(state as any)[k],...(imported as any)[k]]]))} as PersistedState;
-          for(const key of ['projects','timelines','tracks','clips','nodes'])validateCollection((next as any)[key],key);
+          for(const key of ['projects','timelines','tracks','clips','nodes'])validateCollection((next as any)[key],key,holds(key));
           validateRelations(next);
           mkdirSync(resolveDir(id),{recursive:true,mode:0o700});writeFileSync(join(resolveDir(id),'project.frameline.json'),JSON.stringify(body.manifest),{mode:0o600});
           const previous=state;state=next;try{persist();}catch(error){state=previous;throw error;}
@@ -851,7 +1016,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (aborters.size + state.media.filter(asset => asset.status === 'uploading').length >= QUEUE_LIMIT) fail(429, 'The processing queue is full. Wait for current jobs to finish.');
           const id = `media-${randomUUID()}`, spotify = link!.url.includes('open.spotify.com');
           const asset: Asset = { id, projectId: project.id, name: spotify ? 'Spotify track · matching audio' : 'YouTube · waiting to download', kind: link!.mode === 'audio' ? 'audio' : 'video', binId: link!.mode === 'audio' ? 'audio' : 'broll', thumbnail: youtubeThumbnail(link!.url), duration: 0, resolution: '', fps: 0, size: '', status: 'downloading', progress: 0, importLink: link! };
-          mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media.unshift(asset); persist();
+          mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media = [asset, ...state.media]; persist();
           processAsset(id); send(res, 202, { asset }); return;
         }
         if (path === '/api/media' && method === 'POST') {
@@ -862,7 +1027,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const length = Number(req.headers['content-length']); if (length > maxUploadBytes) fail(413, `Files must be smaller than ${Math.floor(maxUploadBytes / 1024 ** 3)} GB.`);
           const audio = /\.(wav|mp3|aac|aiff?|flac|m4a|ogg)$/i.test(name); const image = /\.(png|jpe?g|webp|gif|tiff?|bmp|heic)$/i.test(name);
           const asset: Asset = { id, projectId: project.id, name, kind: audio ? 'audio' : image ? 'image' : 'video', binId: audio ? 'audio' : 'broll', thumbnail: '', duration: 0, resolution: '', fps: 0, size: '', status: 'uploading', progress: 0 };
-          mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media.unshift(asset); persist();
+          mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media = [asset, ...state.media]; persist();
           if (url.searchParams.get('placeholder') === '1') { send(res, 201, { asset }); return; }
           const temporary = join(mediaDir(id), 'upload.part'); let bytes = 0, lastProgress = 0;
           try {
@@ -1238,7 +1403,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (state.renderJobs.filter(job => ['waiting', 'rendering'].includes(job.status)).length >= 20) fail(429, 'The render queue is full.');
           const job: RenderJob = { id: `render-${randomUUID()}`, projectId: project.id, name: textField(body.name, 160, true).trim(), preset: textField(body.preset, 80, true), status: 'waiting', progress: 0, remaining: 'Waiting', settings };
           const snapshot = structuredClone({ project, timeline, timelines:state.timelines.filter(t=>t.projectId===project.id), clips:state.clips.filter(c=>c.projectId===project.id), tracks: state.tracks.filter(track => state.timelines.some(t=>t.id===track.timelineId&&t.projectId===project.id)), nodes: state.nodes.filter(node => node.projectId === project.id), assets: state.media.filter(asset => asset.projectId === project.id).map(asset => ({ asset, path: originalPath(asset.id) })), settings });
-          mkdirSync(join(dataDir, 'renders'), { recursive: true, mode: 0o700 }); state.renderJobs.unshift(job); persist();
+          mkdirSync(join(dataDir, 'renders'), { recursive: true, mode: 0o700 }); state.renderJobs = [job, ...state.renderJobs]; persist();
           startRender(job, snapshot);
           send(res, 202, { job }); return;
         }
@@ -1267,18 +1432,27 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   server.requestTimeout = 60 * 60_000; server.keepAliveTimeout = 120_000; server.headersTimeout = 121_000;
   const housekeeping = setInterval(() => { expired(); purgeExpiredProjects(); const now = Date.now(); for (const [key, value] of authAttempts) if (value.reset < now) authAttempts.delete(key); for (const [res, subscriber] of subscribers) { if (!db.prepare('SELECT token FROM sessions WHERE token=? AND expiresAt>?').get(subscriber.session, now)) { res.end(); subscribers.delete(res); } else res.write(': heartbeat\n\n'); } }, 10_000); housekeeping.unref();
   purgeExpiredProjects();
-  for (const job of state.renderJobs) if (job.status === 'rendering' || job.status === 'waiting') {
+  // Settle what the restart interrupted. Saved entities are frozen, so every change is a new object,
+  // and a list is replaced only when something in it changed.
+  const restarts: [RenderJob, Parameters<typeof startRender>[1]][] = [];
+  const jobs = state.renderJobs.map((job): RenderJob => {
+    if (job.status !== 'rendering' && job.status !== 'waiting') return job;
     const savedSnapshot = db.prepare('SELECT data FROM render_snapshots WHERE id=?').get(job.id);
     const project = state.projects.find(p => p.id === job.projectId);
     const timeline = state.timelines.find(t => t.projectId === job.projectId && (!job.settings.timelineId || t.id === job.settings.timelineId));
-    if (savedSnapshot || (job.status === 'waiting' && project && timeline)) {
-      job.status = 'waiting'; job.progress = 0; job.remaining = 'Queued for export';
-      startRender(job, savedSnapshot ? JSON.parse(String(savedSnapshot.data)) : structuredClone({ project: project!, timeline: timeline!, timelines: state.timelines.filter(t => t.projectId === job.projectId), clips: state.clips.filter(c => c.projectId === job.projectId), tracks: state.tracks.filter(t => state.timelines.some(tl => tl.id === t.timelineId && tl.projectId === job.projectId)), nodes: state.nodes.filter(n => n.projectId === job.projectId), assets: state.media.filter(a => a.projectId === job.projectId).map(asset => ({ asset, path: originalPath(asset.id) })), settings: job.settings }));
-    } else { job.status = 'failed'; job.remaining = 'Interrupted by server restart'; job.error = 'The server restarted. Submit the export again.'; }
-  }
-  for (const asset of state.media as Asset[]) if (!['ready', 'failed', 'uploading'].includes(asset.status)) { asset.status = 'failed'; asset.error = 'Processing was interrupted. Retry to continue from the saved original.'; }
-  for (const asset of state.media) if (asset.status === 'ready') asset.preparationStage = undefined;
-  if (saved) persist();
+    if (!savedSnapshot && !(job.status === 'waiting' && project && timeline)) return { ...job, status: 'failed', remaining: 'Interrupted by server restart', error: 'The server restarted. Submit the export again.' };
+    const queued: RenderJob = { ...job, status: 'waiting', progress: 0, remaining: 'Queued for export' };
+    restarts.push([queued, savedSnapshot ? JSON.parse(String(savedSnapshot.data)) : structuredClone({ project: project!, timeline: timeline!, timelines: state.timelines.filter(t => t.projectId === job.projectId), clips: state.clips.filter(c => c.projectId === job.projectId), tracks: state.tracks.filter(t => state.timelines.some(tl => tl.id === t.timelineId && tl.projectId === job.projectId)), nodes: state.nodes.filter(n => n.projectId === job.projectId), assets: state.media.filter(a => a.projectId === job.projectId).map(asset => ({ asset, path: originalPath(asset.id) })), settings: job.settings })]);
+    return queued;
+  });
+  if (jobs.some((job, i) => job !== state.renderJobs[i])) state.renderJobs = jobs;
+  for (const [job, snapshot] of restarts) startRender(job, snapshot);
+  const media = (state.media as Asset[]).map((asset): Asset => !['ready', 'failed', 'uploading'].includes(asset.status) ? { ...asset, status: 'failed', error: 'Processing was interrupted. Retry to continue from the saved original.' } : asset.status === 'ready' && asset.preparationStage !== undefined ? { ...asset, preparationStage: undefined } : asset);
+  if (media.some((asset, i) => asset !== state.media[i])) state.media = media;
+  if (store.dirty(state)) persist();
+  // A fresh install gets its legacy row now, so `project-bundle.mjs import` has one to merge into;
+  // after a migration or a crash the row is brought up to date before anything reads it.
+  if (!store.legacyCurrent()) store.writeLegacy();
   // Upgrade existing imports in the same bounded worker queue; their current preview stays usable.
   for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && (!asset.proxyVariants?.Stream?.split('?')[0].endsWith(`/${STREAM_VARIANT}`) || !asset.proxyVariants?.StreamLow?.split('?')[0].endsWith(`/${STREAM_LOW_VARIANT}`)) && asset.proxyUrl) {
     const filename = asset.proxyUrl.split('?')[0].split('/').at(-1)!;
@@ -1348,11 +1522,15 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   for (const sound of sounds.list()) if (sound.status === 'ready' && sound.waveformVersion !== 2) addWork(`waveform-${sound.id}`, async signal => {
     try { await sounds.upgradeWaveform(sound.id, signal); } catch (error) { if (!signal.aborted) console.error(`Waveform upgrade failed for ${sound.name}:`, error); }
   });
-  return { server, dataDir, async close() { closed = true; await masks.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); db.close(); } };
+  // What changed only in memory (render progress, a held-back progress value) is saved on the way out,
+  // first thing, in case Windows ends the process before the slower shutdown steps finish.
+  const saveBeforeExit = () => { try { flushProgress(); if (store.dirty(state)) persist(); } catch (error) { console.error('Could not save the workspace on shutdown:', error); } };
+  return { server, dataDir, async close() { closed = true; saveBeforeExit(); await masks.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const app = createFrameLineServer(); const port = Number(process.env.PORT ?? 4310); const host = process.env.HOST ?? '127.0.0.1';
   app.server.listen(port, host, () => console.log(`SharedCut server listening at http://${host}:${port}`));
-  let stopping = false; for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => { if (!stopping) { stopping = true; void app.close().then(() => process.exit(0)); } });
+  // SIGBREAK is Ctrl+Break and SIGHUP a closed console window on Windows; both still get a clean close.
+  let stopping = false; for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP'] as const) process.on(signal, () => { if (!stopping) { stopping = true; void app.close().then(() => process.exit(0), error => { console.error('Shutdown failed:', error); process.exit(1); }); } });
 }

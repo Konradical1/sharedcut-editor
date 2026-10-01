@@ -8,12 +8,20 @@
  *
  * Cache entries: `<url>?fc=<index>` holds chunk bytes, `<url>?fc=meta` holds {size, type, used}.
  * The marker is a query parameter because Cache Storage ignores URL fragments when matching.
+ *
+ * Decoders read ~64 KiB at a time, several layers at once. Recently used chunks therefore also stay
+ * in memory, so each read is a slice rather than another megabyte out of Cache Storage.
  */
 const CACHE = 'footage-v3';
 const pending = new Map();
 const disabledClients = new Set();
 const CHUNK = 1 << 20;
 const MEDIA = /^\/api\/.+\.(mp4|m4a|mov|webm)$/i;
+// ponytail: fixed budget of hot chunks; the browser drops it whenever it stops an idle worker.
+const MEMORY = 80 * CHUNK;
+// Least recently used first (Map order). `reading` dedupes concurrent Cache Storage reads of one chunk.
+const memory = new Map(), reading = new Map(), metas = new Map();
+let memoryBytes = 0, epoch = 0, opened;
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', event => event.waitUntil(Promise.all([self.clients.claim(), caches.delete('footage-v1'), caches.delete('footage-v2')])));
@@ -21,12 +29,36 @@ self.addEventListener('activate', event => event.waitUntil(Promise.all([self.cli
 const keyFor = (url, marker) => `${url}${url.includes('?') ? '&' : '?'}fc=${marker}`;
 const chunkKey = (url, index) => keyFor(url, index);
 const metaKey = url => keyFor(url, 'meta');
+const open = () => opened ??= caches.open(CACHE).catch(error => { opened = undefined; throw error; });
 
-async function readMeta(cache, url) {
-  const hit = await cache.match(metaKey(url));
-  return hit ? hit.json() : null;
+function keep(key, bytes) {
+  const old = memory.get(key);
+  if (old) { memory.delete(key); memoryBytes -= old.byteLength; }
+  memory.set(key, bytes); memoryBytes += bytes.byteLength;
+  for (const [oldest, value] of memory) { if (memoryBytes <= MEMORY) break; memory.delete(oldest); memoryBytes -= value.byteLength; }
+}
+/** Saved chunk bytes, or null. One Cache Storage read per chunk however many readers ask at once. */
+function cached(cache, key) {
+  const hot = memory.get(key);
+  if (hot) { memory.delete(key); memory.set(key, hot); return hot; }
+  let job = reading.get(key);
+  if (!job) {
+    const at = epoch;
+    job = cache.match(key).then(hit => hit ? hit.arrayBuffer() : null).then(bytes => { if (bytes && at === epoch) keep(key, bytes); return bytes; }).finally(() => reading.delete(key));
+    reading.set(key, job);
+  }
+  return job;
+}
+
+/** File size and type. Held in memory once known; a missing entry is looked up again next time. */
+function readMeta(cache, url) {
+  if (metas.has(url)) return metas.get(url);
+  const job = cache.match(metaKey(url)).then(hit => hit ? hit.json() : null).catch(() => null).then(meta => { if (!meta && metas.get(url) === job) metas.delete(url); return meta; });
+  metas.set(url, job);
+  return job;
 }
 async function writeMeta(cache, url, meta) {
+  metas.set(url, meta);
   await cache.put(metaKey(url), new Response(JSON.stringify(meta), { headers: { 'Content-Type': 'application/json' } }));
 }
 
@@ -37,8 +69,8 @@ async function writeMeta(cache, url, meta) {
  */
 async function chunk(request, url, index, cache) {
   const key = chunkKey(url, index);
-  const hit = await cache.match(key);
-  if (hit) return { bytes: await hit.arrayBuffer(), meta: pending.has(key) ? (await pending.get(key)).meta : await readMeta(cache, url) };
+  const bytes = pending.has(key) ? null : await cached(cache, key);
+  if (bytes) return { bytes, meta: await readMeta(cache, url) };
   let job = pending.get(key);
   if (!job) {
     job = (async () => {
@@ -47,15 +79,16 @@ async function chunk(request, url, index, cache) {
       const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') || '');
       if (response.status !== 206 || !range || Number(range[1]) !== start || Number(range[2]) !== Math.min(start + CHUNK, Number(range[3])) - 1) throw new Error('Invalid media range');
       const meta = { size: Number(range[3]), type: response.headers.get('Content-Type') || 'video/mp4', used: Date.now() };
-      const length = Math.min(CHUNK, meta.size - start);
+      const length = Math.min(CHUNK, meta.size - start), whole = new Uint8Array(length), at = epoch;
       let received = 0;
       const checked = new Response(response.body.pipeThrough(new TransformStream({
-        transform(bytes, controller) { received += bytes.byteLength; if (received > length) throw new Error('Oversized media range'); controller.enqueue(bytes); },
+        transform(bytes, controller) { if (received + bytes.byteLength > length) throw new Error('Oversized media range'); whole.set(bytes, received); received += bytes.byteLength; controller.enqueue(bytes); },
         flush() { if (received !== length) throw new Error('Incomplete media range'); },
       })), { headers: { 'Content-Type': meta.type, 'Content-Length': String(length) } });
       // All simultaneous readers share this network request. Keep at most one aligned chunk
       // buffered for late readers; the first reader still receives bytes as they arrive.
       const saved = cache.put(key, checked.clone()).then(() => writeMeta(cache, url, meta)).then(() => {
+        if (at === epoch) keep(key, whole.buffer);
         notify({ type: 'footage-stored', url, index, size: length });
         notify({ type: 'footage-transfer', bytes: length, milliseconds: performance.now() - started });
       }).catch(error => { notify({ type: 'footage-storage-error', url }); throw error; });
@@ -75,7 +108,7 @@ function notify(message) {
 }
 
 async function serveRange(request, url, start, endInclusive) {
-  const cache = await caches.open(CACHE);
+  const cache = await open();
   let meta = await readMeta(cache, url);
   const firstIndex = Math.floor(start / CHUNK);
   // The first chunk settles the file size when nothing is known yet; a miss there is also the
@@ -88,6 +121,7 @@ async function serveRange(request, url, start, endInclusive) {
   if (start >= size) return new Response(null, { status: 416, headers: { 'Content-Range': `bytes */${size}` } });
   const end = Math.min(endInclusive ?? size - 1, size - 1);
   const lastIndex = Math.floor(end / CHUNK);
+  // Last use per file, for the page's eviction order.
   if (Date.now() - (meta.used || 0) > 60000) writeMeta(cache, url, { ...meta, used: Date.now() }).catch(() => {});
   let index = firstIndex, ahead = first, next = lastIndex > firstIndex ? chunk(request, url, firstIndex + 1, cache) : null, reader = null;
   if (next) next.catch(() => {});
@@ -100,7 +134,8 @@ async function serveRange(request, url, start, endInclusive) {
       if (next) next.catch(() => {});
       const from = index === firstIndex ? start - index * CHUNK : 0;
       const to = index === lastIndex ? end - index * CHUNK + 1 : CHUNK;
-      if (current.bytes) controller.enqueue(new Uint8Array(current.bytes, from, Math.min(to, current.bytes.byteLength) - from));
+      // A copy of just the asked-for bytes: the chunk in memory must stay whole for the next reader.
+      if (current.bytes) controller.enqueue(new Uint8Array(current.bytes.slice(from, Math.min(to, current.bytes.byteLength))));
       else {
         reader = current.body.getReader();
         let seen = 0;
@@ -142,6 +177,9 @@ self.addEventListener('message', event => {
   if (event.data?.type === 'footage-clear') event.waitUntil(
     Promise.allSettled([...pending.values()].map(job => job.then(result => result.saved)))
       .then(() => caches.delete(CACHE))
-      .then(() => { notify({ type: 'footage-cleared' }); event.ports?.[0]?.postMessage({ cleared: true }); })
+      .then(() => {
+        epoch++; opened = undefined; memory.clear(); memoryBytes = 0; metas.clear();
+        notify({ type: 'footage-cleared' }); event.ports?.[0]?.postMessage({ cleared: true });
+      })
   );
 });

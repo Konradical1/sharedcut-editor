@@ -1,6 +1,6 @@
 import {useEffect,useState} from 'react';
 import {Info,RotateCw,Sparkles,Square} from 'lucide-react';
-import {useEditorStore} from '../state/store';
+import {useStoreWithoutPlayhead} from '../state/store';
 import type {Clip} from '../state/models';
 import {acesOutputUpgrade} from '../services/color';
 import {eligibility,type LookOption} from '../services/colorAssistant';
@@ -14,7 +14,7 @@ const MAX_SHOTS=40; // server/colorAssistant.ts refuses more
 
 /** Color page Assistant tab: the model proposes Balance/Look values; SharedCut renders the stills and applies them as normal nodes. */
 export default function ColorAssistantPanel({shots,current,capabilities}:{shots:Clip[];current?:Clip;capabilities:AssistantCapabilities}){
-  const s=useEditorStore(),projectId=s.projectId,[job,setJob]=useState<AssistantJob|null>(null),[shown,setShown]=useState<AssistantJob|null>(null),[scope,setScope]=useState<'selected'|'timeline'>('selected'),[prompt,setPrompt]=useState(''),[error,setError]=useState(''),[starting,setStarting]=useState(false);
+  const s=useStoreWithoutPlayhead(),projectId=s.projectId,[job,setJob]=useState<AssistantJob|null>(null),[shown,setShown]=useState<AssistantJob|null>(null),[scope,setScope]=useState<'selected'|'timeline'>('selected'),[prompt,setPrompt]=useState(''),[error,setError]=useState(''),[starting,setStarting]=useState(false);
   const selected=shots.filter(c=>s.selectedClipIds.includes(c.id)),picked=selected.length?selected:current?[current]:[],scoped=scope==='timeline'?shots:picked;
   const name=(id:string)=>s.clips.find(c=>c.id===id)?.name??'Removed shot';
   const skips:AssistantSkip[]=scoped.flatMap(c=>{const e=eligibility(c,s.media.find(m=>m.id===c.mediaId),s.nodes);return e.ok?[]:[{clipId:c.id,code:e.code,text:e.text}];});
@@ -61,7 +61,7 @@ export default function ColorAssistantPanel({shots,current,capabilities}:{shots:
 }
 
 function SkipList({skips,name,label='Will be skipped'}:{skips:AssistantSkip[];name:(id:string)=>string;label?:string}){
-  const s=useEditorStore();if(!skips.length)return null;
+  const s=useStoreWithoutPlayhead();if(!skips.length)return null;
   const fix=({clipId,code}:AssistantSkip)=>{const clip=s.clips.find(c=>c.id===clipId);if(!clip)return null;
     if(code==='not-aces'&&acesOutputUpgrade(clip,s.nodes))return <button onClick={()=>s.useAcesOutput(clipId)}>Use ACES 2 output</button>;
     if(code==='legacy-pipeline')return <button onClick={()=>s.initializeColorGrade(clipId)}>Start wide-gamut grade</button>;return null;};

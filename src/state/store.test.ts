@@ -921,3 +921,12 @@ test('horizontal flip is an undoable clip property', () => {
   state().undo();
   assert.ok(!clip().properties.flipH);
 });
+
+test('panels read the playhead exactly while paused and in quarter-second steps while playing', async () => {
+  const { panelPlayhead, PANEL_PLAYHEAD_STEP } = await import('./store.ts');
+  assert.equal(panelPlayhead({ playing: false, playhead: 3.37 }), 3.37);
+  assert.equal(panelPlayhead({ playing: true, playhead: 3.37 }), 3.25);
+  // Every frame inside one step selects the same value, so a subscribed panel skips those frames.
+  const steps = new Set(Array.from({ length: 30 }, (_, frame) => panelPlayhead({ playing: true, playhead: 10 + frame / 30 })));
+  assert.equal(steps.size, Math.round(1 / PANEL_PLAYHEAD_STEP));
+});

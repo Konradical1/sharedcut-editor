@@ -1,9 +1,11 @@
-import { useEffect, useRef, useState, type PointerEvent } from 'react';
+import { memo, useEffect, useRef, useState, type PointerEvent } from 'react';
 import type { Clip } from '../state/models';
 import { useEditorStore } from '../state/store';
 import { fadeLevel, frameTime } from '../services/animation';
 
-export default function ClipFades({clip,audio,pixels,fps}:{clip:Clip;audio:boolean;pixels:number;fps:number}) {
+// Timeline re-renders every clip row together; each envelope samples 202 fade levels.
+export default memo(ClipFades);
+function ClipFades({clip,audio,pixels,fps}:{clip:Clip;audio:boolean;pixels:number;fps:number}) {
   const [draft,setDraft]=useState<{key:string;value:number}|null>(null);
   const drag=useRef<{key:string;value:number;x:number;scale:number;next:number;lease:ReturnType<typeof setInterval>}|null>(null),s=useEditorStore.getState;
   const finish=(commit:boolean)=>{const d=drag.current;if(!d)return;clearInterval(d.lease);drag.current=null;if(commit)s().updateProperty(clip.id,d.key,d.next);s().releaseLock(clip.id,d.key);setDraft(null);useEditorStore.setState({clipPreview:null});};

@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState, type PointerEvent, type KeyboardEvent } from 'react';
-import { useEditorStore } from '../state/store';
+import { memo, useEffect, useRef, useState, type PointerEvent, type KeyboardEvent } from 'react';
+import { useEditorStore, usePausedPlayhead } from '../state/store';
 import type { Clip } from '../state/models';
 import { evaluateClip } from '../services/animation';
 import { projectSize } from '../services/playback';
@@ -10,11 +10,16 @@ import './shapes.css';
 type XY={x:number;y:number};
 type Drag={id?:string;mode:string;start:XY;doc:ShapeDocument;clip?:Clip;next?:ShapeDocument;rotation:number;nextRotation?:number;index?:number;renewed:number;targets?:SnapBox[]};
 const clamp=(n:number,a:number,b:number)=>Math.max(a,Math.min(b,n));
-export default function ShapeOverlay(){
-  const clips=useEditorStore(s=>s.clips),tracks=useEditorStore(s=>s.tracks),timelineId=useEditorStore(s=>s.timelineId),selectedId=useEditorStore(s=>s.selectedClipId),tool=useEditorStore(s=>s.shapeTool),textTool=useEditorStore(s=>s.textTool),playhead=useEditorStore(s=>s.playhead),playing=useEditorStore(s=>s.playing),preview=useEditorStore(s=>s.clipPreview),project=useEditorStore(s=>s.projects.find(p=>p.id===s.projectId));
+// Memoized and off the moving playhead: the Viewer re-renders every playback frame, and shapes are not editable while playing.
+export default memo(ShapeOverlay);
+function ShapeOverlay(){
+  const clips=useEditorStore(s=>s.clips),tracks=useEditorStore(s=>s.tracks),timelineId=useEditorStore(s=>s.timelineId),selectedId=useEditorStore(s=>s.selectedClipId),tool=useEditorStore(s=>s.shapeTool),textTool=useEditorStore(s=>s.textTool),playhead=usePausedPlayhead(),playing=useEditorStore(s=>s.playing),preview=useEditorStore(s=>s.clipPreview),project=useEditorStore(s=>s.projects.find(p=>p.id===s.projectId));
   const [editing,setEditing]=useState<string|null>(null),[selectedPoint,setSelectedPoint]=useState<number|null>(null),[draft,setDraft]=useState<ShapeDocument|null>(null),[pen,setPen]=useState<ShapePoint[]>([]),[guides,setGuides]=useState<SnapGuide[]>([]);
   const root=useRef<SVGSVGElement>(null),drag=useRef<Drag|null>(null),penRef=useRef<ShapePoint[]>([]),s=useEditorStore.getState;
   const [width,height]=projectSize(project?.resolution??'1920 × 1080');
+  // Handles are sized from the on-screen canvas width at render; memoized, so re-measure when the canvas resizes or the viewer zooms (a transform on the frame).
+  const [,remeasure]=useState(0);
+  useEffect(()=>{const el=root.current;if(!el)return;const bump=()=>remeasure(n=>n+1),resize=new ResizeObserver(bump),zoom=new MutationObserver(bump),frame=el.closest('.viewer-frame');resize.observe(el);if(frame)zoom.observe(frame,{attributes:true,attributeFilter:['style']});return()=>{resize.disconnect();zoom.disconnect();};},[]);
   const selectedShape=clips.find(c=>c.id===selectedId&&isShape(c));
   const visible=clips.filter(c=>c.timelineId===timelineId&&isShape(c)&&!c.disabled&&c.start<=playhead&&c.start+c.duration>playhead&&!tracks.find(t=>t.id===c.trackId)?.hidden).sort((a,b)=>(tracks.find(t=>t.id===b.trackId)?.number??0)-(tracks.find(t=>t.id===a.trackId)?.number??0));
   const framePoint=(e:{clientX:number;clientY:number}):XY=>{const p=root.current!.createSVGPoint();p.x=e.clientX;p.y=e.clientY;const q=p.matrixTransform(root.current!.getScreenCTM()!.inverse());return{x:q.x/width,y:q.y/height};};

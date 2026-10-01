@@ -5,8 +5,8 @@
  *   node scripts/project-bundle.mjs export "Newspaper" ~/Desktop/newspaper-bundle
  *   node scripts/project-bundle.mjs import ~/Desktop/newspaper-bundle
  *
- * Stop the server on BOTH ends first — this reads and writes the SQLite workspace row directly,
- * and a running server holds the whole state in memory and will overwrite an import on its next save.
+ * Stop the server on BOTH ends first — import writes the JSON workspace row directly, which the
+ * next server start picks up, and refuses to run while a server holds the data folder.
  *
  * ponytail: copies whole media directories including generated proxies, so a bundle is bigger than
  * the originals but imports with nothing to re-encode. Delete `prepared/` from the bundle if transfer
@@ -15,6 +15,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { holdDataLock, readWorkspace, writeWorkspaceRow } from './workspace-db.mjs';
 
 const DATA = resolve(process.env.FRAME_LINE_DATA ?? 'data');
 // Per-project slices of the workspace state. `operations` is machine-local undo history and
@@ -27,7 +28,10 @@ const open = () => {
   const db = new DatabaseSync(file);
   const row = db.prepare('SELECT revision,state FROM workspace WHERE id=1').get();
   if (!row) throw new Error('The workspace is empty — start the server once before bundling.');
-  return { db, revision: Number(row.revision), state: JSON.parse(String(row.state)) };
+  // The item rows, unless the JSON row is newer. Writing the JSON row back with a higher revision is
+  // what makes the next server start import it.
+  const { revision, state, fromItems } = readWorkspace(db);
+  return { db, revision: Math.max(Number(row.revision), revision), state, fromItems };
 };
 
 function exportProject(needle, outDir) {
@@ -65,7 +69,7 @@ function exportProject(needle, outDir) {
 function importProject(inDir) {
   const bundle = JSON.parse(readFileSync(join(inDir, 'project.json'), 'utf8'));
   if (bundle.version !== 1) throw new Error(`Unsupported bundle version ${bundle.version}.`);
-  const { db, revision, state } = open();
+  const { db, revision, state, fromItems } = open();
 
   // The owner's account id is per-install. Without a remap the project imports invisible: every
   // membership points at a user that does not exist on this machine.
@@ -90,7 +94,7 @@ function importProject(inDir) {
     tracks: [...state.tracks, ...bundle.tracks],
     ...Object.fromEntries(BY_PROJECT.map(key => [key, [...state[key], ...bundle[key]]])),
   };
-  db.prepare('UPDATE workspace SET revision=?,state=? WHERE id=1').run(revision + 1, JSON.stringify(next));
+  writeWorkspaceRow(db, revision + 1, next, { fromItems });
 
   console.log(`Imported ${JSON.stringify(bundle.project.name)} — ${bundle.media.length} assets, ${bundle.clips.length} clips.`);
   console.log("Start the server and sign in; the project belongs to this machine's first account.");
@@ -98,7 +102,7 @@ function importProject(inDir) {
 
 const [mode, target, out] = process.argv.slice(2);
 if (mode === 'export' && target) exportProject(target, resolve(out ?? `${target.toLowerCase().replace(/\W+/g, '-')}-bundle`));
-else if (mode === 'import' && target) importProject(resolve(target));
+else if (mode === 'import' && target) { const lock = holdDataLock(DATA); try { importProject(resolve(target)); } finally { lock.close(); } }
 else {
   console.error('Usage:\n  node scripts/project-bundle.mjs export <project name or id> [outDir]\n  node scripts/project-bundle.mjs import <bundleDir>\n\nStop the server on both ends first.');
   process.exit(1);

@@ -13,7 +13,7 @@ import { isShape } from '../services/shapes';
 import { isTitle } from '../services/text';
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode, type PointerEvent } from 'react';
 import { Shapes, Type, SlidersHorizontal, ChevronDown, ChevronLeft, ChevronRight, RotateCcw, Diamond, Plus, Film, Crop, Gauge, WandSparkles, Volume2, Layers, LockKeyhole, Info, X, Trash2, ArrowUp, ArrowDown, Crosshair } from 'lucide-react';
-import { useEditorStore } from '../state/store';
+import { useEditorStore, usePanelPlayhead } from '../state/store';
 import { effectDefinitions, effectValue, effectEnabled, acceptsEffect } from '../services/effects';
 import { IconButton, EmptyState, NumberInput, durationLabel, fpsLabel } from './ui';
 import { api } from '../services/api';
@@ -42,7 +42,9 @@ export function Section({ title, icon, children, open = true }: { title: string;
 }
 export function Property({ name, label, initial=0, min, max, step=1, suffix, effectId, clipId, control, animatable=true }: {name:string;animatable?:boolean;label:string;initial?:number;min?:number;max?:number;step?:number;suffix?:string;effectId?:string;clipId?:string;control?:{value:number|undefined;change:(value:number)=>void;preview:(value:number)=>void}}) {
   const clip=useEditorStore(s=>s.clips.find(c=>c.id===(clipId??s.selectedTransition?.clipId??s.selectedClipId)));
-  const playhead=useEditorStore(s=>s.playhead);
+  const path=effectId?`effects.${effectId}.${name==='amount'?'amount':`parameters.${name}`}`:control?`text.${name.slice(5)}`:`properties.${name}`;
+  // Only a keyframed property changes with time, and while playing a 4 Hz readout is enough.
+  const playhead=usePanelPlayhead(!!clip?.keyframes?.[path]?.length);
   const fps=useEditorStore(s=>s.projects.find(p=>p.id===clip?.projectId)?.fps??24);
   const locks=useEditorStore(s=>s.locks);
   const users=useEditorStore(s=>s.users);
@@ -55,7 +57,6 @@ export function Property({ name, label, initial=0, min, max, step=1, suffix, eff
   if(!clip)return null;
   const evaluated=evaluateClip(clip,playhead);
   const effect=evaluated.effects.find(e=>e.id===effectId);
-  const path=effectId?`effects.${effectId}.${name==='amount'?'amount':`parameters.${name}`}`:control?`text.${name.slice(5)}`:`properties.${name}`;
   const keys=(clip.keyframes?.[path]??[]).filter(k=>k.time>=0&&k.time<clip.duration);
   const frame=Math.round((playhead-clip.start)*fps);
   const onKeyframe=playhead>=clip.start&&playhead<clip.start+clip.duration&&keys.some(k=>Math.round(k.time*fps)===frame);
@@ -97,10 +98,12 @@ export function Property({ name, label, initial=0, min, max, step=1, suffix, eff
     setDraft(current.next);
     if(control){control.preview(current.next);return;}
     if(clip.keyframes?.[path]) {
-      const fps=store().projects.find(p=>p.id===clip.projectId)?.fps??24,time=frameTime(Math.max(0,Math.min(clip.duration-1/fps,playhead-clip.start)),fps),keys=clip.keyframes[path],existing=keys.find(k=>Math.abs(k.time-time)<.5/fps);
+      const fps=store().projects.find(p=>p.id===clip.projectId)?.fps??24,time=frameTime(Math.max(0,Math.min(clip.duration-1/fps,store().playhead-clip.start)),fps),keys=clip.keyframes[path],existing=keys.find(k=>Math.abs(k.time-time)<.5/fps);
       useEditorStore.setState({clipPreview:{...clip,keyframes:{...clip.keyframes,[path]:[...keys.filter(k=>k!==existing),{id:existing?.id??'preview',time,value:current.next,interpolation:existing?.interpolation??'linear',...(existing?.curve?{curve:existing.curve}:{})}].sort((a,b)=>a.time-b.time)}}});return;
     }
-    useEditorStore.setState({clipPreview:effectId?{...evaluated,keyframes:undefined,effects:evaluated.effects.map(e=>e.id===effectId?{...e,...(name==='amount'?{amount:current.next}:{parameters:{...e.parameters,[name]:current.next}})}:e)}:{...evaluated,keyframes:undefined,properties:{...evaluated.properties,[name]:current.next}}});
+    // `playhead` is a constant 0 for an unkeyframed property; the frozen preview must pose the clip's other animation at the real playhead.
+    const live=evaluateClip(clip,store().playhead);
+    useEditorStore.setState({clipPreview:effectId?{...live,keyframes:undefined,effects:live.effects.map(e=>e.id===effectId?{...e,...(name==='amount'?{amount:current.next}:{parameters:{...e.parameters,[name]:current.next}})}:e)}:{...live,keyframes:undefined,properties:{...live.properties,[name]:current.next}}});
   };
   const finish = (e: PointerEvent<HTMLElement>) => {
     if(!drag.current)return;move(e);const moved=drag.current.moved;end(true);

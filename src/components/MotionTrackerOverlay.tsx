@@ -1,4 +1,4 @@
-import {useMemo} from 'react';
+import {memo,useMemo} from 'react';
 import {useEditorStore} from '../state/store';
 import type {Clip} from '../state/models';
 import {projectSize} from '../services/playback';
@@ -9,21 +9,31 @@ import {confidenceColor} from './MotionTrackerEditor';
 
 /** The tracked points on the program picture at the playhead: for the selected clip's trackers, or the tracker a
  *  selected layer is attached to. The same mapping the attach arithmetic uses, so what is drawn is what is applied. */
-export default function MotionTrackerOverlay(){
-  const selectedId=useEditorStore(s=>s.selectedClipId),clips=useEditorStore(s=>s.clips),timelineId=useEditorStore(s=>s.timelineId),playhead=useEditorStore(s=>s.playhead);
+type Entry={clip:Clip;tracker:MotionTracker};
+// Memoized, and only subscribed to the playhead while there are trackers to draw: the Viewer re-renders every playback frame.
+export default memo(MotionTrackerOverlay);
+function MotionTrackerOverlay(){
+  const selectedId=useEditorStore(s=>s.selectedClipId),clips=useEditorStore(s=>s.clips),timelineId=useEditorStore(s=>s.timelineId);
   const project=useEditorStore(s=>s.projects.find(p=>p.id===s.projectId)),editing=useTrackerEditor(s=>!!s.clipId);
   const entries=useMemo(()=>{
     const selected=clips.find(c=>c.id===selectedId);
     if(!selected||editing)return [];
     const owners=selected.motionTrackers?.length?[selected]:clips.filter(c=>c.motionTrackers?.some(t=>t.links?.some(l=>l.clipId===selected.id)));
     // A stabilized picture is warped by a solve only the playback engine holds; draw nothing rather than a wrong point.
-    return owners.filter(c=>c.timelineId===timelineId&&!c.disabled&&c.start<=playhead&&playhead<c.start+c.duration&&!stabilizeEffect(c))
+    return owners.filter(c=>c.timelineId===timelineId&&!c.disabled&&!stabilizeEffect(c))
       .flatMap(c=>(c.motionTrackers??[]).filter(t=>c.id===selected.id||t.links?.some(l=>l.clipId===selected.id)).map(tracker=>({clip:c,tracker})));
-  },[clips,selectedId,timelineId,playhead,editing]);
+  },[clips,selectedId,timelineId,editing]);
   if(!project||!entries.length)return null;
-  const [width,height]=projectSize(project.resolution);
+  return <TrackerPoints entries={entries} resolution={project.resolution} fps={project.fps||24}/>;
+}
+
+function TrackerPoints({entries,resolution,fps}:{entries:Entry[];resolution:string;fps:number}){
+  const playhead=useEditorStore(s=>s.playhead);
+  const visible=entries.filter(({clip:c})=>c.start<=playhead&&playhead<c.start+c.duration);
+  if(!visible.length)return null;
+  const [width,height]=projectSize(resolution);
   return <svg className="motion-tracker-overlay" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" aria-hidden="true">
-    {entries.map(({clip,tracker})=><Point key={`${clip.id}:${tracker.id}`} clip={clip} tracker={tracker} project={[width,height]} fps={project.fps||24} playhead={playhead}/>)}
+    {visible.map(({clip,tracker})=><Point key={`${clip.id}:${tracker.id}`} clip={clip} tracker={tracker} project={[width,height]} fps={fps} playhead={playhead}/>)}
   </svg>;
 }
 

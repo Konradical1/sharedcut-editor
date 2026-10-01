@@ -2,7 +2,7 @@ import { animationProperties, evaluateClip } from '../services/animation';
 import './text.css';
 import { useEffect, useRef, useState } from 'react';
 import { AlignLeft, AlignCenter, AlignRight, Bold, Italic, Underline, Upload, Search, Type, Monitor, Globe, ChevronDown, Diamond } from 'lucide-react';
-import { useEditorStore } from '../state/store';
+import { useEditorStore, usePanelPlayhead } from '../state/store';
 import { commonStyle, getText, isTitle, replaceText, textContent, defaultTextEffects, type TextStyle, type TextDocument } from '../services/text';
 import { browseLocalFonts, uploadFont, useFonts } from '../services/fonts';
 import { Property, MotionBlurControl } from './Inspector';
@@ -10,7 +10,8 @@ import { Modal, IconButton } from './ui';
 
 export function TextContentEditor({ clipId, inline = false, onDone }: { clipId: string; inline?: boolean; onDone?: () => void }) {
   const clip = useEditorStore(s => s.clips.find(c => c.id === clipId));
-  const playhead=useEditorStore(s=>s.playhead);
+  // Re-renders the text at the playhead; only animated text changes with time.
+  usePanelPlayhead(Object.keys(clip?.keyframes ?? {}).length > 0);
   const ref = useRef<HTMLTextAreaElement>(null);
   const gesture = useRef('');
   const lease = useRef<ReturnType<typeof setInterval>|undefined>(undefined);
@@ -29,7 +30,7 @@ export default function TextInspector() {
   const clips = useEditorStore(s => s.clips), ids = useEditorStore(s => s.selectedTextIds), selectedId = useEditorStore(s => s.selectedClipId), selection = useEditorStore(s => s.textSelection);
   const timelineId = useEditorStore(s => s.timelineId);
   const selected = clips.filter(c => c.timelineId === timelineId && isTitle(c) && (ids.length ? ids.includes(c.id) : c.id === selectedId));
-  const playhead=useEditorStore(s=>s.playhead);
+  const playhead=usePanelPlayhead(selected.some(c => Object.keys(c.keyframes ?? {}).length > 0));
   const fonts = useFonts();
   const [picker, setPicker] = useState(false), [search, setSearch] = useState(''), [busy, setBusy] = useState(false), [message, setMessage] = useState('');
   const upload = useRef<HTMLInputElement>(null);

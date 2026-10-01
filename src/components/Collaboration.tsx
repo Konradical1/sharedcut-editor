@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Users, Radio, ArrowUpRight, Play, X, MessageSquare, Check, Send, CornerDownRight, Clock3 } from 'lucide-react';
-import { useEditorStore } from '../state/store';
+import { useEditorStore, usePanelPlayhead } from '../state/store';
 import type { Presence, PresenceCursor } from '../state/models';
 import { advanceCursor, type CursorMotion, advancePlayhead, playheadMotion, cursorPosition, presenceCursor } from '../services/presence';
 import { api, connection } from '../services/api';
@@ -33,21 +33,25 @@ function findAnchor(root: HTMLElement, id: string): HTMLElement | undefined {
   return node as HTMLElement|undefined;
 }
 
+const CURSOR_PLAYING_MS = 250, CURSOR_REFRESH_MS = 1000;
+
 export function RemoteCursors() {
   const users = useEditorStore(s => s.users);
   const currentUserId = useEditorStore(s => s.currentUserId);
   const showCursors = useEditorStore(s => s.settings.showCursors !== false);
   const layer = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    let pointer: { x: number; y: number } | null = null, frame = 0;
+    let pointer: { x: number; y: number } | null = null, frame = 0, hitDue = false, hitAt = 0, remoteAt = 0, shown = false;
     const motions = new WeakMap<HTMLElement, { context: string; layout: string; value: CursorMotion }>();
     const preference = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const move = (e: globalThis.PointerEvent) => { pointer = { x: e.clientX, y: e.clientY }; };
+    const move = (e: globalThis.PointerEvent) => { pointer = { x: e.clientX, y: e.clientY }; hitDue = true; };
+    const stale = () => { hitDue = true; };
     const clear = () => { pointer = null; useEditorStore.setState({ cursor: null }); };
     const leave = (e: globalThis.PointerEvent) => { if (!e.relatedTarget) clear(); };
-    const draw = () => {
-      const now = performance.now(), paints: (() => void)[] = [];
-      const state = useEditorStore.getState();
+    // elementFromPoint forces a layout, and playback changes the DOM every frame. The answer only changes when the
+    // pointer or the content under it moves (scroll, resize), so test then, at most 4 Hz while playing, plus a slow
+    // refresh for anything else that shifts the page.
+    const hitTest = (state: ReturnType<typeof useEditorStore.getState>) => {
       const hit = pointer && !document.hidden ? document.elementFromPoint(pointer.x, pointer.y) : null;
       const surface = cursorRoot(hit);
       const anchor = hit&&surface?contentAnchor(hit,surface):null;
@@ -58,8 +62,16 @@ export function RemoteCursors() {
             surface.dataset.cursorSurface === 'timeline' && anchor.dataset.timeSpan ? Number(anchor.dataset.timeSpan) : undefined) });
       }
       if (JSON.stringify(cursor) !== JSON.stringify(state.cursor)) useEditorStore.setState({ cursor });
-      const container = layer.current;
+    };
+    const draw = () => {
+      const now = performance.now(), paints: (() => void)[] = [];
+      const state = useEditorStore.getState(), wait = state.playing ? CURSOR_PLAYING_MS : 0;
+      if (pointer && (hitDue && now - hitAt >= wait || now - hitAt >= CURSOR_REFRESH_MS)) { hitDue = false; hitAt = now; hitTest(state); }
+      // Alone in the project there is nothing to place; one more pass after the last collaborator leaves hides them.
+      const remote = state.presence.some(p => p.online && p.userId !== state.currentUserId && p.projectId === state.projectId);
+      const container = (remote || shown) && now - remoteAt >= wait ? layer.current : null;
       if (container) {
+        remoteAt = now; shown = remote;
         const bounds = container.getBoundingClientRect(), scale = bounds.width / container.offsetWidth;
         for (const node of container.querySelectorAll<HTMLElement>('[data-remote-user]')) {
           const glow=node.querySelector<HTMLElement>('.remote-panel-glow')!;glow.style.display='none';
@@ -110,10 +122,13 @@ export function RemoteCursors() {
     document.addEventListener('pointermove', move);
     document.addEventListener('pointerout', leave);
     document.addEventListener('visibilitychange', clear);
+    document.addEventListener('scroll', stale, { capture: true, passive: true });
+    window.addEventListener('resize', stale);
     window.addEventListener('blur', clear);
     frame = requestAnimationFrame(draw);
     return () => { cancelAnimationFrame(frame); document.removeEventListener('pointermove', move); document.removeEventListener('pointerout', leave);
-      document.removeEventListener('visibilitychange', clear); window.removeEventListener('blur', clear); clear(); };
+      document.removeEventListener('visibilitychange', clear); document.removeEventListener('scroll', stale, { capture: true }); window.removeEventListener('resize', stale);
+      window.removeEventListener('blur', clear); clear(); };
   }, []);
   return <div className="remote-cursor-layer" ref={layer} aria-hidden="true">{showCursors && users.filter(user => user.id !== currentUserId).map(user => {
     return <div className="remote-cursor-layer" data-remote-user={user.id} key={user.id} style={{display:'none',opacity:0,'--user-color':user.color} as CSSProperties} onTransitionEnd={e => {
@@ -160,7 +175,7 @@ export function CommentsPanel() {
   const comments=useEditorStore(s=>s.comments);
   const users=useEditorStore(s=>s.users);
   const projectId=useEditorStore(s=>s.projectId);
-  const playhead=useEditorStore(s=>s.playhead);
+  const playhead=usePanelPlayhead();
   const selectedClipId=useEditorStore(s=>s.selectedClipId);
   const [text,setText]=useState('');
   const [attachment,setAttachment]=useState('timestamp');
@@ -169,7 +184,7 @@ export function CommentsPanel() {
   const [reply,setReply]=useState('');
   const s=useEditorStore.getState;
   const filtered=comments.filter(c=>c.projectId===projectId&&(showResolved||!c.resolved));
-  return <section className="comments-panel panel"><header className="panel-header"><MessageSquare size={15}/><h2>Comments</h2><Badge>{comments.filter(c=>c.projectId===projectId&&!c.resolved).length}</Badge><span className="spacer"/><IconButton label="Close comments" onClick={()=>s().setSidePanel(null)}><X size={14}/></IconButton></header><div className="comments-filter"><span>Comments</span><label><input type="checkbox" checked={showResolved} onChange={e=>setShowResolved(e.target.checked)}/> Resolved</label></div><div className="comments-list">{filtered.length===0&&<EmptyState icon={<MessageSquare size={25}/>} title="No comments" description="Add a comment at the playhead."/>}{filtered.map(c=>{const user=users.find(u=>u.id===c.userId)??users[0];return <article className={`comment ${c.resolved?'resolved':''}`} key={c.id}><div className="comment-heading"><Avatar user={user} size={26}/><b>{user.name}</b><span className="spacer"/><IconButton label={`${c.resolved?'Reopen':'Resolve'} comment by ${user.name}`} className={c.resolved?'active':''} onClick={()=>s().resolveComment(c.id)}><Check size={13}/></IconButton></div><button className="comment-time mono" onClick={()=>s().setPlayhead(c.time)}><Clock3 size={11}/>{timecode(c.time)}{c.range&&` – ${timecode(c.range[1])}`}{c.clipId&&<span> · Clip</span>}</button><p>{c.text}</p>{c.replies.map(r=>{const ru=users.find(u=>u.id===r.userId)??users[0];return <div className="comment-reply" key={r.id}><CornerDownRight size={12}/><div><b style={{color:ru.color}}>{ru.name}</b><p>{r.text}</p></div></div>;})}{replyId===c.id?<form className="reply-form" onSubmit={e=>{e.preventDefault();if(reply.trim()){s().replyComment(c.id,reply.trim());setReply('');setReplyId(null);}}}><input autoFocus aria-label="Reply text" value={reply} onChange={e=>setReply(e.target.value)} placeholder="Write a reply…"/><IconButton label="Post reply" type="submit" disabled={!reply.trim()}><Send size={13}/></IconButton></form>:<button className="text-button comment-reply-button" onClick={()=>setReplyId(c.id)}>Reply{c.resolved?' · Resolved':''}</button>}</article>;})}</div><form className="comment-composer" onSubmit={e=>{e.preventDefault();if(text.trim()){s().addComment(text.trim(),attachment==='clip'&&selectedClipId?{clipId:selectedClipId}:attachment==='range'?{range:[playhead,playhead+5]}:undefined);setText('');}}}><div className="comment-composer-meta"><span className="mono">{timecode(playhead)}</span><select aria-label="Comment attachment" value={attachment} onChange={e=>setAttachment(e.target.value)}><option value="timestamp">At playhead</option><option value="clip" disabled={!selectedClipId}>Selected clip</option><option value="range">Next 5 seconds</option></select></div><textarea aria-label="Comment text" placeholder="Add a comment…" rows={3} value={text} onChange={e=>setText(e.target.value)}/><Button variant="primary" type="submit" disabled={!text.trim()}><Send size={12}/>Post comment</Button></form></section>;
+  return <section className="comments-panel panel"><header className="panel-header"><MessageSquare size={15}/><h2>Comments</h2><Badge>{comments.filter(c=>c.projectId===projectId&&!c.resolved).length}</Badge><span className="spacer"/><IconButton label="Close comments" onClick={()=>s().setSidePanel(null)}><X size={14}/></IconButton></header><div className="comments-filter"><span>Comments</span><label><input type="checkbox" checked={showResolved} onChange={e=>setShowResolved(e.target.checked)}/> Resolved</label></div><div className="comments-list">{filtered.length===0&&<EmptyState icon={<MessageSquare size={25}/>} title="No comments" description="Add a comment at the playhead."/>}{filtered.map(c=>{const user=users.find(u=>u.id===c.userId)??users[0];return <article className={`comment ${c.resolved?'resolved':''}`} key={c.id}><div className="comment-heading"><Avatar user={user} size={26}/><b>{user.name}</b><span className="spacer"/><IconButton label={`${c.resolved?'Reopen':'Resolve'} comment by ${user.name}`} className={c.resolved?'active':''} onClick={()=>s().resolveComment(c.id)}><Check size={13}/></IconButton></div><button className="comment-time mono" onClick={()=>s().setPlayhead(c.time)}><Clock3 size={11}/>{timecode(c.time)}{c.range&&` – ${timecode(c.range[1])}`}{c.clipId&&<span> · Clip</span>}</button><p>{c.text}</p>{c.replies.map(r=>{const ru=users.find(u=>u.id===r.userId)??users[0];return <div className="comment-reply" key={r.id}><CornerDownRight size={12}/><div><b style={{color:ru.color}}>{ru.name}</b><p>{r.text}</p></div></div>;})}{replyId===c.id?<form className="reply-form" onSubmit={e=>{e.preventDefault();if(reply.trim()){s().replyComment(c.id,reply.trim());setReply('');setReplyId(null);}}}><input autoFocus aria-label="Reply text" value={reply} onChange={e=>setReply(e.target.value)} placeholder="Write a reply…"/><IconButton label="Post reply" type="submit" disabled={!reply.trim()}><Send size={13}/></IconButton></form>:<button className="text-button comment-reply-button" onClick={()=>setReplyId(c.id)}>Reply{c.resolved?' · Resolved':''}</button>}</article>;})}</div><form className="comment-composer" onSubmit={e=>{e.preventDefault();if(text.trim()){s().addComment(text.trim(),attachment==='clip'&&selectedClipId?{clipId:selectedClipId}:attachment==='range'?{range:[s().playhead,s().playhead+5]}:undefined);setText('');}}}><div className="comment-composer-meta"><span className="mono">{timecode(playhead)}</span><select aria-label="Comment attachment" value={attachment} onChange={e=>setAttachment(e.target.value)}><option value="timestamp">At playhead</option><option value="clip" disabled={!selectedClipId}>Selected clip</option><option value="range">Next 5 seconds</option></select></div><textarea aria-label="Comment text" placeholder="Add a comment…" rows={3} value={text} onChange={e=>setText(e.target.value)}/><Button variant="primary" type="submit" disabled={!text.trim()}><Send size={12}/>Post comment</Button></form></section>;
 }
 export function Notifications() {
   const notifications=useEditorStore(s=>s.notifications);

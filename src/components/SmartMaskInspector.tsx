@@ -8,12 +8,13 @@ import {analyzeMask,cancelMask,openMaskEditor,useMaskEditor,type MaskCapabilitie
 import './smartMask.css';
 
 export default function SmartMaskInspector({clip,maskId,targetId,node=false}:{clip:Clip;maskId?:string;targetId:string;node?:boolean}){
-  const s=useEditorStore(),editor=useMaskEditor(),[capability,setCapability]=useState<MaskCapabilities|null>(null),[loading,setLoading]=useState(false);
+  // Actions from getState and narrow selectors: a whole-store subscription re-rendered this on every playback frame.
+  const s=useEditorStore.getState(),editor=useMaskEditor(),[capability,setCapability]=useState<MaskCapabilities|null>(null),[loading,setLoading]=useState(false);
   useEffect(()=>{let current=true;void api<MaskCapabilities>('/smart-masks/capabilities').then(value=>{if(current)setCapability(value);}).catch(()=>{if(current)setCapability({available:false,preserveMotionBlur:false,finalQuality:false,reason:'Connect to the analysis server to track this mask.'});});return()=>{current=false;};},[]);
   const mask=clip.smartMasks?.find(m=>m.id===maskId),job=mask&&editor.jobs[`${clip.id}:${mask.id}`],busy=loading||job?.status==='queued'||job?.status==='processing';
-  const locked=s.tracks.find(t=>t.id===clip.trackId)?.locked||s.locks.some(l=>l.targetId===clip.id&&l.userId!==s.currentUserId&&l.expiresAt>Date.now()&&['*','smartMasks'].includes(l.field));
+  const locked=useEditorStore(s=>!!s.tracks.find(t=>t.id===clip.trackId)?.locked||s.locks.some(l=>l.targetId===clip.id&&l.userId!==s.currentUserId&&l.expiresAt>Date.now()&&['*','smartMasks'].includes(l.field)));
   const patch=(value:Parameters<typeof s.updateSmartMask>[2])=>mask&&s.updateSmartMask(clip.id,mask.id,value);
-  const nodeMask=s.nodes.find(n=>n.id===targetId)?.mask;
+  const nodeMask=useEditorStore(s=>s.nodes.find(n=>n.id===targetId)?.mask);
   const current=mask?.result?.signature=== (mask?smartMaskSignature(mask):'');
   // A never-analyzed mask asking for what this engine cannot do would leave Analyze greyed out for no reason.
   useEffect(()=>{if(mask&&!mask.result&&capability?.available&&!capability.finalQuality&&(mask.settings.quality==='final'||mask.settings.preserveMotionBlur))patch({settings:{...mask.settings,quality:'preview',preserveMotionBlur:false}});},[mask?.id,capability?.available]);

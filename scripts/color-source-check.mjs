@@ -1,11 +1,12 @@
 // Read-only diagnosis of camera/proxy decoding using the real GPU renderer.
 import {DatabaseSync} from 'node:sqlite';
+import {readWorkspace} from './workspace-db.mjs';
 import {mkdir,writeFile,symlink} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {createServer} from 'vite';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 const db=new DatabaseSync('data/frameline.sqlite',{readOnly:true});
-const state=JSON.parse(db.prepare('select state from workspace where id=1').get().state);db.close();
+const state=readWorkspace(db).state;db.close();
 const out=resolve(process.env.COLOR_CHECK_OUT||'artifacts/qa/color-reference/baseline');await mkdir(out,{recursive:true});
 for(const asset of state.media.filter(m=>['C0852.MP4','C0363.MP4'].includes(m.name)))await symlink(resolve('data/media',asset.id,'original'),resolve(out,asset.id+'.mp4')).catch(e=>{if(e.code!=='EEXIST')throw e;});
 const server=await createServer({server:{port:0,host:'127.0.0.1'}});await server.listen();

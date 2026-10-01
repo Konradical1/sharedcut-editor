@@ -12,7 +12,7 @@ import ClipFades from './ClipFades';
 import TransitionChips from './TransitionChips';
 import { alignShare, bestAlign, maximumDuration, nearestCut, transitionDefinitions } from '../services/transitions';
 import { isTitle, titlePresets } from '../services/text';
-import { Fragment, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type PointerEvent, type DragEvent } from 'react';
+import { Fragment, memo, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type PointerEvent, type DragEvent } from 'react';
 import { Shapes, PenTool, Layers, ArrowLeft, ArrowRightLeft, Type, MousePointer2, Scissors, Magnet, Link2, Flag, Plus, Minus, ChevronDown, LockKeyhole, LockKeyholeOpen, Eye, EyeOff, Volume2, VolumeX, Film, AudioLines, Copy, Trash2, Gauge, Palette, Music2, FolderSearch, Info, Clipboard, Undo2, GripVertical, ChevronUp, Diamond } from 'lucide-react';
 import { useEditorStore, TRACK_THUMBNAIL_HEIGHT } from '../state/store';
 import { useShallow } from 'zustand/react/shallow';
@@ -65,19 +65,44 @@ function TimelineTime({ fps, color }: { fps?: number; color: string }) {
   return <span className="timeline-time mono" style={{ color }}>{label}</span>;
 }
 
-function TimelinePlayheads({ pixels, color, scrub, scrubMove }: { pixels: number; color: string; scrub: (e: PointerEvent<HTMLDivElement>) => void; scrubMove: (e: PointerEvent<HTMLDivElement>) => void }) {
-  const s = useEditorStore(useShallow(s => ({ playhead: s.playhead, presence: s.presence, users: s.users, timelineId: s.timelineId, projectId: s.projectId, workspace: s.workspace, currentUserId: s.currentUserId, showPlayheads: s.settings.showPlayheads !== false })));
+type PlayheadProps = { pixels: number; color: string; scrub: (e: PointerEvent<HTMLDivElement>) => void; scrubMove: (e: PointerEvent<HTMLDivElement>) => void };
+// Only the local playhead follows every playback frame; remote playheads re-render on presence changes.
+function LocalPlayhead({ pixels, color, scrub, scrubMove }: PlayheadProps) {
+  const playhead = useEditorStore(s => s.playhead);
+  return <div className="local-playhead" onPointerDown={scrub} onPointerMove={scrubMove} style={{ left: 164, transform: `translateX(${playhead * pixels}px)`, '--user-color': color } as CSSProperties}><span/></div>;
+}
+function TimelinePlayheads(props: PlayheadProps) {
+  const { pixels } = props;
+  const s = useEditorStore(useShallow(s => ({ presence: s.presence, users: s.users, timelineId: s.timelineId, projectId: s.projectId, workspace: s.workspace, currentUserId: s.currentUserId, showPlayheads: s.settings.showPlayheads !== false })));
   return <>
     {s.showPlayheads && s.presence.filter(p => p.activity === s.workspace && p.projectId === s.projectId && (!p.timelineId || p.timelineId === s.timelineId) && p.userId !== s.currentUserId && p.online).map(p => { const user = s.users.find(u => u.id === p.userId); return <RemotePlayhead key={`${p.userId}:${s.timelineId}`} person={p} pixels={pixels} color={user?.color} name={user?.name}/>; })}
-    <div className="local-playhead" onPointerDown={scrub} onPointerMove={scrubMove} style={{ left: 164, transform: `translateX(${s.playhead * pixels}px)`, '--user-color': color } as CSSProperties}><span/></div>
+    <LocalPlayhead {...props}/>
   </>;
 }
 
 watchSmartMaskJobs(useMaskEditor);
 
+// The footage cache notifies on every chunk and decoder update (~12/s while playing), which re-rendered all ~400 clip
+// badges each time. One relay forwards it, at most FOOTAGE_RELAY_MS apart while playing; each badge then re-renders
+// only when its own text changes.
+const FOOTAGE_RELAY_MS=250,footageListeners=new Set<()=>void>();
+let footageRelayed=0,relayAt=0,relayTimer:ReturnType<typeof setTimeout>|undefined;
+const subscribeFootage=(listener:()=>void)=>{footageListeners.add(listener);return()=>{footageListeners.delete(listener);};};
+const relayFootage=()=>{relayTimer=undefined;relayAt=performance.now();footageRelayed++;footageListeners.forEach(listener=>listener());};
+function FootageRelay(){
+  const version=useFootageVersion();
+  useEffect(()=>{
+    if(relayTimer!==undefined)return;
+    const wait=useEditorStore.getState().playing?FOOTAGE_RELAY_MS-(performance.now()-relayAt):0;
+    if(wait>0)relayTimer=setTimeout(relayFootage,wait);else relayFootage();
+  },[version]);
+  return null;
+}
+const footageBadge=(clipId:string)=>{const s=clipFootageStatus(clipId);return `${s.state}|${s.progress}|${s.detail}|${s.playback?.detail??''}`;};
+
 /** Picture coverage in the editor; audio coverage in the audio workspace. */
 function RenderBar({pixels,audioOnly}:{pixels:number;audioOnly:boolean}){
-  useFootageVersion();useActivityVersion();
+  useSyncExternalStore(subscribeFootage,()=>footageRelayed);useActivityVersion();
   const clips=useEditorStore(s=>s.clips),media=useEditorStore(s=>s.media),timelineId=useEditorStore(s=>s.timelineId),projectId=useEditorStore(s=>s.projectId);
   const tracks=useEditorStore(s=>s.tracks);
   const segments=barSegments(clips.filter(c=>c.timelineId===timelineId&&c.projectId===projectId&&!c.disabled&&tracks.some(t=>t.id===c.trackId&&(audioOnly?t.kind==='audio'&&!t.muted:t.kind==='video'&&!t.hidden))).map(clip=>{
@@ -89,9 +114,9 @@ function RenderBar({pixels,audioOnly}:{pixels:number;audioOnly:boolean}){
   return <div className="render-bar" role="img" aria-label="Footage on this computer: gray queued, blue downloading, amber preparing a download, green saved locally, red failed">{segments.map((seg,i)=><i key={i} className={seg.state} style={{left:seg.start*pixels,width:Math.max(1,(seg.end-seg.start)*pixels)}}/>)}</div>;
 }
 
-function ClipActivityBar({clipId,cacheable}:{clipId:string;cacheable:boolean}) {
+const ClipActivityBar=memo(function ClipActivityBar({clipId,cacheable}:{clipId:string;cacheable:boolean}) {
   const activity=useClipActivity(clipId);
-  useFootageVersion();
+  useSyncExternalStore(subscribeFootage,()=>cacheable&&!activity?footageBadge(clipId):'');
   if(!activity) {
     if(!cacheable)return null;
     const local=clipFootageStatus(clipId);
@@ -99,9 +124,11 @@ function ClipActivityBar({clipId,cacheable}:{clipId:string;cacheable:boolean}) {
     return <div className={`clip-cache ${local.state}`} title={`${local.detail}${local.playback?` · ${local.playback.detail}`:""}`} aria-label={`${label}: ${local.detail}`} style={{'--progress':`${local.progress}%`} as CSSProperties}><span>{label}</span></div>;
   }
   return <div className={`clip-preparing ${activity.status}`} role="status" title={activity.error??`${activity.kind} preparing`} style={{'--progress':`${Math.max(4,activity.progress)}%`} as CSSProperties}><span>{activity.status==='failed'?`${activity.kind} failed`:`${activity.kind} · ${activity.progress}%`}</span></div>;
-}
+});
 
-export default function Timeline({ audioOnly = false }: { audioOnly?: boolean }) {
+// Memoized so the editor shell re-rendering (presence, save status) does not redraw ~400 clip rows.
+export default memo(Timeline);
+function Timeline({ audioOnly = false }: { audioOnly?: boolean }) {
   const timelineId = useEditorStore(s=>s.timelineId);
   const rangeIn = useEditorStore(s=>s.rangeIn);
   const rangeOut = useEditorStore(s=>s.rangeOut);
@@ -346,7 +373,7 @@ export default function Timeline({ audioOnly = false }: { audioOnly?: boolean })
       <div className="timeline-content" style={{minWidth:width+164}}>
         <div className="timeline-ruler-row"><div className="timeline-track-heading"><span>TRACKS</span><ChevronDown size={12}/></div><div className="timeline-ruler" data-cursor-anchor="ruler" data-time-span={width/pixels} style={{width}} onPointerDown={scrub} onPointerMove={scrubMove}>
           <div className="timeline-range" title="Marked export range" style={{left:rangeIn*pixels,width:(rangeOut-rangeIn)*pixels}}/>
-          <RenderBar pixels={pixels} audioOnly={audioOnly}/>
+          <FootageRelay/><RenderBar pixels={pixels} audioOnly={audioOnly}/>
           {Array.from({length:Math.max(0,lastTick-firstTick+1)},(_,index)=>{const i=index+firstTick;return <div key={i} className="ruler-tick major" style={{left:i*step*pixels}}><span className="mono">{timecode(i*step,fps)}</span></div>;})}
           {markers.map((m,i)=><button key={i} className="timeline-marker" style={{left:m.time*pixels,color:m.color}} title={m.name} aria-label={`Go to marker: ${m.name}`} onClick={e=>{e.stopPropagation();actions().setPlayhead(m.time);}}><Flag size={12} fill="currentColor"/></button>)}
         </div></div>
