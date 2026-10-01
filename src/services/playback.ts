@@ -181,12 +181,19 @@ export function playbackLayers(state: Pick<PlaybackState, 'clips' | 'tracks' | '
 /** Seconds ahead the decoders for upcoming cuts are opened, playing and paused. */
 const WARM_HORIZON = { playing: 4, paused: 2 };
 /**
- * The upcoming cuts to open now, soonest first: the next two on every visible picture layer and, while playing,
- * on every audible sound layer. A dense edit cuts every few frames on several layers at once; a single
- * "next three" across the timeline left most layers opening their decoder at the cut itself.
- * `first` (clips in an upcoming transition) sort ahead. Efficient mode takes one per layer and three in all.
+ * Warm streams in all: each is a preload="auto" download, and each MP4 picture holds up to 32 MiB of decoded frames.
+ * A sound holds no decoded frames, so efficient mode keeps four: with one, dialogue cuts opened cold and started
+ * 0.3–0.7 s late (measured on Part 1 v2 with Performance mode on).
  */
-export function upcomingClips(state: Pick<PlaybackState, 'clips' | 'tracks' | 'media' | 'projectId' | 'timelineId' | 'playhead' | 'playing'>, open: Set<string>, efficient: boolean, first: Set<string> = new Set()): Clip[] {
+const WARM_CAP = { video: 6, audio: 4 }, EFFICIENT_WARM_CAP = { video: 2, audio: 4 };
+/**
+ * The upcoming cuts to open now, soonest first: the next two on every visible picture layer and, while playing,
+ * on every audible sound layer, up to WARM_CAP. A dense edit cuts every few frames on several layers at once; a
+ * single "next three" across the timeline left most layers opening their decoder at the cut itself.
+ * `first` (clips in an upcoming transition) sort ahead. Efficient mode, and a stall (the link is already behind),
+ * take one per layer.
+ */
+export function upcomingClips(state: Pick<PlaybackState, 'clips' | 'tracks' | 'media' | 'projectId' | 'timelineId' | 'playhead' | 'playing'>, open: Set<string>, efficient: boolean, first: Set<string> = new Set(), stalled = false): Clip[] {
   const tracks = byId(state.tracks), media = byId(state.media), horizon = state.playing ? WARM_HORIZON.playing : WARM_HORIZON.paused;
   const lanes = new Map<string, Clip[]>();
   for (const clip of timelineClips(state.clips, state.projectId, state.timelineId)) {
@@ -197,8 +204,9 @@ export function upcomingClips(state: Pick<PlaybackState, 'clips' | 'tracks' | 'm
   }
   const order = (a: Clip, b: Clip) => Number(first.has(b.id)) - Number(first.has(a.id)) || a.start - b.start;
   const video = (clip: Clip) => tracks.get(clip.trackId)!.kind === 'video';
-  const chosen = [...lanes.values()].flatMap(lane => lane.sort((a, b) => a.start - b.start).slice(0, efficient ? 1 : 2)).sort(order);
-  return efficient ? [...chosen.filter(video).slice(0, 2), ...chosen.filter(clip => !video(clip)).slice(0, 1)] : chosen;
+  const chosen = [...lanes.values()].flatMap(lane => lane.sort((a, b) => a.start - b.start).slice(0, efficient || stalled ? 1 : 2)).sort(order);
+  const cap = efficient ? EFFICIENT_WARM_CAP : WARM_CAP;
+  return [...chosen.filter(video).slice(0, cap.video), ...chosen.filter(clip => !video(clip)).slice(0, cap.audio)].sort(order);
 }
 
 export function gradePixels(pixels: Uint8ClampedArray, grade: ReturnType<typeof gradeValues>) {
@@ -307,6 +315,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     else if (now >= failure.retryAt) { cleanup(decoder); for (const [key, open] of decoders) if (open === decoder) decoders.delete(key); failure.retryAt = 0; dirty = true; }
     return true;
   };
+  // Paused, nothing else wakes the tick when a failed layer's pause runs out.
+  const retryDue = () => { const now = performance.now(); for (const failure of failures.values()) if (failure.retryAt && now >= failure.retryAt) return true; return false; };
   // One parsed document per title clip object, so a caption holding its pose repaints its cached composite.
   // A font arriving changes the pictures, so it starts a fresh cache.
   let textDocuments = new WeakMap<Clip, ReturnType<typeof getText>>(), fontsRevision: number | undefined;
@@ -337,9 +347,10 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         decoder = { url: String(url || fallback), element, image, audioOnly, pending: false, blocked: false, filters: [], lastUsed: performance.now() };
         const current = decoder;
         element.crossOrigin = 'anonymous'; element.onerror = () => {
-          const stream = byId(getState().media).get(asset.id)?.proxyVariants?.Stream;
-          if (!image && stream && stream !== current.url && requestedUrl) streamFallbacks.set(requestedUrl, stream);
-          else current.error = !image && (element as HTMLMediaElement).error?.code === 2 ? 'download failed' : 'source could not be decoded';
+          const stream = byId(getState().media).get(asset.id)?.proxyVariants?.Stream, media = image ? undefined : element as HTMLMediaElement;
+          if (media && stream && stream !== current.url && requestedUrl) streamFallbacks.set(requestedUrl, stream);
+          // Chrome reports a 404 as MEDIA_ERR_SRC_NOT_SUPPORTED, not a network error; failing before any metadata is a load failure.
+          else current.error = media?.error?.code === 2 ? 'download failed' : !media || media.readyState < 1 ? 'could not be loaded' : 'source could not be decoded';
           dirty = true;
         };
         if (image) element.onload = () => { dirty = true; };
@@ -449,7 +460,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     if(state.playing)state={...state,playhead:Math.floor(state.playhead*previewFps+1e-6)/previewFps};
     const renderStarted=performance.now();
     const dependencies = [state.timelineId, state.timelines, state.playhead, state.playing, state.clips, state.tracks, state.media, state.leaks, state.nodes, state.settings, project, options.original, options.quality, options.volume, options.compare, options.fontsRevision, state.focus?.clipId, state.focus?.time];
-    if (!dirty && !stalled && dependencies.every((value, i) => value === previous[i])) return;
+    if (!dirty && !stalled && !retryDue() && dependencies.every((value, i) => value === previous[i])) return;
     previous = dependencies; dirty = false; renderSlot = slot;
 
     const [projectWidth, projectHeight] = projectSize(project?.resolution ?? '1920 × 1080');
@@ -714,8 +725,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         if(!queuedFrame){
           decoder.waitingSince??=performance.now();
           // Only a slow link is a reason for the smaller file; a slow decode of a cached Stream file would only move
-          // playback onto a file that is not cached.
-          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow&&footageCache.preferLowStream(decoder.url)){automaticStreams.set(asset.id,asset.proxyVariants.StreamLow);dirty=true;}
+          // playback onto a file that is not cached. An uncached file keeps the plain 1.2 s fallback, the only
+          // signal there is when no rate has been measured (cache off, no service worker yet).
+          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow&&(footageCache.preferLowStream(decoder.url)||!footageCache.clipCached(clip.id))){automaticStreams.set(asset.id,asset.proxyVariants.StreamLow);dirty=true;}
           // Failed codecs switch through buffered() immediately. A network timeout remains visible.
           if(performance.now()-decoder.waitingSince>30000){decoder.framesFailed=true;frames.dispose();decoder.frames=undefined;dirty=true;}
           holdLayer();footageCache.setDecoderStatus(clip.id,decoder.url,`${asset.name} · ${frames.ahead?'Decoding requested frame':'Buffering video'}`);continue;
@@ -929,16 +941,18 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // horizon is opened (upcomingClips). Warming carries on through a stall: the cuts after a slow one are the
     // next thing to stall on.
     // A frame editor stays on one clip: warming the next cuts would only compete with it for the link.
-    const nearby=focused?[]:upcomingClips(state,activeIds,efficient,new Set(upcoming.flatMap(record=>[record.incomingId,record.outgoingId]).filter((id):id is string=>!!id)));
+    const nearby=focused?[]:upcomingClips(state,activeIds,efficient,new Set(upcoming.flatMap(record=>[record.incomingId,record.outgoingId]).filter((id):id is string=>!!id)),loading);
     const mediaById=byId(state.media),trackById=byId(state.tracks);
     for (const clip of nearby) {
       const asset = mediaById.get(clip.mediaId), track = trackById.get(clip.trackId);
       if (!asset || !track) continue;
       if(track.kind==='video'&&(clip.properties.resolveLookUrl||nodesOf(state.nodes,clip.id).some(node=>node.enabled)||Number(clip.properties.inputExposure)||Number(clip.properties.inputTemperature)||clip.properties.yuvMatrix||clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto')) {try{color??=createColorPreview(()=>{dirty=true;});color.preload(clip,asset);}catch{/* The active clip reports an invalid transform. */}}
-      const decoder = decoderFor(clip, asset, track.kind==='video' && asset.kind !== 'audio', options);
-      warmIds.add(clip.id);
+      // Under the id renderLayers plays it by: camera sound on a sound layer is `${clip.id}:audio`.
+      const visual = track.kind==='video' && asset.kind !== 'audio', id = !visual && asset.kind === 'video' ? `${clip.id}:audio` : clip.id;
+      const decoder = decoderFor(id === clip.id ? clip : { ...clip, id }, asset, visual, options);
+      warmIds.add(id);
       // A cut that fails before it is reached is reopened in the background like one on screen.
-      if (decoder && failedDecoder(clip.id, decoder)) continue;
+      if (decoder && failedDecoder(id, decoder)) continue;
       if (decoder && !decoder.image) {
         const media = decoder.element as HTMLMediaElement;
         const window = upcoming.find(record => record.incomingId === clip.id || record.outgoingId === clip.id);
@@ -947,7 +961,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         const time = sourceTime(warmClip, Math.max(state.playhead, warmClip.start), asset.fps || project?.fps || 24, asset.duration || Infinity);
         const frames=track.kind==='video'?buffered(decoder,clip,asset.fps||24,state.settings.footageCache!==false):undefined;
         if(frames){
-          if(asset.hasAudio&&!clip.properties.audioDetached&&!track.muted){
+          // Linked camera sound plays from its own sound-layer clip (playbackLayers' separateAudio), never from the picture.
+          const linked=asset.hasAudio&&timelineClips(state.clips,state.projectId,state.timelineId).some(other=>other.mediaId===clip.mediaId&&other.start===clip.start&&other.sourceIn===clip.sourceIn&&other.duration===clip.duration&&trackById.get(other.trackId)?.kind==='audio');
+          if(asset.hasAudio&&!clip.properties.audioDetached&&!track.muted&&!linked){
             const sound=decoderFor({...clip,id:`${clip.id}:audio`},asset,false,options);
             if(sound){warmIds.add(`${clip.id}:audio`);const element=sound.element as HTMLMediaElement;element.pause();element.muted=true;if(element.readyState>=1&&!element.seeking&&Math.abs(element.currentTime-time)>.05)seeks.push([element,time]);}
           }
@@ -963,6 +979,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         }
       }
     }
+    // A failed layer that left the screen keeps its failure but no due retry, so a paused viewer does not repaint every
+    // frame for it; failedDecoder schedules the next retry if it comes back.
+    for (const [id, failure] of failures) if (failure.retryAt && performance.now() >= failure.retryAt) failures.set(id, { ...failure, retryAt: 0 });
     for (const [id, decoder] of decoders) if (!activeIds.has(id)) {
       footageCache.setDecoderStatus(id, decoder.url);
       // Pausing stops playback but NOT the fetch: preload='auto' keeps filling the buffer, so a pool
@@ -981,7 +1000,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       // uplink. Never evict the next cuts we just prepared: recreating them each tick
       // discards their seek and decoded frame before the cut. Only idle spares can be evicted.
       if (decoders.size <= Math.max(efficient?2:4, activeIds.size)) break;
-      cleanup(decoder); decoders.delete(id);
+      cleanup(decoder); decoders.delete(id); failures.delete(id);
     }
     if(!loading){canvas.dataset.frameRevision=String(++frameRevision);composite.dataset.frameRevision=canvas.dataset.frameRevision;window.dispatchEvent(new CustomEvent('frameline:scope-frame',{detail:composite}));}
     if (options.compare) context.drawImage(reference, 0, 0, width / 2, height, 0, 0, width / 2, height);
@@ -1011,7 +1030,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     loadingSince = loading ? loadingSince ?? performance.now() : undefined;
     // A paused seek that lands within a moment is a scrub, not buffering: hold the last picture quietly.
     // A failed layer never blocks: it is named, with Retry, while the playhead keeps moving.
-    if (!loading || state.playing || performance.now() - loadingSince! > QUIET_SEEK_MS) status(loading ? { title: 'Loading picture…', detail: blocker?.detail ?? 'Preparing required layers', loading: true } : skippedLayers.length ? { title: skippedLayers.length === 1 ? 'Playing without 1 layer' : `Playing without ${skippedLayers.length} layers`, detail: skippedLayers.join(' · '), skipped: true } : missing ? { title: 'Original media offline', detail: 'Import the source files to play this timeline.' } : !picture && !playbackLayers(state, project?.fps || 24).some(l => l.audible) ? { title: 'No picture at playhead' } : autoplayBlocked ? { title: 'Click anywhere to hear playback', detail: 'The browser blocked sound until you interact with the page.' } : fallbackActive ? { title: 'Stream fallback', detail: 'The selected source could not play smoothly. Showing the compatible Stream preview with reduced precision; exports still use originals.', fallback: true } : automaticLow ? { title: 'Auto preview · reduced bandwidth', detail: 'Using the smaller streaming preview to keep playback moving. Originals and export quality are unchanged.' } : warning ? { title: warning } : null);
+    if (!loading || state.playing || performance.now() - loadingSince! > QUIET_SEEK_MS) status(loading ? { title: 'Loading picture…', detail: blocker?.detail ?? 'Preparing required layers', loading: true } : skippedLayers.length ? { title: `${state.playing ? 'Playing' : 'Showing'} without ${skippedLayers.length} layer${skippedLayers.length === 1 ? '' : 's'}`, detail: skippedLayers.join(' · '), skipped: true } : missing ? { title: 'Original media offline', detail: 'Import the source files to play this timeline.' } : !picture && !playbackLayers(state, project?.fps || 24).some(l => l.audible) ? { title: 'No picture at playhead' } : autoplayBlocked ? { title: 'Click anywhere to hear playback', detail: 'The browser blocked sound until you interact with the page.' } : fallbackActive ? { title: 'Stream fallback', detail: 'The selected source could not play smoothly. Showing the compatible Stream preview with reduced precision; exports still use originals.', fallback: true } : automaticLow ? { title: 'Auto preview · reduced bandwidth', detail: 'Using the smaller streaming preview to keep playback moving. Originals and export quality are unchanged.' } : warning ? { title: warning } : null);
   };
   frame = requestAnimationFrame(tick);
   return {
@@ -1021,6 +1040,12 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       scrubs.clear();
       for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); }
       decoders.clear(); failures.clear(); dirty = true;
+    },
+    /** The skipped-layer notice's Retry: reopen the failed layers now, still drawn around until they have a picture. */
+    retryLayers() {
+      for (const [id, decoder] of decoders) if (decoder.error) { cleanup(decoder); decoders.delete(id); }
+      for (const id of failures.keys()) failures.set(id, { count: 0, retryAt: 0 });
+      dirty = true;
     },
     resume() {
       if (disposed) return;
