@@ -87,5 +87,20 @@ node scripts/project-bundle.mjs export "Newspaper" ~/Desktop/newspaper-bundle
 node scripts/project-bundle.mjs import ~/Desktop/newspaper-bundle
 ```
 
-Stop the server on both ends first; the script writes the SQLite workspace row directly and a
-running server will overwrite the import on its next save.
+Stop the server on both ends first. The import refuses to run while a server holds `data/`
+(`data/frameline.lock`); the next server start picks the imported workspace row up.
+
+## Workspace storage and restarts
+
+Since 2026-09-30 the workspace lives one row per entity in `workspace_items` (`server/workspaceStore.ts`),
+so a save writes only what changed. The old single JSON row `workspace.state` is still kept as a
+copy for older builds and tools; scripts read through `scripts/workspace-db.mjs`, never that row.
+Only one server may open a data folder: a second `npm start` beside the live one exits on purpose.
+
+- Restart the live server with no UAC prompt: `schtasks /run /tn "SharedCut Restart"` (log in
+  `logs\restart.log`). `.\scripts\windows-host.ps1 setup` re-creates that task (one prompt).
+- Rolling back to a build older than the item tables (61b8d6b or earlier): stop the server, run
+  `node scripts/sync-legacy-row.mjs`, then start the old build. Restarts are hard kills, so skipping
+  this can start the old build from a copy missing the last edits.
+- `node scripts/remote-playback-check.mjs` plays a timeline on sharedcut.com as a signed-in user and
+  reports pictures/s, freezes and loading time; run it before and after any playback change.
