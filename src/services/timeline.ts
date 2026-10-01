@@ -1,4 +1,5 @@
 import { trimAnimation } from './animation.ts';
+import { snapTime } from './snapping.ts';
 import type { Clip, Track } from '../state/models.ts';
 
 // Preserve source timing on both sides of an overwrite, including retimed media.
@@ -70,4 +71,11 @@ export function filmstripTiles(clip: Pick<Clip, 'duration' | 'sourceIn' | 'prope
     const time = clip.sourceIn + (clip.properties.freeze ? 0 : (clip.properties.reverse ? clip.duration - into : into) * speed);
     return { tile, frame: Math.min(last, Math.max(0, Math.round(time / source.duration * last))) };
   });
+}
+
+/** Where a Select Forward click on empty lane space lands: exactly on a nearby edit point when snapping found one (a stored cut
+ *  may sit off the frame grid, and the half-frame slack in forwardSelection absorbs that), else on the nearest frame. */
+export function forwardClickTime(time: number, boundaries: number[] | null, tolerance: number, fps: number) {
+  const hit = boundaries && snapTime([time], boundaries, tolerance);
+  return Math.max(0, hit ? hit.at : Math.round(time * fps) / fps);
 }

@@ -953,14 +953,19 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           expired(); send(res, 200, { presence: visiblePresence().filter(person => person.projectId === project.id), serverTime: Date.now() }); return;
         }
         if (path === '/api/locks' && ['POST', 'DELETE'].includes(method)) {
-          const body = await jsonBody(req); const project = requireProject(textField(body.projectId, 160, true), userId, true); const targetId = textField(body.targetId, 160, true); const field = textField(body.field, 100, true);
-          if (!idIsValid(targetId) || !lockable(targetId, project.id)) fail(404, 'Lock target not found.');
-          expired(); const key = `${project.id}:${targetId}:${field}`;
-          if (method === 'DELETE') { if (locks.get(key)?.userId === userId) { locks.delete(key); lockChanged(); } send(res, 200, { ok: true }); return; }
-          const conflict = [...locks.values()].find(lock => lock.projectId === project.id && lock.targetId === targetId && lock.userId !== userId && lockConflict(lock.field, field));
+          // One id (targetId) or a batch (targetIds, up to 2000: a multi-clip drag takes and renews them in one request). A batch is all or nothing.
+          const body = await jsonBody(req); const project = requireProject(textField(body.projectId, 160, true), userId, true); const field = textField(body.field, 100, true);
+          const many = body.targetIds !== undefined;
+          if (many && (!Array.isArray(body.targetIds) || !body.targetIds.length || body.targetIds.length > 2000)) fail(400, 'Lock between 1 and 2000 items at a time.');
+          const targetIds = [...new Set<string>(many ? (body.targetIds as unknown[]).map(id => textField(id, 160, true)) : [textField(body.targetId, 160, true)])];
+          if (!targetIds.every(id => idIsValid(id) && lockable(id, project.id))) fail(404, 'Lock target not found.');
+          expired(); const keyOf = (id: string) => `${project.id}:${id}:${field}`;
+          if (method === 'DELETE') { let changed = false; for (const id of targetIds) if (locks.get(keyOf(id))?.userId === userId) { locks.delete(keyOf(id)); changed = true; } if (changed) lockChanged(); send(res, 200, { ok: true }); return; }
+          const wanted = new Set(targetIds);
+          const conflict = [...locks.values()].find(lock => lock.projectId === project.id && wanted.has(lock.targetId) && lock.userId !== userId && lockConflict(lock.field, field));
           if (conflict) { send(res, 409, { error: 'This control is being edited by a collaborator.', lock: conflict }); return; }
-          const lock = { id: key, projectId: project.id, targetId, field, userId, expiresAt: Date.now() + LOCK_TTL }; const held = locks.get(key);
-          locks.set(key, lock); if (held?.userId !== userId) lockChanged(); send(res, 200, { lock }); return;
+          let changed = false; const taken = targetIds.map(targetId => { const key = keyOf(targetId), held = locks.get(key), lock = { id: key, projectId: project.id, targetId, field, userId, expiresAt: Date.now() + LOCK_TTL }; locks.set(key, lock); if (held?.userId !== userId) changed = true; return lock; });
+          if (changed) lockChanged(); send(res, 200, many ? { locks: taken } : { lock: taken[0] }); return;
         }
         if(path === '/api/resolve/bridge' && method === 'GET'){streamFile(req,res,fileURLToPath(new URL('../scripts/resolve-export.lua',import.meta.url)),'text/plain','resolve-export.lua');return;}
         if (path === '/api/resolve/import' && method === 'POST') {

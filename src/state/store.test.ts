@@ -6,6 +6,7 @@ import { defaultShape, getShape } from '../services/shapes.ts';
 import { evaluateClip } from '../services/animation.ts';
 import type { Keyframe } from './models.ts';
 import { neutralBalance, neutralLook, type LookOption } from '../services/colorAssistant.ts';
+import { forwardRoom } from '../services/selection.ts';
 import { LOCK_TTL, mediaService, projectService, renderService, STORAGE_KEY } from '../services/index.ts';
 
 const baseline = store.getState();
@@ -89,6 +90,91 @@ test('renewing locks extends only live ownership and never revives a stale lease
   assert.equal(state().acquireLock('c3', 'speed'), false);
   assert.ok(state().locks.some(lock => lock.id === 'new-owner'));
   assert.equal(state().operations.length, 0);
+});
+
+test('acquireLocks takes many clips in one update, renews them in place, and takes none when one is held by someone else', () => {
+  const ids = state().clips.filter(c => c.projectId === state().projectId).slice(0, 6).map(c => c.id);
+  let updates = 0; const stop = store.subscribe(() => { updates++; });
+  try {
+    assert.equal(state().acquireLocks(ids, 'manipulation'), true);
+    assert.equal(updates, 1, 'One store update for the whole drag, not one per clip.');
+    assert.deepEqual(state().locks.map(l => l.targetId).sort(), [...ids].sort());
+    assert.ok(state().locks.every(l => l.field === 'manipulation' && l.userId === state().currentUserId && l.projectId === state().projectId));
+    const first = state().locks, original = new Map(first.map(l => [l.targetId, l.id]));
+    store.setState({ locks: first.map(l => ({ ...l, expiresAt: Date.now() + 500 })) });
+    assert.equal(state().acquireLocks(ids, 'manipulation'), true, 'The 2 s renewal is the same call.');
+    assert.equal(state().locks.length, ids.length, 'Renewing replaces the leases instead of stacking them.');
+    assert.ok(state().locks.every(l => l.id === original.get(l.targetId) && l.expiresAt >= Date.now() + LOCK_TTL - 50), 'Same lock ids, fresh expiry.');
+    assert.equal(state().acquireLocks([], 'manipulation'), true, 'Nothing to lock is not a refusal.');
+
+    // One clip of the batch is being moved by a collaborator: nothing is taken and the user is told.
+    store.setState({ locks: [{ id: 'remote', userId: 'ashley', projectId: state().projectId, targetId: ids[3], field: 'x', expiresAt: Date.now() + LOCK_TTL }] });
+    assert.equal(state().acquireLocks(ids, 'manipulation'), true, 'A collaborator’s unrelated field does not conflict.');
+    store.setState({ locks: [{ id: 'remote', userId: 'ashley', projectId: state().projectId, targetId: ids[3], field: 'manipulation', expiresAt: Date.now() + LOCK_TTL }], notifications: [] });
+    assert.equal(state().acquireLocks(ids, 'start'), false, 'Movement fields conflict with each other.');
+    assert.deepEqual(state().locks.map(l => l.id), ['remote'], 'None of the other five were taken.');
+    assert.match(state().notifications.at(-1)!.title, /is editing this control/);
+  } finally { stop(); }
+});
+
+test('releaseLocks drops only the caller’s locks for those clips and field', () => {
+  const ids = state().clips.filter(c => c.projectId === state().projectId).slice(0, 4).map(c => c.id), project = state().projectId;
+  const remote = { id: 'remote', userId: 'ashley', projectId: project, targetId: ids[0], field: 'x', expiresAt: Date.now() + LOCK_TTL };
+  state().acquireLocks(ids.slice(0, 3), 'manipulation'); state().acquireLocks([ids[3]], 'speed');
+  store.setState({ locks: [...state().locks, remote] });
+  let updates = 0; const stop = store.subscribe(() => { updates++; });
+  try {
+    state().releaseLocks(ids, 'manipulation');
+    assert.equal(updates, 1);
+    assert.deepEqual(state().locks.map(l => `${l.targetId}:${l.field}`).sort(), [`${ids[3]}:speed`, `${ids[0]}:x`].sort(), 'Another field and a collaborator’s lock stay.');
+    state().releaseLocks(ids, 'manipulation');
+    assert.equal(updates, 1, 'Releasing what is not held changes nothing.');
+  } finally { stop(); }
+});
+
+test('with a server, locks go out as one targetIds request, and a refusal rolls them back and says so', async () => {
+  const { connection } = await import('../services/api.ts');
+  const originalFetch = globalThis.fetch, was = connection.enabled, refresh = connection.refresh;
+  const calls: { method: string; body: { projectId: string; targetIds: string[]; field: string } }[] = [];
+  let answer = 200, refreshed = 0;
+  globalThis.fetch = (async (url: string, options: RequestInit = {}) => {
+    assert.equal(url, '/api/locks');
+    calls.push({ method: String(options.method), body: JSON.parse(String(options.body)) });
+    return new Response(JSON.stringify(answer === 200 ? { locks: [] } : { error: 'This control is being edited by a collaborator.' }), { status: answer, headers: { 'Content-Type': 'application/json' } });
+  }) as typeof fetch;
+  connection.enabled = true; connection.refresh = async () => { refreshed++; };
+  const settle = () => new Promise(resolve => setTimeout(resolve, 10));
+  const ids = state().clips.filter(c => c.projectId === state().projectId).slice(0, 5).map(c => c.id);
+  try {
+    assert.equal(state().acquireLocks(ids, 'manipulation'), true);
+    await settle();
+    assert.equal(calls.length, 1, 'Five clips, one request.');
+    assert.deepEqual(calls[0], { method: 'POST', body: { projectId: state().projectId, targetIds: ids, field: 'manipulation' } });
+    state().acquireLocks(ids, 'manipulation'); await settle();
+    assert.equal(calls.length, 2, 'The renewal is one request too.');
+
+    state().releaseLocks([ids[0], ids[1], 'not-held'], 'manipulation'); await settle();
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls[2], { method: 'DELETE', body: { projectId: state().projectId, targetIds: [ids[0], ids[1]], field: 'manipulation' } }, 'Only what is held is sent.');
+    state().releaseLocks(['not-held'], 'manipulation'); await settle();
+    assert.equal(calls.length, 3, 'Nothing held, no request.');
+    state().releaseLocks(ids, 'manipulation'); await settle();
+
+    // The server refuses (a collaborator grabbed one first): the optimistic locks are rolled back, the user is told, state is refreshed.
+    answer = 409; calls.length = 0;
+    assert.equal(state().acquireLocks(ids, 'manipulation'), true, 'Optimistic until the server answers.');
+    await settle();
+    assert.deepEqual(calls.map(c => c.method), ['POST', 'DELETE']);
+    assert.equal(state().locks.length, 0);
+    assert.equal(state().notifications.at(-1)!.title, 'This control is being edited by a collaborator.');
+    assert.equal(refreshed, 1);
+
+    // Past the server's 2000-id limit a drag goes out in slices instead of failing.
+    answer = 200; calls.length = 0;
+    const many = Array.from({ length: 2500 }, (_, i) => `clip-${i}`);
+    state().acquireLocks(many, 'manipulation'); await settle();
+    assert.deepEqual(calls.map(c => [c.method, c.body.targetIds.length]), [['POST', 2000], ['POST', 500]]);
+  } finally { globalThis.fetch = originalFetch; connection.enabled = was; connection.refresh = refresh; }
 });
 
 test('In/Out range is finite, ordered, bounded, remembered per timeline, and defaults to the edit length', () => {
@@ -986,4 +1072,283 @@ test('a buffering stall holds the exact clock: playback resumes where it stopped
     const straight = play(false), stalled = play(true);
     assert.ok(Math.abs(stalled - straight) < 1e-6, `${stalled} after a stall, ${straight} without`);
   } finally { connection.enabled = was; state().setPlaying(false); store.setState({ playbackBuffering: false }); }
+});
+
+// A timeline built for the Select Forward tests: long enough that moveClip's non-server clamp never bites.
+const proto = baseline.clips.find(c => c.id === 'c7')!;
+const piece = (id: string, trackId: string, start: number, duration: number, extra: Partial<ReturnType<typeof clip>> = {}) => ({ ...structuredClone(proto), id, trackId, start, duration, sourceIn: 0, ...extra });
+const scene = (clips: ReturnType<typeof clip>[], extra: object = {}) => store.setState({ clips, nodes: [], comments: [], operations: [], timelines: state().timelines.map(t => ({ ...t, duration: 2000 })), selectedClipId: null, selectedClipIds: [], settings: { ...state().settings, linkSelection: true }, ...extra });
+
+test('a move that lands on a neighbour\u2019s end through float arithmetic never trims, splits or deletes it', () => {
+  const frame = 1 / 29.97;
+  let seed = 7;
+  const next = () => (seed = (seed * 48271) % 2147483647) / 2147483647;
+  // Near the start of the timeline the subtraction in a move's delta is inexact, so the clip lands a hair inside the neighbour.
+  const cases: [number, number][] = [[7.166666, 2.5], [105.07 - 3.1, 3.1], [4 * frame, 20 * frame], [0.1 + 0.2, 1.7]];
+  while (cases.length < 300) cases.push([Math.round(next() * 400) * frame, Math.round(1 + next() * 60) * frame]);
+  for (const [s, d] of cases) {
+    const neighbour = piece('neighbour', 'v2', s, d), mover = piece('mover', 'v2', s + d + 5 + next() * 200, 3.3), buddy = piece('buddy', 'v1', s + d + 5 + next() * 200, 2.7);
+    scene([neighbour, mover, buddy]);
+    state().selectClips([buddy.id, mover.id]);
+    state().moveClip(mover.id, s + d);
+    assert.deepEqual(clip('neighbour'), neighbour, `neighbour untouched at ${s} + ${d}`);
+    assert.equal(state().clips.length, 3);
+  }
+});
+
+test('moving a group without changing the primary\u2019s track keeps every clip on its own track, even when two tracks share a kind and number', () => {
+  const twin = { ...state().tracks.find(t => t.id === 'v1')!, id: 'v1-twin', name: 'Twin' };
+  scene([piece('p', 'v1', 10, 5), piece('q', 'v1-twin', 10, 5), piece('r', 'a1', 10, 5)], { tracks: [twin, ...state().tracks] });
+  state().selectClips(['q', 'r', 'p']);
+  state().moveClip('p', 12);
+  assert.deepEqual(['p', 'q', 'r'].map(id => [clip(id).trackId, clip(id).start]), [['v1', 12], ['v1-twin', 12], ['a1', 12]]);
+  state().moveClip('p', 20, 'v2');
+  assert.deepEqual(['p', 'r'].map(id => clip(id).trackId), ['v2', 'a1'], 'a cross-track move still maps by kind and number');
+  assert.equal(clip('p').start, 20);
+});
+
+// Select Forward. The line is at 20 s (the anchor clip C). E and I run across it; H is on a locked track; R is on another timeline.
+const forwardClips = () => [
+  piece('A', 'v1', 0, 10), piece('B', 'v1', 10, 10), piece('C', 'v1', 20, 10), piece('D', 'v1', 32, 8),
+  piece('E', 'v2', 5, 20), piece('F', 'v2', 25, 10), piece('G', 'a1', 22, 8), piece('H', 'a3', 40, 10), piece('I', 'a2', 0, 60),
+  piece('R', 'v1-review', 100, 10, { timelineId: 'review-timeline' }),
+];
+const forwardScene = (clips = forwardClips(), extra: object = {}) => scene(clips, { tracks: state().tracks.map(t => t.id === 'a3' ? { ...t, locked: true } : t), ...extra });
+const picked = () => [...state().selectedClipIds].sort();
+
+test('Select Forward from a clip takes it and every later clip on unlocked tracks of this timeline, and re-anchors on each click', () => {
+  forwardScene();
+  state().selectForward({ clipId: 'C' });
+  assert.deepEqual(picked(), ['C', 'D', 'F', 'G'], 'E and I cross the line, H is locked, R is on another timeline, A and B are before it');
+  assert.equal(state().selectedClipId, 'C', 'the clicked clip is the primary');
+  state().selectForward({ clipId: 'F' });
+  assert.deepEqual(picked(), ['D', 'F']);
+  assert.equal(state().selectedClipId, 'F');
+  state().selectForward({ clipId: 'R' });
+  state().selectForward({ clipId: 'nope' });
+  assert.deepEqual(picked(), ['D', 'F'], 'a clip of another timeline or an unknown clip changes nothing');
+  assert.equal(state().operations.length, 0, 'selecting is not an edit');
+});
+
+test('Select Forward from a point in time absorbs float drift, ignores bad times, and clears the selection when nothing is ahead', () => {
+  forwardScene();
+  state().selectForward({ time: 21 });
+  assert.deepEqual(picked(), ['D', 'F', 'G']);
+  assert.equal(state().selectedClipId, state().selectedClipIds.at(-1));
+  state().selectForward({ time: 19.99 });
+  assert.deepEqual(picked(), ['C', 'D', 'F', 'G'], 'a clip starting a hair after the pointer still counts');
+  state().selectForward({ time: Number.NaN });
+  state().selectForward({ time: Infinity });
+  assert.deepEqual(picked(), ['C', 'D', 'F', 'G'], 'a time that is not finite changes nothing');
+  state().selectForward({ time: -5 });
+  assert.deepEqual(picked(), ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'I'], 'before zero means from zero; locked and other-timeline clips never join');
+  state().selectForward({ time: 999 });
+  assert.deepEqual(state().selectedClipIds, []);
+  assert.equal(state().selectedClipId, null);
+});
+
+test('a forward selection moves as one group, time only, leaves crossing clips alone, and one undo restores it', () => {
+  forwardScene();
+  state().selectForward({ clipId: 'C' });
+  const before = structuredClone(state().clips), moving = new Set(['C', 'D', 'F', 'G']);
+  state().moveClip('C', 22);
+  for (const was of before) {
+    const now = clip(was.id);
+    assert.deepEqual(now, moving.has(was.id) ? { ...was, start: was.start + 2 } : was, `${was.id}: ${moving.has(was.id) ? 'moved by +2 on its own track' : 'untouched'}`);
+  }
+  assert.equal(state().operations.length, 1);
+  state().undo();
+  assert.deepEqual(state().clips, before);
+});
+
+test('dragging a forward selection left by exactly the room it has closes the gap without touching what stays behind', () => {
+  const f = 1 / 29.97;
+  forwardScene([
+    piece('A', 'v1', 0, 301 * f), piece('C', 'v1', 457 * f, 300 * f), piece('D', 'v1', 900 * f, 200 * f),
+    piece('E', 'v2', 0, 12.07), piece('F', 'v2', 20.1 + 0.2, 10.3), piece('G', 'a1', 16.7, 4.1),
+  ]);
+  state().selectForward({ clipId: 'C' });
+  const before = structuredClone(state().clips), staying = before.filter(c => !state().selectedClipIds.includes(c.id)), room = forwardRoom(state().clips, state().selectedClipIds);
+  assert.ok(room > 0);
+  state().moveClip('C', clip('C').start - room);
+  assert.equal(state().clips.length, before.length);
+  assert.ok(Math.abs(clip('C').start - (clip('A').start + clip('A').duration)) < 1e-9, 'C now butts against A');
+  for (const c of staying) assert.deepEqual(clip(c.id), c, `${c.id} was neither trimmed, split nor deleted`);
+  for (const c of before.filter(c => !staying.includes(c))) assert.ok(Math.abs(clip(c.id).start - (c.start - room)) < 1e-9);
+});
+
+// Crossing clips for the cut tests: each one runs 10 to 30 s and the line is at 20.
+const crossers = () => [
+  piece('speed', 'v2', 10, 20, { sourceIn: 4, properties: { ...proto.properties, speed: 200 } }),
+  piece('reverse', 'v3', 10, 20, { sourceIn: 50, properties: { ...proto.properties, reverse: true } }),
+  piece('freeze', 'a1', 10, 20, { sourceIn: 7, properties: { ...proto.properties, freeze: true } }),
+  piece('keys', 'a2', 10, 20, { keyframes: { 'properties.opacity': [{ id: 'k1', time: 12, value: 100, interpolation: 'linear' }, { id: 'k2', time: 15, value: 50, interpolation: 'linear' }] } }),
+  piece('graded', 'v1', 10, 20, { sourceIn: 3 }),
+];
+const gradeNodes = () => ['Primary', 'Output Trim'].map((name, i) => ({ id: `n${i}`, projectId: 'city-after-dark', clipId: 'graded', name, kind: 'primary', enabled: true, parameters: { exposure: .2 * i } }));
+const halves = (id: string) => ({ left: clip(id), right: state().clips.find(c => c.id !== id && c.trackId === clip(id).trackId && c.start >= 20 && c.name === clip(id).name)! });
+
+test('cutThrough splits every crossing clip at the line with the same source maths as the playhead split, in one undo step', () => {
+  forwardScene(crossers(), { nodes: gradeNodes() });
+  const before = structuredClone({ clips: state().clips, nodes: state().nodes });
+  assert.equal(state().cutThrough(20), 5);
+  assert.equal(state().clips.length, 10);
+  assert.equal(state().operations.length, 1);
+  assert.equal(state().operations[0].type, 'ClipTrimmed');
+  assert.match(state().operations[0].description, /^cut 5 clips at 0:20$/);
+  for (const id of ['speed', 'reverse', 'freeze', 'keys', 'graded']) { const { left, right } = halves(id); assert.deepEqual([left.start, left.duration, right.start, right.duration], [10, 10, 20, 10], id); }
+  assert.equal(halves('speed').right.sourceIn, 4 + 10 * 2, 'speed 200 consumes twice the source');
+  assert.deepEqual([halves('reverse').left.sourceIn, halves('reverse').right.sourceIn], [60, 50], 'reverse plays the later source first');
+  assert.deepEqual([halves('freeze').left.sourceIn, halves('freeze').right.sourceIn], [7, 7], 'a freeze never advances');
+  assert.deepEqual(halves('keys').left.keyframes!['properties.opacity'].map(k => k.time), [12, 15]);
+  assert.deepEqual(halves('keys').right.keyframes!['properties.opacity'].map(k => k.time), [2, 5], 'keyframes follow the right half');
+  const copies = state().nodes.filter(n => n.clipId === halves('graded').right.id);
+  assert.deepEqual(copies.map(n => [n.name, n.parameters.exposure]), [['Primary', 0], ['Output Trim', .2]]);
+  assert.ok(copies.every(n => !['n0', 'n1'].includes(n.id)), 'the right half gets its own nodes');
+  state().undo();
+  assert.deepEqual(state().clips, before.clips);
+  assert.deepEqual(state().nodes, before.nodes);
+});
+
+test('cutThrough then a forward move, then two undos, restores the edit exactly; the right halves ride with the selection', () => {
+  forwardScene([piece('P', 'v1', 0, 10), piece('Q', 'v1', 20, 10), piece('X', 'v2', 10, 20), piece('Z', 'a1', 25, 15)]);
+  const before = structuredClone(state().clips);
+  state().selectForward({ clipId: 'Q' });
+  assert.equal(state().cutThrough(20), 1);
+  const right = state().clips.find(c => c.id !== 'X' && c.trackId === 'v2')!;
+  assert.deepEqual(picked(), ['Q', 'Z', right.id].sort(), 'the right half joins; the left half stays out');
+  assert.equal(state().selectedClipId, 'Q', 'the primary stays the primary');
+  state().moveClip('Q', 23);
+  assert.deepEqual([clip('Q').start, clip('Z').start, clip(right.id).start, clip('X').start, clip('X').duration], [23, 28, 23, 10, 10]);
+  state().undo(); state().undo();
+  assert.deepEqual(state().clips, before);
+});
+
+test('cutThrough keeps linked clips linked on both sides of the line', () => {
+  const linked = (id: string, trackId: string, start: number, duration: number, group = 'L') => piece(id, trackId, start, duration, { properties: { ...proto.properties, linkGroup: group } });
+  const make = () => forwardScene([linked('V', 'v1', 10, 20), linked('A', 'a1', 10, 20), linked('W', 'a2', 25, 10), linked('U', 'v2', 0, 8)]);
+  make();
+  const before = structuredClone(state().clips);
+  state().selectForward({ time: 20 });
+  assert.equal(state().cutThrough(20), 2);
+  const [vr, ar] = ['V', 'A'].map(id => state().clips.find(c => c.id !== id && c.start === 20 && c.trackId === clip(id).trackId)!);
+  const fresh = vr.properties.linkGroup;
+  assert.ok(fresh && fresh !== 'L');
+  assert.equal(ar.properties.linkGroup, fresh, 'the right halves share one new group');
+  assert.equal(clip('W').properties.linkGroup, fresh, 'a peer that moves with them joins it');
+  assert.deepEqual(['V', 'A', 'U'].map(id => clip(id).properties.linkGroup), ['L', 'L', 'L'], 'the left halves and the peer before the line keep the old group');
+  state().moveClip(vr.id, 22);
+  assert.deepEqual([vr.id, ar.id, 'W'].map(id => clip(id).start), [22, 22, 27], 'moving one right half moves its linked partner');
+  assert.deepEqual([clip('V').start, clip('A').start, clip('U').start], [10, 10, 0]);
+  state().undo(); state().undo();
+  assert.deepEqual(state().clips, before);
+  make();
+  store.setState({ settings: { ...state().settings, linkSelection: false } });
+  state().cutThrough(20);
+  assert.equal(state().clips.filter(c => c.id !== 'V' && c.start === 20 && c.properties.linkGroup).length, 0, 'with linked selection off the right halves are free');
+  assert.equal(clip('W').properties.linkGroup, 'L');
+});
+
+test('a cut clip whose only partner stays behind gives its right half no one-clip link group', () => {
+  const linked = (id: string, trackId: string, start: number, duration: number) => piece(id, trackId, start, duration, { properties: { ...proto.properties, linkGroup: 'L' } });
+  forwardScene([linked('V', 'v1', 10, 20), linked('A', 'a1', 0, 8)]);
+  assert.equal(state().cutThrough(20), 1);
+  assert.equal(state().clips.find(c => c.id !== 'V' && c.trackId === 'v1')!.properties.linkGroup, undefined);
+  assert.equal(clip('V').properties.linkGroup, 'L');
+});
+
+test('with linked selection Select Forward and cutThrough leave alone a clip whose link partner is on a locked track', () => {
+  const linked = (id: string, trackId: string, start: number, duration: number, group: string) => piece(id, trackId, start, duration, { properties: { ...proto.properties, linkGroup: group } });
+  const make = () => forwardScene([linked('P', 'v1', 25, 5, 'L'), linked('Q', 'a3', 25, 5, 'L'), linked('X', 'v1', 10, 30, 'M'), linked('Y', 'a3', 10, 30, 'M'), piece('Z', 'v2', 26, 2)]);
+  make();
+  state().selectForward({ time: 20 });
+  assert.deepEqual(picked(), ['Z'], 'P is held by Q on the locked a3, so a drag of the selection can move');
+  const before = structuredClone(state().clips);
+  assert.equal(state().cutThrough(20), 0, 'X is held by Y the same way');
+  assert.deepEqual(state().clips, before);
+  make();
+  store.setState({ settings: { ...state().settings, linkSelection: false } });
+  state().selectForward({ time: 20 });
+  assert.deepEqual(picked(), ['P', 'Z'], 'with linked selection off a partner is not the clip\u2019s business');
+  assert.equal(state().cutThrough(20), 1);
+});
+
+test('cutThrough works on caption tracks, ignores a caption that ends a hair past the line, and leaves locked tracks and composition contents alone', () => {
+  const caps = { ...state().tracks.find(t => t.id === 'v3')!, id: 'caps', name: 'Captions', number: 7, captionSets: [] };
+  const caption = (i: number, start: number, duration: number) => piece(`cap${i}`, 'caps', start, duration, { properties: { ...proto.properties, captionSet: 's1' } });
+  const nested = { id: 'inner', projectId: 'city-after-dark', name: 'Inner', duration: 20, composition: true };
+  const innerTrack = { ...state().tracks.find(t => t.id === 'v1')!, id: 'inner-v1', timelineId: 'inner' };
+  const innerClip = piece('inner-clip', 'inner-v1', 0, 20, { timelineId: 'inner' });
+  const compClip = piece('comp', 'v2', 10, 20, { mediaId: 'frameline-composition', name: 'Nested', sourceIn: 2, properties: { ...proto.properties, compositionId: 'inner' } });
+  const lockedCross = piece('locked-cross', 'a3', 10, 20);
+  forwardScene([...Array.from({ length: 60 }, (_, i) => caption(i, i, 1)), compClip, lockedCross, innerClip], { tracks: [...state().tracks.map(t => t.id === 'a3' ? { ...t, locked: true } : t), caps, innerTrack], timelines: [...state().timelines.map(t => ({ ...t, duration: 2000 })), nested] });
+  const before = structuredClone(state().clips);
+  assert.equal(state().cutThrough(105.07), 0, 'nothing runs across 105.07');
+  assert.equal(state().cutThrough(30.5), 1, 'caption 30 crosses 30.5');
+  state().undo();
+  assert.equal(state().cutThrough(20), 1, 'the nested clip crosses, the locked-track one does not');
+  assert.deepEqual(clip('locked-cross'), before.find(c => c.id === 'locked-cross'));
+  assert.deepEqual(clip('inner-clip'), before.find(c => c.id === 'inner-clip'));
+  const right = state().clips.find(c => c.id !== 'comp' && c.mediaId === 'frameline-composition')!;
+  assert.deepEqual([right.properties.compositionId, right.start, right.duration, right.sourceIn], ['inner', 20, 10, 12]);
+  assert.equal(state().timelines.filter(t => t.composition).length, 1);
+  state().undo();
+  assert.deepEqual(state().clips, before);
+  state().cutThrough(30.5);
+  const cap = state().clips.find(c => c.id !== 'cap30' && c.start === 30.5)!;
+  assert.deepEqual([cap.trackId, cap.duration, cap.properties.captionSet], ['caps', .5, 's1']);
+  state().selectForward({ time: 30.5 });
+  assert.equal(state().selectedClipIds.length, 30, 'the right half and the 29 captions after it');
+  state().moveClip(state().selectedClipId!, state().selectedClipId === 'cap59' ? 61 : 40);
+  assert.ok(state().selectedClipIds.every(id => clip(id).trackId === 'caps'), 'captions stay on the captions track');
+});
+
+test('a drifting caption end does not count as crossing and a crossing clip within a frame of the line is left whole with a notice', () => {
+  forwardScene([piece('drift', 'v2', 100, 5.0700001), piece('sliver', 'v3', 10, 10.03), piece('real', 'a1', 10, 20)]);
+  assert.equal(state().cutThrough(105.07), 0);
+  assert.equal(state().operations.length, 0);
+  const before = structuredClone(state().clips);
+  assert.equal(state().cutThrough(20), 1, 'only the clip with a real half on each side is cut');
+  assert.deepEqual(clip('sliver'), before.find(c => c.id === 'sliver'));
+  assert.match(state().notifications.at(-1)!.title, /1 clip within a frame of the line left whole/);
+  state().undo();
+  forwardScene([piece('sliver', 'v3', 10, 10.03)]);
+  assert.equal(state().cutThrough(20), 0);
+  assert.equal(state().operations.length, 0);
+});
+
+test('cutThrough refuses the whole cut for a commenter, a locked clip or node held by a collaborator, and bad times', () => {
+  forwardScene(crossers(), { nodes: gradeNodes() });
+  const before = structuredClone({ clips: state().clips, nodes: state().nodes, comments: state().comments });
+  const refused = () => { assert.deepEqual({ clips: state().clips, nodes: state().nodes, comments: state().comments }, before); assert.equal(state().operations.length, 0); };
+  assert.equal(state().cutThrough(Number.NaN), 0); refused();
+  state().setCurrentUser('maya');
+  assert.equal(state().cutThrough(20), 0); refused();
+  state().setCurrentUser('kyle');
+  store.setState({ locks: [{ id: 'remote', userId: 'ashley', projectId: 'city-after-dark', targetId: 'reverse', field: 'manipulation', expiresAt: Date.now() + LOCK_TTL }] });
+  assert.equal(state().cutThrough(20), 0, 'one clip held by a collaborator stops the cut of all five'); refused();
+  store.setState({ locks: [{ id: 'remote-node', userId: 'ashley', projectId: 'city-after-dark', targetId: 'n1', field: 'exposure', expiresAt: Date.now() + LOCK_TTL }] });
+  assert.equal(state().cutThrough(20), 0, 'so does a grade node of a cut clip'); refused();
+  store.setState({ locks: [] });
+  assert.equal(state().cutThrough(20), 5);
+});
+
+test('splitting and cutting move the comments from the cut on to the right half, and undo puts them back', () => {
+  const split = state().comments.find(m => m.id === 'comment-1')!;
+  state().addComment('early', { clipId: 'c3' });
+  const early = state().comments.at(-1)!;
+  store.setState({ comments: state().comments.map(m => m.id === early.id ? { ...m, time: 35 } : m) });
+  const before = structuredClone(state().comments);
+  state().setPlayhead(split.time);
+  state().splitClip('c3');
+  const right = state().selectedClipId!;
+  assert.equal(state().comments.find(m => m.id === split.id)!.clipId, right, 'the comment at the cut goes with the right half');
+  assert.equal(state().comments.find(m => m.id === early.id)!.clipId, 'c3', 'the one before it stays');
+  state().undo();
+  assert.deepEqual(state().comments, before);
+  state().cutThrough(split.time);
+  assert.equal(state().comments.find(m => m.id === split.id)!.clipId, state().clips.find(c => c.id !== 'c3' && c.trackId === 'v2' && c.start === split.time)!.id);
+  assert.equal(state().comments.find(m => m.id === early.id)!.clipId, 'c3');
+  state().undo();
+  assert.deepEqual(state().comments, before);
 });

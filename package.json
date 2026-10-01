@@ -7,7 +7,7 @@
     "dev": "node scripts/dev.mjs",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "test": "node --experimental-strip-types --test --test-concurrency=8 src/state/store.test.ts src/services/*.test.ts server/*.test.ts",
+    "test": "node --experimental-strip-types --test --test-concurrency=8 src/state/store.test.ts src/state/forwardSelect.test.ts src/services/*.test.ts server/*.test.ts",
     "dev:ui": "vite --host 0.0.0.0",
     "start": "node --env-file-if-exists=.env --experimental-strip-types server/index.ts",
     "test:state": "node --experimental-strip-types --test src/state/store.test.ts",

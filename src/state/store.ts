@@ -21,6 +21,7 @@ import { companionAudioTrack, trackGap, trimRoom, uncoveredParts } from '../serv
 import { getText, isTitle, remapTextRuns, presetDocument, styleText, validateText, type TextDocument, type TextStyle, type TextRange } from '../services/text.ts';
 import { api, connection } from '../services/api.ts';
 import { enqueueUploads } from '../services/upload.ts';
+import { forwardSelection } from '../services/selection.ts';
 
 type Collection = 'clips' | 'tracks' | 'nodes' | 'comments' | 'timelines';
 type Change = { collection: Collection; id: string; value: Record<string, unknown> | null; replace?: boolean; unset?: string[] };
@@ -53,6 +54,10 @@ export interface EditorStore extends PersistedState {
   editShapePoint(id:string,index:number,action:'delete'|'corner'):void;
   selectClips(ids:string[]):void; createComposition(name?:string):void; openComposition(id:string):void; leaveComposition(index?:number):void;
   setAnimationChannels(id:string,channels:NonNullable<Clip['keyframes']>,gesture?:string):void;
+  /** Select Forward: the clip (or the point in time) and everything after it on unlocked tracks of this timeline; the clicked clip is the primary. */
+  selectForward(from:{clipId:string}|{time:number}):void;
+  /** Split every clip that runs across `time` on an unlocked track, as one undo step; the right halves join the selection. Returns how many were cut. */
+  cutThrough(time:number):number;
   textTool: boolean; selectedTextIds: string[]; textSelection: TextRange | null; textPreview: Clip[];
   installCaptions(job:CaptionJob,wordsPerLine:number,preset:string,replaceSet?:string):void;
   regroupCaptions(setId:string,wordsPerLine:number):void;
@@ -103,6 +108,8 @@ export interface EditorStore extends PersistedState {
   setUserColor(color: string): void; setUserProfile(profile: { name: string; email: string }): void; setCurrentUser(id: string): void;
   setSettings(patch: Partial<Settings>): void; notify(title: string, kind?: Notification['kind'], detail?: string): void; dismissNotification(id: string): void;
   acquireLock(targetId: string, field: string): boolean; renewLock(targetId: string, field: string): boolean; releaseLock(targetId: string, field: string): void; releaseUserLocks(userId: string): void;
+  /** All-or-nothing lock on many items in one set() and one request (a multi-clip drag, also its renewal); false and nothing taken when any is held by someone else. */
+  acquireLocks(targetIds: string[], field: string): boolean; releaseLocks(targetIds: string[], field: string): void;
   tick(now: number): void; setLiveMode(mode: LiveMode, userId?: string): void;
 }
 
@@ -197,6 +204,8 @@ let lastProcessingTick = Date.now();
 // The playing clock (tick): its exact time, the playhead it last gave the store, and whether it was running then.
 let clockTime = 0, clockPublished = NaN, clockRunning = false;
 
+// The server takes up to 2000 ids per lock request; a bigger drag goes out in slices.
+const lockRequest = (method: 'POST' | 'DELETE', projectId: string, ids: string[], field: string) => Promise.all(Array.from({ length: Math.ceil(ids.length / 2000) }, (_, i) => api('/locks', { method, body: JSON.stringify({ projectId, targetIds: ids.slice(i * 2000, (i + 1) * 2000), field }) })));
 export const useEditorStore = create<EditorStore>((set, get) => {
   const writable = (comment = false) => {
     const state = get();
@@ -248,9 +257,10 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     const next = applyChanges(state, changes);
     set({ ...next, operations: [operation, ...state.operations.slice(coalesce ? 1 : 0)], projects: updatedProjects(state, next.clips), ...(connection.enabled ? { timelines: next.timelines.map(t => ({ ...t, duration: Math.max(t.composition ? t.duration : 180, ...next.clips.filter(c => c.timelineId === t.id).map(c => c.start + c.duration)) })) } : {}) });
   };
+  // A placement that lands on a neighbour's edge through float arithmetic can overlap it by 1e-14: not an overlap, so it must not trim.
   const overwriteChanges = (placed: Clip, excluded: string[] = [], placements:Clip[]=[placed]): Change[] | null => {
     const state = get();
-    const covered = state.clips.filter(clip => !excluded.includes(clip.id) && clip.id !== placed.id && placements.some(p=>clip.trackId===p.trackId&&clip.timelineId===p.timelineId&&clip.start<p.start+p.duration&&clip.start+clip.duration>p.start));
+    const covered = state.clips.filter(clip => !excluded.includes(clip.id) && clip.id !== placed.id && placements.some(p=>clip.trackId===p.trackId&&clip.timelineId===p.timelineId&&clip.start<p.start+p.duration-1e-6&&clip.start+clip.duration>p.start+1e-6));
     if (covered.some(clip => !editableClip(clip.id, '*') || state.nodes.some(node => node.clipId === clip.id && !available(node.id, '*')))) return null;
     return covered.flatMap(clip => {
       const parts=placements.filter(p=>p.trackId===clip.trackId&&p.timelineId===clip.timelineId).sort((a,b)=>a.start-b.start).reduce<Clip[]>((parts,p)=>parts.flatMap(part=>uncoveredParts(part,p.start,p.start+p.duration)),[clip]);
@@ -268,6 +278,17 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       }
       return changes;
     });
+  };
+  // One clip cut at `at`: the left piece shortens in place, the right piece is new. Its source offset honours speed, reverse and freeze;
+  // keyframes, grade nodes and the comments from the cut on go with it. Shared by the playhead split and Select Forward's cut.
+  const cutClip = (c:Clip, at:number, linkGroup?:string) => {
+    const state=get(),offset=at-c.start,speed=Number(c.properties.speed||100),right:Clip={...structuredClone(c),id:createId('clip'),start:at,duration:c.duration-offset,sourceIn:c.properties.freeze||c.properties.reverse?c.sourceIn:c.sourceIn+offset*speed/100,...trimAnimation(c,at,c.duration-offset)};
+    if(linkGroup)right.properties.linkGroup=linkGroup;else delete right.properties.linkGroup;
+    const nodes=copyAnimatedNodes(right,state.nodes.filter(n=>n.clipId===c.id),()=>createId('node'));
+    const changes:Change[]=[{collection:'clips',id:c.id,value:{duration:offset,...(c.properties.reverse?{sourceIn:c.sourceIn+(c.duration-offset)*speed/100}:{}),...trimAnimation(c,c.start,offset)}},{collection:'clips',id:right.id,value:record(right),replace:true}];
+    changes.push(...nodes.map(copy=>({collection:'nodes' as const,id:copy.id,value:record(copy),replace:true})));
+    changes.push(...state.comments.filter(m=>m.clipId===c.id&&m.time>=at).map(m=>({collection:'comments' as const,id:m.id,value:{clipId:right.id}})));
+    return {right,changes};
   };
   const cloneContents = (clip:Clip, changes:Change[], ancestors=new Set<string>()) => {
     if(!isComposition(clip))return;
@@ -612,6 +633,15 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const state=get();
       state.selectClips(id?(additive?(state.selectedClipIds.includes(id)?state.selectedClipIds.filter(c=>c!==id):[...state.selectedClipIds,id]):[id]):[]);
     },
+    selectForward(from) {
+      const state=get(),fps=state.projects.find(p=>p.id===state.projectId)?.fps||24;
+      const anchor='clipId' in from?state.clips.find(c=>c.id===from.clipId&&c.projectId===state.projectId&&c.timelineId===state.timelineId):undefined;
+      const at=anchor?anchor.start:'time' in from&&Number.isFinite(from.time)?Math.max(0,from.time):NaN;
+      if(Number.isNaN(at))return;
+      const {ids}=forwardSelection(state.clips,state.tracks,state.timelineId,at,fps,state.settings.linkSelection!==false);
+      // The clicked clip goes last so it is the primary the Inspector shows.
+      state.selectClips(anchor&&ids.includes(anchor.id)?[...ids.filter(id=>id!==anchor.id),anchor.id]:ids);
+    },
     selectNode(id) { if (!id || get().nodes.some(node => node.id === id && node.projectId === get().projectId)) set({ selectedNodeId: id }); },
     setPlayhead(time) { if (Number.isFinite(time)) set({ playhead: clamp(time, 0, durationOf(get())), liveMode: get().liveMode === 'following' ? 'independent' : get().liveMode, followUserId: null }); },
     setRange(inTime, outTime) {
@@ -691,7 +721,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const delta=Math.max(-Math.min(...group.map(c=>c.start)),desired-clip.start);
       if(!delta&&track.id===clip.trackId)return;
       const placements:Clip[]=[];
-      for(const c of group){const original=state.tracks.find(t=>t.id===c.trackId)!;const target=group.length>1&&original.kind===track.kind?state.tracks.find(t=>t.timelineId===clip.timelineId&&t.kind===original.kind&&t.number===original.number+track.number-previousTrack!.number):c.id===id?track:original;if(!target||target.locked)return;placements.push({...c,start:c.start+delta,trackId:target.id});}
+      for(const c of group){const original=state.tracks.find(t=>t.id===c.trackId)!;const target=track.id===clip.trackId?original:group.length>1&&original.kind===track.kind?state.tracks.find(t=>t.timelineId===clip.timelineId&&t.kind===original.kind&&t.number===original.number+track.number-previousTrack!.number):c.id===id?track:original;if(!target||target.locked)return;placements.push({...c,start:c.start+delta,trackId:target.id});}
       const changes=overwriteChanges(placements[0],group.map(c=>c.id),placements);if(!changes)return;
       changes.push(...placements.map(c=>({collection:'clips' as const,id:c.id,value:{start:c.start,trackId:c.trackId}})));
       commit('ClipMoved',id,`moved ${clip.name}`,changes);
@@ -734,16 +764,30 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const frame=1/(state.projects.find(p=>p.id===state.projectId)?.fps||24);
       if(group.some(c=>state.playhead-c.start<frame||c.start+c.duration-state.playhead<frame)){state.notify('Place the playhead inside the linked clips to split them','info');return;}
       const changes:Change[]=[],linkGroup=createId('link');let selected='';
-      for(const c of group){
-        const offset=state.playhead-c.start,right={...structuredClone(c),id:createId('clip'),start:state.playhead,duration:c.duration-offset,sourceIn:c.properties.freeze||c.properties.reverse?c.sourceIn:c.sourceIn+offset*Number(c.properties.speed||100)/100,...trimAnimation(c,state.playhead,c.duration-offset)};
-        if(group.length>1)right.properties.linkGroup=linkGroup;else delete right.properties.linkGroup;
-        if(c.id===id)selected=right.id;
-        const nodes=copyAnimatedNodes(right,state.nodes.filter(n=>n.clipId===c.id),()=>createId('node'));
-        changes.push({collection:'clips',id:c.id,value:{duration:offset,...(c.properties.reverse?{sourceIn:c.sourceIn+(c.duration-offset)*Number(c.properties.speed||100)/100}:{}),...trimAnimation(c,c.start,offset)}},{collection:'clips',id:right.id,value:record(right),replace:true});
-        changes.push(...nodes.map(copy=>({collection:'nodes' as const,id:copy.id,value:record(copy),replace:true})));
-      }
+      for(const c of group){const cut=cutClip(c,state.playhead,group.length>1?linkGroup:undefined);if(c.id===id)selected=cut.right.id;changes.push(...cut.changes);}
       commit('ClipTrimmed',id,`split ${clip.name} at the playhead`,changes);
       set({selectedClipId:selected,selectedTextIds:isTitle(clip)?[selected]:[],textSelection:null,selectedNodeId:get().nodes.find(n=>n.clipId===selected)?.id??null});
+    },
+    cutThrough(time) {
+      const state=get();if(!Number.isFinite(time)||!writable())return 0;
+      const fps=state.projects.find(p=>p.id===state.projectId)?.fps||24,at=Math.max(0,time),linked=state.settings.linkSelection!==false,{ids,crossing}=forwardSelection(state.clips,state.tracks,state.timelineId,at,fps,linked);
+      const crossed=state.clips.filter(c=>crossing.includes(c.id)),cut=crossed.filter(c=>Math.min(at-c.start,c.start+c.duration-at)>=1/fps-1e-6),whole=crossed.length-cut.length;
+      const reportWhole=()=>{if(whole)state.notify(`${whole} clip${whole>1?'s':''} within a frame of the line left whole`,'info');};
+      if(!cut.length){reportWhole();return 0;}
+      // A linked peer that moves with the selection follows the right halves into their new group; peers before the line stay with the left halves.
+      const old=new Set(linked?cut.flatMap(c=>c.properties.linkGroup?[String(c.properties.linkGroup)]:[]):[]);
+      const peers=old.size?state.clips.filter(c=>ids.includes(c.id)&&old.has(String(c.properties.linkGroup))):[];
+      if(![...cut,...peers].every(c=>editableClip(c.id))||state.nodes.some(n=>cut.some(c=>c.id===n.clipId)&&!available(n.id,'*')))return 0;
+      const groups=new Map<string,string>();
+      for(const g of old)if([...cut,...peers].filter(c=>c.properties.linkGroup===g).length>1)groups.set(g,createId('link'));
+      const changes:Change[]=[],rights:string[]=[];
+      for(const c of cut){const part=cutClip(c,at,groups.get(String(c.properties.linkGroup)));rights.push(part.right.id);changes.push(...part.changes);}
+      for(const c of peers){const group=groups.get(String(c.properties.linkGroup));if(group)changes.push({collection:'clips',id:c.id,value:{'properties.linkGroup':group}});}
+      commit('ClipTrimmed',cut[0].id,`cut ${cut.length} clip${cut.length>1?'s':''} at ${Math.floor(at/60)}:${String(Math.floor(at%60)).padStart(2,'0')}`,changes);
+      const now=get(),primary=now.selectedClipId;
+      now.selectClips([...now.selectedClipIds.filter(id=>id!==primary),...rights,...(primary?[primary]:[])]);
+      reportWhole();
+      return cut.length;
     },
     deleteGap(trackId,start,end) {
       const state=get(),track=state.tracks.find(t=>t.id===trackId&&t.timelineId===state.timelineId);
@@ -1379,12 +1423,27 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const lock: CollaborativeLock = { id: existing?.id ?? createId('lock'), projectId: state.projectId, targetId, field, userId: state.currentUserId, expiresAt: Date.now() + LOCK_TTL };
       set({ locks: [...state.locks.filter(item => item.id !== lock.id && item.expiresAt > Date.now()), lock] }); if (connection.enabled) void api('/locks', { method: 'POST', body: JSON.stringify({ projectId: state.projectId, targetId, field }) }).catch(error => { state.releaseLock(targetId, field); state.notify(error.message, 'error'); void connection.refresh(); }); return true;
     },
+    acquireLocks(targetIds, field) {
+      const state = get(), ids = [...new Set(targetIds)]; if (!ids.length) return true;
+      if (!writable() || !ids.every(id => available(id, field))) return false;
+      const now = Date.now(), wanted = new Set(ids), mine = new Map(state.locks.filter(lock => lock.projectId === state.projectId && lock.field === field && lock.userId === state.currentUserId && lock.expiresAt > now && wanted.has(lock.targetId)).map(lock => [lock.targetId, lock.id]));
+      const taken = ids.map((targetId): CollaborativeLock => ({ id: mine.get(targetId) ?? createId('lock'), projectId: state.projectId, targetId, field, userId: state.currentUserId, expiresAt: now + LOCK_TTL })), replaced = new Set(taken.map(lock => lock.id));
+      set({ locks: [...state.locks.filter(item => !replaced.has(item.id) && item.expiresAt > now), ...taken] });
+      if (connection.enabled) void lockRequest('POST', state.projectId, ids, field).catch(error => { state.releaseLocks(ids, field); state.notify(error.message, 'error'); void connection.refresh(); });
+      return true;
+    },
     renewLock(targetId, field) {
       const state = get();
       if (!state.locks.some(lock => lock.projectId === state.projectId && lock.targetId === targetId && lock.field === field && lock.userId === state.currentUserId && lock.expiresAt > Date.now())) return false;
       return state.acquireLock(targetId, field);
     },
     releaseLock(targetId, field) { const state = get(); if (connection.enabled && state.locks.some(lock => lock.targetId === targetId && lock.field === field && lock.userId === state.currentUserId)) void api('/locks', { method: 'DELETE', body: JSON.stringify({ projectId: state.projectId, targetId, field }) }).catch(() => {}); set({ locks: state.locks.filter(lock => !(lock.targetId === targetId && lock.field === field && lock.userId === state.currentUserId)) }); },
+    releaseLocks(targetIds, field) {
+      const state = get(), wanted = new Set(targetIds), held = state.locks.filter(lock => lock.field === field && lock.userId === state.currentUserId && wanted.has(lock.targetId));
+      if (!held.length) return;
+      if (connection.enabled) void lockRequest('DELETE', state.projectId, held.map(lock => lock.targetId), field).catch(() => {});
+      set({ locks: state.locks.filter(lock => !held.includes(lock)) });
+    },
     releaseUserLocks(userId) { set({ locks: get().locks.filter(lock => lock.userId !== userId) }); },
     tick(now) {
       if (!Number.isFinite(now)) return;

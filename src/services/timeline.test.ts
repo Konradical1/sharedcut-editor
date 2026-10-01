@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Clip, Track } from '../state/models.ts';
-import { companionAudioTrack, filmstripTiles, trackGap, uncoveredParts } from './timeline.ts';
+import { companionAudioTrack, filmstripTiles, forwardClickTime, trackGap, uncoveredParts } from './timeline.ts';
 
 test('overwrites preserve left, right, full coverage, adjacency, reverse and freeze offsets', () => {
   const clip = { start: 10, duration: 20, sourceIn: 5, properties: { speed: 200 } } as unknown as Clip;
@@ -72,4 +72,14 @@ test('taller filmstrips fit fewer proportional tiles while zoom adds time sample
   const zoomed = filmstripTiles(clip, source, 160, 90 * 96 / 54);
   assert.equal(zoomed.length, short.length);
   assert.deepEqual(zoomed.map(t => t.frame), short.map(t => t.frame));
+});
+
+test('select forward click lands on a nearby cut exactly, else on a frame, never before zero',()=>{
+ const cuts=[0,10,105.07];
+ assert.equal(forwardClickTime(105.0,cuts,.1,24),105.07);
+ assert.equal(forwardClickTime(104.5,cuts,.1,24),104.5);
+ assert.equal(forwardClickTime(104.51,cuts,.1,24),104.5);
+ assert.equal(forwardClickTime(105.0,null,.1,24),105);
+ assert.equal(forwardClickTime(-3,null,.1,24),0);
+ assert.equal(forwardClickTime(.04,cuts,.1,24),0);
 });

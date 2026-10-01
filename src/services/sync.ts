@@ -3,12 +3,17 @@ import { stateDelta, applyStateDelta, shareState, stateEqual, type StateDelta } 
 import { useEditorStore, persistentState, persistedKeys, sealHistory } from '../state/store.ts';
 import { createId } from './index.ts';
 import type { PersistedState } from './index.ts';
-import type { CollaborativeLock, Presence, User, MediaAsset } from '../state/models.ts';
+import type { CollaborativeLock, DragPreview, Presence, User, MediaAsset } from '../state/models.ts';
 import { api, ApiError, connection } from './api.ts';
 import { mergeState } from './merge.ts';
 import { presenceDue, receivedPresence } from './presence.ts';
 
 type Envelope = { incremental?: boolean; baseRevision?: number; delta?: StateDelta; revision: number; lockRevision?: number; state?: PersistedState; presence?: Presence[]; locks?: CollaborativeLock[] };
+// The server answers 400 to a preview of more than 1000 items, which reads as offline mid-drag; collaborators see a partial ghost instead.
+const PREVIEW_ITEMS = 1000;
+// A preview this big is the biggest thing presence carries; while it is in motion it goes out at the running-playhead 4 Hz, not at every 50 ms tick.
+const PACED_PREVIEW_CLIPS = 100;
+const capPreview = (p: DragPreview | null) => p && ((p.clips?.length ?? 0) > PREVIEW_ITEMS || (p.tracks?.length ?? 0) > PREVIEW_ITEMS) ? { ...p, ...(p.clips && { clips: p.clips.slice(0, PREVIEW_ITEMS) }), ...(p.tracks && { tracks: p.tracks.slice(0, PREVIEW_ITEMS) }) } : p;
 let baseline: PersistedState | null = null;
 let incremental = false;
 let refreshing: Promise<void> | null = null;
@@ -341,7 +346,7 @@ export async function connectSession() {
   // Exchange only ephemeral presence at 20Hz; project persistence has its own slower poll.
   const clientId = createId('presence'), presenceAbort = new AbortController();
   let pollingPresence = false, lastPresence = 0, presenceRetryAt = 0, presenceFailures = 0, lastPublished = 0;
-  let publishedProject: string | null = null, publishedCursor = false, presenceRefreshPending = false, publishedPlaying = false;
+  let publishedProject: string | null = null, publishedCursor = false, presenceRefreshPending = false, publishedPlaying = false, publishedPaced = false;
   let publishedSignature = '';
   const pollPresence = async () => {
     if (pollingPresence || session !== generation || Date.now() < presenceRetryAt || (typeof document !== 'undefined' && document.hidden && !publishedCursor && Date.now() - lastPresence < 1000)) return;
@@ -357,18 +362,20 @@ export async function connectSession() {
         return;
       }
       const active = typeof document === 'undefined' || (!document.hidden && document.hasFocus());
-      const cursor = active ? s.cursor : null;
+      const cursor = active ? s.cursor : null, preview = active ? capPreview(s.dragPreview) : null;
       // Anything a collaborator can see goes in the signature, so a moving cursor still publishes every
       // tick; only genuinely idle repeats are held back, and a running playhead is sent at 4 Hz.
-      const signature = JSON.stringify([active, s.projectId, s.timelineId, cursor, s.playhead, s.selectedClipId, s.mediaPresenceTab, s.inspectorPresenceTab, s.workspace, s.liveMode === 'presenting', s.playing && !s.playbackBuffering, s.dragPreview]);
+      const signature = JSON.stringify([active, s.projectId, s.timelineId, cursor, s.playhead, s.selectedClipId, s.mediaPresenceTab, s.inspectorPresenceTab, s.workspace, s.liveMode === 'presenting', s.playing && !s.playbackBuffering, preview]);
       // Starting and stopping go out at once; only a playhead already known to be running is held to 4 Hz.
-      if (!presenceDue(signature, publishedSignature, Date.now() - lastPublished, s.playing && publishedPlaying) && (incremental && events?.readyState === 1 || Date.now() - lastPublished < 100)) return;
-      const response = await api<{ presence: Presence[]; serverTime?: number }>('/presence', { method: 'POST', signal: AbortSignal.any([presenceAbort.signal, AbortSignal.timeout(5000)]), body: JSON.stringify({ clientId, active, projectId: s.projectId, timelineId: s.timelineId, cursor, playhead: s.playhead, selectedClipId: s.selectedClipId, mediaTab: s.mediaPresenceTab, inspectorTab: s.inspectorPresenceTab, activity: s.workspace, online: true, presenting: s.liveMode === 'presenting', playing: s.playing && !s.playbackBuffering, preview: active ? s.dragPreview : null }) });
+      // The drag's first preview (nothing big published yet) and its end (preview null) are never held; only the updates between them are.
+      const paced = (preview?.clips?.length ?? 0) > PACED_PREVIEW_CLIPS && publishedPaced;
+      if (!presenceDue(signature, publishedSignature, Date.now() - lastPublished, s.playing && publishedPlaying || paced) && (paced || incremental && events?.readyState === 1 || Date.now() - lastPublished < 100)) return;
+      const response = await api<{ presence: Presence[]; serverTime?: number }>('/presence', { method: 'POST', signal: AbortSignal.any([presenceAbort.signal, AbortSignal.timeout(5000)]), body: JSON.stringify({ clientId, active, projectId: s.projectId, timelineId: s.timelineId, cursor, playhead: s.playhead, selectedClipId: s.selectedClipId, mediaTab: s.mediaPresenceTab, inspectorTab: s.inspectorPresenceTab, activity: s.workspace, online: true, presenting: s.liveMode === 'presenting', playing: s.playing && !s.playbackBuffering, preview }) });
       publishedProject = s.projectId; publishedCursor = !!cursor;
-      publishedSignature = signature; lastPublished = Date.now(); publishedPlaying = s.playing;
+      publishedSignature = signature; lastPublished = Date.now(); publishedPlaying = s.playing; publishedPaced = (preview?.clips?.length ?? 0) > PACED_PREVIEW_CLIPS;
       presenceFailures = 0; presenceRetryAt = 0;
       receivePresence({ ...response, projectId: s.projectId });
-    } catch (error) { presenceRetryAt = Date.now() + Math.min(3000, 250 * 2 ** presenceFailures++); if (session === generation) { useEditorStore.setState({ serverOnline: false }); if (error instanceof ApiError && error.status === 401) resetSession(); } }
+    } catch (error) { presenceRetryAt = Date.now() + Math.min(3000, 250 * 2 ** presenceFailures++); if (session === generation) { if (!(error instanceof ApiError && error.status < 500)) useEditorStore.setState({ serverOnline: false }); /* a 4xx (rejected preview, held item) means the server answered */ if (error instanceof ApiError && error.status === 401) resetSession(); } }
     finally { pollingPresence = false; if (presenceRefreshPending) { presenceRefreshPending = false; void pollPresence(); } }
   };
   const refreshPresence = () => { if (pollingPresence) presenceRefreshPending = true; else void pollPresence(); };

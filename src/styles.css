@@ -155,6 +155,10 @@
 
 .track-lane:focus-visible{outline:none;box-shadow:inset 2px 0 var(--accent)}
 .timeline-gap{position:absolute;inset-block:4px;border:1px solid var(--accent);background:#b9d9ca22;pointer-events:none}
+.timeline-forward .track-lane,.timeline-forward .timeline-clip,.timeline-forward .timeline-clip .trim-handle{cursor:e-resize}
+.timeline-forward-line{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:repeating-linear-gradient(to bottom,var(--user-color) 0 6px,transparent 6px 10px);z-index:7;pointer-events:none}
+.timeline-hint button{margin-left:6px;padding:1px 6px;font-size:8px;color:#aac6bc;border:1px solid #3b5560;border-radius:3px;background:#1b2a30}.timeline-hint button:hover{background:#243840;color:#dce8e4}.timeline-hint button:focus-visible{outline-offset:-2px}
+@media(max-width:1250px){.timeline-hint.has-action{display:block}}
 .animation-sidebar{flex-direction:column;align-items:stretch;justify-content:flex-start;gap:4px}
 .animation-sidebar>span{flex:none;padding:3px 0}
 .animation-sidebar .animation-key-controls{position:static;width:100%;height:auto;padding:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:4px;white-space:normal}

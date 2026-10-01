@@ -1,7 +1,7 @@
 import { useEffect, type Dispatch, type SetStateAction } from 'react';
 import { useEditorStore } from './state/store';
 import { fieldOwnsKey, typingSurface } from './services/focus';
-export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['I / O','Mark In / Out'], ['V / B','Selection / blade tool'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['Delete','Delete selected clip'] ];
+export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['I / O','Mark In / Out'], ['V / B / A','Selection / blade / select forward tool'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['Delete','Delete selected clip'] ];
 /** A click is an action, not a focus grab. Editing apps keep the keyboard on the app, so Space plays
  *  instead of replaying the last button touched — and nothing sits there wearing a focus ring. */
 export function useFocusRelease() {
@@ -56,6 +56,7 @@ export function useTimelineShortcuts(setTool: Dispatch<SetStateAction<string>>, 
       if (k === 'v') { setTool('select'); useEditorStore.setState({textTool:false,shapeTool:null}); }
       if (k === 't') { useEditorStore.setState({textTool:!s.textTool,shapeTool:null,playing:false}); }
       if (k === 'b') {setTool('blade');useEditorStore.setState({textTool:false,shapeTool:null});}
+      if (k === 'a') {setTool('forward');useEditorStore.setState({textTool:false,shapeTool:null});}
       if (k === 's' || k === 'p') {setTool('select');useEditorStore.setState({shapeTool:k==='p'?'pen':'rectangle',textTool:false,playing:false});}
       if (k === 'n') setSnapping(value => !value);
       if (k === 'i') s.setRange(s.playhead, s.rangeOut);
