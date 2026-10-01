@@ -1,6 +1,7 @@
 // Read-only Newspaper samples: original-media export versus the CPU preview equations.
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
+import {readWorkspace} from './workspace-db.mjs';
 import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {resolve,join} from 'node:path';
@@ -10,7 +11,7 @@ import {renderTimeline} from '../server/media.ts';
 import {starterGrade,colorTransform,makeCube,sampleCube} from '../src/services/color.ts';
 const run=promisify(execFile),temp=await mkdtemp(join(tmpdir(),'frameline-color-export-'));
 const db=new DatabaseSync('data/frameline.sqlite',{readOnly:true});
-const state=JSON.parse(db.prepare('select state from workspace where id=1').get().state);db.close();
+const state=readWorkspace(db).state;db.close();
 const results=[];
 const ffmpeg=async args=>(await run('ffmpeg',['-v','error',...args],{encoding:'buffer',maxBuffer:64*1024*1024})).stdout;
 try {

@@ -5,9 +5,8 @@
  *   node scripts/project-bundle.mjs export "Newspaper" ~/Desktop/newspaper-bundle
  *   node scripts/project-bundle.mjs import ~/Desktop/newspaper-bundle
  *
- * Stop the server on BOTH ends first — this reads the workspace from SQLite and writes the JSON
- * workspace row directly, and a running server holds the whole state in memory and will overwrite
- * an import when it stops. The next start picks the written row up.
+ * Stop the server on BOTH ends first — import writes the JSON workspace row directly, which the
+ * next server start picks up, and refuses to run while a server holds the data folder.
  *
  * ponytail: copies whole media directories including generated proxies, so a bundle is bigger than
  * the originals but imports with nothing to re-encode. Delete `prepared/` from the bundle if transfer
@@ -16,33 +15,23 @@
 import { DatabaseSync } from 'node:sqlite';
 import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { holdDataLock, readWorkspace, writeWorkspaceRow } from './workspace-db.mjs';
 
 const DATA = resolve(process.env.FRAME_LINE_DATA ?? 'data');
 // Per-project slices of the workspace state. `operations` is machine-local undo history and
 // `renderJobs` are finished exports pointing at files that do not travel; neither is worth carrying.
 const BY_PROJECT = ['media', 'clips', 'nodes', 'comments', 'snapshots'];
 
-// The server keeps the workspace one row per entity in `workspace_items` and rewrites the single JSON
-// row only now and then (always on a clean stop), so after a crash the items are newer. They are the
-// current copy unless something (this script, an older build) wrote the JSON row since.
-const LISTS = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'];
-const current = db => {
-  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE name='workspace_meta'").get()) return undefined;
-  const meta = Object.fromEntries(db.prepare('SELECT key,value FROM workspace_meta').all().map(row => [row.key, String(row.value)]));
-  if (meta.revision === undefined || meta.legacyWritten === '1') return undefined;
-  const state = { ...Object.fromEntries(LISTS.map(key => [key, []])), ...JSON.parse(meta.fields ?? '{}') };
-  for (const row of db.prepare('SELECT collection,data FROM workspace_items ORDER BY collection,seq,rowid').all()) (state[row.collection] ??= []).push(JSON.parse(String(row.data)));
-  return { revision: Number(meta.revision), state };
-};
 const open = () => {
   const file = join(DATA, 'frameline.sqlite');
   if (!existsSync(file)) throw new Error(`No database at ${file}. Set FRAME_LINE_DATA or run from the repo root.`);
   const db = new DatabaseSync(file);
   const row = db.prepare('SELECT revision,state FROM workspace WHERE id=1').get();
   if (!row) throw new Error('The workspace is empty — start the server once before bundling.');
-  const items = current(db);
-  // Writing the JSON row back with a higher revision is what makes the next server start import it.
-  return { db, revision: Math.max(Number(row.revision), items?.revision ?? 0), state: items?.state ?? JSON.parse(String(row.state)) };
+  // The item rows, unless the JSON row is newer. Writing the JSON row back with a higher revision is
+  // what makes the next server start import it.
+  const { revision, state, fromItems } = readWorkspace(db);
+  return { db, revision: Math.max(Number(row.revision), revision), state, fromItems };
 };
 
 function exportProject(needle, outDir) {
@@ -80,7 +69,7 @@ function exportProject(needle, outDir) {
 function importProject(inDir) {
   const bundle = JSON.parse(readFileSync(join(inDir, 'project.json'), 'utf8'));
   if (bundle.version !== 1) throw new Error(`Unsupported bundle version ${bundle.version}.`);
-  const { db, revision, state } = open();
+  const { db, revision, state, fromItems } = open();
 
   // The owner's account id is per-install. Without a remap the project imports invisible: every
   // membership points at a user that does not exist on this machine.
@@ -105,7 +94,7 @@ function importProject(inDir) {
     tracks: [...state.tracks, ...bundle.tracks],
     ...Object.fromEntries(BY_PROJECT.map(key => [key, [...state[key], ...bundle[key]]])),
   };
-  db.prepare('UPDATE workspace SET revision=?,state=? WHERE id=1').run(revision + 1, JSON.stringify(next));
+  writeWorkspaceRow(db, revision + 1, next, { fromItems });
 
   console.log(`Imported ${JSON.stringify(bundle.project.name)} — ${bundle.media.length} assets, ${bundle.clips.length} clips.`);
   console.log("Start the server and sign in; the project belongs to this machine's first account.");
@@ -113,7 +102,7 @@ function importProject(inDir) {
 
 const [mode, target, out] = process.argv.slice(2);
 if (mode === 'export' && target) exportProject(target, resolve(out ?? `${target.toLowerCase().replace(/\W+/g, '-')}-bundle`));
-else if (mode === 'import' && target) importProject(resolve(target));
+else if (mode === 'import' && target) { const lock = holdDataLock(DATA); try { importProject(resolve(target)); } finally { lock.close(); } }
 else {
   console.error('Usage:\n  node scripts/project-bundle.mjs export <project name or id> [outDir]\n  node scripts/project-bundle.mjs import <bundleDir>\n\nStop the server on both ends first.');
   process.exit(1);

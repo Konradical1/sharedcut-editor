@@ -8,6 +8,7 @@ import { copyFile, cp, link, mkdir, mkdtemp, readdir, realpath, rm } from 'node:
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { readWorkspace } from './workspace-db.mjs';
 import { execFileSync } from 'node:child_process';
 import { writeFile } from 'node:fs/promises';
 import { createFrameLineServer } from '../server/index.ts';
@@ -19,7 +20,7 @@ const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright')
 const sourceData = resolve(process.argv[2] || 'data'), shots = resolve('artifacts/qa');
 const PROJECT = 'project-b65a6aab56903ac940bc1d5cd5bcad5272bec25a', BALL = 'clip-a4fe560c-1f39-495e-9bb2-e0b7dd45b4d5', FACE = 'clip-c51297a1-fd7b-4a9c-91a3-825637a0f4e9', TITLE = 'clip-2bb272e1-5f72-4f33-a384-60593d1b91a7';
 const database = new DatabaseSync(join(sourceData, 'frameline.sqlite'), { readOnly: true });
-const source = JSON.parse(database.prepare('SELECT state FROM workspace WHERE id=1').get().state);
+const source = readWorkspace(database).state;
 // The project's title uses a font uploaded to the shared font library; the export needs it too.
 const fonts = database.prepare('SELECT * FROM fonts').all(); database.close();
 const project = source.projects.find(p => p.id === PROJECT);

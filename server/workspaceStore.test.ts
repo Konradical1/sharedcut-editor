@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { cpSync, readdirSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -8,7 +9,7 @@ import { request as httpRequest } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { createFrameLineServer } from './index.ts';
+import { createFrameLineServer, mergeVisible } from './index.ts';
 import { COLLECTIONS, sequence, workspaceStore } from './workspaceStore.ts';
 import { stateDelta, applyStateDelta } from '../src/services/stateDelta.ts';
 import type { PersistedState } from '../src/services/index.ts';
@@ -39,6 +40,31 @@ const clip = (id: string, mediaId: string, start: number) => ({ id, projectId: '
 const operation = (id: string, userId: string, targetId: string) => ({ id, projectId: 'film', userId, timestamp: Date.now(), targetId, type: 'ClipMoved', description: id, oldState: [], newState: [] });
 const storedState = (file: string) => { const db = new DatabaseSync(file), store = workspaceStore(db, file, { legacyEveryMs: 1e9 }); try { return plain(store.load().state); } finally { db.close(); } };
 const legacyState = (file: string) => { const db = new DatabaseSync(file, { readOnly: true }); try { return JSON.parse(String((db.prepare('SELECT state FROM workspace WHERE id=1').get() as { state: string }).state)); } finally { db.close(); } };
+// A server in its own process, so it can be killed the way production stops it (Stop-Process -Force).
+const startChild = async (dataDir: string) => {
+  const script = `import { createFrameLineServer } from ${JSON.stringify(pathToFileURL(join(import.meta.dirname, 'index.ts')).href)}; const app = createFrameLineServer({ dataDir: process.env.WORKSPACE_TEST_DATA }); app.server.listen(0, '127.0.0.1', () => console.log(app.server.address().port));`;
+  const child = spawn(process.execPath, ['--experimental-strip-types', '--no-warnings', '--input-type=module', '-e', script], { env: { ...process.env, WORKSPACE_TEST_DATA: dataDir }, stdio: ['ignore', 'pipe', 'inherit'] });
+  const port = await new Promise<number>((resolve, reject) => { child.stdout.once('data', data => resolve(Number(String(data).trim()))); child.once('exit', code => reject(new Error(`server exited with ${code}`))); });
+  return { base: `http://127.0.0.1:${port}/api`, kill: async () => { if (child.exitCode === null && child.signalCode === null) { child.kill('SIGKILL'); await new Promise(resolve => child.once('exit', resolve)); } } };
+};
+const script = (name: string, data: string, ...args: string[]) => new Promise<{ code: number | null; output: string }>(resolve => {
+  const child = spawn(process.execPath, ['--no-warnings', join(import.meta.dirname, '..', 'scripts', name), ...args], { env: { ...process.env, FRAME_LINE_DATA: data }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = ''; child.stdout.on('data', data => { output += data; }); child.stderr.on('data', data => { output += data; });
+  child.once('exit', code => resolve({ code, output }));
+});
+// What a build from before the item tables (61b8d6b) does on start: read the JSON row, take its revision
+// from workspace_revision, and save the row back at once.
+const olderBuild = (file: string, change: (state: PersistedState) => void) => {
+  const db = new DatabaseSync(file);
+  try {
+    const saved = db.prepare('SELECT revision,state FROM workspace WHERE id=1').get() as { revision: number; state: string };
+    const tick = (db.prepare('SELECT revision FROM workspace_revision WHERE id=1').get() as { revision: number } | undefined)?.revision ?? 0;
+    const state = JSON.parse(saved.state) as PersistedState, revision = Math.max(saved.revision, tick + 1) + 1; change(state);
+    db.prepare('INSERT INTO workspace(id,revision,state) VALUES(1,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,state=excluded.state').run(revision, JSON.stringify(state));
+    return { revision, state };
+  } finally { db.close(); }
+};
+const recoveryFiles = (dataDir: string) => readdirSync(dataDir).filter(name => name.startsWith('workspace-replaced-'));
 
 test('sequence keeps stored positions, slots new entries between neighbours and gives up when a gap is exhausted', () => {
   const [a, b, c, x, y] = [{}, {}, {}, {}, {}];
@@ -50,6 +76,36 @@ test('sequence keeps stored positions, slots new entries between neighbours and 
   assert.deepEqual(moved.slice(1), [0, 1], 'only the moved entry gets a new place'); assert.ok(moved[0] < 0);
   assert.deepEqual(sequence([x], new Map(), 0, 1), [0.5]);
   assert.equal(sequence([x], new Map(), 1, 1 + Number.EPSILON), undefined, 'no double fits between these, so the caller renumbers');
+});
+
+test('a merged save keeps hidden entries in their slots and the caller\'s entries in the order sent', () => {
+  const entry = (id: string, hidden = false) => ({ id, hidden });
+  const [h1, a, h2, b, c, h3] = [entry('h1', true), entry('a'), entry('h2', true), entry('b'), entry('c'), entry('h3', true)];
+  const merge = (sent: { id: string; hidden: boolean }[]) => mergeVisible([h1, a, h2, b, c, h3], item => item.hidden, sent).map(item => item.id);
+  assert.deepEqual(merge([entry('n'), a, b, c]), ['n', 'h1', 'a', 'h2', 'b', 'c', 'h3'], 'new at the head of the caller\'s list goes to the head of the whole list');
+  assert.deepEqual(merge([a, b, c, entry('n')]), ['h1', 'a', 'h2', 'b', 'c', 'h3', 'n'], 'and new at its tail to the tail');
+  assert.deepEqual(merge([a, entry('n'), b]), ['h1', 'a', 'h2', 'n', 'b', 'h3'], 'between kept entries it goes before the later one; c was deleted');
+  assert.deepEqual(merge([c, a, b]), ['h1', 'c', 'a', 'h2', 'b', 'h3'], 'a reorder moves only the caller\'s entries');
+});
+
+test('entries added into one gap again and again renumber a few neighbours, never the whole list', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'workspace-gap-')), file = join(dir, 'frameline.sqlite');
+  const db = new DatabaseSync(file); db.exec('PRAGMA journal_mode=WAL; CREATE TABLE workspace(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL,state TEXT NOT NULL)');
+  const store = workspaceStore(db, file, { legacyEveryMs: 1e9 });
+  try {
+    const entry = (id: string) => ({ id, projectId: 'p' });
+    let list = Array.from({ length: 2000 }, (_, i) => entry(`e${i}`));
+    store.replace({ operations: list }, 1);
+    const changes = () => Number((db.prepare('SELECT total_changes() AS n').get() as { n: number }).n);
+    let most = 0;
+    // Doubles run out of room after ~50 inserts into one gap; that used to renumber all 2,000 rows.
+    for (let i = 0; i < 200; i++) {
+      list = [...list.slice(0, 1000), entry(`new${i}`), ...list.slice(1000)];
+      const before = changes(); store.save({ operations: list }, i + 2); most = Math.max(most, changes() - before);
+    }
+    assert.ok(most < 50, `one save wrote ${most} rows`);
+    assert.deepEqual(storedState(file).operations.map((item: { id: string }) => item.id), list.map(item => item.id));
+  } finally { await store.close(); db.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
 test('the store writes only what changed, freezes what it wrote, and forgets a save its transaction rolled back', async () => {
@@ -81,9 +137,8 @@ test('the store writes only what changed, freezes what it wrote, and forgets a s
 
 test('every acknowledged save survives a killed server, and a clean restart and the legacy row agree', { timeout: 60_000 }, async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'workspace-crash-')), file = join(dataDir, 'frameline.sqlite');
-  const script = `import { createFrameLineServer } from ${JSON.stringify(pathToFileURL(join(import.meta.dirname, 'index.ts')).href)}; const app = createFrameLineServer({ dataDir: process.env.WORKSPACE_TEST_DATA }); app.server.listen(0, '127.0.0.1', () => console.log(app.server.address().port));`;
-  const child = spawn(process.execPath, ['--experimental-strip-types', '--no-warnings', '--input-type=module', '-e', script], { env: { ...process.env, WORKSPACE_TEST_DATA: dataDir }, stdio: ['ignore', 'pipe', 'inherit'] });
-  let app: App | undefined, base = `http://127.0.0.1:${await new Promise<number>((resolve, reject) => { child.stdout.once('data', data => resolve(Number(String(data).trim()))); child.once('exit', code => reject(new Error(`server exited with ${code}`))); })}/api`;
+  const child = await startChild(dataDir);
+  let app: App | undefined, base = child.base;
   const { call, signup, edit } = client(() => base);
   try {
     const alice = await signup('alice'), bob = await signup('bob');
@@ -114,7 +169,7 @@ test('every acknowledged save survives a killed server, and a clean restart and 
     const expected = plain((await call('/state', alice.cookie) as Envelope).state), expectedBob = plain((await call('/state', bob.cookie) as Envelope).state);
     assert.ok(expected.operations.length === 3 && expected.media[0].progress === 50 && expected.projects.length === 2, 'the edits all landed');
 
-    child.kill('SIGKILL'); await new Promise(resolve => child.once('exit', resolve));
+    await child.kill();
     app = createFrameLineServer({ dataDir, legacyEveryMs: 1e9 }); base = await listen(app);
     assert.deepEqual(plain((await call('/state', alice.cookie) as Envelope).state), expected, 'nothing acknowledged was lost to the kill');
     assert.deepEqual(plain((await call('/state', bob.cookie) as Envelope).state), expectedBob);
@@ -126,7 +181,7 @@ test('every acknowledged save survives a killed server, and a clean restart and 
     assert.deepEqual(legacyState(file), storedState(file), 'a clean shutdown leaves the legacy row complete for a rollback');
     app = createFrameLineServer({ dataDir, legacyEveryMs: 1e9 }); base = await listen(app);
     assert.deepEqual(plain((await call('/state', alice.cookie) as Envelope).state), edited);
-  } finally { child.kill('SIGKILL'); await app?.close(); await rm(dataDir, { recursive: true, force: true }); }
+  } finally { await child.kill(); await app?.close(); await rm(dataDir, { recursive: true, force: true }); }
 });
 
 test('a single-row database migrates once, and a legacy row written by an older build or a script is imported', { timeout: 60_000 }, async () => {
@@ -168,10 +223,7 @@ test('a single-row database migrates once, and a legacy row written by an older 
 
 test('project-bundle exports the latest edits even when the legacy row is behind, and its import appears on the next start', { timeout: 60_000 }, async () => {
   const [source, target, bundle] = await Promise.all(['bundle-from-', 'bundle-to-', 'bundle-'].map(prefix => mkdtemp(join(tmpdir(), prefix))));
-  const bundleScript = (...args: string[]) => new Promise<void>((resolve, reject) => {
-    const child = spawn(process.execPath, [join(import.meta.dirname, '..', 'scripts', 'project-bundle.mjs'), ...args], { env: { ...process.env, FRAME_LINE_DATA: args[0] === 'export' ? source : target }, stdio: 'ignore' });
-    child.once('exit', code => code === 0 ? resolve() : reject(new Error(`project-bundle ${args[0]} exited with ${code}`)));
-  });
+  const bundleScript = async (...args: string[]) => { const run = await script('project-bundle.mjs', args[0] === 'export' ? source : target, ...args); assert.equal(run.code, 0, run.output); };
   let from = createFrameLineServer({ dataDir: source, legacyEveryMs: 1e9 }), base = await listen(from);
   const { call, signup, edit } = client(() => base);
   let to: App | undefined;
@@ -239,4 +291,93 @@ test('upload progress wakes clients at most once a second', { timeout: 30_000 },
     upload.end(Buffer.alloc(size)); await finished;
     assert.ok(changes <= 3, `${changes} progress revisions in ~1.2 s`);
   } finally { events.abort(); await app.close(); await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test('a save moves no one else\'s rows, and history added in front never renumbers the list', { timeout: 60_000 }, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'workspace-two-users-')), file = join(dataDir, 'frameline.sqlite');
+  const app = createFrameLineServer({ dataDir, legacyEveryMs: 1e9 }), base = await listen(app);
+  const { call, signup, edit } = client(() => base);
+  const history = (id: string, userId: string, projectId: string) => ({ ...operation(id, userId, 'x'), projectId });
+  const rows = () => { const db = new DatabaseSync(file, { readOnly: true }); try { return new Map((db.prepare("SELECT rowid,seq,data FROM workspace_items WHERE collection IN ('operations','projects')").all() as { rowid: number; seq: number; data: string }[]).map(row => [JSON.parse(row.data).id as string, `${row.rowid}:${row.seq}`])); } finally { db.close(); } };
+  try {
+    const users = [{ ...await signup('alice'), project: 'film' }, { ...await signup('bob'), project: 'other' }];
+    for (const user of users) {
+      const initial = await call('/state', user.cookie) as Envelope;
+      initial.state.projects.push(project(user.project, user.id));
+      initial.state.operations = Array.from({ length: 30 }, (_, i) => history(`${user.project}-${i}`, user.id, user.project)) as never;
+      await call('/state', user.cookie, initial, 'PUT');
+    }
+    // Each sees only their own project, so the other's entries are hidden from every save they make.
+    // Sixty saves cross the ~50 inserts after which a shrinking gap used to renumber the whole list.
+    for (let round = 0; round < 60; round++) {
+      const user = users[round % 3 === 2 ? 1 : 0], id = `${user.project}-new${round}`, before = rows();
+      await edit(user.cookie, state => ({ ...state, operations: [history(id, user.id, user.project), ...state.operations] as never }));
+      const changed = [...rows()].filter(([key, row]) => before.get(key) !== row).map(([key]) => key);
+      assert.deepEqual(changed, [id], `save ${round} wrote only its own new entry`);
+    }
+    for (const user of users) {
+      const seen = (await call('/state', user.cookie) as Envelope).state.operations.map(item => item.id);
+      const added = Array.from({ length: 60 }, (_, round) => round).filter(round => (round % 3 === 2) === (user.project === 'other')).reverse().map(round => `${user.project}-new${round}`);
+      assert.deepEqual(seen, [...added, ...Array.from({ length: 30 }, (_, i) => `${user.project}-${i}`)], 'each still sees their history newest first');
+    }
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test('a second server on the same data folder refuses to start instead of saving over the first', { timeout: 30_000 }, async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'workspace-second-')), file = join(dataDir, 'frameline.sqlite');
+  let app = createFrameLineServer({ dataDir, legacyEveryMs: 1e9 });
+  const base = await listen(app), { call, signup } = client(() => base);
+  const rows = () => { const db = new DatabaseSync(file, { readOnly: true }); try { return db.prepare('SELECT rowid,data FROM workspace_items ORDER BY rowid').all(); } finally { db.close(); } };
+  try {
+    const alice = await signup('alice');
+    const initial = await call('/state', alice.cookie) as Envelope;
+    initial.state.projects.push(project('film', alice.id));
+    await call('/state', alice.cookie, initial, 'PUT');
+    // An asset mid-upload: a second start would mark it interrupted and save that over the live server's row.
+    await call('/media?projectId=film&name=shot.mp4&placeholder=1', alice.cookie, {});
+    const before = rows();
+    assert.throws(() => createFrameLineServer({ dataDir, legacyEveryMs: 1e9 }), /Another SharedCut server/);
+    assert.deepEqual(rows(), before, 'the refused start wrote nothing');
+    await app.close();
+    app = createFrameLineServer({ dataDir, legacyEveryMs: 1e9 });
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test('after a hard kill, sync-legacy-row hands an older build every save; without it, rolling forward keeps what the older build missed', { timeout: 60_000 }, async () => {
+  const [dataDir, unsynced] = await Promise.all(['workspace-rollback-', 'workspace-unsynced-'].map(prefix => mkdtemp(join(tmpdir(), prefix))));
+  const file = join(dataDir, 'frameline.sqlite'), server = await startChild(dataDir);
+  let app: App | undefined, base = server.base;
+  const { call, signup, edit } = client(() => base);
+  try {
+    const alice = await signup('alice');
+    const initial = await call('/state', alice.cookie) as Envelope;
+    initial.state.projects.push(project('film', alice.id));
+    await call('/state', alice.cookie, initial, 'PUT');
+    let saved = initial;
+    for (const description of ['edit one', 'edit two', 'edit three']) saved = await edit(alice.cookie, state => ({ ...state, projects: state.projects.map(item => ({ ...item, description })) }));
+    for (const run of [await script('sync-legacy-row.mjs', dataDir), await script('project-bundle.mjs', dataDir, 'import', dataDir)]) {
+      assert.notEqual(run.code, 0, 'scripts that write the workspace refuse to run beside the server'); assert.match(run.output, /Another SharedCut server/);
+    }
+    await server.kill();
+    assert.equal(legacyState(file).projects.length, 0, 'killed before its first background copy, the legacy row predates the project');
+    cpSync(dataDir, unsynced, { recursive: true });
+
+    // The documented rollback: stop the server, sync, start the older build.
+    const sync = await script('sync-legacy-row.mjs', dataDir); assert.equal(sync.code, 0, sync.output);
+    const older = olderBuild(file, state => { state.projects[0].name = 'Renamed on the older build'; });
+    assert.equal(older.state.projects[0].description, 'edit three', 'the older build starts from the last acknowledged save');
+    assert.ok(older.revision > saved.revision, 'and never reuses a revision an open tab already holds');
+    app = createFrameLineServer({ dataDir, legacyEveryMs: 1e9 }); base = await listen(app);
+    assert.deepEqual((await call('/state', alice.cookie) as Envelope).state.projects.map(item => [item.name, item.description]), [['Renamed on the older build', 'edit three']]);
+    assert.deepEqual(recoveryFiles(dataDir), [], 'nothing was replaced');
+    await app.close(); app = undefined;
+
+    // Forgetting the sync: the older build misses the last saves, and rolling forward keeps them in a file.
+    olderBuild(join(unsynced, 'frameline.sqlite'), () => {});
+    app = createFrameLineServer({ dataDir: unsynced, legacyEveryMs: 1e9 }); base = await listen(app);
+    assert.equal((await call('/state', alice.cookie) as Envelope).state.projects.length, 0, 'the latest writer, the older build, wins');
+    const [recovery] = recoveryFiles(unsynced);
+    assert.ok(recovery, 'the replaced workspace is kept');
+    assert.equal(JSON.parse(readFileSync(join(unsynced, recovery), 'utf8')).projects[0].description, 'edit three');
+  } finally { await server.kill(); await app?.close(); await Promise.all([dataDir, unsynced].map(dir => rm(dir, { recursive: true, force: true }))); }
 });

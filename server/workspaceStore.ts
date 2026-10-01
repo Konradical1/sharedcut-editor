@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { statSync } from 'node:fs';
+import { join } from 'node:path';
 
 // The workspace lives in memory and in `workspace_items`, one row per entity ordered by `seq`, so a
 // save writes only what changed. Writing the whole 37 MB JSON row on every edit blocked the server
@@ -8,8 +9,9 @@ import { statSync } from 'node:fs';
 //
 // `workspace.state` — the single JSON row older builds and the scripts read — is still kept whole:
 // written on a clean shutdown, at startup when stale, and at most once a minute by a worker thread
-// while edits come in. Anything else that writes that row (an older build after a rollback,
+// once edits pause. Anything else that writes that row (an older build after a rollback,
 // project-bundle.mjs) trips a trigger, and the next start imports the row instead of the items.
+// Production stops are hard kills, so before starting an older build run scripts/sync-legacy-row.mjs.
 export const COLLECTIONS = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'] as const;
 type State = Record<string, unknown>;
 type Row = { rowid: number; seq: number };
@@ -19,6 +21,7 @@ const EMPTY: readonly unknown[] = Object.freeze([]);
 const SCHEMA = `CREATE TABLE IF NOT EXISTS workspace_items(collection TEXT NOT NULL,id TEXT,seq REAL NOT NULL,data TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS workspace_items_order ON workspace_items(collection,seq);
 CREATE TABLE IF NOT EXISTS workspace_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS workspace_revision(id INTEGER PRIMARY KEY,revision INTEGER NOT NULL);
 INSERT OR IGNORE INTO workspace_meta(key,value) VALUES('legacyWritten','0');
 CREATE TRIGGER IF NOT EXISTS workspace_row_inserted AFTER INSERT ON workspace BEGIN UPDATE workspace_meta SET value='1' WHERE key='legacyWritten'; END;
 CREATE TRIGGER IF NOT EXISTS workspace_row_updated AFTER UPDATE ON workspace BEGIN UPDATE workspace_meta SET value='1' WHERE key='legacyWritten'; END;`;
@@ -66,6 +69,20 @@ export function writeLegacy(db: DatabaseSync) {
   return revision;
 }
 
+/**
+ * One server per data folder. A second start used to load the same rows, mark the live server's
+ * uploads and exports interrupted and save that over its rows, leaving two copies of an entity.
+ * SQLite's exclusive lock on `frameline.lock` lasts as long as the returned connection, and the OS
+ * drops it when the process dies, so a killed server leaves nothing stale. Scripts that write the
+ * workspace take the same lock (scripts/workspace-db.mjs).
+ */
+export function holdDataLock(dataDir: string) {
+  const lock = new DatabaseSync(join(dataDir, 'frameline.lock'), { timeout: 2000 });
+  try { lock.exec('PRAGMA locking_mode=EXCLUSIVE; CREATE TABLE IF NOT EXISTS holder(pid INTEGER NOT NULL); DELETE FROM holder'); lock.prepare('INSERT INTO holder(pid) VALUES(?)').run(process.pid); }
+  catch (error) { lock.close(); throw new Error(`Another SharedCut server or script is using ${dataDir}. Stop it first.`, { cause: error }); }
+  return lock;
+}
+
 // Positions of one longest strictly increasing run through `values`: the entries that keep their seq.
 function increasing(values: number[]) {
   const tails: number[] = [], previous: number[] = [];
@@ -106,11 +123,12 @@ export function workspaceStore(db: DatabaseSync, path: string, options: { legacy
   const insert = db.prepare('INSERT INTO workspace_items(collection,id,seq,data) VALUES(?,?,?,?)');
   const remove = db.prepare('DELETE FROM workspace_items WHERE rowid=?');
   const move = db.prepare('UPDATE workspace_items SET seq=? WHERE rowid=?');
+  const bump = db.prepare('INSERT INTO workspace_revision(id,revision) VALUES(1,?) ON CONFLICT(id) DO UPDATE SET revision=max(revision,excluded.revision)');
   const json = new WeakMap<object, string>();
   let tables = new Map<string, Table>(), fields = '', persisted = 0;
   // undefined: no transaction; null: inside transaction() with nothing saved yet; else the save waiting on COMMIT.
   let transaction: { apply: () => void } | null | undefined;
-  let worker: Worker | undefined, busy = false, closed = false, legacyAt = Date.now(), savedAt = 0, legacyRevision = Number(meta(db).legacyRevision ?? -1);
+  let worker: Worker | undefined, busy = false, closed = false, failed = false, legacyAt = Date.now(), savedAt = 0, legacyRevision = Number(meta(db).legacyRevision ?? -1);
   const keys = () => new Set<string>([...COLLECTIONS, ...tables.keys()]);
 
   // Writes one list's difference. Only the stretch between the unchanged head and tail can differ, and an
@@ -134,8 +152,16 @@ export function workspaceStore(db: DatabaseSync, path: string, options: { legacy
       changes.push([item, { rowid: Number(insert.run(key, typeof id === 'string' ? id : null, seq, text).lastInsertRowid), seq }]);
       json.set(item, text); freeze(item);
     };
-    const seqs = sequence(window, rows, head ? rows.get(array[head - 1])!.seq : undefined, tail ? rows.get(array[array.length - tail])!.seq : undefined);
-    if (seqs) window.forEach((item, i) => place(item, seqs[i])); else array.forEach(place);
+    // The stretch's neighbours lie in the unchanged head and tail, so they are stored rows.
+    const below = (from: number) => from ? rows.get(array[from - 1])!.seq : undefined, above = (to: number) => to < array.length ? rows.get(array[to])!.seq : undefined;
+    let from = head, to = array.length - tail, seqs = sequence(window, rows, below(from), above(to));
+    // Doubles run out of room after ~50 inserts into one gap. Renumber a stretch around it rather than
+    // the whole list (10,000 history rows), widening it until its entries fit between its neighbours.
+    for (let span = 1; !seqs; span *= 2) {
+      from = Math.max(0, head - span); to = Math.min(array.length, array.length - tail + span);
+      seqs = sequence(array.slice(from, to), new Map(), below(from), above(to));
+    }
+    for (let i = from; i < to; i++) place(array[i], seqs[i - from]);
     return { table: { array: Object.freeze(array), rows }, apply: () => { for (const [item, row] of changes) if (row) rows.set(item, row); else rows.delete(item); } };
   };
   // Writes the difference between `state` and what was last stored; the caches move only once committed.
@@ -147,7 +173,9 @@ export function workspaceStore(db: DatabaseSync, path: string, options: { legacy
       const written = writeCollection(key, array, next.get(key)); next.set(key, written.table); applied.push(written.apply);
     }
     if (text !== fields) setMeta(db, 'fields', text);
-    setMeta(db, 'revision', String(revision));
+    // Older builds start counting from here; behind the saves, one started after a rollback reused
+    // revisions that open tabs already held.
+    setMeta(db, 'revision', String(revision)); bump.run(revision);
     return () => { for (const apply of applied) apply(); tables = next; fields = text; persisted = revision; savedAt = Date.now(); };
   };
   const writeLegacyNow = () => { legacyRevision = writeLegacy(db); legacyAt = Date.now(); };
@@ -161,24 +189,33 @@ export function workspaceStore(db: DatabaseSync, path: string, options: { legacy
         if (reply.error) console.error('Workspace backup failed:', reply.error);
         else if (reply.revision !== undefined) { legacyRevision = reply.revision; legacyAt = Date.now(); }
       });
-      spawned.on('error', error => console.error('Workspace backup worker failed:', error));
+      // Without the worker nothing checkpoints and the write-ahead log grows across restarts.
+      spawned.on('error', error => {
+        failed = true; console.error('Workspace backup worker failed; the legacy row is now written only at startup and shutdown:', error);
+        if (!closed) db.exec('PRAGMA wal_autocheckpoint=1000');
+      });
       spawned.on('exit', () => { if (worker === spawned) { worker = undefined; busy = false; } });
     }
     worker.postMessage(task);
   };
-  // Waits for a quiet second so the write lock the copy takes does not stall a save, unless saves never stop.
+  // The copy holds the write lock for ~100 ms of a 37 MB write, and a save that meets it waits on the
+  // server thread; so it runs only once saves have paused. The rollback path does not depend on it:
+  // shutdown writes the row, and after a hard kill scripts/sync-legacy-row.mjs does.
+  const quietMs = Math.min(3000, legacyEveryMs);
   const tick = () => {
-    if (closed || busy) return;
-    const now = Date.now(), due = persisted !== legacyRevision && now - legacyAt >= legacyEveryMs && (now - savedAt >= 1000 || now - legacyAt >= 2 * legacyEveryMs);
+    if (closed || busy || failed) return;
+    const now = Date.now(), due = persisted !== legacyRevision && now - legacyAt >= legacyEveryMs && now - savedAt >= quietMs;
     let wal = 0; try { wal = statSync(`${path}-wal`).size; } catch { /* no write-ahead log yet */ }
     if (due) run('legacy'); else if (wal > 8 * 1024 * 1024) run('checkpoint');
   };
-  const timer = setInterval(tick, Math.min(5_000, legacyEveryMs)); timer.unref();
+  const timer = setInterval(tick, Math.min(1_000, legacyEveryMs)); timer.unref();
 
   return {
     /** The rows are the current copy: migrated, and nothing else has written the legacy row since. */
     current: () => { const values = meta(db); return values.revision !== undefined && values.legacyWritten !== '1'; },
     revision: () => Number(meta(db).revision ?? 0),
+    /** The rows as legacy JSON when they hold saves the legacy row never got, which replace() would drop. */
+    unsynced: () => { const values = meta(db); return values.revision !== undefined && Number(values.revision) > Number(values.legacyRevision ?? -1) ? legacyJson(db).json : undefined; },
     load() {
       const values = meta(db), lists = new Map<string, unknown[]>(COLLECTIONS.map(key => [key, []])), rows = new Map<string, Map<unknown, Row>>();
       for (const row of db.prepare('SELECT rowid,collection,seq,data FROM workspace_items ORDER BY collection,seq,rowid').all() as { rowid: number; collection: string; seq: number; data: string }[]) {

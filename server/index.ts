@@ -2,7 +2,7 @@ import { createPreviewCache } from './previewCache.ts';
 import { validateMotionBlur } from '../src/services/motionBlur.ts';
 import { workQueue } from './workQueue.ts';
 import { stateDelta, applyStateDelta, stateEqual, shareState } from '../src/services/stateDelta.ts';
-import { COLLECTIONS, workspaceStore } from './workspaceStore.ts';
+import { COLLECTIONS, holdDataLock, workspaceStore } from './workspaceStore.ts';
 import { parseImportLink, downloadLink, youtubeThumbnail } from './linkImport.ts';
 import { soundLibrary } from './sfx.ts';
 import { projectLibrary } from './library.ts';
@@ -55,6 +55,40 @@ const jsonValue = (value: unknown) => value === undefined ? undefined : JSON.par
 // Structural first: saved entities are shared by reference, so a 10 MB media list compares in
 // microseconds instead of two JSON round trips. The JSON pass keeps the old answer for the rest.
 const same = (a: unknown, b: unknown) => a === b || stateEqual(a, b) || isDeepStrictEqual(jsonValue(a), jsonValue(b));
+/**
+ * A list rebuilt from one caller's save of the entries they can see. Hidden entries keep their slots, so
+ * one user's save never moves another's rows. New entries at either end of the caller's list go to that
+ * end of the whole list, where the store has room: put next to the first hidden entry instead, history
+ * halved one gap until the store had to renumber every row.
+ */
+export function mergeVisible<T extends { id?: unknown }>(old: readonly T[], hidden: (item: T) => boolean, sent: readonly T[]) {
+  let merged: T[] = [], next = 0;
+  const emit = (to: number) => { while (next < to) merged.push(sent[next++]); };
+  // Usually the caller kept every entry they could see, in order, and added only at the ends; then each
+  // kept entry takes its old slot without indexing every id (10,000 history entries on each save).
+  const seen = old.find(item => !hidden(item)), lead = seen ? sent.findIndex(item => item.id === seen.id) : sent.length;
+  if (lead >= 0) {
+    emit(lead);
+    let inOrder = true;
+    for (const item of old) {
+      if (hidden(item)) merged.push(item);
+      else if (next < sent.length && sent[next].id === item.id) merged.push(sent[next++]);
+      else { inOrder = false; break; }
+    }
+    if (inOrder) { emit(sent.length); return merged; }
+    merged = []; next = 0;
+  }
+  const rank = new Map<unknown, number>();
+  for (let i = 0; i < sent.length; i++) rank.set(sent[i].id, i);
+  let first = sent.length;
+  for (const item of old) if (!hidden(item)) first = Math.min(first, rank.get(item.id) ?? first);
+  emit(first);
+  // Each kept entry takes its old slot, preceded by the new ones the caller put before it; one the caller
+  // moved earlier has already been placed.
+  for (const item of old) if (hidden(item)) merged.push(item); else emit((rank.get(item.id) ?? -1) + 1);
+  emit(sent.length);
+  return merged;
+}
 const initials = (name: string) => name.split(/\s+/).map(part => part[0]).slice(0, 2).join('').toUpperCase();
 class HttpError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status; } }
 const fail = (status: number, message: string): never => { throw new HttpError(status, message); };
@@ -150,6 +184,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const maxUploadBytes = options.maxUploadBytes ?? Number(process.env.FRAME_LINE_MAX_UPLOAD_BYTES ?? 10 * 1024 ** 3);
   if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes <= 0) throw new Error('FRAME_LINE_MAX_UPLOAD_BYTES must be a positive integer.');
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  // Before anything is read or written: a second server (a double start, `npm start` beside the live
+  // one) stops here instead of saving its view of the workspace over the running server's.
+  const lock = holdDataLock(dataDir);
   // The timeout waits out the backup worker's write lock instead of failing a save.
   const db = new DatabaseSync(join(dataDir, 'frameline.sqlite'), { timeout: 5000 });
   db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,email TEXT UNIQUE NOT NULL,data TEXT NOT NULL); CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,userId TEXT NOT NULL REFERENCES accounts(id),expiresAt INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS workspace(id INTEGER PRIMARY KEY CHECK(id=1),revision INTEGER NOT NULL,state TEXT NOT NULL); CREATE TABLE IF NOT EXISTS deleted_projects(id TEXT PRIMARY KEY,ownerId TEXT NOT NULL,expiresAt INTEGER NOT NULL,data TEXT NOT NULL);');
@@ -177,6 +214,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const saved = db.prepare('SELECT revision,state FROM workspace WHERE id=1').get() as { revision: number; state: string } | undefined;
     state = { ...emptyState(), ...(saved ? JSON.parse(saved.state) : {}) };
     revision = Math.max(store.revision(), saved?.revision ?? 0, tickRevision) + 1;
+    // An older build started after a hard kill without scripts/sync-legacy-row.mjs read a row that
+    // lacked the last saves. As the latest writer its row wins, but the rows it replaces are kept.
+    const replaced = store.unsynced();
+    if (replaced) {
+      const file = join(dataDir, `workspace-replaced-${Date.now()}.json`); writeFileSync(file, replaced, { mode: 0o600 });
+      console.error(`Another program saved the workspace from a copy that lacked the latest saves. The workspace it replaced is in ${file}.`);
+    }
     store.replace(state, revision);
   }
   const presence = new Map<string, { person: Presence; session: string; active: boolean }>(); const locks = new Map<string, CollaborativeLock>();
@@ -568,7 +612,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     });
     for (const project of currentView.projects) if (!nextProjectIds.has(project.id) && roleFor(existing.get(project.id)!, userId) !== 'Owner') fail(403, 'Only the owner can delete a project.');
     const removedProject = currentView.projects.some(project => !nextProjectIds.has(project.id));
-    const next = { ...state }; next.projects = [...state.projects.filter(project => !allowed.has(project.id)), ...projects];
+    const next = { ...state }; next.projects = mergeVisible(state.projects, project => !allowed.has(project.id), projects);
     const oldTimelines = new Map(state.timelines.map(item => [item.id, item.projectId])); const newTimelines = new Map(incoming.timelines.map(item => [item.id, item.projectId]));
     for (const key of ['timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots'] as const) {
       const oldItems = state[key] as unknown as Entry[]; const newItems = incoming[key] as unknown as Entry[];
@@ -606,8 +650,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           }
         }
       }
-      const hidden: Entry[] = []; let visible = 0;
-      for (const oldItem of oldItems) { const projectId = itemProject(oldItem, false); if (!allowed.has(projectId)) hidden.push(oldItem); else if (nextProjectIds.has(projectId)) visible++; }
+      const hidden = (item: Entry) => !allowed.has(itemProject(item, false));
+      let visible = 0, hiddenCount = 0;
+      for (const oldItem of oldItems) { const projectId = itemProject(oldItem, false); if (!allowed.has(projectId)) hiddenCount++; else if (nextProjectIds.has(projectId)) visible++; }
       // Nothing was deleted when every entity the caller could see came back as the same object.
       if (held !== visible) {
         const newIds = new Set(newItems.map(item => item.id));
@@ -617,7 +662,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if ([...locks.values()].some(lock => lock.targetId === oldItem.id && lock.projectId === itemProject(oldItem, false) && lock.userId !== userId && lock.expiresAt > Date.now())) fail(423, 'A collaborator has locked this item.');
         }
       }
-      (next as unknown as Entry)[key] = hidden.length ? [...hidden, ...newItems] : newItems;
+      (next as unknown as Entry)[key] = hiddenCount ? mergeVisible(oldItems, hidden, newItems) : newItems;
     }
     const deleted = new Set([...allowed].filter(id => !nextProjectIds.has(id)));
     if (deleted.size) { next.media = state.media.filter(item => !deleted.has(item.projectId)); next.renderJobs = state.renderJobs.filter(item => !deleted.has(item.projectId)); }
@@ -1480,7 +1525,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   // What changed only in memory (render progress, a held-back progress value) is saved on the way out,
   // first thing, in case Windows ends the process before the slower shutdown steps finish.
   const saveBeforeExit = () => { try { flushProgress(); if (store.dirty(state)) persist(); } catch (error) { console.error('Could not save the workspace on shutdown:', error); } };
-  return { server, dataDir, async close() { closed = true; saveBeforeExit(); await masks.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); } };
+  return { server, dataDir, async close() { closed = true; saveBeforeExit(); await masks.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

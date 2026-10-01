@@ -7,12 +7,13 @@ import {copyFileSync,existsSync,mkdirSync,readdirSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
+import {readWorkspace} from './workspace-db.mjs';
 import {colorAssistantService} from '../server/colorAssistant.ts';
 const args=process.argv.slice(2),flag=name=>{const i=args.indexOf(`--${name}`);return i<0?undefined:args.splice(i,2)[1];};
 const style=flag('style'),data=resolve(flag('data')??'data'),out=resolve(flag('out')??join(tmpdir(),'sharedcut-color-assistant-tune')),name=flag('name')??'run',[projectId,...clipIds]=args;
 if(!projectId||!clipIds.length){console.error('Usage: color-assistant-tune.mjs <projectId> <clipId>... [--style text] [--data dir] [--out dir] [--name label]');process.exit(2);}
 const ffmpeg=process.env.FFMPEG_PATH||'ffmpeg';
-const db=new DatabaseSync(join(data,'frameline.sqlite'),{readOnly:true}),state=JSON.parse(db.prepare('SELECT state FROM workspace WHERE id=1').get().state);db.close();
+const db=new DatabaseSync(join(data,'frameline.sqlite'),{readOnly:true}),state=readWorkspace(db).state;db.close();
 const service=colorAssistantService(out),started=Date.now();
 const {jobId}=service.start({projectId,body:{mode:'looks',clipIds,...(style&&{prompt:style})},clips:state.clips,media:state.media,nodes:state.nodes,source:id=>join(data,'media',id,'original')});
 const folder=join(out,'color-assistant',projectId,jobId),draft=join(out,`${name}-draft`);mkdirSync(draft,{recursive:true});

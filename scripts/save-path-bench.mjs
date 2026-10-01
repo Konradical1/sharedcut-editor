@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomBytes, createHash } from 'node:crypto';
+import { readWorkspace } from './workspace-db.mjs';
 
 const argv = process.argv.slice(2);
 
@@ -56,7 +57,7 @@ if (argv[0] === '--child') {
   // Sign in as the owner of the benchmark project by minting a session in the copy.
   const token = randomBytes(32).toString('base64url');
   const db = new DatabaseSync(copy);
-  const legacy = JSON.parse(String(db.prepare('SELECT state FROM workspace WHERE id=1').get().state));
+  const legacy = readWorkspace(db).state;
   const target = legacy.projects.find(p => p.name === projectName || legacy.timelines.some(t => t.projectId === p.id && t.name.startsWith(projectName))) ?? legacy.projects.map(p => [p, legacy.clips.filter(c => c.projectId === p.id).length]).sort((a, b) => b[1] - a[1])[0][0];
   const ownerId = target.members.find(m => m.role === 'Owner').userId;
   db.prepare('INSERT INTO sessions(token,userId,expiresAt) VALUES(?,?,?)').run(createHash('sha256').update(token).digest('hex'), ownerId, Date.now() + 86400_000);
