@@ -287,6 +287,8 @@ function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,
   // Live: one raster per word (one for the whole line when nothing pops), each at the largest zoom its samples reach so
   // no sample enlarges it; a word that holds still stays 1:1. Canvas shadows ignore the transform, so they scale by hand.
   const live=shutter==='live'&&count>1,pops=samples.some(s=>s.zooms.some(z=>z!==1));
+  // Rasters live only through a pop or entrance; kept per caption for the session, every captioned clip played held its own.
+  if(!live)captionSprites.delete(doc);
   const reach=(n?:number)=>Math.ceil(Math.max(1,...samples.map(s=>(n===undefined?1:s.zooms[n])*s.m.zoom))*8)/8;
   const sprite=(d:TextDocument,key:string,raster:number):Sprite=>{
     let cache=captionSprites.get(doc);

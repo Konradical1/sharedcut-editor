@@ -324,4 +324,4 @@
 /* While playing, the playhead and the timecodes are canvases: per-frame element changes re-layerize the whole page. */
 .local-playhead-canvas{position:absolute;z-index:9;pointer-events:none}
 .timeline-scroll[data-playing] .clip-cache:before,.timeline-scroll[data-playing] .clip-preparing:before{transition:none}
-.live-timecode{position:relative}.live-timecode-held::after{content:attr(data-text);visibility:hidden}.live-timecode-origin{display:inline-block;width:0;height:0}.live-timecode-canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+.live-timecode{position:relative}.live-timecode-held::after{content:attr(data-text);visibility:hidden}.live-timecode-origin{display:inline-block;width:0;height:0}.live-timecode-canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;image-rendering:pixelated}

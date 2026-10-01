@@ -4,43 +4,46 @@ import {createId} from '../services';
 import type {GradeNode,ColorCurve,CurvePoint,ColorCurves} from '../state/models';
 import {identityCurve,sampleCurve,curveSlope} from '../services/color';
 import {IconButton,NumberInput} from '../components/ui';
-export type Scope = 'Waveform' | 'RGB Parade' | 'Vectorscope' | 'Histogram';
+import {useEditorStore} from '../state/store';
+import {renderScope,SAMPLE_HEIGHT,SAMPLE_WIDTH,SCOPE_HEIGHT,SCOPE_WIDTH,type Scope} from './scopeRender';
+export type {Scope};
 export const scopes: Scope[] = ['Waveform', 'RGB Parade', 'Vectorscope', 'Histogram'];
+const canvas2d=(width:number,height:number)=>{const c=document.createElement('canvas');c.width=width;c.height=height;return c.getContext('2d',{willReadFrequently:true})!;};
 export const ScopeDisplay = memo(function ScopeDisplay({ type }: { type: Scope }) {
   const ref = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
-    const sampler = document.createElement('canvas'); sampler.width=192; sampler.height=108;
-    const sample = sampler.getContext('2d',{willReadFrequently:true})!;
+    const sample=canvas2d(SAMPLE_WIDTH,SAMPLE_HEIGHT),scope=canvas2d(SCOPE_WIDTH,SCOPE_HEIGHT);
+    // Newest wins: a plot finishing late on the worker never covers one drawn since.
+    let worker:Worker|undefined,busy=false,failed=false,issued=0,shown=0;
+    const show=(picture:CanvasImageSource,revision:string,ticket:number)=>{
+      const canvas=ref.current,ctx=canvas?.getContext('2d');if(!canvas||!ctx||ticket<shown)return;
+      shown=ticket;ctx.drawImage(picture,0,0);
+      canvas.dataset.frameRevision=revision;canvas.dataset.updatedAt=String(performance.now());
+    };
     const draw = (event: Event) => {
-      const source=(event as CustomEvent<HTMLCanvasElement>).detail;
-      const ctx=ref.current?.getContext('2d'); if(!ctx||!source?.width)return;
-      sample.drawImage(source,0,0,192,108);
-      const pixels=sample.getImageData(0,0,192,108).data;
-      ctx.fillStyle='#14191a';ctx.fillRect(0,0,320,160);
-      ctx.strokeStyle='#303739';ctx.lineWidth=1;
-      for(let i=0;i<=4;i++){ctx.beginPath();ctx.moveTo(0,8+i*36);ctx.lineTo(320,8+i*36);ctx.stroke();}
-      const hist=[new Uint32Array(256),new Uint32Array(256),new Uint32Array(256)];
-      const image=ctx.getImageData(0,0,320,160),out=image.data;
-      const plot=(x:number,y:number,color:number[])=>{x=Math.floor(x);y=Math.floor(y);if(x<0||x>=320||y<0||y>=160)return;const at=(y*320+x)*4;for(let c=0;c<3;c++)out[at+c]=out[at+c]*.84+color[c]*.16;};
-      const colors=[[230,128,128],[138,198,141],[131,168,220]],green=[188,232,199];
-      for(let i=0;i<pixels.length;i+=4){
-        const r=pixels[i],g=pixels[i+1],b=pixels[i+2],y=.2126*r+.7152*g+.0722*b;
-        if(type==='Histogram'){hist[0][r]++;hist[1][g]++;hist[2][b]++;continue;}
-        if(type==='Vectorscope'){plot(160+(b-y)/1.8556*.52,80-(r-y)/1.5748*.52,green);}
-        else if(type==='Waveform'){plot((i/4%192)/192*320,152-y/255*144,green);}
-        else for(let c=0;c<3;c++)plot(c*106+(i/4%192)/192*104,152-pixels[i+c]/255*144,colors[c]);
+      const source=(event as CustomEvent<HTMLCanvasElement>).detail,revision=source?.dataset.frameRevision||'';
+      if(!ref.current||!source?.width)return;
+      // Reading the GPU frame back stalls this thread (~13 ms a picture, a third of playback's main thread). Playing, the
+      // worker reads and plots it, one picture at a time; paused, it is plotted here at once so the scope matches the picture.
+      if(useEditorStore.getState().playing&&!failed){
+        if(busy)return;
+        busy=true;const ticket=++issued;
+        if(!worker){worker=new Worker(new URL('./scopeWorker.ts',import.meta.url),{type:'module'});worker.onmessage=({data}:MessageEvent<{picture:ImageBitmap;revision:string;ticket:number}>)=>{busy=false;show(data.picture,data.revision,data.ticket);data.picture.close();};worker.onerror=()=>{busy=false;failed=true;};}
+        const target=worker;
+        createImageBitmap(source,{resizeWidth:SAMPLE_WIDTH,resizeHeight:SAMPLE_HEIGHT}).then(frame=>target.postMessage({frame,type,revision,ticket},[frame])).catch(()=>{busy=false;});
+        return;
       }
-      ctx.putImageData(image,0,0);
-      ref.current!.dataset.frameRevision=source.dataset.frameRevision||'';
-      ref.current!.dataset.updatedAt=String(performance.now());
-      if(type==='Histogram')hist.forEach((bins,c)=>{const max=Math.max(...bins,1);ctx.strokeStyle=['#e68080','#8ac68d','#83a8dc'][c];ctx.beginPath();bins.forEach((v,i)=>{const x=i/255*320,y=152-v/max*140;i?ctx.lineTo(x,y):ctx.moveTo(x,y);});ctx.stroke();});
-      if(type==='Vectorscope'){ctx.strokeStyle='#56635d';[32,64].forEach(r=>{ctx.beginPath();ctx.arc(160,80,r,0,Math.PI*2);ctx.stroke();});ctx.beginPath();ctx.moveTo(160,80);ctx.lineTo(125,15);ctx.setLineDash([3,3]);ctx.stroke();ctx.setLineDash([]);}
+      sample.drawImage(source,0,0,SAMPLE_WIDTH,SAMPLE_HEIGHT);
+      renderScope(scope,sample.getImageData(0,0,SAMPLE_WIDTH,SAMPLE_HEIGHT).data,type);
+      show(scope.canvas,revision,++issued);
     };
     window.addEventListener('frameline:scope-frame',draw);
     window.dispatchEvent(new Event('frameline:request-scope'));
-    return ()=>{window.removeEventListener('frameline:scope-frame',draw);};
+    // The last plot of playback can trail the picture it stopped on; pausing redraws the picture, and the scope with it.
+    const paused=useEditorStore.subscribe((state,previous)=>{if(previous.playing&&!state.playing)window.dispatchEvent(new Event('frameline:request-scope'));});
+    return ()=>{window.removeEventListener('frameline:scope-frame',draw);paused();worker?.terminate();};
   },[type]);
-  return <div className="scope-display"><canvas ref={ref} width={320} height={160} role="img" aria-label={`${type} of the current SDR preview`} style={{width:'100%',height:'100%',objectFit:'contain'}}/><div className="scope-axis"><span>0</span><span>SDR preview samples</span><span>100%</span></div></div>;
+  return <div className="scope-display"><canvas ref={ref} width={SCOPE_WIDTH} height={SCOPE_HEIGHT} role="img" aria-label={`${type} of the current SDR preview`} style={{width:'100%',height:'100%',objectFit:'contain'}}/><div className="scope-axis"><span>0</span><span>SDR preview samples</span><span>100%</span></div></div>;
 });
 
 const defaults:Record<string,number>={exposure:0,temperature:0,tint:0,contrast:1,pivot:.5,saturation:100,lift:0,gamma:0,gain:1,offset:0,curve25:.25,curve50:.5,curve75:.75};

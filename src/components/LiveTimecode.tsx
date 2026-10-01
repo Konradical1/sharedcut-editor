@@ -44,19 +44,8 @@ export function LiveTimecode({ fps, className, style }: { fps?: number; classNam
     // On the panel's own opaque colour the canvas gets the same subpixel (LCD) text the DOM does; transparent, only greyscale.
     const backdrop = opaqueBackdrop(element), context = surface.getContext('2d', { alpha: !backdrop });
     if (!context) return;
-    // Everything below is in device pixels, the units layout itself snaps text and replaced elements to.
-    const css = getComputedStyle(element), rect = element.getBoundingClientRect(), dpr = devicePixelRatio;
-    const scale = rect.width / (parseFloat(css.width) || rect.width) * dpr, px = (value: string) => (parseFloat(value) || 0) * scale;
-    // Paint snaps the box (the canvas with it) to whole pixels; text keeps its fractional x but its baseline lands on a
-    // whole pixel at its layout offset from the snapped top.
-    const left = Math.round(rect.left * dpr), top = Math.round(rect.top * dpr);
-    surface.width = Math.max(1, Math.round(rect.right * dpr) - left); surface.height = Math.max(1, Math.round(rect.bottom * dpr) - top);
-    context.font = `${css.fontStyle} ${css.fontWeight} ${px(css.fontSize)}px ${css.fontFamily}`;
-    context.letterSpacing = `${px(css.letterSpacing)}px`; context.textBaseline = 'alphabetic';
-    // Layout's own pen position: an empty inline-block sits on the held text's baseline, right where its first glyph starts.
-    const origin = element.querySelector('.live-timecode-origin')?.getBoundingClientRect() ?? rect;
-    const x = origin.left * dpr - left, y = Math.round((origin.bottom - rect.top) * dpr);
-    let shown = '';
+    let shown = '', x = 0, y = 0;
+    const css = getComputedStyle(element);
     const draw = (text: string) => {
       if (text === shown) return;
       shown = text;
@@ -65,8 +54,30 @@ export function LiveTimecode({ fps, className, style }: { fps?: number; classNam
       context.fillStyle = css.color; context.fillText(text, x, y);
       surface.textContent = text;
     };
-    draw(timecode(useEditorStore.getState().playhead, fps));
-    return onPicture(playhead => draw(timecode(playhead, fps)));
+    // Everything below is in device pixels, the units layout itself snaps text and replaced elements to.
+    const place = () => {
+      const rect = element.getBoundingClientRect(), dpr = devicePixelRatio;
+      const scale = rect.width / (parseFloat(css.width) || rect.width) * dpr, px = (value: string) => (parseFloat(value) || 0) * scale;
+      // Paint snaps the box (the canvas with it) to whole pixels; text keeps its fractional x but its baseline lands on a
+      // whole pixel at its layout offset from the snapped top. At 125% or 150% the panel itself can sit mid-pixel, so the
+      // canvas is sized to exactly its pixels and shown unfiltered (styles.css): stretched or filtered, the digits went soft.
+      const left = Math.round(rect.left * dpr), top = Math.round(rect.top * dpr);
+      surface.width = Math.max(1, Math.round(rect.right * dpr) - left); surface.height = Math.max(1, Math.round(rect.bottom * dpr) - top);
+      Object.assign(surface.style, { width: `${surface.width / scale}px`, height: `${surface.height / scale}px` });
+      context.font = `${css.fontStyle} ${css.fontWeight} ${px(css.fontSize)}px ${css.fontFamily}`;
+      context.letterSpacing = `${px(css.letterSpacing)}px`; context.textBaseline = 'alphabetic';
+      // Layout's own pen position: an empty inline-block sits on the held text's baseline, right where its first glyph starts.
+      const origin = element.querySelector('.live-timecode-origin')?.getBoundingClientRect() ?? rect;
+      x = origin.left * dpr - left; y = Math.round((origin.bottom - rect.top) * dpr);
+      const last = shown; shown = ''; draw(last || timecode(useEditorStore.getState().playhead, fps));
+    };
+    place();
+    // A breakpoint can resize the box mid-playback (the window crossing 1250 px changes the font).
+    let size = `${element.offsetWidth}x${element.offsetHeight}`;
+    const resize = new ResizeObserver(() => { const now = `${element.offsetWidth}x${element.offsetHeight}`; if (now !== size) { size = now; place(); } });
+    resize.observe(element);
+    const unsubscribe = onPicture(playhead => draw(timecode(playhead, fps)));
+    return () => { unsubscribe(); resize.disconnect(); };
   }, [playing, fps]);
   return <span ref={box} className={`${className} live-timecode`} style={style}>{playing ? <><span className="live-timecode-held" data-text={held.current} aria-hidden="true"><i className="live-timecode-origin"/></span><canvas ref={canvas} className="live-timecode-canvas"/></> : label}</span>;
 }

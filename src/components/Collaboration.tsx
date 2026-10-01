@@ -146,13 +146,16 @@ export function RemotePlayhead({ person, pixels, color, name }: { person: Presen
   const latest = useRef({ person, pixels }); latest.current = { person, pixels };
   const reducedMotion = useEditorStore(s => s.settings.reducedMotion);
   useEffect(() => {
-    let frame = 0;
+    let frame = 0, shown = NaN;
     const motion = playheadMotion(latest.current.person, performance.now());
     const preference = window.matchMedia('(prefers-reduced-motion: reduce)');
     const draw = () => {
       const { person, pixels } = latest.current;
       const position = advancePlayhead(motion, person, performance.now());
-      if (element.current) { element.current.style.visibility = 'visible'; element.current.style.transform = `translateX(${(reducedMotion || preference.matches ? person.playhead : position) * pixels}px)`; }
+      // Each move re-layerizes the whole timeline, so it moves only when it reaches the next device pixel: at the default
+      // zoom a playing collaborator's line advances a pixel every few frames, not every display frame.
+      const x = Math.round((reducedMotion || preference.matches ? person.playhead : position) * pixels * devicePixelRatio) / devicePixelRatio;
+      if (element.current && x !== shown) { shown = x; element.current.style.visibility = 'visible'; element.current.style.transform = `translateX(${x}px)`; }
       frame = requestAnimationFrame(draw);
     };
     frame = requestAnimationFrame(draw);

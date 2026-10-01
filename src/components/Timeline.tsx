@@ -98,7 +98,13 @@ function MovingPlayhead({ pixels, color, line, scroller }: { pixels: number; col
     let left = NaN, top = 0, scale = 1, shown = NaN;
     const draw = (playhead: number) => {
       // In the track area's coordinates, like the paused element.
-      const at = element.offsetLeft + playhead * pixels;
+      const at = element.offsetLeft + playhead * pixels, view = scroll.scrollLeft - area.offsetLeft;
+      // Off screen it is left blank and still. Zoomed in, the line leaves the view within a second, and redrawing the unseen
+      // strip every picture stalled the GPU process ~100 ms every few seconds (measured at 30 frames across the view).
+      if (at + PLAYHEAD_MARGIN < view || at - PLAYHEAD_MARGIN > view + scroll.clientWidth) {
+        if (shown === shown) { context.setTransform(1, 0, 0, 1, 0, 0); context.clearRect(0, 0, surface.width, surface.height); shown = NaN; }
+        return;
+      }
       if (!(at - PLAYHEAD_MARGIN >= left && at + PLAYHEAD_MARGIN <= left + PLAYHEAD_PAGE)) { left = Math.floor(at - PLAYHEAD_MARGIN); surface.style.left = `${left}px`; shown = NaN; }
       const x = at - left;
       if (x === shown) return;

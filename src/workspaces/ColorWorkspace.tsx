@@ -1,8 +1,9 @@
 import SmartMaskInspector from '../components/SmartMaskInspector';
-import {useEffect,useRef,useState,type CSSProperties,type PointerEvent} from 'react';
+import {memo,useEffect,useLayoutEffect,useRef,useState,type CSSProperties,type PointerEvent} from 'react';
 import {Plus,RotateCcw,Trash2,ChevronUp,ChevronDown,Power,Search,PanelRightClose,PanelRightOpen,GitBranch,SlidersHorizontal,Spline,ArrowRightLeft,Layers2} from 'lucide-react';
 import {createId} from '../services';
-import {useEditorStore,usePanelPlayhead,useStoreWithoutPlayhead} from '../state/store';
+import {useEditorStore,usePanelPlayhead,usePausedPlayhead,useStoreWithoutPlayhead} from '../state/store';
+import {onPicture} from '../components/LiveTimecode';
 import type {Clip,ColorEffect,ColorTransformEffect,GradeNode} from '../state/models';
 import {profiles,gamuts,interpretation,primaryDefaults,defaultCST,parseCube,processingStages,acesOutputUpgrade} from '../services/color';
 import {assistantCapabilities,type AssistantCapabilities} from '../services/colorAssistantClient';
@@ -29,11 +30,17 @@ function CSTSettings({effect,change}:{effect:ColorTransformEffect;change:(e:Colo
     <details open><summary>Gamut mapping</summary><ColorSelect label="Gamut Mapping Method" value={effect.gamutMapping} options={effect.toneMapping==='aces2'?['none']:['none','compress']} change={gamutMapping=>patch({gamutMapping:gamutMapping as 'none'})}/><small>{effect.gamutMapping==='compress'?'Compresses out-of-gamut colors toward neutral for SDR output.':'Keeps the transformed gamut until a later output stage.'}</small></details>
   </div>;
 }
-// The scrub bar is this workspace's transport readout, so it alone follows every playback frame.
-function ColorScrub({clip,fps}:{clip?:Clip;fps:number}){
-  const playhead=useEditorStore(s=>s.playhead),following=useEditorStore(s=>s.liveMode==='following'),s=useEditorStore.getState;
-  return <div className="color-scrub"><span className="scrub-clip-name" title={clip?.name}>{clip?.name??'No clip selected'}</span><input type="range" aria-label="Scrub color footage" aria-valuetext={timecode(playhead,fps)} disabled={!clip||following} min={clip?.start??0} max={Math.max(clip?.start??0,(clip?.start??0)+(clip?.duration??0)-1/fps)} step={1/fps} value={playhead} onPointerDown={()=>s().setPlaying(false)} onChange={e=>{s().setPlaying(false);s().setPlayhead(Number(e.target.value));}}/><span className="mono">{timecode(Math.max(0,playhead-(clip?.start??0)),fps)}</span></div>;
-}
+// The scrub bar is this workspace's transport readout. Paused, React places it; playing, it follows each presented picture
+// directly: a render per store tick re-laid-out the page at the display's rate, twice or more per picture. Memoized, so the
+// workspace's quarter-second steps leave it alone.
+const ColorScrub=memo(function ColorScrub({clip,fps}:{clip?:Clip;fps:number}){
+  const paused=usePausedPlayhead(),playing=paused<0,following=useEditorStore(s=>s.liveMode==='following'),s=useEditorStore.getState;
+  // A render while playing (a new shot) takes the live playhead, so the bar never steps back to where playback started.
+  const playhead=playing?s().playhead:paused,start=clip?.start??0,input=useRef<HTMLInputElement>(null),time=useRef<HTMLSpanElement>(null);
+  // Playing, the timecode is written here; keyed on `playing`, the span is a fresh one on pause, so React never diffs against it.
+  useLayoutEffect(()=>{if(!playing)return;let shown='';return onPicture(p=>{const text=timecode(Math.max(0,p-start),fps);if(text===shown)return;shown=text;if(input.current)input.current.value=String(p);if(time.current)time.current.textContent=text;});},[playing,start,fps]);
+  return <div className="color-scrub"><span className="scrub-clip-name" title={clip?.name}>{clip?.name??'No clip selected'}</span><input ref={input} type="range" aria-label="Scrub color footage" aria-valuetext={timecode(playhead,fps)} disabled={!clip||following} min={start} max={Math.max(start,start+(clip?.duration??0)-1/fps)} step={1/fps} value={playhead} onPointerDown={()=>s().setPlaying(false)} onChange={e=>{s().setPlaying(false);s().setPlayhead(Number(e.target.value));}}/><span ref={time} key={String(playing)} className="mono">{timecode(Math.max(0,playhead-start),fps)}</span></div>;
+});
 export default function ColorWorkspace(){
   // Shot choice and animated grades follow the playhead in quarter-second steps while playing, not every frame.
   const s={...useStoreWithoutPlayhead(),playhead:usePanelPlayhead()},gesture=useRef<string|undefined>(undefined),fileInput=useRef<HTMLInputElement>(null),fileTarget=useRef<string>('');
