@@ -60,10 +60,12 @@ test('drag previews of up to 1000 clips pass, anything else a collaborator canno
     assert.equal((await post(ada, '/locks', { projectId: 'p1', targetId: 'c5', field: 'manipulation' }, 'DELETE')).status, 200);
     assert.equal((await preview(bo, [entry('c5')])).status, 200, 'Releasing the lock frees the clip.');
 
-    // One lock request per moving clip, renewed and released the same way: 400 of each.
+    // The single-id form under load, renewed and released the same way: 400 of each. Sent 50 at a time:
+    // 400 sockets at once overflow Windows' accept backlog (ECONNREFUSED), which tests the OS, not the server.
     const burst = Array.from({ length: 400 }, (_, i) => ({ projectId: 'p1', targetId: `c${i}`, field: 'manipulation' }));
     const all = async (cookie: string, method: string, expected: number, bodies = burst) => {
-      const statuses = await Promise.all(bodies.map(body => post(cookie, '/locks', body, method).then(response => response.status)));
+      const statuses: number[] = [];
+      for (let i = 0; i < bodies.length; i += 50) statuses.push(...await Promise.all(bodies.slice(i, i + 50).map(body => post(cookie, '/locks', body, method).then(response => response.status))));
       assert.deepEqual([...new Set(statuses)], [expected]);
     };
     await all(ada, 'POST', 200);
