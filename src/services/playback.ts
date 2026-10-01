@@ -234,6 +234,8 @@ type AudioRoute = {
 type Decoder = AudioRoute & {
   url: string; element: HTMLMediaElement | HTMLImageElement; image: boolean; pending: boolean; blocked: boolean;
   frames?: ReturnType<typeof createVideoFrames>; framesFailed?: boolean; lastUsed: number; waitingSince?: number; error?: string; audioOnly: boolean; videoCallback?: number;
+  /** Opened on StreamLow by the automatic rule, not asked for by name (an alpha graphic's 1/4 file is also its StreamLow). */
+  automaticLow?: boolean;
 };
 
 /** The timeline consumes prepared frames; native media remains the audio/compatibility path. */
@@ -341,7 +343,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // saved what that one reads. While nothing measures the line (no answer: cache off, no controlling footage worker, no
     // rate yet) a stall's low stream stands.
     if (automatic && !open) { const slow = preferLowStream(requestedUrl); if (slow) automaticStreams.set(asset.id, low); else if (slow === false) automaticStreams.delete(asset.id); }
-    const url = automatic && (open?.url === requestedUrl || open?.url === low) ? open!.url : selectedUrl(asset, options, visual), audioOnly = !visual || asset.kind === 'audio';
+    const url = automatic && (open?.url === requestedUrl || open?.url === low && open.automaticLow) ? open!.url : selectedUrl(asset, options, visual), audioOnly = !visual || asset.kind === 'audio';
     const fallback = !url && visual && asset.thumbnail;
     if (!url && !fallback) return;
       let decoder = decoders.get(clip.id);
@@ -349,7 +351,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if (!decoder) {
         const image = asset.kind === 'image' || !!fallback;
         const element = image ? new Image() : document.createElement(audioOnly ? 'audio' : 'video');
-        decoder = { url: String(url || fallback), element, image, audioOnly, pending: false, blocked: false, filters: [], lastUsed: performance.now() };
+        decoder = { url: String(url || fallback), element, image, audioOnly, pending: false, blocked: false, filters: [], lastUsed: performance.now(), automaticLow: automatic && url === low };
         const current = decoder;
         element.crossOrigin = 'anonymous'; element.onerror = () => {
           const stream = byId(getState().media).get(asset.id)?.proxyVariants?.Stream, media = image ? undefined : element as HTMLMediaElement;
@@ -1034,7 +1036,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // Only a picture the automatic rule moved, by the clip's own asset (a decoder keeps its low stream to the end of its
     // shot after the asset is back on Stream). An alpha graphic's StreamLow is its 1/4 file, which it may be asked for by name.
     const clipById=byId(state.clips);
-    const automaticLow=options.quality==='Stream'&&!options.original&&[...activeIds].some(id=>{const decoder=decoders.get(id),asset=mediaById.get(clipById.get(id)?.mediaId??''),low=asset?.proxyVariants?.StreamLow;return !!decoder&&!!low&&decoder.url===low&&playbackUrl(asset!,options,true)!==low;});
+    const automaticLow=options.quality==='Stream'&&!options.original&&[...activeIds].some(id=>{const decoder=decoders.get(id),asset=mediaById.get(clipById.get(id)?.mediaId??''),low=asset?.proxyVariants?.StreamLow;return !!decoder?.automaticLow&&!!low&&decoder.url===low&&playbackUrl(asset!,options,true)!==low;});
     const fallbackActive = [...activeIds].some(id => { const decoder = decoders.get(id); return decoder && [...streamFallbacks.values()].includes(decoder.url); });
     loadingSince = loading ? loadingSince ?? performance.now() : undefined;
     // A paused seek that lands within a moment is a scrub, not buffering: hold the last picture quietly.

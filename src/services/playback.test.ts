@@ -291,10 +291,11 @@ async function fakeBrowser(state: Record<string, any>, quality = 'Full', extraGl
   const originals = Object.keys(replacements).map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
   for (const [key, value] of Object.entries(replacements)) Object.defineProperty(globalThis, key, { configurable: true, value });
   (globalThis.window as EventTarget).addEventListener('frameline:playback-health', event => health.push((event as CustomEvent).detail));
-  const playback = attachPlayback(new Canvas() as unknown as HTMLCanvasElement, () => state as any, () => ({ original: false, quality, volume: 0, compare: false }), status => statuses.push(status), preferLowStream);
+  let current = quality;
+  const playback = attachPlayback(new Canvas() as unknown as HTMLCanvasElement, () => state as any, () => ({ original: false, quality: current, volume: 0, compare: false }), status => statuses.push(status), preferLowStream);
   const live = (src: string) => media.filter(element => element.src === src);
   const restore = () => { playback.dispose(); for (const [key, descriptor] of originals) if (descriptor) Object.defineProperty(globalThis, key, descriptor); else Reflect.deleteProperty(globalThis, key); };
-  return { playback, media, live, statuses, health, clock, restore, tick: (ms = 34) => { clock.now += ms; clock.frame(); } };
+  return { playback, media, live, statuses, health, clock, restore, setQuality: (next: string) => { current = next; }, tick: (ms = 34) => { clock.now += ms; clock.frame(); } };
 }
 const layerFixture = (id: string, name: string, number: number, kind = 'video', asset: Record<string, unknown> = {}) => ({
   clip: { id, name, projectId: 'p', timelineId: 't', trackId: `${kind[0]}${number}`, mediaId: `m-${id}`, start: 0, duration: 5, sourceIn: 0, properties: {}, effects: [] },
@@ -379,6 +380,22 @@ test('reduced bandwidth is reported only for a picture the automatic rule moved,
       assert.equal(fake.statuses.at(-1), null, `${quality}: the graphic plays the file asked for`);
     } finally { fake.restore(); }
   }
+});
+
+test('switching from 1/4 to Auto moves an alpha graphic to its Stream file: its 1/4 file is not a low stream the automatic rule chose', async () => {
+  // An alpha graphic's StreamLow is the same file as its 1/4. Held as if the automatic rule had picked it, the graphic stayed
+  // on 1/4 until its clip ended and showed a false reduced-bandwidth note.
+  const graphic = layerFixture('graphic', 'Lower third', 1, 'video', { hasAlpha: true, proxyVariants: { '1/2': '/graphic-half.webm', '1/4': '/graphic-quarter.webm', Stream: '/graphic-half.webm', StreamLow: '/graphic-quarter.webm' } });
+  const state = timelineState([graphic], { playing: true }), fake = await fakeBrowser(state, '1/4', {}, () => false);
+  try {
+    fake.tick(); fake.tick();
+    assert.equal(fake.live('/graphic-quarter.webm').length, 1);
+    // Playing composites once per timeline frame, so the switch shows from the next picture.
+    fake.setQuality('Stream'); state.playhead = .5; fake.tick(); fake.tick();
+    assert.equal(fake.live('/graphic-half.webm').length, 1, 'Auto plays the graphic\'s Stream file');
+    assert.equal(fake.live('/graphic-quarter.webm').length, 0);
+    assert.notEqual(fake.statuses.at(-1)?.title, 'Auto preview · reduced bandwidth');
+  } finally { fake.restore(); }
 });
 
 test('an asset back from the low stream opens Stream at its next decoder, never mid-shot', async () => {
