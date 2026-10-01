@@ -14,7 +14,8 @@ import { defaultProperties } from '../src/state/demo.ts';
 const exec = promisify(execFile);
 const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
 
-test('Stabilize export bakes a shaky clip and rejects conflicting effects', { timeout: 180000 }, async () => {
+// ~60 s alone; Stabilize saturates every core, so beside the rest of `npm test` it took over 180 s and was cancelled.
+test('Stabilize export bakes a shaky clip and rejects conflicting effects', { timeout: 600000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'frameline-stabilize-'));
   try {
     const source = path.join(dir, 'shaky.mp4');
