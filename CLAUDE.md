@@ -80,7 +80,7 @@ the two share ~95% of their code and long gaps make painful merges.
 
 ## Moving a project between machines
 
-`data/` is 125 GB and gitignored — projects do not travel through git.
+`data/` is ~240 GB (October 2026) and gitignored — projects do not travel through git.
 
 ```
 node scripts/project-bundle.mjs export "Newspaper" ~/Desktop/newspaper-bundle
