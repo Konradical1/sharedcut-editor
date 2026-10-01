@@ -80,17 +80,18 @@ async function chunk(request, url, index, cache, prefetch = false) {
   let job = pending.get(key);
   if (!job) {
     job = (async () => {
-      const start = index * CHUNK;
+      // Taken before the request: a download begun before or during a clear must not save into the cache after it.
+      const start = index * CHUNK, at = epoch;
       const response = await fetch(new Request(request.url, { headers: { Range: `bytes=${start}-${start + CHUNK - 1}` }, credentials: 'include', cache: 'no-store' }));
       const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') || '');
       if (response.status !== 206 || !range || Number(range[1]) !== start || Number(range[2]) !== Math.min(start + CHUNK, Number(range[3])) - 1) throw new Error('Invalid media range');
       const meta = { size: Number(range[3]), type: response.headers.get('Content-Type') || 'video/mp4', used: Date.now() };
-      const length = Math.min(CHUNK, meta.size - start), whole = new Uint8Array(length), at = epoch;
-      let received = 0, firstAt = 0, firstSize = 0, lastAt = 0;
+      const length = Math.min(CHUNK, meta.size - start), whole = new Uint8Array(length);
+      let received = 0, reads = 0, firstAt = 0, firstSize = 0, lastAt = 0;
       const checked = new Response(response.body.pipeThrough(new TransformStream({
         transform(bytes, controller) {
           if (received + bytes.byteLength > length) throw new Error('Oversized media range');
-          if (!received) { firstAt = performance.now(); firstSize = bytes.byteLength; }
+          if (!reads++) { firstAt = performance.now(); firstSize = bytes.byteLength; }
           whole.set(bytes, received); received += bytes.byteLength; lastAt = performance.now(); controller.enqueue(bytes);
         },
         flush() { if (received !== length) throw new Error('Incomplete media range'); },
@@ -98,12 +99,18 @@ async function chunk(request, url, index, cache, prefetch = false) {
       // All simultaneous readers share this network request. Keep at most one aligned chunk
       // buffered for late readers; the first reader still receives bytes as they arrive.
       const copy = checked.clone();
-      const saved = reopen().then(store => store.put(key, copy).then(() => writeMeta(store, url, meta))).then(() => {
-        if (at === epoch) keep(key, whole.buffer);
+      const saved = reopen().then(async store => {
+        // A clear began since: the cache this would land in, or be announced in, is being replaced.
+        if (at !== epoch) { copy.body?.cancel().catch(() => {}); return; }
+        await store.put(key, copy); await writeMeta(store, url, meta);
+        if (at !== epoch) return;
+        keep(key, whole.buffer);
         notify({ type: 'footage-stored', url, index, size: length });
         // Line speed is how fast the body arrived, first byte to last; the wait for the first byte is latency, and
-        // counting it read a lightly used fast line as a slow one. Scaled so bytes / milliseconds is that speed.
-        notify({ type: 'footage-transfer', bytes: length, milliseconds: (lastAt - firstAt) * length / Math.max(1, length - firstSize), ago: performance.now() - lastAt });
+        // counting it read a lightly used fast line as a slow one. Scaled so bytes / milliseconds is that speed. A body
+        // that came in one read, or mostly in its first, was already buffered when it was timed: 0, no sample.
+        const timed = reads > 1 && firstSize <= length / 2;
+        notify({ type: 'footage-transfer', bytes: length, milliseconds: timed ? (lastAt - firstAt) * length / (length - firstSize) : 0, ago: performance.now() - lastAt });
       }).catch(error => { notify({ type: 'footage-storage-error', url }); throw error; });
       saved.catch(() => {});
       void saved.finally(() => { pending.delete(key); checked.body.cancel().catch(() => {}); }).catch(() => {});
@@ -118,9 +125,10 @@ async function chunk(request, url, index, cache, prefetch = false) {
 
 /** Writes a chunk held in memory back to Cache Storage if the store no longer has it. */
 async function persist(url, index, key, bytes, meta) {
-  const store = await reopen();
-  if (await store.match(key)) return;
+  const at = epoch, store = await reopen();
+  if (await store.match(key) || at !== epoch) return;
   await store.put(key, new Response(bytes.slice(0), { headers: { 'Content-Type': meta?.type || 'video/mp4', 'Content-Length': String(bytes.byteLength) } }));
+  if (at !== epoch) return;
   if (meta) await writeMeta(store, url, meta);
   notify({ type: 'footage-stored', url, index, size: bytes.byteLength });
 }
@@ -197,12 +205,16 @@ self.addEventListener('message', event => {
   if (event.data?.type === 'footage-enabled' && event.source?.id) {
     if (event.data.enabled) disabledClients.delete(event.source.id); else disabledClients.add(event.source.id);
   }
-  if (event.data?.type === 'footage-clear') event.waitUntil(
-    Promise.allSettled([...pending.values()].map(job => job.then(result => result.saved)))
-      .then(() => caches.delete(CACHE))
-      .then(() => {
-        epoch++; opened = undefined; memory.clear(); memoryBytes = 0; metas.clear();
-        notify({ type: 'footage-cleared' }); event.ports?.[0]?.postMessage({ cleared: true });
-      })
-  );
+  if (event.data?.type === 'footage-clear') {
+    // From here on, writes not yet begun are skipped rather than saved into the cache this clear is about to replace.
+    epoch++;
+    event.waitUntil(
+      Promise.allSettled([...pending.values()].map(job => job.then(result => result.saved)))
+        .then(() => caches.delete(CACHE))
+        .then(() => {
+          epoch++; opened = undefined; memory.clear(); memoryBytes = 0; metas.clear();
+          notify({ type: 'footage-cleared' }); event.ports?.[0]?.postMessage({ cleared: true });
+        })
+    );
+  }
 });

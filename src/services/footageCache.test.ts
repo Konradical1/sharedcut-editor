@@ -50,7 +50,7 @@ function harness({ badIndex = false, quota = false, status = 206, registrationFa
   const drain = async (rounds = 12) => { for (let i = 0; i < rounds; i++) { pending.splice(0).forEach(job => job.resolve()); await flush(); } };
   const subscribe = (listener: () => void) => { sandbox.subscribed = [listener]; sandbox.api.useFootageVersion(); sandbox.subscribed = undefined; };
   const tick = () => { const due = [...timers.values()]; timers.clear(); due.forEach(fn => fn()); };
-  return { ...sandbox.api as Record<'clipCached' | 'clipFootageStatus' | 'setDecoderStatus' | 'clearFootageCache' | 'retryFootage' | 'preferLowStream' | 'evict', any>, cache, saved:(url:string,index:number)=>{cache.set(`${url}?fc=${index}`,new Response('',{headers:{'Content-Length':String(CHUNK)}}));handlers.message({data:{cache:'footage-v3',type:'footage-stored',url,index,size:CHUNK}});}, meta:(url:string,used:number)=>cache.set(`${url}?fc=meta`,new Response(JSON.stringify({size:3*CHUNK,type:'video/mp4',used}))), transfer:(bytes:number,milliseconds:number)=>handlers.message({data:{cache:'footage-v3',type:'footage-transfer',bytes,milliseconds}}), state, sandbox, update, drain, subscribe, tick, delays, pending, requests, ranges, timers, advance: (ms: number) => { now += ms; }, recover: () => { badIndex = false; quota = false; status = 206; registrationFails = false; }, metrics: () => ({ peak, calls }) };
+  return { ...sandbox.api as Record<'clipCached' | 'clipFootageStatus' | 'setDecoderStatus' | 'clearFootageCache' | 'retryFootage' | 'preferLowStream' | 'evict', any>, cache, saved:(url:string,index:number)=>{cache.set(`${url}?fc=${index}`,new Response('',{headers:{'Content-Length':String(CHUNK)}}));handlers.message({data:{cache:'footage-v3',type:'footage-stored',url,index,size:CHUNK}});}, meta:(url:string,used:number)=>cache.set(`${url}?fc=meta`,new Response(JSON.stringify({size:3*CHUNK,type:'video/mp4',used}))), transfer:(bytes:number,milliseconds:number,ago=0)=>handlers.message({data:{cache:'footage-v3',type:'footage-transfer',bytes,milliseconds,ago}}), state, sandbox, update, drain, subscribe, tick, delays, pending, requests, ranges, timers, advance: (ms: number) => { now += ms; }, recover: () => { badIndex = false; quota = false; status = 206; registrationFails = false; }, metrics: () => ({ peak, calls }) };
 }
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
@@ -114,7 +114,7 @@ test('paused prefetch uses six files at once and never two requests for one file
 });
 
 test('coverage counts the alpha WebM graphic and the separate sound file playback opens', async () => {
-  const h = harness({ count: 4, failing: /m3\/files\/audio/ });
+  const h = harness({ count: 4, failing: /m3\/files\/audio/ }); await flush();
   const audio = (i: number) => `/api/media/m${i}/files/audio-v1.m4a`;
   for (const i of [0, 1, 2, 3]) Object.assign(h.state.media[i], { hasAudio: true, audioProxyUrl: audio(i) });
   h.state.media[1].proxyUrl = '/api/media/m1/files/proxy-half-alpha-v1.webm';
@@ -166,12 +166,12 @@ test('parallel downloads are measured as the line they share, not as one slow re
 });
 
 test('a Stream file whose needed ranges are saved is never abandoned for the low stream', async () => {
-  const h = harness(); h.state.clips = h.state.clips.slice(0, 2); h.update(); await flush();
-  h.transfer(CHUNK, 4000);
+  const h = harness(); lowStreams(h); h.state.clips = h.state.clips.slice(0, 2); await flush(); h.update(); await flush();
+  h.transfer(CHUNK, 4000); h.update();
   assert.equal(h.preferLowStream('/api/media/m0/files/stream.mp4'), true, 'slow link, nothing saved yet');
-  await h.drain(6);
-  assert.equal(h.clipCached('c0'), true);
+  await h.drain(12); h.update();
   assert.equal(h.preferLowStream('/api/media/m0/files/stream.mp4'), false);
+  assert.equal(h.clipCached('c0'), true, 'the Stream file it now plans is saved');
 });
 
 test('rolling cache evicts least recently used files first and keeps the current playable window',async()=>{
@@ -324,27 +324,116 @@ test('the urgent window of an incoming clip starts at its transition handle, not
   assert.ok(h.ranges.some(([from, to]) => Math.abs(from - 2.5) < 1e-9 && Math.abs(to - 13) < 1e-9), JSON.stringify(h.ranges));
 });
 
-test('the low stream is declined while the next seconds of a Stream file are saved, whatever is missing later', async () => {
-  const h = harness({ timedRanges: true }), url = '/api/media/m0/files/stream.mp4';
-  h.state.clips = [h.state.clips[0]]; h.state.clips[0].duration = 100;
+test('on a slow line the low stream is declined only while all a decoder would still read from the Stream file is saved', async () => {
+  const h = harness({ timedRanges: true }), url = '/api/media/m0/files/stream.mp4'; lowStreams(h);
+  h.state.clips = [h.state.clips[0]]; h.state.clips[0].duration = 100; await flush();
   h.update(); await flush();
   h.pending.splice(0).forEach(job => job.resolve()); await flush();
   h.saved(url, 0); h.saved(url, 1); h.transfer(CHUNK, 4000);
-  assert.equal(h.clipCached('c0'), false, 'the rest of the clip is not saved');
-  assert.equal(h.preferLowStream(url), false, 'header and the window from the playhead are saved');
+  // The next ten seconds alone would run dry partway through the clip: a stall, then the low stream anyway.
+  assert.equal(h.preferLowStream(url), true, 'the next seconds are saved, the rest of the clip is not');
+  h.saved(url, 2);
+  assert.equal(h.preferLowStream(url), false, 'everything to the end of the clip is saved');
   h.state.playhead = 50; h.update();
-  assert.equal(h.preferLowStream(url), true, 'further on, the window reaches bytes that are not saved');
+  assert.equal(h.preferLowStream(url), false, 'and still is further on');
 });
 
 const lowStreams = (h: ReturnType<typeof harness>) => { for (const asset of h.state.media) asset.proxyVariants = { Stream: asset.proxyUrl, StreamLow: String(asset.proxyUrl).replace('stream', 'low') }; };
-test('on a slow line the prefetcher fetches the low stream a new decoder will open, two downloads at a time', async () => {
-  const h = harness({ count: 6 }); lowStreams(h);
+test('on a slow line the prefetcher fills the low stream a new decoder opens, two at a time, then the Stream file behind it', async () => {
+  const h = harness({ count: 6 }), stream = '/api/media/m0/files/stream.mp4'; lowStreams(h); await flush();
   h.transfer(CHUNK, 4000); h.update(); await flush();
   assert.equal(h.pending.length, 2, 'a slow line gets two downloads at once, not six');
-  await h.drain(30);
-  assert.ok(h.requests.length && h.requests.every(request => /low\.mp4/.test(request.url)), 'no Stream bytes');
+  assert.ok(h.pending.every(job => /low\.mp4/.test(job.url)), 'the low stream first');
+  assert.equal(h.preferLowStream(stream), true, 'and a new decoder is steered to it');
+  await h.drain(80);
   assert.equal(h.clipCached('c0'), true, 'green means the file playback will open is saved');
-  assert.equal(h.preferLowStream('/api/media/m0/files/stream.mp4'), true, 'and a new decoder is steered to it');
+  const firstStream = h.requests.findIndex(request => /stream\.mp4/.test(request.url));
+  assert.ok(firstStream > 0 && ['m0', 'm1'].every(m => h.requests.slice(0, firstStream).filter(request => request.url.includes(`${m}/files/low`)).length >= 3), 'Stream bytes only after the near clips\' low windows');
+  // Idle bandwidth filled the Stream file: a decoder opened from now on, or on the next visit, takes full quality.
+  h.update();
+  assert.equal(h.preferLowStream(stream), false);
+  assert.equal(h.clipCached('c0'), true);
+});
+
+test('behind the low stream, the Stream file fills nearest the playhead first, what just played included', async () => {
+  const h = harness({ count: 3 }); lowStreams(h); await flush();
+  // Played: c0 at 0-5 s (15 s back) and c1 at 10-15 s (5 s back); playhead 20 s; c2 comes at 30 s (10 s ahead).
+  h.state.clips[2].start = 30; h.state.playhead = 20;
+  h.transfer(CHUNK, 4000); h.update(); await h.drain(40);
+  const firstStream = (m: string) => h.requests.findIndex(request => request.url === `/api/media/${m}/files/stream.mp4` && request.start > 0);
+  assert.ok(firstStream('m1') >= 0 && firstStream('m1') < firstStream('m2') && firstStream('m2') < firstStream('m0'), JSON.stringify(h.requests.map(r => `${/m\d\/files\/\w+/.exec(r.url)![0]}:${r.start / CHUNK}`)));
+});
+
+test('one file cut into two clips is planned and opened as one choice, and a stalled Stream decoder may move', async () => {
+  const h = harness({ count: 2 }), S = '/api/media/m0/files/stream.mp4', L = '/api/media/m0/files/low.mp4'; lowStreams(h);
+  Object.assign(h.state.clips[1], { mediaId: 'm0', start: 6, sourceIn: 50 });
+  // Chunk 1 holds source 0-20 s, chunk 2 the rest.
+  h.sandbox.parseMp4Index = () => ({ moovEnd: 16, tracks: [{ times: [0, 100], sizes: [150e6] }] });
+  h.sandbox.byteRange = (_: unknown, from: number) => from < 20 ? { start: CHUNK, end: 2 * CHUNK } : { start: 2 * CHUNK, end: 3 * CHUNK };
+  await flush(); h.update(); await flush();
+  h.pending.splice(0).forEach(job => job.resolve()); await flush();
+  h.saved(S, 0); h.saved(S, 1); // the first clip played on Stream before
+  h.transfer(CHUNK, 4000); h.update(); await flush();
+  assert.equal(h.preferLowStream(S), true, 'the second clip\'s Stream bytes are not saved and the line cannot carry them');
+  assert.ok(h.pending.some(job => job.url === L), 'and the prefetcher fills the low stream both clips open');
+  h.state.playhead = 7; h.update();
+  assert.equal(h.preferLowStream(S), true, 'a decoder stalled on Stream in the second clip may move to the low stream');
+  await h.drain(20); h.update();
+  assert.equal(h.preferLowStream(S), false, 'once idle bandwidth has saved its Stream bytes, Stream is kept');
+  assert.equal(h.clipCached('c1'), true);
+});
+
+test('after a reload on a slow line, a Stream file an earlier visit saved is opened, not traded for the low stream', async () => {
+  const S = '/api/media/m0/files/stream.mp4';
+  const reload = (saved: boolean) => {
+    const h = harness({ count: 1 }); lowStreams(h); h.sandbox.location = { origin: 'https://sharedcut.test' };
+    // The project state, 5 MB in 4 s: the page measures a 10 Mbit/s line before any footage moves.
+    h.sandbox.performance.getEntriesByType = () => [{ name: 'https://sharedcut.test/api/state', transferSize: 5e6, encodedBodySize: 5e6, responseStart: 100, responseEnd: 4100 }];
+    if (saved) for (const i of [0, 1, 2]) h.cache.set(`${S}?fc=${i}`, new Response('', { headers: { 'Content-Length': String(CHUNK) } }));
+    return h;
+  };
+  const h = reload(true); h.update();
+  assert.equal(h.preferLowStream(S), false, 'a decoder before the cache is listed');
+  await flush(); h.update();
+  assert.equal(h.preferLowStream(S), false, 'listed, its index not read yet');
+  h.pending.splice(0).forEach(job => job.resolve()); await flush(); h.update(); await flush();
+  assert.equal(h.preferLowStream(S), false, 'the index places the playhead in saved bytes');
+  assert.ok(h.requests.every(request => request.url === S), 'nothing of the low stream is fetched');
+  assert.equal(h.clipCached('c0'), true);
+  const cold = reload(false); await flush(); cold.update();
+  assert.equal(cold.preferLowStream(S), true, 'with nothing saved, the same page speed picks the low stream from the first frame');
+});
+
+test('a Stream index is read even on a line the guess calls slow, and a file the line can carry stays Stream', async () => {
+  const h = harness({ count: 1 }), S = '/api/media/m0/files/stream.mp4'; lowStreams(h); await flush();
+  // A 4 Mbit/s Stream file on a 14 Mbit/s line.
+  h.sandbox.parseMp4Index = () => ({ moovEnd: 16, tracks: [{ times: [0, 100], sizes: [50e6] }] });
+  h.transfer(CHUNK, 600); h.update(); await flush();
+  assert.equal(h.preferLowStream(S), true, 'judged by the 12 Mbit/s guess while its index is unread');
+  assert.ok(h.pending.some(job => job.url === S), 'its index is read alongside the low stream');
+  await h.drain(1);
+  assert.equal(h.preferLowStream(S), false, 'its real bitrate fits the line');
+});
+
+test('a good line keeps four downloads while playing, even when its heaviest files are traded for the low stream', async () => {
+  const h = harness({ count: 6 }); lowStreams(h); await flush(); h.state.playing = true;
+  // 25 Mbit/s: a 1 MiB chunk every 335 ms.
+  for (let i = 0; i < 4; i++) { h.advance(335); h.transfer(CHUNK, 335); }
+  h.update(); await flush();
+  assert.equal(h.pending.length, 4);
+  assert.ok(h.pending.every(job => /stream\.mp4/.test(job.url)));
+  // Every file turns out to run 24 Mbit/s, more than the line carries with a 1.3x margin.
+  h.sandbox.parseMp4Index = () => ({ moovEnd: 16, tracks: [{ times: [0, 100], sizes: [300e6] }] });
+  await h.drain(1); h.update(); await flush();
+  assert.equal(h.preferLowStream('/api/media/m0/files/stream.mp4'), true);
+  assert.equal(h.pending.length, 4);
+});
+
+test('a chunk whose save outlasted the 20 s measuring window does not break the line measurement', () => {
+  const h = harness();
+  assert.doesNotThrow(() => h.transfer(CHUNK, 1000, 25000));
+  h.transfer(CHUNK, 4000);
+  assert.equal(h.preferLowStream('/unknown.mp4'), true);
 });
 
 test('a fast line, or Stream bytes saved before, keeps the Stream file planned', async () => {
@@ -387,4 +476,28 @@ test('before any footage, the page\'s own large downloads say how fast the line 
   assert.equal(h.preferLowStream('/unknown.mp4'), false, 'a few slow chunks can be the page still loading beside them');
   h.advance(1000); h.transfer(CHUNK, 1000);
   assert.equal(h.preferLowStream('/unknown.mp4'), true, '16 MiB of footage at 8 Mbit/s outweighs the page');
+  h.advance(25000); h.transfer(CHUNK, 1000);
+  assert.equal(h.preferLowStream('/unknown.mp4'), true, 'for good, not only while those 16 MiB are in the last 20 s');
+});
+
+test('a download begun while the cache is being cleared is not saved into the cache that replaces it', async () => {
+  // 300 ms to each first byte: the clear waits for the first download, and the second, begun meanwhile, answers after it.
+  const file = randomBytes(CHUNK), sw = worker(file, undefined, { wait: 300, parts: 2, gap: 20 });
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  const before = sw.request('/api/media/a/files/stream.mp4', 'bytes=0-10');
+  await sleep(50);
+  const clear = sw.message({ type: 'footage-clear' });
+  await sleep(100);
+  const during = sw.request('/api/media/b/files/stream.mp4', 'bytes=0-10');
+  await Promise.all([before, clear, during]);
+  await sleep(200);
+  assert.deepEqual([...sw.store.keys()], []);
+  assert.ok(!sw.messages.some(message => message.type === 'footage-stored' && message.url.includes('/b/')), 'nor announced as saved');
+});
+
+test('a chunk body that arrived in one read gives no line-speed sample', async () => {
+  const sw = worker(randomBytes(CHUNK), undefined, { wait: 20, parts: 1, gap: 0 }), path = '/api/media/buffered/files/stream.mp4';
+  await sw.request(path, 'bytes=0-10');
+  for (let i = 0; i < 100 && !sw.messages.some(message => message.type === 'footage-transfer'); i++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(sw.messages.find(message => message.type === 'footage-transfer').milliseconds, 0);
 });

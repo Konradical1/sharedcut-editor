@@ -7,6 +7,8 @@
 //
 // Env: ORIGIN (https://sharedcut.com)  PROJECT  TIMELINE (tab text)  SECONDS (30)  PASSES (2)  FPS (30)
 //      QUALITY (Preview quality option)  CACHE_WAIT ms between passes (30000)  PROFILE=1 (main-thread hotspots)
+//      RELOAD=1: reload the page before every pass after the first, a later visit: saved footage stays, choices the
+//        page made in memory (such as playing an asset's low stream) do not.
 //      DIST=<built client dir>: serve that build's HTML/assets/worker instead of the live bundle, so a client
 //        change is measured against live data before it is deployed.
 //      MIN_FPS, MAX_FREEZE_MS, MAX_LOADING_PCT: thresholds for the cached pass; any miss exits 1.
@@ -96,7 +98,8 @@ await context.addInitScript(() => {
   window.qaReset = () => { window.qa = { frames: [], health: [] }; };
   window.qaReset();
   window.addEventListener('frameline:frame', (e) => window.qa.frames.push([performance.now(), e.detail?.dataset?.sourceTimestamp]));
-  window.addEventListener('frameline:playback-health', (e) => { const d = e.detail; if (d.playing) window.qa.health.push([performance.now(), d.loading, d.engine, d.loading ? d.reason : '', d.error ?? '', d.playhead]); });
+  // [at, loading, engine, reason, error, playhead, showing the automatic low stream ("reduced bandwidth" note)]
+  window.addEventListener('frameline:playback-health', (e) => { const d = e.detail; if (d.playing) window.qa.health.push([performance.now(), d.loading, d.engine, d.loading ? d.reason : '', d.error ?? '', d.playhead, !!document.querySelector('.viewer-demo-note')?.textContent?.includes('reduced bandwidth')]); });
   // What the footage worker downloads and saves, for the whole session: [at, bytes, ms] and [at, url, bytes].
   window.qaNet = { transfer: [], stored: [] };
   navigator.serviceWorker?.addEventListener('message', (e) => { const d = e.data; if (d?.type === 'footage-transfer') window.qaNet.transfer.push([performance.now() - (d.ago || 0), d.bytes, d.milliseconds]); if (d?.type === 'footage-stored') window.qaNet.stored.push([performance.now(), d.url, d.size]); });
@@ -131,6 +134,12 @@ if (process.env.QUALITY) await page.getByRole('combobox', { name: 'Preview quali
 const timecode = (t) => { const [h, m, s, f] = String(t).split(':').map(Number); return h * 3600 + m * 60 + s + f / FPS; };
 report.passes = [];
 for (let pass = 0; pass < PASSES; pass++) {
+  if (pass && process.env.RELOAD) {
+    await page.reload();
+    await page.locator('.timeline-tabs button', { hasText: TIMELINE }).first().click({ timeout: 120000 });
+    await page.waitForFunction(() => document.querySelector('.viewer canvas')?.dataset.hasPicture === 'true', null, { timeout: 60000 }).catch(() => {});
+    if (process.env.QUALITY) await page.getByRole('combobox', { name: 'Preview quality', exact: true }).selectOption(process.env.QUALITY);
+  }
   // The editor has no Home shortcut: step back edit by edit so every pass plays the same opening seconds.
   for (let i = 0; i < 500 && timecode(await page.locator('.transport-time').textContent()) > 0; i++) await page.getByRole('button', { name: /^(Previous edit|First frame)$/ }).first().click();
   await page.evaluate(() => window.qaReset());
@@ -141,9 +150,9 @@ for (let pass = 0; pass < PASSES; pass++) {
   const startedAt = Date.now(), pageStart = await page.evaluate(() => performance.now());
   await page.getByRole('button', { name: 'Play playback', exact: true }).first().click();
   await page.waitForTimeout(SECONDS * 1000);
-  const endTime = await page.locator('.transport-time').textContent();
-  const statusText = await page.locator('.viewer-playback-status').textContent().catch(() => '');
-  const footage = await page.locator('.footage-loading summary').textContent().catch(() => '');
+  // Read without waiting, then pause at once: a locator waits 30 s for the status line, which only exists while something
+  // loads, and playback ran on meanwhile, so passes covered 30 or 60 s depending on what was loading.
+  const { endTime, statusText, footage } = await page.evaluate(() => ({ endTime: document.querySelector('.transport-time')?.textContent ?? '', statusText: document.querySelector('.viewer-playback-status')?.textContent ?? '', footage: document.querySelector('.footage-loading summary')?.textContent ?? '' }));
   await page.getByRole('button', { name: 'Pause playback', exact: true }).first().click().catch(() => {});
   await page.getByRole('button', { name: 'Play playback', exact: true }).first().waitFor({ timeout: 5000 }).catch(() => page.keyboard.press('Space'));
   const endedAt = Date.now();
@@ -155,16 +164,17 @@ for (let pass = 0; pass < PASSES; pass++) {
     // Where on the timeline each long freeze began, so a genuine gap in the edit is not mistaken for a stall.
     const playheadAt = (at) => h.find((x) => x[0] >= at)?.[5];
     const freezesAt = gaps.filter(([ms]) => ms > 250).slice(0, 5).map(([ms, at]) => `${Math.round(ms)}ms@${Number(playheadAt(at)).toFixed(2)}s`);
-    let loadingMs = 0, run = 0; const runs = [], reasons = {}, errors = new Set();
+    let loadingMs = 0, lowMs = 0, run = 0; const runs = [], reasons = {}, errors = new Set();
     for (let i = 1; i < h.length; i++) {
       const dt = h[i][0] - h[i - 1][0];
+      if (h[i - 1][6]) lowMs += dt;
       if (h[i - 1][4]) errors.add(h[i - 1][4]);
       if (h[i - 1][1]) { loadingMs += dt; run += dt; const r = (h[i - 1][3] || '?').slice(0, 90); reasons[r] = (reasons[r] || 0) + dt; } else if (run) { runs.push(run); run = 0; }
     }
     if (run) runs.push(run);
     const span = h.length > 1 ? h.at(-1)[0] - h[0][0] : 1;
     return { renderedPerSec: +(f.length / (span / 1000)).toFixed(1), picturesPerSec: +(distinct / (span / 1000)).toFixed(1), worstFreezesMs: gaps.slice(0, 5).map(([ms]) => Math.round(ms)), freezesAt,
-      loadingPct: +(100 * loadingMs / span).toFixed(1), longestLoadingMs: Math.round(Math.max(0, ...runs)), engines: [...new Set(h.map((x) => x[2]).filter(Boolean))], errors: [...errors].slice(0, 5),
+      loadingPct: +(100 * loadingMs / span).toFixed(1), lowStreamPct: +(100 * lowMs / span).toFixed(1), longestLoadingMs: Math.round(Math.max(0, ...runs)), engines: [...new Set(h.map((x) => x[2]).filter(Boolean))], errors: [...errors].slice(0, 5),
       loadingReasonsMs: Object.fromEntries(Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => [k, Math.round(v)])), ...window.qaNetSummary(since) };
   }, pageStart);
   if (cdp) {
