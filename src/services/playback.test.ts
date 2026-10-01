@@ -269,7 +269,7 @@ test('warm-up opens the next cuts on every layer within the horizon, soonest fir
 });
 
 /** attachPlayback against fake media elements, a manual clock and a manual frame pump. */
-async function fakeBrowser(state: Record<string, any>, quality = 'Full', extraGlobals: Record<string, unknown> = {}, preferLowStream?: (url: string) => boolean) {
+async function fakeBrowser(state: Record<string, any>, quality = 'Full', extraGlobals: Record<string, unknown> = {}, preferLowStream?: (url: string) => boolean | undefined) {
   const { attachPlayback } = await import('./playback.ts');
   class Media extends EventTarget {
     readyState = 2; seeking = false; paused = true; duration = 10; videoWidth = 320; videoHeight = 180; preload = '';
@@ -338,12 +338,13 @@ async function streamChoice(settings: Record<string, unknown> = {}, stalled = ne
   Object.assign(shot.clip, { duration: 8 });
   const state = timelineState([shot], { playing: true, settings });
   state.clips = [...state.clips, { ...shot.clip, id: 'shot-2', start: 8, duration: 2 }];
-  const answer = { slow: false };
+  // undefined is footageCache's "nothing measures the line" (cache off, no controlling worker, no rate yet).
+  const answer: { slow: boolean | undefined } = { slow: false };
   const fake = await fakeBrowser(state, 'Stream', { VideoDecoder: class {}, Worker: decodeWorker(stalled), location: { href: 'http://localhost/' } }, () => answer.slow);
   return { ...fake, state, answer, play: (to: number) => { state.playhead = to; fake.tick(); fake.tick(); } };
 }
 
-test('a long wait moves a Stream picture to the low stream only on a line too slow for it, or with the cache off', async () => {
+test('a long wait moves a Stream picture to the low stream only on a line too slow for it, or one nothing measures', async () => {
   const fake = await streamChoice({}, new Set(['/stream.mp4']));
   try {
     fake.tick(); fake.tick(1300); fake.tick(50);
@@ -352,15 +353,32 @@ test('a long wait moves a Stream picture to the low stream only on a line too sl
     assert.deepEqual([fake.live('/stream.mp4').length, fake.live('/low.mp4').length], [0, 1], 'too slow a line with unsaved bytes ahead: the stalled picture moves');
     assert.equal(fake.statuses.at(-1)?.title, 'Auto preview · reduced bandwidth');
   } finally { fake.restore(); }
-  const off = await streamChoice({ footageCache: false }, new Set(['/stream.mp4']));
-  try {
-    off.tick(); off.tick(1300); off.tick(50);
-    assert.equal(off.live('/low.mp4').length, 1, 'nothing measures the line with the cache off: the 1.2 s wait is the signal');
-    const [low] = off.live('/low.mp4');
-    off.play(4.5); off.play(8.5);
-    assert.deepEqual(off.live('/stream.mp4'), [], 'and its low stream stands for the next clip, rather than stalling on Stream again');
-    assert.equal(off.live('/low.mp4').length, 2); assert.ok(off.live('/low.mp4').includes(low));
-  } finally { off.restore(); }
+  // The cache off, or on with no controlling footage worker (blocked, first load, unsupported) or no rate yet.
+  for (const settings of [{ footageCache: false }, {}]) {
+    const off = await streamChoice(settings, new Set(['/stream.mp4']));
+    try {
+      off.answer.slow = undefined;
+      off.tick(); off.tick(1300); off.tick(50);
+      assert.equal(off.live('/low.mp4').length, 1, `nothing measures the line (${JSON.stringify(settings)}): the 1.2 s wait is the signal`);
+      const [low] = off.live('/low.mp4');
+      off.play(4.5); off.play(8.5);
+      assert.deepEqual(off.live('/stream.mp4'), [], 'and its low stream stands for the next clip, rather than stalling on Stream again');
+      assert.equal(off.live('/low.mp4').length, 2); assert.ok(off.live('/low.mp4').includes(low));
+    } finally { off.restore(); }
+  }
+});
+
+test('reduced bandwidth is reported only for a picture the automatic rule moved, never for an alpha graphic\'s own 1/4 file', async () => {
+  // An alpha graphic's StreamLow is its 1/4 WebM: 1/4 asks for it by name, and Stream falls back to it without a Stream file.
+  for (const quality of ['1/4', 'Stream']) {
+    const graphic = layerFixture('graphic', 'Lower third', 1, 'video', { hasAlpha: true, proxyVariants: { '1/4': '/graphic-quarter.webm', StreamLow: '/graphic-quarter.webm' } });
+    const fake = await fakeBrowser(timelineState([graphic], { playing: true }), quality);
+    try {
+      fake.tick(); fake.tick();
+      assert.equal(fake.live('/graphic-quarter.webm').length, 1);
+      assert.equal(fake.statuses.at(-1), null, `${quality}: the graphic plays the file asked for`);
+    } finally { fake.restore(); }
+  }
 });
 
 test('an asset back from the low stream opens Stream at its next decoder, never mid-shot', async () => {

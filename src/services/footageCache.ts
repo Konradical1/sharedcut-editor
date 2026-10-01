@@ -28,6 +28,8 @@ const decoding = new Map<string, { url: string; detail: string; failed: boolean 
 let clearing = false, registrationError = '', listed = false;
 let version = 0, registered = false, controlled = false, disabled = false, concurrency = 6;
 let lastUpdate = -Infinity, lastEviction = 0, generation = 0, retryTimer: ReturnType<typeof setTimeout> | undefined;
+// The newest update() arguments, throttled or not, and the playhead the plan was made for.
+let latest: Parameters<typeof update> | undefined, plannedHead = 0;
 let transferred = 0, transferStart = 0, transferLast = 0, networkRate = 0, seededRate = 0, measuredBytes = 0;
 // [start, end, bytes] of each network chunk the worker saved in the last 20 s.
 const transfers: [number, number, number][] = [], lowered = new Set<string>();
@@ -102,9 +104,10 @@ function bitrateOf(index: Mp4Index) {
   return rate;
 }
 /**
- * The link cannot carry this file at 1.3x real time; once judged so, it takes 1.5x to win it back. False before any
- * measurement. Leans optimistic: playback keeps a decoder's low stream for the session, while a Stream file that
- * does stall moves to the low stream after 1.2 s anyway.
+ * The link cannot carry this file at 1.3x real time; once judged so, it takes 1.5x to win it back, so the answer does
+ * not flip from one decoder to the next on a line near the file's bitrate. False before any measurement, when
+ * preferLowStream has no answer and playback's 1.2 s stall rule decides. Playback asks as each picture decoder opens
+ * and keeps that stream to the end of the shot.
  */
 function slowFor(url: string) {
   const rate = linkRate(), layout = indexes.get(url), need = layout && 'tracks' in layout ? bitrateOf(layout) : STREAM_GUESS;
@@ -172,9 +175,10 @@ export function sourceSpan(clip: Clip) {
 
 type Options = { original: boolean; quality?: string };
 export function update(state: TimelineState, options: Options, urlFor: (asset: MediaAsset, visual: boolean) => string | undefined) {
+  latest = [state, options, urlFor];
   const now = performance.now();
   if (now - lastUpdate < 400) return;
-  lastUpdate = now;
+  lastUpdate = now; plannedHead = state.playhead;
   const nextDisabled = state.settings.footageCache === false;
   if (nextDisabled !== disabled && supported()) navigator.serviceWorker.controller?.postMessage?.({ type: 'footage-enabled', enabled: !nextDisabled });
   disabled = nextDisabled;
@@ -243,15 +247,16 @@ function plan(state: TimelineState, options: Options, urlFor: (asset: MediaAsset
  * Every use of this Stream file plays its low stream instead: the line cannot carry the file and some use near the
  * playhead has bytes ahead of it that are not saved. Per file, as playback picks per asset: the prefetcher and a new
  * decoder ask the same question, so a decoder opens the file being prefetched and a stalled one may move.
+ * Undefined, not false, while nothing measures the line: the cache off, no controlling worker, or no rate yet.
  */
 function goesLow(url: string, uses: Wanted[]) {
-  const near = uses.filter(entry => entry.order < 15);
-  if (!disabled && controlled && near.length) {
+  const near = uses.filter(entry => entry.order < 15), watched = !disabled && controlled;
+  if (watched && near.length) {
     // What is saved is unknown until the cache is listed, and where the playhead falls in it until the file's index is read.
     if (!listed || !indexes.has(url) && (stored.get(url)?.size ?? 0) > 1) return false;
     if (near.every(tailSaved)) return false;
   }
-  return slowFor(url);
+  return slowFor(url) || (watched && linkRate() > 0 ? false : undefined);
 }
 
 export function setDecoderStatus(clipId: string, url: string, detail?: string, failed = false) {
@@ -276,8 +281,13 @@ export function clipFootageStatus(clipId: string): FootageStatus {
   const busy = entries.some(entry => inFlight.has(entry.url));
   return { ...values, state: busy ? 'blue' : 'gray', detail: entries.every(entry => indexes.has(entry.url)) ? `${values.progress}% cached on this computer` : busy ? 'Reading media index' : 'Queued' };
 }
-/** Select a smaller prepared stream before opening a decoder on a constrained connection. */
-export function preferLowStream(url: string) {
+/**
+ * Select a smaller prepared stream before opening a decoder on a constrained connection. Undefined while nothing
+ * measures the line (cache off, no controlling worker, no rate yet): only a stall says anything then.
+ */
+export function preferLowStream(url: string): boolean | undefined {
+  // A decoder opened just after a seek asks about where it landed, not the plan of up to 400 ms before.
+  if (latest && latest[0].playhead !== plannedHead) { lastUpdate = -Infinity; update(...latest); }
   // Saved bytes play at disk speed whatever the connection does: a Stream file stays while what the clips at and just
   // after the playhead read from it is saved.
   return goesLow(url, streamUses.get(url) ?? []);
