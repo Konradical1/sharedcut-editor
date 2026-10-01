@@ -294,11 +294,13 @@
 .motion-blur-control .inspector-note { margin-bottom: 0; }
 
 .clip-preparing{position:absolute;left:0;right:0;bottom:0;height:11px;z-index:6;pointer-events:none;border-radius:0 0 3px 3px;overflow:hidden;background:#0b141aee;font-size:7px;color:#dbe9ee;display:flex;align-items:center;padding:0 6px;white-space:nowrap}
-.clip-preparing:before{content:"";position:absolute;inset:0;width:var(--progress);background:linear-gradient(90deg,#3f8f7a,#6fd0b0);opacity:.75;transition:width .4s}
-.clip-preparing:after{content:"";position:absolute;inset:0;background:repeating-linear-gradient(-45deg,#ffffff18 0 6px,transparent 6px 12px);animation:clip-preparing-stripes 1s linear infinite}
-.clip-preparing.failed:before{background:#b04a4a;width:100%}.clip-preparing.failed:after{animation:none}
+.clip-preparing:before{content:"";position:absolute;inset:0;width:100%;transform-origin:left;scale:var(--progress) 1;background:linear-gradient(90deg,#3f8f7a,#6fd0b0);opacity:.75;transition:scale .4s}
+.clip-preparing:after{content:"";position:absolute;inset:0 0 0 -12px;background:repeating-linear-gradient(-45deg,#ffffff18 0 6px,transparent 6px 12px);background-position:12px 0;animation:clip-preparing-stripes 1s linear infinite}
+.clip-preparing.failed:before{background:#b04a4a;scale:1}.clip-preparing.failed:after{animation:none}
 .clip-preparing>span{position:relative;z-index:1;text-shadow:0 1px 2px #000a}
-@keyframes clip-preparing-stripes{to{background-position:12px 0}}
+/* Badge bars scale and stripes slide on the compositor: a width or background-position animation re-laid-out and
+   re-layerized the whole timeline every frame it ran. */
+@keyframes clip-preparing-stripes{to{transform:translateX(12px)}}
 
 .render-bar{position:absolute;left:0;right:0;bottom:0;height:3px;pointer-events:none;z-index:1}.render-bar>i{position:absolute;top:0;bottom:0;display:block}.render-bar>i.green{background:#4cc26a}.render-bar>i.yellow{background:#e0b93f}.render-bar>i.red{background:#e0524a}
 
@@ -316,6 +318,10 @@
 .viewer-playback-status{gap:10px}.viewer-playback-status small{max-width:90%;line-height:1.5}.viewer-demo-note{font-size:10px;color:#d4dee5;background:#172027e8;padding:6px 9px;text-transform:none;letter-spacing:0;max-width:90%}
 
 .clip-cache{position:absolute;left:0;right:0;bottom:0;height:11px;z-index:6;overflow:hidden;background:#101820e8;font-size:7px;color:#dbe9ee;display:flex;align-items:center;padding:0 6px;white-space:nowrap;pointer-events:none;--cache-color:#73808b}
-.clip-cache:before{content:"";position:absolute;left:0;top:0;bottom:0;width:var(--progress);background:var(--cache-color);opacity:.6;transition:width .3s}
+.clip-cache:before{content:"";position:absolute;left:0;top:0;bottom:0;width:100%;transform-origin:left;scale:var(--progress) 1;background:var(--cache-color);opacity:.6;transition:scale .3s}
 .clip-cache>span{position:relative;text-shadow:0 1px 2px #000}
 .clip-cache.blue{--cache-color:#559ef0}.clip-cache.green{--cache-color:#4cc26a}.clip-cache.yellow{--cache-color:#e0b93f}.clip-cache.red{--cache-color:#e0524a}
+/* While playing, the playhead and the timecodes are canvases: per-frame element changes re-layerize the whole page. */
+.local-playhead-canvas{position:absolute;z-index:9;pointer-events:none}
+.timeline-scroll[data-playing] .clip-cache:before,.timeline-scroll[data-playing] .clip-preparing:before{transition:none}
+.live-timecode{position:relative}.live-timecode-held::after{content:attr(data-text);visibility:hidden}.live-timecode-origin{display:inline-block;width:0;height:0}.live-timecode-canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}

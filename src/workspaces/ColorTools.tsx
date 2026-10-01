@@ -28,7 +28,7 @@ export const ScopeDisplay = memo(function ScopeDisplay({ type }: { type: Scope }
         if(type==='Histogram'){hist[0][r]++;hist[1][g]++;hist[2][b]++;continue;}
         if(type==='Vectorscope'){plot(160+(b-y)/1.8556*.52,80-(r-y)/1.5748*.52,green);}
         else if(type==='Waveform'){plot((i/4%192)/192*320,152-y/255*144,green);}
-        else [r,g,b].forEach((v,c)=>{plot(c*106+(i/4%192)/192*104,152-v/255*144,colors[c]);});
+        else for(let c=0;c<3;c++)plot(c*106+(i/4%192)/192*104,152-pixels[i+c]/255*144,colors[c]);
       }
       ctx.putImageData(image,0,0);
       ref.current!.dataset.frameRevision=source.dataset.frameRevision||'';

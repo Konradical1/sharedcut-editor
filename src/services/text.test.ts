@@ -90,3 +90,22 @@ test('a caption holding its pose repaints its last composite instead of laying t
   const fresh = (d: typeof doc, time: number) => live(structuredClone(d), time);
   assert.equal(live(popping, .97), fresh(popping, .97), 'and each one matches a drawing from scratch');
 });
+
+test('live playback exposes a popping or entering caption through the same shutter, drawn from one raster per word', async () => {
+  const { captionDocument } = await import('./captions.ts');
+  const words = [{ text: 'Pop', start: 0, end: .5 }, { text: 'goes', start: .5, end: 1 }, { text: 'here', start: 1, end: 1.6 }];
+  const doc = captionDocument(words, 'highlight', 2); doc.caption = { ...doc.caption!, wordPop: true };
+  const canvas = createCanvas(640, 360), ctx = canvas.getContext('2d') as unknown as CanvasRenderingContext2D;
+  const draw = (shutter: boolean | 'live', time: number, d = structuredClone(doc)) => { ctx.clearRect(0, 0, 640, 360); drawText(ctx, d, 640, 360, 1920, 1080, time, undefined, shutter); return canvas.getContext('2d').getImageData(0, 0, 640, 360).data; };
+  // Mean difference over the caption's own pixels.
+  const distance = (a: Uint8ClampedArray, b: Uint8ClampedArray) => { let sum = 0, n = 0; for (let i = 0; i < a.length; i++) if (a[i] || b[i]) { sum += Math.abs(a[i] - b[i]); n++; } return sum / Math.max(1, n); };
+  // "goes" early in its pop, and the line early in its entrance: the export draws the vector shutter there.
+  for (const [time, margin] of [[.56, 3], [.06, 1.5]]) {
+    const exact = draw(true, time), live = draw('live', time), single = draw(false, time);
+    assert.ok(distance(live, exact) < distance(single, exact) / margin, `at ${time} s live is ${distance(live, exact).toFixed(2)} from the export, one sample ${distance(single, exact).toFixed(2)}`);
+  }
+  // Rasters are kept per document: the next frame of the same pop reuses them and draws what a fresh document draws.
+  const same = structuredClone(doc);
+  assert.deepEqual(draw('live', .62, same), draw('live', .62, same));
+  assert.deepEqual(draw('live', .62, same), draw('live', .62));
+});

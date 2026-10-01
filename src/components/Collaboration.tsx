@@ -48,9 +48,9 @@ export function RemoteCursors() {
     const stale = () => { hitDue = true; };
     const clear = () => { pointer = null; useEditorStore.setState({ cursor: null }); };
     const leave = (e: globalThis.PointerEvent) => { if (!e.relatedTarget) clear(); };
-    // elementFromPoint forces a layout, and playback changes the DOM every frame. The answer only changes when the
-    // pointer or the content under it moves (scroll, resize), so test then, at most 4 Hz while playing, plus a slow
-    // refresh for anything else that shifts the page.
+    // elementFromPoint forces a layout and hit-tests every timeline element. The answer only changes when the pointer or
+    // the content under it moves (scroll, resize), so test then, at most 4 Hz while playing, plus a slow refresh while
+    // paused for anything else that shifts the page (playback itself moves no layout).
     const hitTest = (state: ReturnType<typeof useEditorStore.getState>) => {
       const hit = pointer && !document.hidden ? document.elementFromPoint(pointer.x, pointer.y) : null;
       const surface = cursorRoot(hit);
@@ -66,7 +66,7 @@ export function RemoteCursors() {
     const draw = () => {
       const now = performance.now(), paints: (() => void)[] = [];
       const state = useEditorStore.getState(), wait = state.playing ? CURSOR_PLAYING_MS : 0;
-      if (pointer && (hitDue && now - hitAt >= wait || now - hitAt >= CURSOR_REFRESH_MS)) { hitDue = false; hitAt = now; hitTest(state); }
+      if (pointer && (hitDue && now - hitAt >= wait || !state.playing && now - hitAt >= CURSOR_REFRESH_MS)) { hitDue = false; hitAt = now; hitTest(state); }
       // Alone in the project there is nothing to place; one more pass after the last collaborator leaves hides them.
       const remote = state.presence.some(p => p.online && p.userId !== state.currentUserId && p.projectId === state.projectId);
       const container = (remote || shown) && now - remoteAt >= wait ? layer.current : null;
