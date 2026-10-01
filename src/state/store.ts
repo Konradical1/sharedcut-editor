@@ -1395,17 +1395,18 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (!follow) { followedMotion = null; followedUser = null; }
       if (follow && (!followedMotion || followedUser !== follow.userId)) { followedMotion = playheadMotion(follow, now); followedUser = follow.userId; }
       const remoteTime = follow && connection.enabled ? advancePlayhead(followedMotion!, follow, now) : follow?.playhead;
-      // The playing clock runs here at full precision; a playhead set from outside (a seek, a loop, pausing) restarts it.
-      const advancing = !follow && state.playing && !state.playbackBuffering;
-      const from = advancing && clockRunning && state.playhead === clockPublished ? clockTime : state.playhead;
-      const time = follow ? Math.min(durationOf(state), remoteTime!) : advancing ? Math.min(playbackEnd, from + elapsed) : state.playhead;
+      // The playing clock runs here at full precision; a playhead set from outside (a seek, a loop, pausing) restarts it. A
+      // buffering stall only holds it: restarting from the store's playhead lost up to a picture of progress each stall.
+      const clocked = !follow && state.playing;
+      const from = clocked && clockRunning && state.playhead === clockPublished ? clockTime : state.playhead;
+      const time = follow ? Math.min(durationOf(state), remoteTime!) : clocked ? Math.min(playbackEnd, from + (state.playbackBuffering ? 0 : elapsed)) : state.playhead;
       const playing = time >= playbackEnd ? false : follow ? !!follow.playing : state.playing;
       // Every store change re-runs every subscriber's selector (~3 ms a tick at 4x CPU slowdown on a real timeline) and the
       // display ticks two to five times per picture. The picture changes only on a frame boundary (playback.ts steps at this
       // rate), so while playing the store's playhead moves once per picture: everything reading it sees the picture shown.
       const rate = parseFloat(String(state.settings.playbackFrameRate)) || state.projects.find(p => p.id === state.projectId)?.fps || 24;
       const playhead = playing && Math.floor(time * rate + 1e-6) === Math.floor(state.playhead * rate + 1e-6) ? state.playhead : time;
-      clockTime = time; clockPublished = playhead; clockRunning = advancing;
+      clockTime = time; clockPublished = playhead; clockRunning = clocked;
       const locks = collaborationService.expireLocks(state.locks, now);
       // A tick that changes nothing notifies nobody: paused, it ran every selector 30 times a second for nothing.
       const patch: Partial<EditorStore> = {};

@@ -181,7 +181,8 @@ export function RemotePlayhead({ person, pixels, color, name, scroller }: { pers
       // On whole device pixels, so a slow line redraws only when it visibly moves.
       const x = Math.round((reduced ? person.playhead : position) * pixels * devicePixelRatio) / devicePixelRatio;
       if (person.playing || !reduced && (motion.velocity !== 0 || motion.position !== motion.target)) {
-        if (!strip) { line.style.visibility = 'hidden'; surface.hidden = false; strip = playheadStrip(surface, scroll, line.offsetParent as HTMLElement, painter()); origin = line.offsetLeft; shown = NaN; }
+        // The strip keeps room on the right for the name tag (and a pixel for its anti-aliased edge).
+        if (!strip) { line.style.visibility = 'hidden'; surface.hidden = false; strip = playheadStrip(surface, scroll, line.offsetParent as HTMLElement, painter(), label.offsetLeft + label.offsetWidth + 1); origin = line.offsetLeft; shown = NaN; }
         strip.draw(origin + x);
       } else {
         if (strip) { strip.dispose(); strip = undefined; surface.hidden = true; }

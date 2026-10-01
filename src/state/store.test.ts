@@ -966,3 +966,24 @@ test('the clock tells subscribers only of real changes: nothing while paused, th
     assert.equal(state().playing, false); assert.equal(state().playhead, end);
   } finally { stop(); connection.enabled = was; state().setPlaying(false); }
 });
+
+test('a buffering stall holds the exact clock: playback resumes where it stopped, not at the picture shown', async () => {
+  const { connection } = await import('../services/api.ts');
+  const was = connection.enabled; connection.enabled = true;
+  try {
+    // Whole milliseconds a tick, so the clock adds up exactly and the stall lands where it is meant to.
+    let now = Date.now() + 7_200_000;
+    const run = (seconds: number) => { for (let i = 0; i < Math.round(seconds * 100); i++) state().tick(now += 10); };
+    // A second of playback from 1 s at 24 fps, with or without a fifth of a second of buffering at 1.57 s: the picture
+    // shown (from 1.5417 s) went up on the 1.55 s tick, so the store's playhead is 0.02 s behind the clock.
+    const play = (stall: boolean) => {
+      state().setPlaying(false); state().setPlayhead(1); run(.1);
+      state().setPlaying(true); run(.57);
+      if (stall) { store.setState({ playbackBuffering: true }); run(.2); store.setState({ playbackBuffering: false }); }
+      run(.43);
+      return state().playhead;
+    };
+    const straight = play(false), stalled = play(true);
+    assert.ok(Math.abs(stalled - straight) < 1e-6, `${stalled} after a stall, ${straight} without`);
+  } finally { connection.enabled = was; state().setPlaying(false); store.setState({ playbackBuffering: false }); }
+});
