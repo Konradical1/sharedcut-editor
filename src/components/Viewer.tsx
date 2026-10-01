@@ -1,17 +1,19 @@
-import { footageSummary, retryFootage, useFootageVersion } from '../services/footageCache';
+import { footageSummary, retryFootage } from '../services/footageCache';
+import { FootageRelay, footageRelayed, subscribeFootage } from './footageRelay';
 import SmartMaskEditor from './SmartMaskOverlay';
 import MotionTrackerEditor from './MotionTrackerEditor';
 import MotionTrackerOverlay from './MotionTrackerOverlay';
 import TextOverlay from './TextOverlay';
 import ShapeOverlay from './ShapeOverlay';
 import { refreshFonts, useFonts, detectLocalFonts } from '../services/fonts';
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import { SkipBack, SkipForward, Play, Pause, ChevronLeft, ChevronRight, Volume2, VolumeX, Maximize, Scan, Settings2, Columns2, Radio } from 'lucide-react';
 import { useEditorStore } from '../state/store';
 import { attachPlayback, projectSize, type PlaybackStatus } from '../services/playback';
 import { FOCUS_ZOOMS, followFocus, sourceFocus, stepFocus, useFocusClipId, useFocusKind, useFocusZoom } from '../services/sourceFocus';
 import { sourceSize } from '../services/motionTracker';
-import { IconButton, timecode } from './ui';
+import { IconButton } from './ui';
+import { LiveTimecode } from './LiveTimecode';
 
 /**
  * Streaming is the default, and deliberately not the sharpest option. The all-intra proxies hold
@@ -21,14 +23,10 @@ import { IconButton, timecode } from './ui';
  */
 const viewerQuality = (preference: unknown) => preference === 'Quarter resolution' ? '1/4' : preference === 'Half resolution' ? '1/2' : preference === 'Full resolution' ? 'Full' : 'Stream';
 
-/** How often the footage panel re-reads the cache: decoder statuses change at every cut while playing. */
-const FOOTAGE_REFRESH_MS = 500;
+/** The footage panel re-reads the cache with the timeline's badges (footageRelay): decoder statuses change at every cut. */
 function FootageLoading({ retry }: { retry: () => void }) {
-  const version = useFootageVersion(), [shown, setShown] = useState(version), latest = useRef(version);
-  latest.current = version;
-  const stale = version !== shown;
-  useEffect(() => { if (!stale) return; const timer = setTimeout(() => setShown(latest.current), FOOTAGE_REFRESH_MS); return () => clearTimeout(timer); }, [stale, shown]);
-  return useMemo(() => <FootageSummary retry={retry}/>, [shown, retry]);
+  const shown = useSyncExternalStore(subscribeFootage, footageRelayed);
+  return useMemo(() => <><FootageRelay/><FootageSummary retry={retry}/></>, [shown, retry]);
 }
 function FootageSummary({ retry }: { retry: () => void }) {
   const { entries, transferred, speed, active } = footageSummary();
@@ -47,13 +45,9 @@ function FootageSummary({ retry }: { retry: () => void }) {
   </details>;
 }
 
-/** The only part of the viewer that follows the playhead: it moves every frame while playing. */
-function TransportTime({ fps }: { fps: number }) {
-  const playhead = useEditorStore(s => s.playhead);
-  return <span className="transport-time mono">{timecode(playhead, fps)}</span>;
-}
-
-export default function Viewer({ compact = false, colorAccurate=false }: { compact?: boolean; colorAccurate?:boolean }) {
+// Memoized: the workspaces around it re-render on panel-playhead steps and store changes, and none of that reaches its props.
+export default memo(Viewer);
+function Viewer({ compact = false, colorAccurate=false }: { compact?: boolean; colorAccurate?:boolean }) {
   const fontsRevision = useFonts(s => s.revision);
   useEffect(() => { detectLocalFonts(); void refreshFonts(); const timer = setInterval(() => void refreshFonts(), 15000); return () => clearInterval(timer); }, []);
   // The shared overlay pack is needed to draw a light-leak transition, not only to browse one.
@@ -153,6 +147,6 @@ export default function Viewer({ compact = false, colorAccurate=false }: { compa
       {settings && <div className="viewer-settings popover"><span className="eyebrow">VIEWER OVERLAYS</span><label><input type="checkbox" checked={safe} onChange={e => setSafe(e.target.checked)}/> Title & action safe areas</label><label><input type="checkbox" checked={compare} onChange={e => setCompare(e.target.checked)}/> Compare ungraded image</label><label><input type="checkbox" checked={original} onChange={e => setOriginal(e.target.checked)}/> Decode original media</label><small className="muted">Preview uses browser decoders and SDR processing up to 1920 pixels wide. Exports use originals at the selected resolution.</small></div>}
     </div>
     <div className="viewer-focus-strip" ref={setFocusStrip}/>
-    <div className="viewer-transport"><div className="row viewer-quality"><button className="proxy-indicator" onClick={() => setOriginal(!original)} title="Toggle proxy / original"><i/>{status?.fallback ? 'STREAM FALLBACK' : original ? 'ORIGINAL' : 'PROXY'}</button><select aria-label="Preview quality" value={quality} onChange={e => setQuality(e.target.value)}><option value="Color">Color · high precision</option><option value="Stream">Auto · streaming</option><option>1/4</option><option>1/2</option><option>Full</option></select></div><div className="transport-controls"><IconButton label={focused ? 'First frame' : 'Previous edit'} disabled={lockedPlayback} onClick={() => { if (!stepFocus(-1e9)) navigateEdit(-1); }}><SkipBack size={14}/></IconButton><IconButton label="Previous frame" disabled={lockedPlayback} onClick={() => step(-1)}><ChevronLeft size={17}/></IconButton><IconButton label={playing ? 'Pause playback' : 'Play playback'} disabled={lockedPlayback} className="play-button" onClick={() => { playback.current?.resume(); setPlaying(!playing); }}>{playing ? <Pause size={17} fill="currentColor"/> : <Play size={17} fill="currentColor"/>}</IconButton><IconButton label="Next frame" disabled={lockedPlayback} onClick={() => step(1)}><ChevronRight size={17}/></IconButton><IconButton label={focused ? 'Last frame' : 'Next edit'} disabled={lockedPlayback} onClick={() => { if (!stepFocus(1e9)) navigateEdit(1); }}><SkipForward size={14}/></IconButton><TransportTime fps={fps}/></div><div className="row viewer-tools"><IconButton label={volume ? 'Mute viewer' : 'Unmute viewer'} onClick={() => setVolume(volume ? 0 : 80)}>{volume ? <Volume2 size={15}/> : <VolumeX size={15}/>}</IconButton><input aria-label="Viewer volume" type="range" min="0" max="100" value={volume} onChange={e => setVolume(Number(e.target.value))}/><IconButton label="Compare reference" className={compare ? 'active' : ''} onClick={() => setCompare(!compare)}><Columns2 size={15}/></IconButton><IconButton label="Safe areas" className={safe ? 'active' : ''} onClick={() => setSafe(!safe)}><Scan size={15}/></IconButton><IconButton label="Fullscreen viewer" onClick={() => { if (document.fullscreenElement) void document.exitFullscreen(); else void ref.current?.requestFullscreen().catch(() => useEditorStore.getState().notify('Fullscreen unavailable', 'info')); }}><Maximize size={15}/></IconButton></div></div>
+    <div className="viewer-transport"><div className="row viewer-quality"><button className="proxy-indicator" onClick={() => setOriginal(!original)} title="Toggle proxy / original"><i/>{status?.fallback ? 'STREAM FALLBACK' : original ? 'ORIGINAL' : 'PROXY'}</button><select aria-label="Preview quality" value={quality} onChange={e => setQuality(e.target.value)}><option value="Color">Color · high precision</option><option value="Stream">Auto · streaming</option><option>1/4</option><option>1/2</option><option>Full</option></select></div><div className="transport-controls"><IconButton label={focused ? 'First frame' : 'Previous edit'} disabled={lockedPlayback} onClick={() => { if (!stepFocus(-1e9)) navigateEdit(-1); }}><SkipBack size={14}/></IconButton><IconButton label="Previous frame" disabled={lockedPlayback} onClick={() => step(-1)}><ChevronLeft size={17}/></IconButton><IconButton label={playing ? 'Pause playback' : 'Play playback'} disabled={lockedPlayback} className="play-button" onClick={() => { playback.current?.resume(); setPlaying(!playing); }}>{playing ? <Pause size={17} fill="currentColor"/> : <Play size={17} fill="currentColor"/>}</IconButton><IconButton label="Next frame" disabled={lockedPlayback} onClick={() => step(1)}><ChevronRight size={17}/></IconButton><IconButton label={focused ? 'Last frame' : 'Next edit'} disabled={lockedPlayback} onClick={() => { if (!stepFocus(1e9)) navigateEdit(1); }}><SkipForward size={14}/></IconButton><LiveTimecode className="transport-time mono" fps={fps}/></div><div className="row viewer-tools"><IconButton label={volume ? 'Mute viewer' : 'Unmute viewer'} onClick={() => setVolume(volume ? 0 : 80)}>{volume ? <Volume2 size={15}/> : <VolumeX size={15}/>}</IconButton><input aria-label="Viewer volume" type="range" min="0" max="100" value={volume} onChange={e => setVolume(Number(e.target.value))}/><IconButton label="Compare reference" className={compare ? 'active' : ''} onClick={() => setCompare(!compare)}><Columns2 size={15}/></IconButton><IconButton label="Safe areas" className={safe ? 'active' : ''} onClick={() => setSafe(!safe)}><Scan size={15}/></IconButton><IconButton label="Fullscreen viewer" onClick={() => { if (document.fullscreenElement) void document.exitFullscreen(); else void ref.current?.requestFullscreen().catch(() => useEditorStore.getState().notify('Fullscreen unavailable', 'info')); }}><Maximize size={15}/></IconButton></div></div>
   </section>;
 }

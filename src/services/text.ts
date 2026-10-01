@@ -133,8 +133,13 @@ export function typingCount(doc: TextDocument, elapsed: number, budget?: number)
   }
   return count;
 }
-/** `shutter: false` draws a moving caption as one sample instead of its motion-blur shutter (live playback). */
-export function drawText(ctx: TextCanvas, doc: TextDocument, width: number, height: number, projectWidth = width, projectHeight = height, elapsed = Infinity, visibleCharacters?: number, shutter = true) {
+/**
+ * How a moving caption is exposed. `true` (exports, paused frames): seven samples across the shutter, each laid out and
+ * drawn. `'live'` (playback): the same seven samples composited from one raster per word, so it costs one drawing instead
+ * of seven. `false` (efficient playback): one sample at the frame's own time.
+ */
+export type CaptionShutter = boolean | 'live';
+export function drawText(ctx: TextCanvas, doc: TextDocument, width: number, height: number, projectWidth = width, projectHeight = height, elapsed = Infinity, visibleCharacters?: number, shutter: CaptionShutter = true) {
   if(doc.caption){drawCaption(ctx as CanvasRenderingContext2D,doc,width,height,projectWidth,projectHeight,elapsed,shutter);return;}
   const fx = { ...defaultTextEffects, ...doc };
   const reveal = fx.typingEnabled && visibleCharacters !== undefined ? Math.min(visibleCharacters, typingCount({...doc,typingEnabled:false},elapsed)) : typingCount(doc, elapsed);
@@ -228,7 +233,10 @@ export function remapTextRuns(base: TextDocument, current: TextDocument, next: T
 // Reuse two transparent canvases per target; temporal samples add before compositing once.
 // `sum` also keeps the last composite: a caption holds one pose for most of its frames.
 const captionSurfaces=new WeakMap<object,{sample:HTMLCanvasElement;sum:HTMLCanvasElement;doc?:TextDocument;pose?:string}>();
-function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,height:number,pw:number,ph:number,elapsed:number,shutter:boolean) {
+/** Live-shutter rasters per caption document: a word keeps its picture through its pop, frame after frame. */
+type Sprite={canvas:HTMLCanvasElement;x:number;y:number;w:number;h:number};
+const captionSprites=new WeakMap<TextDocument,Map<string,Sprite>>();
+function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,height:number,pw:number,ph:number,elapsed:number,shutter:CaptionShutter) {
   const data=doc.caption!,preset=captionPreset(data.preset),time=Number.isFinite(elapsed)?elapsed:.5;
   if(time<0||time>=data.duration)return;
   const timing=captionTiming(data),entrance=Math.min(data.duration,timing.entranceDuration),exit=Math.min(data.duration,timing.exitDuration);
@@ -249,14 +257,10 @@ function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,
   const wordZoom=(w:CaptionData['words'][number],t:number)=>{const local=t-captionHighlightLead-w.start;return data.wordPop&&local>=0&&local<wordPopDuration?snapZoom(local/wordPopDuration):1;};
   const popping=Boolean(data.wordPop)&&data.words.some(w=>{const local=time-captionHighlightLead-w.start;return local>=0&&local<wordPopDuration+1/60;});
   const moving=['pull','pop','rise','bounce','snap'].includes(preset.motion)&&entrance>0&&time<entrance+1/60;
-  // ponytail: seven outlined, shadowed rasters per moving frame were most of live playback's canvas time, so live
-  // playback draws the pose at the frame's own time (the shutter is at most 1/60 s); paused frames and exports keep it.
   const count=shutter&&(moving||popping)?7:1,exposure=Math.min(1/60,Math.max(entrance,popping?wordPopDuration:0)/4);
+  const make=()=>{if(typeof document!=='undefined')return document.createElement('canvas');return new (ctx.canvas.constructor as {new(w:number,h:number):HTMLCanvasElement})(width,height);};
   let surfaces=captionSurfaces.get(ctx);
-  if(!surfaces){
-    const make=()=>{if(typeof document!=='undefined')return document.createElement('canvas');return new (ctx.canvas.constructor as {new(w:number,h:number):HTMLCanvasElement})(width,height);};
-    surfaces={sample:make(),sum:make()};captionSurfaces.set(ctx,surfaces);
-  }
+  if(!surfaces){surfaces={sample:make(),sum:make()};captionSurfaces.set(ctx,surfaces);}
   const cue=Math.max(data.words[0]?.start??0,time-captionHighlightLead),active=data.words.findIndex(w=>cue>=w.start&&cue<w.end);
   // A single sample is fully described by its motion, word pops and highlighted word; the document object stands for the rest.
   const still=count===1?motion(time):undefined,pose=still&&`${width}:${height}:${pw}:${ph}:${active}:${still.zoom}:${still.y}:${still.blur}:${still.alpha}:${data.words.map(w=>wordZoom(w,time)).join()}`;
@@ -268,29 +272,69 @@ function drawCaption(ctx:CanvasRenderingContext2D,doc:TextDocument,width:number,
   ctx.save();ctx.font=canvasFont(style);const measured=ctx.measureText(data.words.map(w=>w.text).join(' ')).width;ctx.restore();
   style.fontSize*=Math.min(1,pw*doc.width/Math.max(1,measured));
   const sum=surfaces.sum.getContext('2d')!,sample=surfaces.sample.getContext('2d')!;
-  sum.clearRect(0,0,width,height);
-  for(let i=0;i<count;i++){
-    const t=Math.max(0,time-(count===1?0:(1-i/(count-1))*exposure)),m=motion(t);
-    sample.clearRect(0,0,width,height);sample.save();sample.globalAlpha=m.alpha;
-    const cx=(doc.x+doc.width/2)*width,cy=(doc.y*ph+style.fontSize*.55)*height/ph;
-    sample.translate(cx,cy+m.y*scale*height/ph);sample.scale(m.zoom,m.zoom);sample.translate(-cx,-cy);
-    if(preset.backing){sample.fillStyle='#080b10cc';sample.fillRect(doc.x*width-8*scale*width/pw,doc.y*height-5*scale*height/ph,doc.width*width+16*scale*width/pw,style.fontSize*1.3*height/ph);}
-    const color=(n:number)=>(preset.highlight||data.accent)&&n===active?data.accent??preset.accent:style.color;
-    const plain={...doc,caption:undefined,blur:m.blur*scale,outlineWidth:(doc.outlineWidth??0)*scale,shadowBlur:(doc.shadowBlur??8)*scale,shadowX:(doc.shadowX??0)*scale,shadowY:(doc.shadowY??4)*scale,runs:data.words.map((w,n)=>({text:(n?' ':'')+w.text,style:{...style,color:color(n)}}))};
-    const zooms=data.words.map(w=>wordZoom(w,t));
-    if(zooms.every(z=>z===1))drawText(sample,plain,width,height,pw,ph,t);
-    else {
-      // The line always fits on one row (the font shrinks to fit above), so each word sits at its measured offset.
-      sample.font=canvasFont(style);const line=sample.measureText(data.words.map(w=>w.text).join(' ')).width,left=doc.x*pw+(doc.width*pw-line)/2;
-      data.words.forEach((w,n)=>{
-        const offset=sample.measureText(data.words.slice(0,n).map(v=>v.text+' ').join('')).width,size=sample.measureText(w.text).width,wx=(left+offset+size/2)*width/pw;
-        sample.save();sample.translate(wx,cy);sample.scale(zooms[n],zooms[n]);sample.translate(-wx,-cy);
-        drawText(sample,{...plain,x:(left+offset)/pw,width:(size+style.fontSize*.2)/pw,align:'left',runs:[{text:w.text,style:{...style,color:color(n)}}]},width,height,pw,ph,t);
-        sample.restore();
-      });
+  const cx=(doc.x+doc.width/2)*width,cy=(doc.y*ph+style.fontSize*.55)*height/ph;
+  const color=(n:number)=>(preset.highlight||data.accent)&&n===active?data.accent??preset.accent:style.color;
+  const plain=(blur:number):TextDocument=>({...doc,caption:undefined,blur:blur*scale,outlineWidth:(doc.outlineWidth??0)*scale,shadowBlur:(doc.shadowBlur??8)*scale,shadowX:(doc.shadowX??0)*scale,shadowY:(doc.shadowY??4)*scale,runs:data.words.map((w,n)=>({text:(n?' ':'')+w.text,style:{...style,color:color(n)}}))});
+  // The line always fits on one row (the font shrinks to fit above), so each word sits at its measured offset.
+  type Placed={n:number;x:number;width:number;wx:number;text:string};
+  let placed:Placed[]|undefined;
+  const words=()=>placed??=(()=>{
+    sample.font=canvasFont(style);const line=sample.measureText(data.words.map(w=>w.text).join(' ')).width,left=doc.x*pw+(doc.width*pw-line)/2;
+    return data.words.map((w,n)=>{const offset=sample.measureText(data.words.slice(0,n).map(v=>v.text+' ').join('')).width,size=sample.measureText(w.text).width;return {n,x:(left+offset)/pw,width:(size+style.fontSize*.2)/pw,wx:(left+offset+size/2)*width/pw,text:w.text};});
+  })();
+  const word=(base:TextDocument,p:Placed):TextDocument=>({...base,x:p.x,width:p.width,align:'left',runs:[{text:p.text,style:{...style,color:color(p.n)}}]});
+  const samples=Array.from({length:count},(_,i)=>{const t=Math.max(0,time-(count===1?0:(1-i/(count-1))*exposure));return {t,m:motion(t),zooms:data.words.map(w=>wordZoom(w,t))};});
+  // Live: one raster per word (one for the whole line when nothing pops), each at the largest zoom its samples reach so
+  // no sample enlarges it; a word that holds still stays 1:1. Canvas shadows ignore the transform, so they scale by hand.
+  const live=shutter==='live'&&count>1,pops=samples.some(s=>s.zooms.some(z=>z!==1));
+  // Rasters live only through a pop or entrance; kept per caption for the session, every captioned clip played held its own.
+  if(!live)captionSprites.delete(doc);
+  const reach=(n?:number)=>Math.ceil(Math.max(1,...samples.map(s=>(n===undefined?1:s.zooms[n])*s.m.zoom))*8)/8;
+  const sprite=(d:TextDocument,key:string,raster:number):Sprite=>{
+    let cache=captionSprites.get(doc);
+    if(!cache){cache=new Map();captionSprites.set(doc,cache);}
+    const id=`${width}:${height}:${pw}:${ph}:${raster}:${key}`,hit=cache.get(id);
+    if(hit)return hit;
+    const fx={...defaultTextEffects,...d},pad=Math.max(fx.outlineWidth,fx.shadowOpacity?fx.shadowBlur*3+Math.max(Math.abs(fx.shadowX),Math.abs(fx.shadowY)):0);
+    const x=Math.floor((d.x*pw-pad)*width/pw),y=Math.floor((d.y*ph-pad)*height/ph),w=Math.ceil((d.x*pw+d.width*pw+pad)*width/pw)-x,h=Math.ceil((d.y*ph+d.height*ph+pad)*height/ph)-y;
+    const canvas=make();canvas.width=Math.max(1,Math.ceil(w*raster));canvas.height=Math.max(1,Math.ceil(h*raster));
+    const c=canvas.getContext('2d')!;c.setTransform(raster,0,0,raster,-x*raster,-y*raster);
+    drawText(c,{...d,shadowBlur:fx.shadowBlur*raster,shadowX:fx.shadowX*raster,shadowY:fx.shadowY*raster},width,height,pw,ph,time);
+    const made={canvas,x,y,w:canvas.width/raster,h:canvas.height/raster};
+    cache.set(id,made);return made;
+  };
+  const rasters=!live?[]:pops?words().map(p=>({p,s:sprite(word(plain(0),p),`${p.n}:${color(p.n)}`,reach(p.n))})):[{p:undefined,s:sprite(plain(0),`line:${active}`,reach())}];
+  const backing=[doc.x*width-8*scale*width/pw,doc.y*height-5*scale*height/ph,doc.width*width+16*scale*width/pw,style.fontSize*1.3*height/ph] as const;
+  // Live, every pixel a sample can touch is known (its rasters and backing, moved by its zooms and lift, plus its blur), so
+  // the seven clears and composites cover that band instead of the whole frame.
+  let region:[number,number,number,number]=[0,0,width,height];
+  if(live){
+    let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+    for(const {m,zooms} of samples){
+      const lift=m.y*scale*height/ph,spread=m.blur*scale*width/pw*3;
+      const cover=(x:number,y:number,w:number,h:number,wx=cx,z=1)=>{const k=m.zoom*z,X=cx+m.zoom*((x-wx)*z+wx-cx),Y=cy+lift+k*(y-cy);x0=Math.min(x0,X-spread);y0=Math.min(y0,Y-spread);x1=Math.max(x1,X+w*k+spread);y1=Math.max(y1,Y+h*k+spread);};
+      if(preset.backing)cover(...backing);
+      for(const {p,s} of rasters)cover(s.x,s.y,s.w,s.h,p?.wx,p?zooms[p.n]:1);
     }
-    sample.restore();
-    sum.globalCompositeOperation='lighter';sum.globalAlpha=1/count;sum.drawImage(surfaces.sample,0,0);
+    const left=Math.max(0,Math.floor(x0)-1),top=Math.max(0,Math.floor(y0)-1);
+    region=[left,top,Math.max(0,Math.min(width,Math.ceil(x1)+1)-left),Math.max(0,Math.min(height,Math.ceil(y1)+1)-top)];
   }
-  sum.globalCompositeOperation='source-over';sum.globalAlpha=1;ctx.drawImage(surfaces.sum,0,0);
+  sum.clearRect(...region);
+  for(const {t,m,zooms} of samples){
+    sample.clearRect(...region);sample.save();sample.globalAlpha=m.alpha;
+    sample.translate(cx,cy+m.y*scale*height/ph);sample.scale(m.zoom,m.zoom);sample.translate(-cx,-cy);
+    if(preset.backing){sample.fillStyle='#080b10cc';sample.fillRect(...backing);}
+    const around=(p:Placed,paint:()=>void)=>{sample.save();sample.translate(p.wx,cy);sample.scale(zooms[p.n],zooms[p.n]);sample.translate(-p.wx,-cy);paint();sample.restore();};
+    if(live){
+      if(m.blur)sample.filter=`blur(${m.blur*scale*width/pw}px)`;
+      for(const {p,s} of rasters){const paint=()=>sample.drawImage(s.canvas,s.x,s.y,s.w,s.h);if(p)around(p,paint);else paint();}
+    }
+    else if(zooms.every(z=>z===1))drawText(sample,plain(m.blur),width,height,pw,ph,t);
+    else for(const p of words())around(p,()=>drawText(sample,word(plain(m.blur),p),width,height,pw,ph,t));
+    sample.restore();
+    sum.globalCompositeOperation='lighter';sum.globalAlpha=1/count;
+    if(region[2]&&region[3])sum.drawImage(surfaces.sample,...region,...region);
+  }
+  sum.globalCompositeOperation='source-over';sum.globalAlpha=1;
+  if(region[2]&&region[3])ctx.drawImage(surfaces.sum,...region,...region);
 }

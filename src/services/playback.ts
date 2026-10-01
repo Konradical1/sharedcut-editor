@@ -640,7 +640,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         if(!visual)continue;
         layerContext.clearRect(0,0,width,height);
         const artwork=transformMotion(clip,time,project?.fps??24,projectWidth,projectHeight).length>1?motionArtwork(clip):clip;
-        if(isTitle(clip))drawText(layerContext,textOf(artwork),width,height,projectWidth,projectHeight,sourceTime(original,time,project?.fps||24),clip.properties.animationTypingCount as number | undefined,!state.playing);
+        if(isTitle(clip))drawText(layerContext,textOf(artwork),width,height,projectWidth,projectHeight,sourceTime(original,time,project?.fps||24),clip.properties.animationTypingCount as number | undefined,!state.playing||(efficient?false:'live'));
         else drawShape(layerContext,getShape(artwork),width,height,projectWidth,projectHeight);
         if(options.compare)draw(referenceTarget,clip,width,height,projectWidth,projectHeight,time,project?.fps??24);
         picture=true;beginSide();finishLayer(clip,asset,time,layerTarget,undefined);continue;

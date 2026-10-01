@@ -1400,7 +1400,9 @@ export const useEditorStore = create<EditorStore>((set, get) => {
           patch.renderJobs.forEach((job, index) => { if (job.status === 'complete' && state.renderJobs[index].status !== 'complete') state.notify(`Demo render complete: ${job.name}`, 'success'); });
           if (!patch.renderJobs.some(job => job.status === 'rendering')) { const next = [...patch.renderJobs].reverse().find(job => job.status === 'waiting'); if (next) patch.renderJobs = patch.renderJobs.map(job => job.id === next.id ? { ...job, status: 'rendering', remaining: '1:20 remaining' } : job); }
         }
-        patch.notifications = get().notifications.filter(item => now - item.timestamp < 7_000);
+        // Only when one expires: a new array every second re-rendered every panel that reads the whole store.
+        const notifications = get().notifications, kept = notifications.filter(item => now - item.timestamp < 7_000);
+        if (kept.length !== notifications.length) patch.notifications = kept;
       }
       set(patch);
     },

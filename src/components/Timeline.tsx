@@ -12,7 +12,7 @@ import ClipFades from './ClipFades';
 import TransitionChips from './TransitionChips';
 import { alignShare, bestAlign, maximumDuration, nearestCut, transitionDefinitions } from '../services/transitions';
 import { isTitle, titlePresets } from '../services/text';
-import { Fragment, memo, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type PointerEvent, type DragEvent } from 'react';
+import { Fragment, memo, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type PointerEvent, type DragEvent, type RefObject } from 'react';
 import { Shapes, PenTool, Layers, ArrowLeft, ArrowRightLeft, Type, MousePointer2, Scissors, Magnet, Link2, Flag, Plus, Minus, ChevronDown, LockKeyhole, LockKeyholeOpen, Eye, EyeOff, Volume2, VolumeX, Film, AudioLines, Copy, Trash2, Gauge, Palette, Music2, FolderSearch, Info, Clipboard, Undo2, GripVertical, ChevronUp, Diamond } from 'lucide-react';
 import { useEditorStore, TRACK_THUMBNAIL_HEIGHT } from '../state/store';
 import { useShallow } from 'zustand/react/shallow';
@@ -21,9 +21,11 @@ import { ContextMenu, IconButton, timecode, Badge, fpsLabel } from './ui';
 import { companionAudioTrack, edgeScrollVelocity, rulerStep, timelineZoom, uncoveredParts, trackGap, filmstripTiles } from '../services/timeline';
 import { snapTime, SNAP_PIXELS } from '../services/snapping';
 import { RemotePlayhead } from './Collaboration';
+import { LiveTimecode, onPicture } from './LiveTimecode';
 import { acceptsEffect } from '../services/effects';
 import { useClipActivity, watchSmartMaskJobs, useActivityVersion } from '../services/clipStatus';
-import { clipFootageStatus, useFootageVersion } from '../services/footageCache';
+import { clipFootageStatus } from '../services/footageCache';
+import { FootageRelay, footageRelayed, subscribeFootage } from './footageRelay';
 import { barSegments, type BarState } from '../services/renderBar';
 import { useMaskEditor } from '../services/smartMaskClient';
 import type { Clip, MediaAsset } from '../state/models';
@@ -60,16 +62,85 @@ function ClipFilmstrip({ asset, clip, pixels }: { asset?: MediaAsset; clip: Pick
 }
 
 
-function TimelineTime({ fps, color }: { fps?: number; color: string }) {
-  const label = useEditorStore(s => timecode(s.playhead, fps));
-  return <span className="timeline-time mono" style={{ color }}>{label}</span>;
+type PlayheadProps = { pixels: number; color: string; scrub: (e: PointerEvent<HTMLDivElement>) => void; scrubMove: (e: PointerEvent<HTMLDivElement>) => void; scroller: RefObject<HTMLDivElement | null> };
+/**
+ * Paused, the playhead is this element, placed by React. Playing, it holds still (hidden) and the moving line is drawn into
+ * a canvas strip. Any per-frame change to an element here re-layerized the whole page (~13 ms a frame on a fast laptop,
+ * ~75 ms at 4x CPU slowdown), will-change or not; a CSS or WAAPI animation instead made every frame recalculate style and
+ * intersection observers and cost the picture its smoothness. Redrawing a canvas does neither.
+ */
+function LocalPlayhead({ pixels, color, scrub, scrubMove, scroller }: PlayheadProps) {
+  const playing = useEditorStore(s => s.playing), paused = useEditorStore(s => s.playing ? -1 : s.playhead);
+  const line = useRef<HTMLDivElement>(null), held = useRef(paused);
+  if (paused >= 0) held.current = paused;
+  // Badge bars ease only while paused: a running transition is an animation, and animations cost every frame (above).
+  useLayoutEffect(() => { scroller.current?.toggleAttribute('data-playing', playing); }, [playing, scroller]);
+  return <>
+    <div ref={line} className="local-playhead" onPointerDown={scrub} onPointerMove={scrubMove} style={{ left: 164, transform: `translateX(${held.current * pixels}px)`, visibility: playing ? 'hidden' : undefined, '--user-color': color } as CSSProperties}><span/></div>
+    {playing && <MovingPlayhead pixels={pixels} color={color} line={line} scroller={scroller}/>}
+  </>;
 }
-
-type PlayheadProps = { pixels: number; color: string; scrub: (e: PointerEvent<HTMLDivElement>) => void; scrubMove: (e: PointerEvent<HTMLDivElement>) => void };
-// Only the local playhead follows every playback frame; remote playheads re-render on presence changes.
-function LocalPlayhead({ pixels, color, scrub, scrubMove }: PlayheadProps) {
-  const playhead = useEditorStore(s => s.playhead);
-  return <div className="local-playhead" onPointerDown={scrub} onPointerMove={scrubMove} style={{ left: 164, transform: `translateX(${playhead * pixels}px)`, '--user-color': color } as CSSProperties}><span/></div>;
+/** Width of the moving playhead's canvas and the room its line keeps from the edges, in CSS pixels. */
+const PLAYHEAD_PAGE = 256, PLAYHEAD_MARGIN = 16;
+/**
+ * The playing playhead: the paused element's own box, glow and head, drawn at each presented picture's playhead. The canvas
+ * is a strip as tall as the visible timeline rather than all of it, so each frame redraws and composites little; it jumps
+ * ahead (one layout) only when the line nears its edge.
+ */
+function MovingPlayhead({ pixels, color, line, scroller }: { pixels: number; color: string; line: RefObject<HTMLDivElement | null>; scroller: RefObject<HTMLDivElement | null> }) {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  useLayoutEffect(() => {
+    const surface = canvas.current, scroll = scroller.current, element = line.current, head = element?.firstElementChild as HTMLElement | null, context = surface?.getContext('2d');
+    if (!surface || !scroll || !element || !head || !context) return;
+    const area = element.offsetParent as HTMLElement;
+    // `0 0 6px #eb7d7340`: a canvas shadow of the same blur and colour is the same Gaussian glow.
+    const glow = /^(rgba?\([^)]*\)|#\w+)\s+0px\s+0px\s+([\d.]+)px/.exec(getComputedStyle(element).boxShadow);
+    let left = NaN, top = 0, scale = 1, shown = NaN;
+    const draw = (playhead: number) => {
+      // In the track area's coordinates, like the paused element.
+      const at = element.offsetLeft + playhead * pixels, view = scroll.scrollLeft - area.offsetLeft;
+      // Off screen it is left blank and still. Zoomed in, the line leaves the view within a second, and redrawing the unseen
+      // strip every picture stalled the GPU process ~100 ms every few seconds (measured at 30 frames across the view).
+      if (at + PLAYHEAD_MARGIN < view || at - PLAYHEAD_MARGIN > view + scroll.clientWidth) {
+        if (shown === shown) { context.setTransform(1, 0, 0, 1, 0, 0); context.clearRect(0, 0, surface.width, surface.height); shown = NaN; }
+        return;
+      }
+      if (!(at - PLAYHEAD_MARGIN >= left && at + PLAYHEAD_MARGIN <= left + PLAYHEAD_PAGE)) { left = Math.floor(at - PLAYHEAD_MARGIN); surface.style.left = `${left}px`; shown = NaN; }
+      const x = at - left;
+      if (x === shown) return;
+      shown = x;
+      context.setTransform(1, 0, 0, 1, 0, 0); context.clearRect(0, 0, surface.width, surface.height);
+      context.setTransform(scale, 0, 0, scale, 0, 0); context.fillStyle = color;
+      const y = element.offsetTop - top;
+      context.save();
+      if (glow) { context.shadowColor = glow[1]; context.shadowBlur = Number(glow[2]) * scale; }
+      context.fillRect(x, y, element.offsetWidth, element.offsetHeight);
+      context.restore();
+      // The head's clip-path: polygon(0 0, 100% 0, 100% 65%, 50% 100%, 0 65%).
+      const hx = x + head.offsetLeft, hy = y + head.offsetTop, w = head.offsetWidth, h = head.offsetHeight;
+      context.beginPath(); context.moveTo(hx, hy); context.lineTo(hx + w, hy); context.lineTo(hx + w, hy + h * .65); context.lineTo(hx + w / 2, hy + h); context.lineTo(hx, hy + h * .65); context.closePath(); context.fill();
+    };
+    // As tall as what the scroller shows; horizontal scrolling carries it along with the content.
+    const place = () => {
+      top = scroll.scrollTop - area.offsetTop;
+      scale = (scroll.offsetWidth ? scroll.getBoundingClientRect().width / scroll.offsetWidth : 1) * devicePixelRatio;
+      Object.assign(surface.style, { top: `${top}px`, width: `${PLAYHEAD_PAGE}px`, height: `${scroll.clientHeight}px` });
+      // Resizing a canvas reallocates it; scrolling alone only moves it.
+      const width = Math.max(1, Math.round(PLAYHEAD_PAGE * scale)), height = Math.max(1, Math.round(scroll.clientHeight * scale));
+      if (surface.width !== width || surface.height !== height) { surface.width = width; surface.height = height; }
+      shown = NaN; draw(useEditorStore.getState().playhead);
+    };
+    place();
+    const resize = new ResizeObserver(place);
+    resize.observe(scroll);
+    let scrolledTop = scroll.scrollTop;
+    const scrolled = () => { if (scroll.scrollTop !== scrolledTop) { scrolledTop = scroll.scrollTop; place(); } };
+    scroll.addEventListener('scroll', scrolled, { passive: true });
+    // Steps with the picture (onPicture), one frame of the timeline at a time.
+    const unsubscribe = onPicture(draw);
+    return () => { unsubscribe(); resize.disconnect(); scroll.removeEventListener('scroll', scrolled); };
+  }, [pixels, color, line, scroller]);
+  return <canvas ref={canvas} className="local-playhead-canvas" aria-hidden="true"/>;
 }
 function TimelinePlayheads(props: PlayheadProps) {
   const { pixels } = props;
@@ -82,27 +153,12 @@ function TimelinePlayheads(props: PlayheadProps) {
 
 watchSmartMaskJobs(useMaskEditor);
 
-// The footage cache notifies on every chunk and decoder update (~12/s while playing), which re-rendered all ~400 clip
-// badges each time. One relay forwards it, at most FOOTAGE_RELAY_MS apart while playing; each badge then re-renders
-// only when its own text changes.
-const FOOTAGE_RELAY_MS=250,footageListeners=new Set<()=>void>();
-let footageRelayed=0,relayAt=0,relayTimer:ReturnType<typeof setTimeout>|undefined;
-const subscribeFootage=(listener:()=>void)=>{footageListeners.add(listener);return()=>{footageListeners.delete(listener);};};
-const relayFootage=()=>{relayTimer=undefined;relayAt=performance.now();footageRelayed++;footageListeners.forEach(listener=>listener());};
-function FootageRelay(){
-  const version=useFootageVersion();
-  useEffect(()=>{
-    if(relayTimer!==undefined)return;
-    const wait=useEditorStore.getState().playing?FOOTAGE_RELAY_MS-(performance.now()-relayAt):0;
-    if(wait>0)relayTimer=setTimeout(relayFootage,wait);else relayFootage();
-  },[version]);
-  return null;
-}
+// ~400 clip badges follow the footage relay; each re-renders only when its own text changes.
 const footageBadge=(clipId:string)=>{const s=clipFootageStatus(clipId);return `${s.state}|${s.progress}|${s.detail}|${s.playback?.detail??''}`;};
 
 /** Picture coverage in the editor; audio coverage in the audio workspace. */
 function RenderBar({pixels,audioOnly}:{pixels:number;audioOnly:boolean}){
-  useSyncExternalStore(subscribeFootage,()=>footageRelayed);useActivityVersion();
+  useSyncExternalStore(subscribeFootage,footageRelayed);useActivityVersion();
   const clips=useEditorStore(s=>s.clips),media=useEditorStore(s=>s.media),timelineId=useEditorStore(s=>s.timelineId),projectId=useEditorStore(s=>s.projectId);
   const tracks=useEditorStore(s=>s.tracks);
   const segments=barSegments(clips.filter(c=>c.timelineId===timelineId&&c.projectId===projectId&&!c.disabled&&tracks.some(t=>t.id===c.trackId&&(audioOnly?t.kind==='audio'&&!t.muted:t.kind==='video'&&!t.hidden))).map(clip=>{
@@ -368,7 +424,7 @@ function Timeline({ audioOnly = false }: { audioOnly?: boolean }) {
   return <section className={`timeline panel ${audioOnly?'timeline-audio':''} ${density==='compact'?'timeline-dense':''}`} aria-label={audioOnly?'Audio timeline':'Timeline'} onKeyDownCapture={e=>{if(gap&&(e.key==='Delete'||e.key==='Backspace')&&!(e.target as HTMLElement).closest('input,select,textarea')){e.preventDefault();e.stopPropagation();actions().deleteGap(gap.trackId,gap.start,gap.end);setGap(null);}}}>
     {timelineMenu&&<ContextMenu {...timelineMenu} onClose={()=>setTimelineMenu(null)}><button role="menuitem" onClick={()=>{setTimelineMenu(null);actions().setModal('timeline-settings');}}>Timeline settings…</button></ContextMenu>}
     <div className="timeline-toolbar">{trail.length>0&&<nav className="composition-breadcrumb" aria-label="Composition navigation">{trail.map((entry,i)=><button key={i} onClick={()=>actions().leaveComposition(i)} aria-label={`Back to ${timelines.find(t=>t.id===entry.timelineId)?.name}`}><ArrowLeft size={12}/>{timelines.find(t=>t.id===entry.timelineId)?.name}</button>)}<b><Layers size={13}/>{timeline?.name}</b></nav>}<div className="timeline-tabs" hidden={trail.length>0}>{timelines.filter(t=>t.projectId===projectId&&!t.composition).map(t=><button key={t.id} className={t.id===timelineId?'active':''} onContextMenu={e=>{e.preventDefault();actions().setTimeline(t.id);setTimelineMenu({x:e.clientX,y:e.clientY});}} onClick={()=>actions().setTimeline(t.id)}><Film size={13}/>{t.name}{t.id===timelineId&&<span className="timeline-tab-dot"/>}</button>)}</div><span className="spacer"/><button className="text-button" onClick={async()=>{try{await connection.flush();const result=await api(`/projects/${projectId}/resolve-export?timelineId=${encodeURIComponent(timelineId)}`);const url=URL.createObjectURL(new Blob([JSON.stringify(result.otio,null,2)],{type:'application/json'})),link=document.createElement('a');link.href=url;link.download='SharedCut-timeline.otio';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);actions().notify('Resolve timeline exported','info',result.warnings.join(' '));}catch(error){actions().notify('Resolve export failed','error',(error as Error).message);}}}>Resolve OTIO</button><button title="Timeline settings" className="timeline-format mono text-button" onClick={()=>actions().setModal('timeline-settings')}>{project?.resolution} <span>·</span> {fpsLabel(project?.fps)} fps</button><IconButton label="Add track" onClick={()=>actions().createTrack(audioOnly?'audio':'video')}><Plus size={15}/></IconButton></div>
-    <div className="timeline-tools"><TimelineTime fps={project?.fps} color={ownColor}/><div className="tool-group"><IconButton label="Selection tool (V)" className={tool==='select'&&!textTool&&!shapeTool?'active':''} onClick={()=>{setTool('select');useEditorStore.setState({textTool:false,shapeTool:null});}}><MousePointer2 size={15}/></IconButton><IconButton label="Blade tool (B)" className={tool==='blade'?'active':''} onClick={()=>{setTool('blade');useEditorStore.setState({textTool:false,shapeTool:null});}}><Scissors size={15}/></IconButton><IconButton label="Text tool (T)" className={textTool?'active':''} onClick={()=>useEditorStore.setState({textTool:!textTool,shapeTool:null,playing:false})}><Type size={15}/></IconButton><IconButton label="Shape tool (S)" className={shapeTool&&shapeTool!=='pen'?'active':''} onClick={()=>useEditorStore.setState({shapeTool:shapeTool==='rectangle'?null:'rectangle',textTool:false,playing:false})}><Shapes size={15}/></IconButton><IconButton label="Pen tool (P)" className={shapeTool==='pen'?'active':''} onClick={()=>useEditorStore.setState({shapeTool:shapeTool==='pen'?null:'pen',textTool:false,playing:false})}><PenTool size={15}/></IconButton><span className="tool-separator"/><IconButton label="Snapping (N)" className={snapping?'active':''} onClick={()=>setSnapping(!snapping)}><Magnet size={15}/></IconButton><IconButton title="Select and edit linked audio/video together" label="Linked selection" className={linked?'active':''} onClick={()=>{setLinked(!linked);actions().notify(linked?'Linked selection off':'Linked selection on','info');}}><Link2 size={15}/></IconButton><IconButton label="Add marker at playhead" onClick={()=>setMarkers([...markers,{time:actions().playhead,name:`Marker ${markers.length+1}`,color:ownColor}])}><Flag size={14}/></IconButton><button className="range-mark-button" title="Mark In (I)" aria-label="Mark In at playhead" onClick={()=>actions().setRange(actions().playhead,rangeOut)}>[</button><button className="range-mark-button" title="Mark Out (O)" aria-label="Mark Out at playhead" onClick={()=>actions().setRange(rangeIn,actions().playhead)}>]</button><span className="tool-separator"/><IconButton label="Undo my action (⌘Z)" onClick={()=>actions().undo()}><Undo2 size={15}/></IconButton></div><span className="spacer"/><span className="timeline-hint">{placement?`Place at ${timecode(placement.start,project?.fps)} · release to overwrite`:'Shift-click or drag to select · ruler to scrub'}</span><div className="timeline-zoom"><IconButton label="Zoom timeline out" onClick={()=>changeZoom(zoom/1.4)}><Minus size={13}/></IconButton><input aria-label="Timeline zoom" aria-valuetext={`${Math.round(usable/pixels*fps)} frames visible`} title="Pinch or Command-scroll to zoom around the playhead" type="range" min={Math.log2(Math.min(6,usable/Math.max(length,1))/6)} max={Math.log2(usable*fps/15/6)} step="0.02" value={Math.log2(zoom)} onChange={e=>changeZoom(2**Number(e.target.value))}/><IconButton label="Zoom timeline in" onClick={()=>changeZoom(zoom*1.4)}><Plus size={13}/></IconButton><button className="text-button mono" onClick={()=>changeZoom(usable/(length*6))}>Fit</button><button className="text-button mono" onClick={()=>changeZoom(usable*fps/60/6)}>60f</button><button className="text-button mono" onClick={()=>changeZoom(usable*fps/30/6)}>30f</button></div></div>
+    <div className="timeline-tools"><LiveTimecode className="timeline-time mono" style={{ color: ownColor }} fps={project?.fps}/><div className="tool-group"><IconButton label="Selection tool (V)" className={tool==='select'&&!textTool&&!shapeTool?'active':''} onClick={()=>{setTool('select');useEditorStore.setState({textTool:false,shapeTool:null});}}><MousePointer2 size={15}/></IconButton><IconButton label="Blade tool (B)" className={tool==='blade'?'active':''} onClick={()=>{setTool('blade');useEditorStore.setState({textTool:false,shapeTool:null});}}><Scissors size={15}/></IconButton><IconButton label="Text tool (T)" className={textTool?'active':''} onClick={()=>useEditorStore.setState({textTool:!textTool,shapeTool:null,playing:false})}><Type size={15}/></IconButton><IconButton label="Shape tool (S)" className={shapeTool&&shapeTool!=='pen'?'active':''} onClick={()=>useEditorStore.setState({shapeTool:shapeTool==='rectangle'?null:'rectangle',textTool:false,playing:false})}><Shapes size={15}/></IconButton><IconButton label="Pen tool (P)" className={shapeTool==='pen'?'active':''} onClick={()=>useEditorStore.setState({shapeTool:shapeTool==='pen'?null:'pen',textTool:false,playing:false})}><PenTool size={15}/></IconButton><span className="tool-separator"/><IconButton label="Snapping (N)" className={snapping?'active':''} onClick={()=>setSnapping(!snapping)}><Magnet size={15}/></IconButton><IconButton title="Select and edit linked audio/video together" label="Linked selection" className={linked?'active':''} onClick={()=>{setLinked(!linked);actions().notify(linked?'Linked selection off':'Linked selection on','info');}}><Link2 size={15}/></IconButton><IconButton label="Add marker at playhead" onClick={()=>setMarkers([...markers,{time:actions().playhead,name:`Marker ${markers.length+1}`,color:ownColor}])}><Flag size={14}/></IconButton><button className="range-mark-button" title="Mark In (I)" aria-label="Mark In at playhead" onClick={()=>actions().setRange(actions().playhead,rangeOut)}>[</button><button className="range-mark-button" title="Mark Out (O)" aria-label="Mark Out at playhead" onClick={()=>actions().setRange(rangeIn,actions().playhead)}>]</button><span className="tool-separator"/><IconButton label="Undo my action (⌘Z)" onClick={()=>actions().undo()}><Undo2 size={15}/></IconButton></div><span className="spacer"/><span className="timeline-hint">{placement?`Place at ${timecode(placement.start,project?.fps)} · release to overwrite`:'Shift-click or drag to select · ruler to scrub'}</span><div className="timeline-zoom"><IconButton label="Zoom timeline out" onClick={()=>changeZoom(zoom/1.4)}><Minus size={13}/></IconButton><input aria-label="Timeline zoom" aria-valuetext={`${Math.round(usable/pixels*fps)} frames visible`} title="Pinch or Command-scroll to zoom around the playhead" type="range" min={Math.log2(Math.min(6,usable/Math.max(length,1))/6)} max={Math.log2(usable*fps/15/6)} step="0.02" value={Math.log2(zoom)} onChange={e=>changeZoom(2**Number(e.target.value))}/><IconButton label="Zoom timeline in" onClick={()=>changeZoom(zoom*1.4)}><Plus size={13}/></IconButton><button className="text-button mono" onClick={()=>changeZoom(usable/(length*6))}>Fit</button><button className="text-button mono" onClick={()=>changeZoom(usable*fps/60/6)}>60f</button><button className="text-button mono" onClick={()=>changeZoom(usable*fps/30/6)}>30f</button></div></div>
     <div className="timeline-scroll" data-cursor-surface="timeline" ref={scrollRef} onScroll={e=>setViewport({left:e.currentTarget.scrollLeft,width:e.currentTarget.clientWidth})}>
       <div className="timeline-content" style={{minWidth:width+164}}>
         <div className="timeline-ruler-row"><div className="timeline-track-heading"><span>TRACKS</span><ChevronDown size={12}/></div><div className="timeline-ruler" data-cursor-anchor="ruler" data-time-span={width/pixels} style={{width}} onPointerDown={scrub} onPointerMove={scrubMove}>
@@ -455,7 +511,7 @@ function Timeline({ audioOnly = false }: { audioOnly?: boolean }) {
             </div>
           </div>{expandedTracks.includes(track.id)&&<KeyframeLanes clips={clips.filter(c=>c.trackId===track.id)} pixels={pixels} width={width} visibleStart={Math.max(0,viewport.left-164)} visibleEnd={Math.min(width,viewport.left+viewport.width-164)}/>}</Fragment>;})}
           {snapLine!==undefined&&<div className="timeline-snap-line" aria-hidden="true" style={{left:164,transform:`translateX(${snapLine*pixels}px)`}}/>}
-          <TimelinePlayheads pixels={pixels} color={ownColor} scrub={scrub} scrubMove={scrubMove}/>
+          <TimelinePlayheads pixels={pixels} color={ownColor} scrub={scrub} scrubMove={scrubMove} scroller={scrollRef}/>
         </div>
       </div>
     </div>
