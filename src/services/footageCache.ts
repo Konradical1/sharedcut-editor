@@ -25,7 +25,11 @@ const decoding = new Map<string, { url: string; detail: string; failed: boolean 
 let clearing = false, registrationError = '';
 let version = 0, registered = false, controlled = false, disabled = false, concurrency = 6;
 let lastUpdate = -Infinity, lastEviction = 0, generation = 0, retryTimer: ReturnType<typeof setTimeout> | undefined;
-let transferred = 0, transferStart = 0, transferLast = 0, networkRate = 0;
+let transferred = 0, transferStart = 0, transferLast = 0, networkRate = 0, seededRate = 0, measuredBytes = 0;
+// [start, end, bytes] of each network chunk the worker saved in the last 20 s.
+const transfers: [number, number, number][] = [], lowered = new Set<string>();
+// ponytail: one bitrate for a Stream file whose index is not loaded yet (960-wide CRF 16 runs ~8-16 Mbit/s).
+const STREAM_GUESS = 1.5e6;
 let shown = '', notified = -Infinity, notifyTimer: ReturnType<typeof setTimeout> | undefined;
 /** Subscribers re-render at most four times a second, and only when something they show changed. */
 function notify() {
@@ -52,6 +56,56 @@ function chunksFor(entry: Wanted) {
 }
 /** The next seconds from the playhead: downloaded first, never evicted. */
 const windowOf = (entry: Wanted, index: Layout) => 'size' in index ? { start: 0, end: index.size } : byteRange(index, entry.at - PRE, Math.min(entry.to + POST, entry.at + 10));
+/** Header and window chunks of this use are saved. */
+function windowSaved(entry: Wanted) {
+  const index = indexes.get(entry.url), saved = stored.get(entry.url), range = index && windowOf(entry, index);
+  return !!range && [...('size' in index! ? [] : chunksOf({ start: 0, end: index!.moovEnd })), ...chunksOf(range)].every(i => saved?.has(i));
+}
+/** What the link carries, not one request: bytes over the time any download was running. Parallel downloads share the line. */
+function throughput(spans: [number, number, number][]) {
+  let busy = 0, reach = -Infinity, bytes = 0;
+  for (const [from, to, size] of [...spans].sort((a, b) => a[0] - b[0])) { bytes += size; busy += Math.max(0, to - Math.max(from, reach)); reach = Math.max(reach, to); }
+  return busy > 0 ? bytes / (busy / 1000) : 0;
+}
+/**
+ * Footage chunks. A lightly used line runs one at a time and one stalled chunk would stretch the busy time; a line
+ * shared with the page's thumbnails slows every chunk. No chunk arrives faster than the line, so the faster quarter
+ * of them speaks for it then.
+ */
+function chunkRate(spans: [number, number, number][]) {
+  const each = spans.map(([from, to, size]) => size / ((to - from) / 1000)).sort((a, b) => a - b);
+  return Math.max(throughput(spans), each[Math.floor(each.length * .75)] ?? 0);
+}
+/** How fast the page's own large downloads (app, project state) arrived: the line speed before any footage has crossed it. */
+function pageRate() {
+  if (typeof performance.getEntriesByType !== 'function') return 0;
+  // As with chunks, a body that arrived in under 50 ms is no evidence of Internet throughput.
+  const own = (performance.getEntriesByType('resource') as PerformanceResourceTiming[]).filter(entry => entry.transferSize > 0 && entry.encodedBodySize >= 256 * 1024 && entry.responseEnd - entry.responseStart >= 50 && entry.name.startsWith(location.origin));
+  // A small sample is slow-start and latency, not bandwidth: it could only ever argue for the low stream wrongly.
+  return own.reduce((sum, entry) => sum + entry.encodedBodySize, 0) >= 2 * CHUNK ? throughput(own.map(entry => [entry.responseStart, entry.responseEnd, entry.encodedBodySize])) : 0;
+}
+/** Measured footage throughput; until 16 MiB of it, no lower than the page rate, since the first chunks share the line with the rest of the page loading. */
+const linkRate = () => measuredBytes < 16 * CHUNK ? Math.max(networkRate, seededRate) : networkRate;
+const bitrates = new WeakMap<Mp4Index, number>();
+function bitrateOf(index: Mp4Index) {
+  let rate = bitrates.get(index);
+  if (rate === undefined) {
+    const duration = Math.max(0, ...index.tracks.map(track => track.times.at(-1) ?? 0));
+    rate = duration > 0 ? index.tracks.reduce((sum, track) => sum + track.sizes.reduce((n, size) => n + size, 0), 0) / duration : STREAM_GUESS;
+    bitrates.set(index, rate);
+  }
+  return rate;
+}
+/**
+ * The link cannot carry this file at 1.3x real time; once judged so, it takes 1.5x to win it back. False before any
+ * measurement. Leans optimistic: playback keeps a decoder's low stream for the session, while a Stream file that
+ * does stall moves to the low stream after 1.2 s anyway.
+ */
+function slowFor(url: string) {
+  const rate = linkRate(), layout = indexes.get(url), need = layout && 'tracks' in layout ? bitrateOf(layout) : STREAM_GUESS;
+  if (rate && rate < need * 1.3) lowered.add(url); else if (!rate || rate > need * 1.5) lowered.delete(url);
+  return lowered.has(url);
+}
 function remember(url: string, index: number, size: number) {
   let chunks = stored.get(url); if (!chunks) { chunks = new Map(); stored.set(url, chunks); }
   chunks.set(index, size);
@@ -78,8 +132,16 @@ if (supported()) {
     if (data.type === 'footage-cleared') { stored.clear(); indexes.clear(); lastUpdate = -Infinity; notify(); }
     if (data.type === 'footage-stored') { remember(data.url, data.index, data.size); notify(); }
     if (data.type === 'footage-transfer') {
-      transferStart ||= performance.now(); transferLast = performance.now(); transferred += data.bytes;
-      if(data.milliseconds >= 50 && data.bytes > 0){const rate=data.bytes/(data.milliseconds/1000);networkRate=networkRate?networkRate*.7+rate*.3:rate;}
+      const now = performance.now();
+      transferStart ||= now; transferLast = now; transferred += data.bytes;
+      // An almost instantaneous response is not evidence of Internet throughput.
+      if (data.milliseconds >= 50 && data.bytes > 0) {
+        // The worker reports when the body finished arriving (`ago`): saving it is not network time.
+        const end = now - (Number(data.ago) || 0);
+        transfers.push([end - data.milliseconds, end, data.bytes]);
+        while (transfers[0][1] < now - 20000) transfers.shift();
+        networkRate = chunkRate(transfers); measuredBytes = transfers.reduce((sum, [, , bytes]) => sum + bytes, 0);
+      }
       notify();
     }
     if (data.type === 'footage-storage-error') {
@@ -95,16 +157,21 @@ export function sourceSpan(clip: Clip) {
   return { from: clip.sourceIn + Math.min(...offsets), to: clip.sourceIn + Math.max(...offsets) };
 }
 
-export function update(state: TimelineState, options: { original: boolean }, urlFor: (asset: MediaAsset, visual: boolean) => string | undefined) {
+type Options = { original: boolean; quality?: string };
+export function update(state: TimelineState, options: Options, urlFor: (asset: MediaAsset, visual: boolean) => string | undefined) {
   const now = performance.now();
   if (now - lastUpdate < 400) return;
   lastUpdate = now;
   const nextDisabled = state.settings.footageCache === false;
   if (nextDisabled !== disabled && supported()) navigator.serviceWorker.controller?.postMessage?.({ type: 'footage-enabled', enabled: !nextDisabled });
   disabled = nextDisabled;
-  concurrency = state.playing ? 4 : 6;
+  seededRate ||= pageRate();
+  const rate = linkRate();
+  // Enough downloads to keep the line busy through each request's half-second round trip, and no more: on a slow
+  // link every extra parallel download only delays the chunk playback needs next.
+  concurrency = Math.min(state.playing ? 4 : 6, rate ? Math.max(2, 1 + Math.ceil(rate * .5 / CHUNK)) : 6);
   wanted.clear();
-  if (!disabled) plan(state, urlFor);
+  if (!disabled) plan(state, options, urlFor);
   const urls = new Set(files().map(entry => entry.url));
   for (const [url, controller] of inFlight) if (!urls.has(url)) controller.abort();
   if (!disabled && supported()) { void register(); pump(); }
@@ -113,7 +180,7 @@ export function update(state: TimelineState, options: { original: boolean }, url
 }
 
 /** Mirrors playbackLayers and the decoders playback opens, so green means every file a clip plays from is local. */
-function plan(state: TimelineState, urlFor: (asset: MediaAsset, visual: boolean) => string | undefined) {
+function plan(state: TimelineState, options: Options, urlFor: (asset: MediaAsset, visual: boolean) => string | undefined) {
   const clips = state.clips.filter(clip => clip.timelineId === state.timelineId && clip.projectId === state.projectId && !clip.disabled);
   const tracks = new Map(state.tracks.map(track => [track.id, track])), media = new Map(state.media.map(asset => [asset.id, asset]));
   const solo = state.tracks.some(track => track.timelineId === state.timelineId && track.solo && !track.muted);
@@ -126,11 +193,6 @@ function plan(state: TimelineState, urlFor: (asset: MediaAsset, visual: boolean)
     if (!track || !asset || asset.status !== 'ready' || asset.kind === 'image') continue;
     const p = clip.properties, visual = track.kind === 'video' && !track.hidden && asset.kind !== 'audio';
     const audible = (asset.kind === 'audio' || !!asset.hasAudio) && !p.freeze && !track.muted && (!solo || track.solo) && !(track.kind === 'video' && (p.audioDetached || separated.has(twin(clip))));
-    const picture = visual ? urlFor(asset, true) : undefined;
-    // A WebCodecs picture is silent and its sound plays from a second element; a native <video> carries its own.
-    const decoded = !!picture && /\.mp4(\?|$)/i.test(picture) && !p.reverse && !p.freeze && Number(p.speed ?? 100) <= 200;
-    const urls = [...new Set([picture, audible && (!visual || decoded) ? urlFor(asset, false) : undefined])].filter((url): url is string => !!url && CACHEABLE.test(url));
-    if (!urls.length) continue;
     const span = sourceSpan(clip), own = records.get(clip.id) ?? [], end = clip.start + clip.duration;
     // Transition handles come out of the unused source at the clip's speed; playback caps that at 8x.
     const rate = Math.min(8, Math.max(.01, Number(p.speed ?? 100) / 100, ...(clip.keyframes?.['properties.speed'] ?? []).map(key => Number(key.value) / 100))) || 1;
@@ -139,8 +201,21 @@ function plan(state: TimelineState, urlFor: (asset: MediaAsset, visual: boolean)
     const reversed = !!p.reverse || !!clip.keyframes?.['properties.reverse']?.length;
     span.from = Math.max(0, span.from - (reversed ? lead + tail : lead) * rate); span.to += (reversed ? lead + tail : tail) * rate;
     const first = clip.start - lead, last = end + tail, playhead = state.playhead;
-    const at = clip.sourceIn + animatedSourceOffset(clip, Math.max(0, Math.min(clip.duration, playhead - clip.start)));
+    // Before its cut, a clip with an incoming transition already plays from the handle, that much source earlier.
+    const early = reversed ? 0 : Math.max(0, clip.start - Math.max(playhead, first)) * rate;
+    const at = Math.max(0, clip.sourceIn + animatedSourceOffset(clip, Math.max(0, Math.min(clip.duration, playhead - clip.start))) - early);
     const order = last > playhead && first <= playhead ? 0 : first > playhead ? first - playhead : 1e6 + playhead - last;
+    let picture = visual ? urlFor(asset, true) : undefined;
+    // Plan the file a new decoder will open: preferLowStream steers it to the low stream on a slow link, so prefetching
+    // the Stream file there would spend the line on bytes nothing plays. An index already saved costs nothing to read,
+    // and then decides whether this use's Stream window is saved.
+    const low = asset.proxyVariants?.StreamLow, stream = { url: picture ?? '', name: asset.name, ...span, at, order };
+    if (low && picture && picture !== low && picture === asset.proxyVariants?.Stream && options.quality === 'Stream' && !options.original
+      && !windowSaved(stream) && (indexes.has(picture) || !stored.get(picture)?.has(0)) && slowFor(picture)) picture = low;
+    // A WebCodecs picture is silent and its sound plays from a second element; a native <video> carries its own.
+    const decoded = !!picture && /\.mp4(\?|$)/i.test(picture) && !p.reverse && !p.freeze && Number(p.speed ?? 100) <= 200;
+    const urls = [...new Set([picture, audible && (!visual || decoded) ? urlFor(asset, false) : undefined])].filter((url): url is string => !!url && CACHEABLE.test(url));
+    if (!urls.length) continue;
     wanted.set(clip.id, urls.map(url => ({ url, name: asset.name, ...span, at, order })));
   }
 }
@@ -169,14 +244,11 @@ export function clipFootageStatus(clipId: string): FootageStatus {
 }
 /** Select a smaller prepared stream before opening a decoder on a constrained connection. */
 export function preferLowStream(url: string) {
-  // Saved bytes play at disk speed whatever the connection does: never trade a cached Stream file away.
-  const uses = files().filter(entry => entry.url === url), saved = stored.get(url);
-  if (!disabled && controlled && uses.length && uses.every(entry => chunksFor(entry)?.every(i => saved?.has(i)))) return false;
-  const layout = indexes.get(url), index = layout && !('size' in layout) ? layout : undefined;
-  if(!networkRate)return false;
-  const duration=index?Math.max(...index.tracks.map(track=>track.times.at(-1)??0)):0;
-  const bytes=index?index.tracks.reduce((sum,track)=>sum+track.sizes.reduce((n,size)=>n+size,0),0):0;
-  return networkRate < (duration?bytes/duration:500000)*1.5;
+  // Saved bytes play at disk speed whatever the connection does: never trade away a Stream file whose next
+  // seconds (from the playhead, or from the cut of a clip coming up) are already saved.
+  const uses = files().filter(entry => entry.url === url), near = uses.filter(entry => entry.order < 15);
+  if (!disabled && controlled && uses.length && (near.length ? near : uses).every(windowSaved)) return false;
+  return slowFor(url);
 }
 
 export const clipCached = (clipId: string) => clipFootageStatus(clipId).state === 'green';
@@ -192,7 +264,7 @@ function visible() {
 export function useFootageVersion() {
   return useSyncExternalStore(listener => { listeners.add(listener); return () => { listeners.delete(listener); }; }, () => version, () => 0);
 }
-export function retryFootage() { if (registrationError) { registrationError = ''; registered = false; void register(); } failures.clear(); lastUpdate = -Infinity; notify(); pump(); }
+export function retryFootage() { if (registrationError) { registrationError = ''; registered = false; void register(); } failures.clear(); lowered.clear(); lastUpdate = -Infinity; notify(); pump(); }
 
 async function readRange(url: string, start: number, end: number, signal: AbortSignal) {
   const response = await fetch(url, { headers: { Range: `bytes=${start}-${end}`, 'X-Footage-Prefetch': '1' }, signal });
