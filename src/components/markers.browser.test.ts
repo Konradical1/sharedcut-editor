@@ -106,6 +106,11 @@ test('right-click the ruler adds a marker with a note and color; it drags, edits
   await edit.getByRole('button', { name: 'Save' }).click();
   await saved();
   assert.equal((await markers())[0].note, 'Focus fixed');
+  // Hovering the flag shows its name and note right away.
+  await flag.hover();
+  await page.getByRole('tooltip').filter({ hasText: 'Focus fixed' }).filter({ hasText: 'Intro' }).waitFor({ timeout: 2000 });
+  await page.mouse.move(10, 10);
+  assert.equal(await page.getByRole('tooltip').count(), 0, 'and hides when the pointer leaves');
 
   // M adds one at the playhead; Shift-click selects both; ⌘C, then ⌘V at 20 s keeps their spacing; Delete removes the pasted pair.
   await page.mouse.click(await xAt(8.5), await rulerY());

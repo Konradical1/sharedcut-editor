@@ -32,6 +32,12 @@ export function TimelineMarkers({ pixels, fps, snapping, screenPixels, rulerMenu
   const draftRef = useRef(draft); draftRef.current = draft;
   const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null);
   const [editor, setEditor] = useState<{ x: number; y: number; marker: Placed; isNew: boolean } | null>(null);
+  // Hovering (or focusing) a flag shows its name and note at once. Text is looked up by id at render, so an edit shows
+  // and a flag deleted under the pointer takes its card with it.
+  const [tip, setTip] = useState<{ id: string; x: number; y: number } | null>(null);
+  const tipFor = (id: string) => ({ onPointerEnter: (e: ReactPointerEvent<HTMLButtonElement>) => { const r = e.currentTarget.getBoundingClientRect(); setTip({ id, x: r.left + r.width / 2, y: r.bottom + 6 }); },
+    onFocus: (e: { currentTarget: HTMLButtonElement }) => { const r = e.currentTarget.getBoundingClientRect(); setTip({ id, x: r.left + r.width / 2, y: r.bottom + 6 }); },
+    onPointerLeave: () => setTip(null), onBlur: () => setTip(null) });
 
   // A click anywhere but on markers and their menus drops the selection, so Delete goes back to clips.
   useEffect(() => {
@@ -80,13 +86,15 @@ export function TimelineMarkers({ pixels, fps, snapping, screenPixels, rulerMenu
   const timeline = anchor.current?.closest<HTMLElement>('.timeline');
   const overlay = (children: ReactNode) => timeline && createPortal(<div style={{ display: 'contents' }} onPointerDown={e => e.stopPropagation()} onPointerMove={e => e.stopPropagation()} onContextMenu={e => { e.preventDefault(); e.stopPropagation(); }} onDoubleClick={e => e.stopPropagation()}>{children}</div>, timeline);
   const menuMarker = menu && markers.find(m => m.id === menu.id);
+  const tipMarker = tip && markers.find(m => m.id === tip.id), tipComment = tip && !tipMarker && comments.find(c => c.id === tip.id);
+  const tipText = tipMarker ? { title: tipMarker.name, note: tipMarker.note } : tipComment ? { title: users.find(u => u.id === tipComment.userId)?.name ?? 'Comment', note: tipComment.text } : null;
 
   return <>
     <span ref={anchor} hidden/>
-    {comments.map(c => { const author = users.find(u => u.id === c.userId); return <button key={c.id} className="timeline-marker timeline-comment-flag" style={{ left: c.time * pixels, color: author?.color }} title={`${author?.name ?? 'Comment'}: ${c.text}`} aria-label={`Comment by ${author?.name ?? 'someone'} at ${timecode(c.time, fps)}: ${c.text}`}
+    {comments.map(c => { const author = users.find(u => u.id === c.userId); return <button key={c.id} className="timeline-marker timeline-comment-flag" style={{ left: c.time * pixels, color: author?.color }} {...tipFor(c.id)} aria-label={`Comment by ${author?.name ?? 'someone'} at ${timecode(c.time, fps)}: ${c.text}`}
       onPointerDown={e => e.stopPropagation()} onClick={() => { actions().setPlayhead(c.time); actions().setSidePanel('comments'); }}><MessageSquare size={11} fill="currentColor"/></button>; })}
     {markers.map(m => <button key={m.id} className={`timeline-marker ${selected.includes(m.id) ? 'selected' : ''} ${draft?.[m.id] !== undefined ? 'dragging' : ''}`} style={{ left: (draft?.[m.id] ?? m.time) * pixels, color: m.color }}
-      title={`${m.name}${m.note ? `\n${m.note}` : ''}\nDrag to move · double-click to edit`} aria-label={`Marker ${m.name} at ${timecode(m.time, fps)}`} aria-pressed={selected.includes(m.id)}
+      {...tipFor(m.id)} aria-label={`Marker ${m.name} at ${timecode(m.time, fps)}${m.note ? `: ${m.note}` : ''}`} aria-pressed={selected.includes(m.id)}
       onPointerDown={e => down(e, m)} onPointerMove={move} onPointerUp={() => up(m, true)} onPointerCancel={() => up(m, false)} onLostPointerCapture={() => { if (drag.current) up(m, true); }}
       onDoubleClick={e => { const p = point(e); openEditor(m, p.x, p.y); }}
       onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); const p = point({ clientX: 0, clientY: 0, currentTarget: e.currentTarget }); openEditor(m, p.x, p.y); } }}
@@ -107,6 +115,7 @@ export function TimelineMarkers({ pixels, fps, snapping, screenPixels, rulerMenu
       <button role="menuitem" onClick={() => openEditor(fresh(actions().playhead), rulerMenu.x, rulerMenu.y, true)}><Plus/>Add marker at playhead…<kbd>M</kbd></button>
       {canPaste && <button role="menuitem" onClick={() => { closeRulerMenu(); actions().pasteMarkers(); }}><Clipboard/>Paste markers at playhead<kbd>⌘V</kbd></button>}
     </ContextMenu>)}
+    {tip && tipText && !draft && !menu && !editor && overlay(<div className="marker-tip" role="tooltip" style={{ left: Math.max(140, Math.min(tip.x, window.innerWidth - 140)), top: tip.y }}><b>{tipText.title}</b>{tipText.note && <p>{tipText.note}</p>}</div>)}
     {editor && overlay(<MarkerEditor key={`${editor.marker.id}:${editor.marker.time}`} {...editor} fps={fps} onClose={() => setEditor(null)}/>)}
   </>;
 }
