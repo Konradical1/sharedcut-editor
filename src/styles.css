@@ -321,9 +321,9 @@
 .footage-loading button,.viewer-playback-status button,.viewer-demo-note button{padding:6px 10px;border:1px solid #69818d;border-radius:4px;color:#e4eef3;background:#26343c;cursor:pointer}
 .viewer-playback-status{gap:10px}.viewer-playback-status small{max-width:90%;line-height:1.5}.viewer-demo-note{font-size:10px;color:#d4dee5;background:#172027e8;padding:6px 9px;text-transform:none;letter-spacing:0;max-width:90%}
 
-.clip-cache{position:absolute;left:0;right:0;bottom:0;height:11px;z-index:6;overflow:hidden;background:#101820e8;font-size:7px;color:#dbe9ee;display:flex;align-items:center;padding:0 6px;white-space:nowrap;pointer-events:none;--cache-color:#73808b}
+.clip-cache{position:absolute;left:0;right:0;bottom:0;height:3px;z-index:6;overflow:hidden;background:#10182080;pointer-events:none;--cache-color:#73808b}
 .clip-cache:before{content:"";position:absolute;left:0;top:0;bottom:0;width:100%;transform-origin:left;scale:var(--progress) 1;background:var(--cache-color);opacity:.6;transition:scale .3s}
-.clip-cache>span{position:relative;text-shadow:0 1px 2px #000}
+.clip-cache>span{display:none}
 .clip-cache.blue{--cache-color:#559ef0}.clip-cache.green{--cache-color:#4cc26a}.clip-cache.yellow{--cache-color:#e0b93f}.clip-cache.red{--cache-color:#e0524a}
 /* While playing, the playheads (a collaborator's too) and the timecodes are canvases: per-frame element changes re-layerize the whole page. */
 .local-playhead-canvas{position:absolute;z-index:9;pointer-events:none}
