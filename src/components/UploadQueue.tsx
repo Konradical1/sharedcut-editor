@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useStore } from 'zustand';
 import { api, connection } from '../services/api';
 import { dismissUpload, pauseUpload, resumeUpload, uploadQueue } from '../services/upload';
@@ -8,18 +8,10 @@ const bytes = (value: number) => value >= 1e9 ? `${(value / 1e9).toFixed(2)} GB`
 const duration = (seconds: number) => seconds >= 60 ? `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s` : `${Math.round(seconds)}s`;
 export default function UploadQueue({ projectId, media, onSelectFiles }: { projectId: string; media: MediaAsset[]; onSelectFiles: () => void }) {
   const jobs = useStore(uploadQueue, state => state.jobs).filter(job => job.projectId === projectId);
-  const [localUrl, setLocalUrl] = useState('');
   const [actionError, setActionError] = useState('');
   const retryPreparation = (id: string) => { setActionError(''); void api(`/media/${id}/retry`, {method:'POST'}).then(() => connection.refresh()).catch(error => setActionError(error.message)); };
-  const local = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
-  useEffect(() => { if (connection.enabled) void api<{localUrl: string}>('/uploads/info').then(info => setLocalUrl(info.localUrl)).catch(() => {}); }, []);
   const pending = media.filter(asset => asset.projectId === projectId && (asset.status === 'uploading' || asset.preparationStage) && !jobs.some(job => job.assetId === asset.id || !job.assetId && job.name === asset.name));
   return <section className="upload-queue" aria-label="Upload queue">
-    <div className={`upload-route ${local ? 'local' : ''}`}>
-      <strong>{local ? 'Direct local connection' : 'Uploading over the internet'}</strong>
-      <span>{local ? 'Files stay on this Mac. No internet transfer.' : 'On the Mac hosting SharedCut? Upload directly for faster transfers.'}</span>
-      {!local && localUrl && <a href={`${localUrl}/project/${encodeURIComponent(projectId)}`} target="_blank" rel="noreferrer">Open local uploader ↗</a>}
-    </div>
     {actionError && <p role="alert">{actionError}</p>}
     {(jobs.length > 0 || pending.length > 0) && <details open={jobs.some(job => job.status !== 'uploaded') || pending.some(asset => asset.status === 'uploading')} className="upload-jobs"><summary>Uploads · {jobs.length + pending.length}{jobs.every(job => job.status === 'uploaded') && media.some(asset => asset.projectId === projectId && asset.preparationStage) ? ' · Preparing previews' : ''}</summary><div>
       {jobs.map(job => {

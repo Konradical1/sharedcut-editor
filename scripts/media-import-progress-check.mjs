@@ -52,11 +52,11 @@ try {
   }
   releaseUpload();
   if (process.env.FRAME_LINE_LIVE_LINK_CHECK === '1') {
-    await page.getByRole('button', { name: 'Import link', exact: true }).click();
+    await page.getByRole('button', { name: 'Add media', exact: true }).click();
     await page.getByLabel('YouTube video or Spotify track link').fill('https://youtu.be/jNQXAC9IVRw');
     await page.getByLabel('Maximum quality').selectOption('720');
     await page.getByRole('button', { name: 'Import', exact: true }).click();
-    await page.getByRole('dialog').waitFor({ state: 'hidden' });
+    await page.getByRole('dialog', { name: 'Add media' }).waitFor({ state: 'hidden' });
     const poster = page.locator('.media-scrub-thumbnail img[src="https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg"]');
     await poster.waitFor(); await poster.evaluate(img => img.decode());
     const card = poster.locator('xpath=ancestor::*[contains(@class,"media-asset")][1]');

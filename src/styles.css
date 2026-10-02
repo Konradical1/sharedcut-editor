@@ -328,5 +328,53 @@
 /* While playing, the playheads (a collaborator's too) and the timecodes are canvases: per-frame element changes re-layerize the whole page. */
 .local-playhead-canvas{position:absolute;z-index:9;pointer-events:none}
 .remote-playhead-canvas{position:absolute;z-index:4;pointer-events:none;opacity:.52}
+/* Media bin: one search row, one + button, a folder dropdown, dense tiles. */
+.media-panel{position:relative}
+.media-panel.dropping:after{content:"Drop to upload";position:absolute;inset:6px;z-index:30;display:grid;place-items:center;border:2px dashed var(--accent);border-radius:8px;background:#101214e6;color:var(--accent);font-size:12px;pointer-events:none}
+.media-head{display:flex;align-items:center;gap:6px;padding:10px 10px 6px;flex-shrink:0}
+.media-head .media-search{margin:0;flex:1;min-width:0}
+.media-head .media-add{flex:none;width:30px;height:30px;border-radius:6px;background:var(--accent);color:#0d2818}
+.media-head .media-add:hover,.media-head .media-add.active{filter:brightness(1.12)}
+.media-head .media-add.active svg{transform:rotate(45deg)}
+.media-head .media-add svg{transition:transform .15s}
+.media-search .search-clear{right:6px}
+.media-bar{display:flex;align-items:center;gap:2px;padding:0 8px 4px 10px;min-height:28px;flex-shrink:0}
+.media-bar .eyebrow{font-size:9px;letter-spacing:.5px;color:#7d8b91}
+.media-folder{max-width:62%;background:transparent;border:0;color:#c0ccd0;font-size:10px;padding:4px 2px;border-radius:4px;cursor:pointer;text-overflow:ellipsis}
+.media-folder:hover{background:#ffffff08}
+.media-bar .icon-button{height:24px;width:24px}
+.media-bar .icon-button.on{color:var(--accent)}
+.media-pop{position:absolute;top:92px;left:8px;right:8px;z-index:20;display:flex;flex-direction:column;gap:8px;padding:10px;background:#1a1f22;border:1px solid #ffffff1c;border-radius:9px;box-shadow:0 10px 30px #000a}
+.media-pop-row{display:flex;align-items:center;gap:8px;height:32px;padding:0 8px;border-radius:6px;font-size:11px;color:#d3dcdc;text-align:left}
+.media-pop-row:hover{background:#ffffff0a}
+.media-pop-row svg{color:var(--accent)}
+.media-filters select{width:100%;padding:6px;font-size:10px}
+.media-link{display:flex;flex-direction:column;gap:6px;padding-top:8px;border-top:1px solid #ffffff12}
+.media-link-input{position:relative;display:flex;align-items:center;color:#738187}
+.media-link-input svg{position:absolute;left:8px}
+.media-link-input input{width:100%;height:30px;padding:0 8px 0 27px;font-size:10px;background:#111618;border:1px solid #2c3337;border-radius:5px}
+.media-link-options{display:grid;grid-template-columns:1fr 1fr;gap:5px}
+.media-link-options select{flex:1;min-width:0;padding:5px;font-size:10px}
+.media-link-go{grid-column:1/-1;height:30px;border-radius:5px;background:var(--accent);color:#0d2818;font-size:10px;font-weight:600}
+.media-link p{margin:0;font-size:9px;line-height:1.5}
+.media-assets{grid-template-columns:repeat(auto-fill,minmax(72px,1fr));gap:9px 6px;padding:4px 10px 10px;scrollbar-gutter:stable}
+.media-thumbnail{aspect-ratio:16/10;border-radius:4px}
+.media-asset-meta{gap:0;padding:3px 1px 0}
+.media-asset-meta b{font-size:9px}
+.media-asset-meta>span{display:none}
+.media-duration{bottom:3px;right:3px;font-size:8px;padding:1px 3px}
+.media-state-icon{top:3px;right:3px}
+.media-state-icon.ready{opacity:0}
+.media-asset:hover .media-state-icon.ready{opacity:1}
+.media-add-button{bottom:3px;left:3px;width:20px;height:20px}
+.media-assets.media-list{grid-template-columns:1fr;gap:4px}
+.media-list .media-asset{grid-template-columns:58px 1fr;gap:8px;align-items:center;padding:2px;border-radius:5px}
+.media-list .media-asset:hover{background:#ffffff08}
+.media-list .media-asset-meta>span{display:block;font-size:9px;margin-top:2px}
+.upload-queue{padding:5px 10px;border-top:1px solid #ffffff12;border-bottom:0}
+.upload-jobs{margin-top:0}
+.upload-jobs>div{max-height:min(180px,24vh)}
+.media-assets .empty-state{grid-column:1/-1}
+.timeline-clip{contain:layout style}
 .timeline-scroll[data-playing] .clip-cache:before,.timeline-scroll[data-playing] .clip-preparing:before{transition:none}
 .live-timecode{position:relative}.live-timecode-held::after{content:attr(data-text);visibility:hidden}.live-timecode-origin{display:inline-block;width:0;height:0}.live-timecode-canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;image-rendering:pixelated}
