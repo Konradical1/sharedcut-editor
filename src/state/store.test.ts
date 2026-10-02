@@ -902,6 +902,65 @@ test('closing a gap carries the linked audio with the picture', () => {
   assert.deepEqual([clip('picture').start, clip('sound').start], [40, 40]);
 });
 
+test('delete gaps closes common gaps between the selection, keeps sync, leaves a music bed, and undoes once', () => {
+  const source = clip('c7'), at = (id: string, trackId: string, start: number, duration: number, linkGroup?: string) => ({ ...structuredClone(source), id, trackId, start, duration, properties: { ...source.properties, ...(linkGroup ? { linkGroup } : {}) } });
+  const timelineId = state().timelineId;
+  store.setState({ clips: [at('x1', 'v1', 0, 10, 'p1'), at('y1', 'a1', 0, 10, 'p1'), at('x2', 'v1', 15, 5), at('x3', 'v1', 30, 10, 'p3'), at('y3', 'a1', 30, 10, 'p3'), at('title', 'v3', 32, 2), at('music', 'a2', 0, 40)],
+    nodes: [], comments: [], settings: { ...state().settings, linkSelection: true },
+    timelines: state().timelines.map(t => t.id === timelineId ? { ...t, markers: [{ time: 12, name: 'In gap', color: 'Blue' }, { time: 35, name: 'On x3', color: 'Red' }] } : t) });
+  state().deleteGaps(['x1', 'x2', 'x3']);
+  assert.deepEqual(['x1', 'x2', 'x3', 'y1', 'y3'].map(id => clip(id).start), [0, 10, 15, 0, 15], 'picture and its linked audio close together');
+  assert.equal(clip('title').start, 17, 'a title over the moved picture rides along');
+  assert.equal(clip('music').start, 0, 'a music bed under the gaps stays put');
+  assert.match(state().notifications.at(-1)!.detail ?? '', /Music/);
+  const markers = state().timelines.find(t => t.id === timelineId)!.markers!;
+  assert.deepEqual(markers.map(m => m.time), [10, 20], 'markers follow the content they sit on');
+  assert.equal(state().operations.length, 1);
+  state().undo();
+  assert.deepEqual(['x2', 'x3', 'y3', 'title'].map(id => clip(id).start), [15, 30, 30, 32]);
+  assert.deepEqual(state().timelines.find(t => t.id === timelineId)!.markers!.map(m => m.time), [12, 35]);
+  state().deleteGaps(['x2']);
+  assert.match(state().notifications.at(-1)!.title, /two or more/);
+  state().deleteGaps(['x1']);
+  assert.match(state().notifications.at(-1)!.title, /No gaps/, 'a linked pair has nothing between it');
+});
+
+test('markers add, move, copy, paste and delete as undoable edits that never undo a clip edit instead', () => {
+  const timelineId = state().timelineId, markers = () => state().timelines.find(t => t.id === timelineId)!.markers ?? [];
+  store.setState({ timelines: state().timelines.map(t => t.id === timelineId ? { ...t, markers: [] } : t) });
+  state().moveClip('c3', clip().start + 1);
+  const moved = clip().start;
+  state().setPlayhead(5);
+  const id = state().addMarker({ note: 'check focus' })!;
+  assert.deepEqual(markers().map(m => [m.id, m.time, m.note]), [[id, 5, 'check focus']]);
+  assert.deepEqual(state().selectedMarkerIds, [id]);
+  state().undo();
+  assert.equal(markers().length, 0, 'undo removes the marker');
+  assert.equal(clip().start, moved, 'and leaves the earlier clip move alone');
+  state().addMarker({ time: 2, name: 'A' }); state().addMarker({ time: 4, name: 'B' });
+  const [a, b] = markers();
+  state().setMarkers(markers().map(m => m.id === a.id ? { ...m, time: 8 } : m), 'moved marker A');
+  assert.deepEqual(markers().map(m => [m.name, m.time]), [['B', 4], ['A', 8]], 'markers stay in time order');
+  state().copyMarkers([a.id!, b.id!]);
+  state().setPlayhead(20);
+  state().pasteMarkers();
+  assert.deepEqual(markers().map(m => m.time), [4, 8, 20, 24], 'pasted from the playhead, spacing kept');
+  assert.equal(new Set(markers().map(m => m.id)).size, 4, 'pasted markers get new ids');
+  state().deleteMarkers(state().selectedMarkerIds);
+  assert.deepEqual(markers().map(m => m.time), [4, 8]);
+  state().undo();
+  assert.equal(markers().length, 4);
+  state().selectClip('c3');
+  assert.deepEqual(state().selectedMarkerIds, [], 'selecting a clip hands Delete back to clips');
+});
+
+test('timed comments remember their timeline; commenters cannot add markers', () => {
+  state().addComment('Too dark here');
+  assert.equal(state().comments.at(-1)!.timelineId, state().timelineId);
+  store.setState({ projects: state().projects.map(p => p.id === state().projectId ? { ...p, members: p.members.map(m => m.userId === 'kyle' ? { ...m, role: 'Commenter' as const } : m) } : p) });
+  assert.equal(state().addMarker(), undefined);
+});
+
 test('a bin multi-drop lays clips end to end and undoes as one action',()=>{
   const base={...state().media[0],hasAudio:false,duration:4,kind:'video' as const,status:'ready' as const};
   const assets=Array.from({length:40},(_,i)=>({...base,id:`bulk-${i}`,name:`bulk ${i}`}));

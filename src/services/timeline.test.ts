@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Clip, Track } from '../state/models.ts';
-import { companionAudioTrack, filmstripTiles, forwardClickTime, trackGap, uncoveredParts } from './timeline.ts';
+import { closedShift, commonGaps, companionAudioTrack, filmstripTiles, forwardClickTime, markersOf, trackGap, uncoveredParts } from './timeline.ts';
 
 test('overwrites preserve left, right, full coverage, adjacency, reverse and freeze offsets', () => {
   const clip = { start: 10, duration: 20, sourceIn: 5, properties: { speed: 200 } } as unknown as Clip;
@@ -25,6 +25,26 @@ test('gap selection merges overlaps and excludes clips and trailing canvas',()=>
  assert.deepEqual(trackGap(clips,12),{start:12,end:15});
  assert.equal(trackGap(clips,17),null);
  assert.equal(trackGap([],0),null);
+});
+
+test('delete gaps closes only time empty on every selected track, between the selection',()=>{
+ // V1: 0-5, 8-10, 20-25 · A1: 0-5, 12-14, 20-25. Only time empty on both counts: 8-10 and 12-14 each hold a clip on one track.
+ const clips=[{start:0,duration:5},{start:8,duration:2},{start:20,duration:5},{start:0,duration:5},{start:12,duration:2},{start:20,duration:5}];
+ assert.deepEqual(commonGaps(clips,0,25),[{start:5,end:8},{start:10,end:12},{start:14,end:20}]);
+ // A clip across 9-13 on either track fills 10-12, so only the outer two remain.
+ assert.deepEqual(commonGaps([...clips,{start:9,duration:4}],0,25),[{start:5,end:8},{start:14,end:20}]);
+ // Nothing before the first or after the last selected clip, and touching clips (float residue included) are no gap.
+ assert.deepEqual(commonGaps([{start:2,duration:3},{start:5+1e-9,duration:3}],2,8),[]);
+ const gaps=[{start:5,end:8},{start:14,end:20}];
+ assert.equal(closedShift(gaps,4),0);
+ assert.equal(closedShift(gaps,6),1);
+ assert.equal(closedShift(gaps,8),3);
+ assert.equal(closedShift(gaps,25),9);
+});
+
+test('markers without ids get stable positional ones',()=>{
+ assert.deepEqual(markersOf({markers:[{time:1,name:'a',color:'Blue'},{id:'m-x',time:2,name:'b',color:'Red'}]}).map(m=>m.id),['marker-0','m-x']);
+ assert.deepEqual(markersOf(undefined),[]);
 });
 
 test('audio preview picks the same unlocked companion track or describes the new row',()=>{

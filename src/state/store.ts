@@ -10,14 +10,14 @@ import { animationProperties, boundedAnimationValue, copyAnimatedNodes, evaluate
 import type { Keyframe, KeyframeValue } from './models.ts';
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
-import type { Clip, CollaborativeLock, Comment, GradeNode, MediaAsset, Notification, Operation, OperationType, Presence, Project, ProjectState, RenderJob, Settings, Snapshot, Timeline, Track, User, Workspace } from './models.ts';
+import type { Clip, CollaborativeLock, Comment, GradeNode, Marker, MediaAsset, Notification, Operation, OperationType, Presence, Project, ProjectState, RenderJob, Settings, Snapshot, Timeline, Track, User, Workspace } from './models.ts';
 import { createDemoProject, defaultProperties, projects, users } from './demo.ts';
 import { authenticationService, collaborationService, colorService, createId, LOCK_TTL, lockConflict, mediaService, projectService, renderService } from '../services/index.ts';
 import type { PersistedState } from '../services/index.ts';
 import { acceptsEffect, effectDefinitions } from '../services/effects.ts';
 import { transitionPresetId, type TransitionPreset, timelineTransitions, trimLeak, leakRange, bestAlign, defaultTransition, leakAudioTrack, leakMediaId, maximumDuration, neighbourAt, transitionAlign, transitionCurve, transitionDefinitions, transitionDuration, transitionFields, transitionName, transitionParams, transitionProperty, type TransitionAlign, type TransitionParams, type TransitionSide } from '../services/transitions.ts';
 import { advancePlayhead, playheadMotion, type PlayheadMotion } from '../services/presence.ts';
-import { companionAudioTrack, trackGap, trimRoom, uncoveredParts } from '../services/timeline.ts';
+import { closedShift, commonGaps, companionAudioTrack, markersOf, trackGap, trimRoom, uncoveredParts } from '../services/timeline.ts';
 import { getText, isTitle, remapTextRuns, presetDocument, styleText, validateText, type TextDocument, type TextStyle, type TextRange } from '../services/text.ts';
 import { api, connection } from '../services/api.ts';
 import { enqueueUploads } from '../services/upload.ts';
@@ -77,6 +77,15 @@ export interface EditorStore extends PersistedState {
   keyframeProperty(clipId: string, path: string, value?: KeyframeValue): void;
   unlinkClip(id: string): void; linkClip(id: string): void;
   moveClip(id: string, start: number, trackId?: string): void; trimClip(id: string, start: number, duration: number): void; fitTrim(id: string, start: number, duration: number): {start:number;duration:number}|null;
+  /** Markers selected on the current timeline (Delete, ⌘C act on them), and the last markers copied. */
+  selectedMarkerIds: string[]; markerClipboard: Marker[] | null;
+  /** Replace the current timeline's markers as one undoable edit. */
+  setMarkers(markers: Marker[], description: string): void;
+  /** A new marker (at the playhead, in your color, unless `fields` say otherwise); selects it and returns its id. */
+  addMarker(fields?: Partial<Marker>): string | undefined;
+  deleteMarkers(ids: string[]): void; copyMarkers(ids: string[]): void; pasteMarkers(): void;
+  /** Close the gaps between the selected clips (Resolve's Delete Gaps), rippling everything after them as one undo. */
+  deleteGaps(ids: string[]): void;
   deleteGap(trackId:string,start:number,end:number):void; splitClip(id: string): void; deleteClip(id: string): void; duplicateClip(id: string): void; copyClip(id: string): void; pasteClip(): void;
   addMediaToTimeline(mediaId: string | string[], start?: number, trackId?: string): void; updateTrack(id: string, patch: Partial<Track>, gesture?: string): void; moveTrack(id: string, direction: 'up' | 'down'): void; deleteTrack(id: string): void; createTrack(kind: 'video' | 'audio'): void; setTimeline(id: string): void;
   addTransition(clipId: string, side: TransitionSide, name: string, patch?: { duration?: number; align?: TransitionAlign; params?: TransitionParams }): void;
@@ -389,7 +398,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     notifications: recoveryMessage ? [{ id: 'recovery', title: 'Recovered the demo project', detail: recoveryMessage, kind: 'error', timestamp: Date.now() }] : [],
     dragPreview: null, presence: demo.presence, locks: [{ id: 'demo-speed-lock', projectId: 'city-after-dark', targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }],
     playhead: 42, rangeIn: 0, rangeOut: 180, revealedMediaId: null, playing: false, playbackBuffering: false, workspace: 'edit', sidePanel: 'inspector', modal: null,
-    clipPreview: null, draggingMediaId: null, inspectorTab: 'Video', selectedTransition: null, draggingTransition: null, leaks: [], transitionPresets: [], transitionFavorites: [], saveStatus: 'Saved', liveMode: 'independent', followUserId: null, clipboard: null, clipboardClips: [], clipboardNodes: [], gradeClipboard: null,
+    selectedMarkerIds: [], markerClipboard: null, clipPreview: null, draggingMediaId: null, inspectorTab: 'Video', selectedTransition: null, draggingTransition: null, leaks: [], transitionPresets: [], transitionFavorites: [], saveStatus: 'Saved', liveMode: 'independent', followUserId: null, clipboard: null, clipboardClips: [], clipboardNodes: [], gradeClipboard: null,
     addTitle(preset = 0, box = {}, placement, animated = true) {
       const state=get();if(!writable())return;
       const fps=state.projects.find(p=>p.id===state.projectId)?.fps||24;
@@ -627,7 +636,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     selectClips(ids) {
       const state=get(),clips=state.clips.filter(c=>c.timelineId===state.timelineId&&ids.includes(c.id));
       const id=ids.filter(id=>clips.some(c=>c.id===id)).at(-1)??null;
-      set({selectedTransition:null,selectedClipIds:clips.map(c=>c.id),selectedClipId:id,selectedTextIds:clips.filter(isTitle).map(c=>c.id),textSelection:null,textPreview:[],selectedNodeId:state.nodes.find(n=>n.clipId===id)?.id??null, ...(id?{sidePanel:'inspector' as const,inspectorTab:isTitle(clips.find(c=>c.id===id)!)?'Text':isShape(clips.find(c=>c.id===id)!)?'Shape':'Video'}:{})});
+      set({...(clips.length?{selectedMarkerIds:[]}:{}),selectedTransition:null,selectedClipIds:clips.map(c=>c.id),selectedClipId:id,selectedTextIds:clips.filter(isTitle).map(c=>c.id),textSelection:null,textPreview:[],selectedNodeId:state.nodes.find(n=>n.clipId===id)?.id??null, ...(id?{sidePanel:'inspector' as const,inspectorTab:isTitle(clips.find(c=>c.id===id)!)?'Text':isShape(clips.find(c=>c.id===id)!)?'Shape':'Video'}:{})});
     },
     selectClip(id,additive=false) {
       const state=get();
@@ -789,6 +798,62 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       reportWhole();
       return cut.length;
     },
+    setMarkers(markers, description) {
+      const state=get(),timeline=state.timelines.find(t=>t.id===state.timelineId&&t.projectId===state.projectId);
+      if(!timeline||!writable())return;
+      const duration=Math.max(durationOf(state),...state.clips.filter(c=>c.timelineId===timeline.id).map(c=>c.start+c.duration));
+      const clean=markers.map(m=>({id:m.id??createId('marker'),time:clamp(m.time,0,duration),name:m.name.trim().slice(0,255)||'Marker',color:m.color.slice(0,64),...(m.note?.trim()?{note:m.note.slice(0,5000)}:{})})).sort((a,b)=>a.time-b.time);
+      commit('MarkerChanged',timeline.id,description,[{collection:'timelines',id:timeline.id,value:{markers:clean}}]);
+    },
+    addMarker(fields={}) {
+      const state=get(),markers=markersOf(state.timelines.find(t=>t.id===state.timelineId)),id=createId('marker');
+      const marker={id,time:state.playhead,name:`Marker ${markers.length+1}`,color:state.users.find(u=>u.id===state.currentUserId)?.color??'#ec7b77',...fields};
+      const before=get().operations[0];
+      state.setMarkers([...markers,marker],`added marker ${marker.name.trim()||'Marker'}`);
+      if(get().operations[0]===before)return undefined;
+      set({selectedMarkerIds:[id]});return id;
+    },
+    deleteMarkers(ids) {
+      const state=get(),markers=markersOf(state.timelines.find(t=>t.id===state.timelineId)),gone=markers.filter(m=>ids.includes(m.id));
+      if(!gone.length)return;
+      state.setMarkers(markers.filter(m=>!ids.includes(m.id)),gone.length>1?`deleted ${gone.length} markers`:`deleted marker ${gone[0].name}`);
+      set({selectedMarkerIds:get().selectedMarkerIds.filter(id=>!ids.includes(id))});
+    },
+    copyMarkers(ids) {
+      const state=get(),copied=markersOf(state.timelines.find(t=>t.id===state.timelineId)).filter(m=>ids.includes(m.id));
+      if(!copied.length)return;
+      set({markerClipboard:structuredClone(copied)});state.notify(copied.length>1?`${copied.length} markers copied`:'Marker copied');
+    },
+    pasteMarkers() {
+      // The first copied marker lands on the playhead; the rest keep their spacing from it.
+      const state=get(),copied=state.markerClipboard;if(!copied?.length)return;
+      const offset=state.playhead-Math.min(...copied.map(m=>m.time)),pasted=copied.map(m=>({...m,id:createId('marker'),time:m.time+offset}));
+      state.setMarkers([...markersOf(state.timelines.find(t=>t.id===state.timelineId)),...pasted],pasted.length>1?`pasted ${pasted.length} markers`:`pasted marker ${pasted[0].name}`);
+      set({selectedMarkerIds:pasted.map(m=>m.id)});
+    },
+    deleteGaps(ids) {
+      const state=get();if(!writable())return;
+      const onTimeline=state.clips.filter(c=>c.timelineId===state.timelineId&&c.projectId===state.projectId);
+      const selected=[...new Map(onTimeline.filter(c=>ids.includes(c.id)).flatMap(linkedClips).map(c=>[c.id,c])).values()];
+      if(selected.length<2){state.notify('Select two or more clips','info','Delete Gaps closes the empty time between them.');return;}
+      const scope=new Set(selected.map(c=>c.trackId)),tracks=state.tracks.filter(t=>t.timelineId===state.timelineId);
+      const gaps=commonGaps(onTimeline.filter(c=>scope.has(c.trackId)),Math.min(...selected.map(c=>c.start)),Math.max(...selected.map(c=>c.start+c.duration)));
+      if(!gaps.length){state.notify('No gaps between the selected clips','info');return;}
+      // Other tracks ride along so titles and effects after the gaps stay in sync, unless they are locked or have something
+      // inside a gap (a music bed): closing it would cut under that clip, so that track stays where it is.
+      const inGap=(c:Clip)=>gaps.some(g=>c.start<g.end-1e-6&&c.start+c.duration>g.start+1e-6);
+      const held=tracks.filter(t=>!scope.has(t.id)&&(t.locked||onTimeline.some(c=>c.trackId===t.id&&inGap(c))));
+      const moving=onTimeline.filter(c=>!held.some(t=>t.id===c.trackId)&&closedShift(gaps,c.start)>1e-9);
+      if(!moving.every(c=>editableClip(c.id)))return;
+      const timeline=state.timelines.find(t=>t.id===state.timelineId)!,markers=markersOf(timeline),shiftedMarkers=markers.some(m=>closedShift(gaps,m.time)>1e-9);
+      const removed=gaps.reduce((sum,g)=>sum+g.end-g.start,0);
+      commit('ClipMoved',selected[0].id,`deleted ${gaps.length} gap${gaps.length>1?'s':''}`,[
+        ...moving.map(c=>({collection:'clips' as const,id:c.id,value:{start:c.start-closedShift(gaps,c.start)}})),
+        ...(shiftedMarkers?[{collection:'timelines' as const,id:timeline.id,value:{markers:markers.map(m=>({...m,time:m.time-closedShift(gaps,m.time)}))}}]:[]),
+      ]);
+      const kept=held.filter(t=>!t.locked).map(t=>t.name);
+      state.notify(`Deleted ${gaps.length} gap${gaps.length>1?'s':''} · ${removed.toFixed(2)} s`,'success',kept.length?`${kept.join(', ')} stayed put: ${kept.length>1?'they have':'it has'} clips inside the gaps.`:undefined);
+    },
     deleteGap(trackId,start,end) {
       const state=get(),track=state.tracks.find(t=>t.id===trackId&&t.timelineId===state.timelineId);
       if(!track||track.locked||!writable())return;
@@ -812,7 +877,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if(state.selectedClipId&&ids.has(state.selectedClipId))set({selectedClipId:null,selectedClipIds:[],selectedTextIds:[],textSelection:null,textPreview:[],selectedNodeId:null});
     },
     duplicateClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) {const group=selectedGroup(clip)??[clip];insertClip(clip,clip.start+Math.max(...group.map(c=>c.start+c.duration))-Math.min(...group.map(c=>c.start)),`${clip.name} copy`);} },
-    copyClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) { const group=selectedGroup(clip)??[clip],ids=new Set(group.map(c=>c.id));set({ clipboard: structuredClone(clip),clipboardClips:structuredClone([clip,...group.filter(c=>c.id!==clip.id)]),clipboardNodes:structuredClone(get().nodes.filter(n=>ids.has(n.clipId))) }); get().notify('Clip copied'); } },
+    copyClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) { const group=selectedGroup(clip)??[clip],ids=new Set(group.map(c=>c.id));set({ markerClipboard: null, clipboard: structuredClone(clip),clipboardClips:structuredClone([clip,...group.filter(c=>c.id!==clip.id)]),clipboardNodes:structuredClone(get().nodes.filter(n=>ids.has(n.clipId))) }); get().notify('Clip copied'); } },
     pasteClip() { const state = get(); if (!state.clipboard) return; if (state.clipboard.projectId !== state.projectId || (!isTitle(state.clipboard) && !isShape(state.clipboard) && !isComposition(state.clipboard) && !state.media.some(media => media.id === state.clipboard!.mediaId && media.projectId === state.projectId))) { state.notify('Copy a clip from this project first', 'info'); return; } insertClip(state.clipboard, state.playhead,state.clipboard.name,true); },
     // A drop can carry the whole bin. Ready clips land end to end from the drop point, sharing one
     // gesture id so the hundred-clip drop is a single undo.
@@ -884,7 +949,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const track: Track = { id: createId('track'), timelineId: state.timelineId, name: `${kind === 'video' ? 'Video' : 'Audio'} ${number}`, kind, number, muted: false, solo: false, locked: false, hidden: false, gain: 0, pan: 0 };
       commit('TrackCreated', track.id, `added ${track.name}`, [{ collection: 'tracks', id: track.id, value: record(track), replace: true }]);
     },
-    setTimeline(id) { const state = get(); const timeline = state.timelines.find(t => t.id === id && t.projectId === state.projectId); if (!timeline) return; const clip = state.clips.find(c => c.timelineId === id); set({ selectedTransition:null,compositionTrail:[],selectedClipIds:clip?[clip.id]:[],shapeTool:null, timelineId: id, selectedTextIds: clip && isTitle(clip) ? [clip.id] : [], textSelection: null, textTool: false, textPreview: [], selectedClipId: clip?.id ?? null, selectedNodeId: null, playhead: 0, ...initialRange(state, id), revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, locks: state.locks.filter(lock => lock.userId !== state.currentUserId) }); },
+    setTimeline(id) { const state = get(); const timeline = state.timelines.find(t => t.id === id && t.projectId === state.projectId); if (!timeline) return; const clip = state.clips.find(c => c.timelineId === id); set({ selectedMarkerIds:[],selectedTransition:null,compositionTrail:[],selectedClipIds:clip?[clip.id]:[],shapeTool:null, timelineId: id, selectedTextIds: clip && isTitle(clip) ? [clip.id] : [], textSelection: null, textTool: false, textPreview: [], selectedClipId: clip?.id ?? null, selectedNodeId: null, playhead: 0, ...initialRange(state, id), revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, locks: state.locks.filter(lock => lock.userId !== state.currentUserId) }); },
     selectTransition(clipId, side) {
       // Deliberately no clip selection: a transition is stored on the incoming clip, and selecting
       // that clip alongside it lit up the whole second shot on the timeline. The inspector reads
@@ -1387,7 +1452,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const state = get(); if (!text.trim() || !writable(true)) return;
       const clipId = target?.clipId && state.clips.some(c => c.id === target.clipId && c.projectId === state.projectId) ? target.clipId : undefined;
       const range = target?.range?.every(Number.isFinite) ? [clamp(Math.min(...target.range), 0, durationOf(state)), clamp(Math.max(...target.range), 0, durationOf(state))] as [number, number] : undefined;
-      const comment: Comment = { id: createId('comment'), projectId: state.projectId, userId: state.currentUserId, text: text.trim().slice(0, 5000), timestamp: Date.now(), time: state.playhead, clipId, range, resolved: false, replies: [] };
+      const comment: Comment = { id: createId('comment'), projectId: state.projectId, userId: state.currentUserId, text: text.trim().slice(0, 5000), timestamp: Date.now(), time: state.playhead, timelineId: state.timelineId, clipId, range, resolved: false, replies: [] };
       commit('CommentAdded', comment.id, `commented at ${Math.floor(state.playhead / 60)}:${String(Math.floor(state.playhead % 60)).padStart(2, '0')}`, [{ collection: 'comments', id: comment.id, value: record(comment), replace: true }]);
     },
     replyComment(id, text) { const state = get(); const comment = state.comments.find(c => c.id === id && c.projectId === state.projectId); if (comment && text.trim() && writable(true)) commit('CommentChanged', id, 'replied to a review comment', [{ collection: 'comments', id, value: { replies: [...comment.replies, { id: createId('reply'), userId: state.currentUserId, text: text.trim().slice(0, 5000), timestamp: Date.now() }] } }]); },

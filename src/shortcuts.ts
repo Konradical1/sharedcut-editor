@@ -1,7 +1,7 @@
 import { useEffect, type Dispatch, type SetStateAction } from 'react';
 import { useEditorStore } from './state/store';
 import { fieldOwnsKey, typingSurface } from './services/focus';
-export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['I / O','Mark In / Out'], ['V / B / A','Selection / blade / select forward tool'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['Delete','Delete selected clip'] ];
+export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['I / O','Mark In / Out'], ['V / B / A','Selection / blade / select forward tool'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['M','Add marker at playhead'], ['Right-click ruler','Add marker here, paste markers'], ['Delete','Delete selected clip'] ];
 /** A click is an action, not a focus grab. Editing apps keep the keyboard on the app, so Space plays
  *  instead of replaying the last button touched — and nothing sits there wearing a focus ring. */
 export function useFocusRelease() {
@@ -31,6 +31,11 @@ export function useEditorShortcuts(enabled: boolean) {
       const s=useEditorStore.getState();const command=e.metaKey||e.ctrlKey;
       if(s.workspace==='color'&&command&&['c','v'].includes(e.key.toLowerCase())){e.preventDefault();if(s.selectedClipId){if(e.key.toLowerCase()==='c')s.copyGrade(s.selectedClipId);else s.pasteGrade(s.selectedClipId);}return;}
       if(s.workspace==='color'&&((command&&e.key.toLowerCase()==='d')||e.key==='Backspace'||e.key==='Delete')){e.preventDefault();const node=s.nodes.find(n=>n.id===s.selectedNodeId&&n.clipId===s.selectedClipId);if(node){if(command)s.updateNode(node.id,{enabled:!node.enabled});else s.removeNode(node.id);}return;}
+      // Selected markers own Delete and ⌘C; copied markers own ⌘V until a clip is copied.
+      if(s.selectedMarkerIds.length&&(e.key==='Delete'||e.key==='Backspace')){e.preventDefault();s.deleteMarkers(s.selectedMarkerIds);return;}
+      if(s.selectedMarkerIds.length&&command&&e.key.toLowerCase()==='c'){e.preventDefault();s.copyMarkers(s.selectedMarkerIds);return;}
+      if(s.markerClipboard&&command&&e.key.toLowerCase()==='v'){e.preventDefault();s.pasteMarkers();return;}
+      if(s.selectedMarkerIds.length&&e.key==='Escape'){useEditorStore.setState({selectedMarkerIds:[]});return;}
       if(command&&e.key.toLowerCase()==='s'){e.preventDefault();s.setModal('snapshot');}
       else if(command&&e.key.toLowerCase()==='z'){e.preventDefault();s.undo();}
       else if(command&&e.key.toLowerCase()==='b'&&s.selectedClipId){e.preventDefault();s.splitClip(s.selectedClipId);}
@@ -59,6 +64,7 @@ export function useTimelineShortcuts(setTool: Dispatch<SetStateAction<string>>, 
       if (k === 'a') {setTool('forward');useEditorStore.setState({textTool:false,shapeTool:null});}
       if (k === 's' || k === 'p') {setTool('select');useEditorStore.setState({shapeTool:k==='p'?'pen':'rectangle',textTool:false,playing:false});}
       if (k === 'n') setSnapping(value => !value);
+      if (k === 'm' && !e.repeat) s.addMarker();
       if (k === 'i') s.setRange(s.playhead, s.rangeOut);
       if (k === 'o') s.setRange(s.rangeIn, s.playhead);
     };

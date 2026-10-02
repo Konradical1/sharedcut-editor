@@ -1,6 +1,6 @@
 import { trimAnimation } from './animation.ts';
 import { snapTime } from './snapping.ts';
-import type { Clip, Track } from '../state/models.ts';
+import type { Clip, Marker, Timeline, Track } from '../state/models.ts';
 
 // Preserve source timing on both sides of an overwrite, including retimed media.
 export function uncoveredParts(clip: Clip, start: number, end: number): Clip[] {
@@ -39,6 +39,24 @@ export function trackGap(clips: Pick<Clip,'start'|'duration'>[], time:number) {
   }
   return null;
 }
+
+/** Delete Gaps: stretches between `from` and `to` empty on every track `clips` sit on at once (a hole on V1 under a
+ *  clip on A1 is not a gap, closing it would break sync), earliest first. */
+export function commonGaps(clips: Pick<Clip,'start'|'duration'>[], from: number, to: number) {
+  const gaps: {start:number;end:number}[] = [];
+  let at = from;
+  for (const clip of [...clips].sort((a,b)=>a.start-b.start)) {
+    if (clip.start >= to) break;
+    if (clip.start > at + 1e-6) gaps.push({ start: at, end: clip.start });
+    at = Math.max(at, clip.start + clip.duration);
+  }
+  return gaps;
+}
+/** How far `time` moves left once `gaps` close; a time inside a gap lands on its start. */
+export const closedShift = (gaps: {start:number;end:number}[], time: number) => gaps.reduce((shift, g) => shift + Math.min(Math.max(time - g.start, 0), g.end - g.start), 0);
+
+/** Markers with an id each: ones saved before ids existed get a stable positional one until their next edit. */
+export const markersOf = (timeline?: Pick<Timeline,'markers'>) => (timeline?.markers ?? []).map((m, i) => m.id ? m as Marker & {id:string} : { ...m, id: `marker-${i}` });
 
 // How much room a trim has on its track. Extending an edge is a trim, not an overwrite: it stops at
 // the neighbour instead of eating it, so only the move drag overwrites. Clips in `group` move with

@@ -26,7 +26,7 @@ export function importResolve(manifest:RecordValue,projectId:string,userId:strin
   for(const [ti,t] of sourceTimelines.entries()) {
     const fps=resolveRate(t.settings?.timelineFrameRate??project.fps),start=number(t.startFrame),end=number(t.endFrame);
     if(end<=start)throw new Error('Resolve timeline is empty.');
-    const timeline:Timeline={id:id('timeline',t.id),projectId,name:text(t.name),duration:(end-start)/fps,markers:Object.entries(t.markers||{}).filter(([k])=>/^\d+$/.test(k)).map(([k,m]:[string,any])=>({time:Number(k)/fps,name:String(m.name||'Marker'),color:String(m.color||'Blue')}))};
+    const timeline:Timeline={id:id('timeline',t.id),projectId,name:text(t.name),duration:(end-start)/fps,markers:Object.entries(t.markers||{}).filter(([k])=>/^\d+$/.test(k)).map(([k,m]:[string,any])=>({time:Number(k)/fps,name:String(m.name||'Marker').slice(0,255),color:String(m.color||'Blue').slice(0,64),...(m.note?{note:String(m.note).slice(0,5000)}:{})}))};
     Object.assign(timeline,{frameRate:fps,startFrame:start,startTimecode:String(t.startTimecode||'00:00:00:00'),resolveId:t.id});timelines.push(timeline);files.add(`timeline-${ti+1}.otio`);
     if(ti===0){project.fps=fps;project.resolution=`${number(t.settings?.timelineResolutionWidth||1920)} × ${number(t.settings?.timelineResolutionHeight||1080)}`;project.duration=timeline.duration;}
     for(const tr of array(t.tracks)) {
