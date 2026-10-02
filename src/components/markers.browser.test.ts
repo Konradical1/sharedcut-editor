@@ -137,7 +137,7 @@ test('right-click the ruler adds a marker with a note and color; it drags, edits
 });
 
 test('Delete gaps on a right-clicked group closes the gaps between them, carries a title along, and undoes', async t => {
-  const { page, clips, saved, clipPoint } = await openScene(t, [
+  const { page, clips, saved, clipPoint, xAt, rulerY } = await openScene(t, [
     { id: 'A', track: 'v1', start: 0, duration: 4 }, { id: 'B', track: 'v1', start: 6, duration: 2 }, { id: 'C', track: 'v1', start: 12, duration: 2 },
     { id: 'T', track: 'v2', start: 12.5, duration: 1 },
   ]);
@@ -151,6 +151,14 @@ test('Delete gaps on a right-clicked group closes the gaps between them, carries
   assert.deepEqual([after.A, after.B, after.C, after.T], [0, 4, 6, 6.5]);
   await page.getByRole('button', { name: 'Undo my action (⌘Z)' }).click(); await saved();
   assert.deepEqual(await clips(), before);
+  // Ctrl/⌘X cuts the selected clip; ⌘V puts it back at the playhead.
+  const b = await clipPoint('B');
+  await page.mouse.click(b.x, b.y);
+  await page.keyboard.press('ControlOrMeta+x'); await saved();
+  assert.equal((await clips()).B, undefined, 'cut removes the clip');
+  await page.mouse.click(await xAt(20), await rulerY());
+  await page.keyboard.press('ControlOrMeta+v'); await saved();
+  assert.ok(Object.values(await clips()).some(start => Math.abs(start - 20) < 1e-6), 'pasted at the playhead');
 });
 
 test("clicking a collaborator's name tag moves your playhead to theirs", async t => {

@@ -961,6 +961,19 @@ test('timed comments remember their timeline; commenters cannot add markers', ()
   assert.equal(state().addMarker(), undefined);
 });
 
+test('cut then paste puts the earliest cut clip on the playhead and keeps the group spacing', () => {
+  const [a, b] = ['c3', 'c4'].map(id => structuredClone(clip(id)));
+  state().selectClips([a.id, b.id]);
+  state().copyClip(b.id); state().deleteClip(b.id);
+  assert.ok(!state().clips.some(c => c.id === a.id || c.id === b.id), 'cut removes the whole selection');
+  state().setPlayhead(100);
+  state().pasteClip();
+  const pasted = state().clips.filter(c => state().selectedClipIds.includes(c.id)).sort((x, y) => x.start - y.start);
+  assert.equal(pasted.length, 2);
+  assert.equal(pasted[0].start, 100, 'the earliest clip starts at the playhead, not the one that was clicked');
+  assert.equal(pasted[1].start - pasted[0].start, b.start - a.start);
+});
+
 test('a bin multi-drop lays clips end to end and undoes as one action',()=>{
   const base={...state().media[0],hasAudio:false,duration:4,kind:'video' as const,status:'ready' as const};
   const assets=Array.from({length:40},(_,i)=>({...base,id:`bulk-${i}`,name:`bulk ${i}`}));

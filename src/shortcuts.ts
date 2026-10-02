@@ -1,7 +1,7 @@
 import { useEffect, type Dispatch, type SetStateAction } from 'react';
 import { useEditorStore } from './state/store';
 import { fieldOwnsKey, typingSurface } from './services/focus';
-export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['I / O','Mark In / Out'], ['V / B / A','Selection / blade / select forward tool'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['M','Add marker at playhead'], ['Right-click ruler','Add marker here, paste markers'], ['Delete','Delete selected clip'] ];
+export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + X','Cut selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['I / O','Mark In / Out'], ['V / B / A','Selection / blade / select forward tool'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['M','Add marker at playhead'], ['Right-click ruler','Add marker here, paste markers'], ['Delete','Delete selected clip'] ];
 /** A click is an action, not a focus grab. Editing apps keep the keyboard on the app, so Space plays
  *  instead of replaying the last button touched — and nothing sits there wearing a focus ring. */
 export function useFocusRelease() {
@@ -34,12 +34,14 @@ export function useEditorShortcuts(enabled: boolean) {
       // Selected markers own Delete and ⌘C; copied markers own ⌘V until a clip is copied.
       if(s.selectedMarkerIds.length&&(e.key==='Delete'||e.key==='Backspace')){e.preventDefault();s.deleteMarkers(s.selectedMarkerIds);return;}
       if(s.selectedMarkerIds.length&&command&&e.key.toLowerCase()==='c'){e.preventDefault();s.copyMarkers(s.selectedMarkerIds);return;}
+      if(s.selectedMarkerIds.length&&command&&e.key.toLowerCase()==='x'){e.preventDefault();s.copyMarkers(s.selectedMarkerIds);s.deleteMarkers(s.selectedMarkerIds);return;}
       if(s.markerClipboard&&command&&e.key.toLowerCase()==='v'){e.preventDefault();s.pasteMarkers();return;}
       if(s.selectedMarkerIds.length&&e.key==='Escape'){useEditorStore.setState({selectedMarkerIds:[]});return;}
       if(command&&e.key.toLowerCase()==='s'){e.preventDefault();s.setModal('snapshot');}
       else if(command&&e.key.toLowerCase()==='z'){e.preventDefault();s.undo();}
       else if(command&&e.key.toLowerCase()==='b'&&s.selectedClipId){e.preventDefault();s.splitClip(s.selectedClipId);}
       else if(command&&e.key.toLowerCase()==='c'&&s.selectedClipId){e.preventDefault();s.copyClip(s.selectedClipId);}
+      else if(command&&e.key.toLowerCase()==='x'&&s.selectedClipId){e.preventDefault();s.copyClip(s.selectedClipId);s.deleteClip(s.selectedClipId);}
       else if(command&&e.key.toLowerCase()==='v'){e.preventDefault();s.pasteClip();}
       else if(command&&e.key.toLowerCase()==='d'&&s.selectedClipId){e.preventDefault();s.duplicateClip(s.selectedClipId);}
       else if(command&&e.key.toLowerCase()==='t'){e.preventDefault();s.applyTransitionAtPlayhead();}
