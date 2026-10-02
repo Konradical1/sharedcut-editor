@@ -39,7 +39,7 @@ try {
   const assertFitted=async()=>{
     await page.waitForFunction(()=>{
       const scroll=document.querySelector('.timeline-scroll'),clip=document.querySelector('.timeline-clip');
-      return scroll&&clip&&scroll.scrollLeft===0&&Math.abs(parseFloat(clip.style.width)-(scroll.clientWidth-164))<2;
+      return scroll&&clip&&scroll.scrollLeft===0&&Math.abs(clip.offsetWidth-(scroll.clientWidth-164))<2;
     });
   };
   await assertFitted();

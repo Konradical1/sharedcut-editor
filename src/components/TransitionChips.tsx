@@ -1,4 +1,4 @@
-import { useRef, useState, type PointerEvent } from 'react';
+import { useMemo, useRef, useState, type PointerEvent } from 'react';
 import { ArrowRightLeft, AudioLines, Info, Trash2 } from 'lucide-react';
 import { useEditorStore } from '../state/store';
 import { useShallow } from 'zustand/react/shallow';
@@ -17,7 +17,8 @@ export default function TransitionChips({ trackId, timelineId, pixels }: { track
   const drag = useRef<{ record: TransitionRecord; mode: 'left' | 'right' | 'move'; x: number; duration: number; align: TransitionAlign } | null>(null);
   const actions = useEditorStore.getState;
 
-  const records = timelineTransitions(clips, timelineId, media).filter(record => clips.find(clip => clip.id === record.clipId)?.trackId === trackId);
+  const all = useMemo(() => timelineTransitions(clips, timelineId, media), [clips, timelineId, media]);
+  const records = useMemo(() => { const track = new Set(clips.filter(clip => clip.trackId === trackId).map(clip => clip.id)); return all.filter(record => track.has(record.clipId)); }, [all, clips, trackId]);
   if (!records.length && !menu) return null;
 
   const start = (event: PointerEvent<HTMLElement>, record: TransitionRecord, mode: 'left' | 'right' | 'move') => {

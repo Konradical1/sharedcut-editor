@@ -328,6 +328,12 @@
 /* While playing, the playheads (a collaborator's too) and the timecodes are canvases: per-frame element changes re-layerize the whole page. */
 .local-playhead-canvas{position:absolute;z-index:9;pointer-events:none}
 .remote-playhead-canvas{position:absolute;z-index:4;pointer-events:none;opacity:.52}
+.timeline-scroll[data-playing] .clip-cache:before,.timeline-scroll[data-playing] .clip-preparing:before{transition:none}
+.live-timecode{position:relative}.live-timecode-held::after{content:attr(data-text);visibility:hidden}.live-timecode-origin{display:inline-block;width:0;height:0}.live-timecode-canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;image-rendering:pixelated}
+
+/* Clips sit in a layer exactly as wide as the timeline's duration at the current zoom and are placed by percentage, so zooming resizes one box instead of restyling every clip. */
+.clip-layer{position:absolute;left:0;top:0;bottom:0;pointer-events:none}.clip-layer>*{pointer-events:auto}
+
 /* Media bin: one search row, one + button, a folder dropdown, dense tiles. */
 .media-panel{position:relative}
 .media-panel.dropping:after{content:"Drop to upload";position:absolute;inset:6px;z-index:30;display:grid;place-items:center;border:2px dashed var(--accent);border-radius:8px;background:#101214e6;color:var(--accent);font-size:12px;pointer-events:none}
@@ -376,5 +382,3 @@
 .upload-jobs>div{max-height:min(180px,24vh)}
 .media-assets .empty-state{grid-column:1/-1}
 .timeline-clip{contain:layout style}
-.timeline-scroll[data-playing] .clip-cache:before,.timeline-scroll[data-playing] .clip-preparing:before{transition:none}
-.live-timecode{position:relative}.live-timecode-held::after{content:attr(data-text);visibility:hidden}.live-timecode-origin{display:inline-block;width:0;height:0}.live-timecode-canvas{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;image-rendering:pixelated}

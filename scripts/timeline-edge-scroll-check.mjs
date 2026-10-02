@@ -59,16 +59,16 @@ try {
     const cancelled = await scroll();
     await page.waitForTimeout(100);
     assert.equal(await scroll(), cancelled, 'Escape stops edge scrolling');
-    assert.equal(await clip.evaluate(el => parseFloat(el.style.left)), 0, 'Cancelled drag preserves the original clip');
+    assert.equal(await clip.evaluate(el => el.offsetLeft), 0, 'Cancelled drag preserves the original clip');
   }
   await page.locator('.timeline-scroll').evaluate(el => { el.scrollLeft = 0; });
   const box = await clip.boundingBox(), view = await page.locator('.timeline-scroll').boundingBox();
   await page.mouse.move(box.x + 20, box.y + box.height / 2); await page.mouse.down();
   await page.mouse.move(view.x + view.width - 12, box.y + box.height / 2, { steps: 8 });
   await page.waitForTimeout(250);
-  const expected = await clip.evaluate(el => parseFloat(el.style.left));
+  const expected = await clip.evaluate(el => el.offsetLeft);
   await page.mouse.up(); await saved();
-  assert.ok(Math.abs(await clip.evaluate(el => parseFloat(el.style.left)) - expected) < 5, 'Drop commits the scrolled placement');
+  assert.ok(Math.abs(await clip.evaluate(el => el.offsetLeft) - expected) < 5, 'Drop commits the scrolled placement');
   const released = await scroll(); await page.waitForTimeout(100);
   assert.equal(await scroll(), released, 'Release stops scrolling');
   assert.deepEqual(errors, []);

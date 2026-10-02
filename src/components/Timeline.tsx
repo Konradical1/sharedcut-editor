@@ -12,7 +12,8 @@ import ClipFades from './ClipFades';
 import TransitionChips from './TransitionChips';
 import { alignShare, bestAlign, maximumDuration, nearestCut, transitionDefinitions } from '../services/transitions';
 import { isTitle, titlePresets } from '../services/text';
-import { Fragment, memo, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore, type CSSProperties, type PointerEvent, type DragEvent, type RefObject } from 'react';
+import { flushSync } from 'react-dom';
+import { Fragment, memo, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties, type PointerEvent, type DragEvent, type RefObject } from 'react';
 import { Shapes, PenTool, Layers, ArrowLeft, ArrowRightLeft, Type, MousePointer2, Scissors, ArrowRightToLine, Magnet, Link2, Flag, Plus, Minus, ChevronDown, LockKeyhole, LockKeyholeOpen, Eye, EyeOff, Volume2, VolumeX, Film, AudioLines, Copy, Trash2, Gauge, Palette, Music2, FolderSearch, Info, Clipboard, Undo2, GripVertical, ChevronUp, Diamond, ArrowLeftToLine } from 'lucide-react';
 import { useEditorStore, TRACK_THUMBNAIL_HEIGHT } from '../state/store';
 import { useShallow } from 'zustand/react/shallow';
@@ -42,7 +43,9 @@ const FRAME_ASPECT = 96 / 54, MAX_FRAMES = 240;
  * reads as the shot rather than the same still repeated. Falls back to the poster frame for media
  * imported before filmstrips existed (the server backfills those on its next start).
  */
-function ClipFilmstrip({ asset, clip, pixels }: { asset?: MediaAsset; clip: Pick<Clip,'duration'|'sourceIn'|'properties'>; pixels: number }) {
+/** Zoom in quarter-octave steps: tiles (and the frames they show) are rebuilt only when this changes, not on every zoom frame. */
+const tileBucket = (pixels: number) => 2 ** (Math.round(Math.log2(pixels) * 4) / 4);
+const ClipFilmstrip = memo(function ClipFilmstrip({ asset, clip, pixels }: { asset?: MediaAsset; clip: Pick<Clip,'duration'|'sourceIn'|'properties'>; pixels: number }) {
   const strip = useRef<HTMLDivElement>(null);
   const [height, setHeight] = useState(45);
   useLayoutEffect(() => {
@@ -56,11 +59,14 @@ function ClipFilmstrip({ asset, clip, pixels }: { asset?: MediaAsset; clip: Pick
   const frames = asset?.filmstripFrames ?? 0;
   if (!asset?.filmstrip || frames < 2 || !(asset.duration > 0)) return <div ref={strip} className="clip-filmstrip" style={{ backgroundImage: asset?.thumbnail ? `url(${asset.thumbnail})` : undefined }}/>;
   const image = `url(${asset.filmstrip})`;
+  // `pixels` is the bucket, up to ~9% under the real zoom: a few spare tiles at the end (clipped by the strip) cover the difference.
+  const tiles = filmstripTiles(clip, { duration: asset.duration, frames }, pixels, Math.max(1, height * FRAME_ASPECT), MAX_FRAMES);
+  const spare = Array.from({ length: Math.ceil(tiles.length * .1) + 1 }, () => tiles[tiles.length - 1]);
   return <div ref={strip} className="clip-filmstrip clip-filmstrip-tiled">
-    {filmstripTiles(clip, { duration: asset.duration, frames }, pixels, Math.max(1, height * FRAME_ASPECT), MAX_FRAMES).map(({ tile, frame }, i) =>
+    {[...tiles, ...spare].map(({ tile, frame }, i) =>
       <i key={i} style={{ flexBasis: tile, backgroundImage: image, backgroundSize: `${frames * 100}% auto`, backgroundPositionY: 'center', backgroundPositionX: `${frame / (frames - 1) * 100}%` }}/>)}
   </div>;
-}
+});
 
 
 type PlayheadProps = { pixels: number; color: string; scrub: (e: PointerEvent<HTMLDivElement>) => void; scrubMove: (e: PointerEvent<HTMLDivElement>) => void; scroller: RefObject<HTMLDivElement | null> };
@@ -123,18 +129,19 @@ watchSmartMaskJobs(useMaskEditor);
 const footageBadge=(clipId:string)=>{const s=clipFootageStatus(clipId);return `${s.state}|${s.progress}|${s.detail}|${s.playback?.detail??''}`;};
 
 /** Picture coverage in the editor; audio coverage in the audio workspace. */
-function RenderBar({pixels,audioOnly}:{pixels:number;audioOnly:boolean}){
-  useSyncExternalStore(subscribeFootage,footageRelayed);useActivityVersion();
+const RenderBar=memo(function RenderBar({audioOnly,span,pixels}:{audioOnly:boolean;span:number;pixels:number}){
+  const relayed=useSyncExternalStore(subscribeFootage,footageRelayed),activity=useActivityVersion();
   const clips=useEditorStore(s=>s.clips),media=useEditorStore(s=>s.media),timelineId=useEditorStore(s=>s.timelineId),projectId=useEditorStore(s=>s.projectId);
   const tracks=useEditorStore(s=>s.tracks);
-  const segments=barSegments(clips.filter(c=>c.timelineId===timelineId&&c.projectId===projectId&&!c.disabled&&tracks.some(t=>t.id===c.trackId&&(audioOnly?t.kind==='audio'&&!t.muted:t.kind==='video'&&!t.hidden))).map(clip=>{
+  // Segments do not depend on zoom: they are percentages of a bar `span` seconds wide, so a zoom gesture never recomputes them.
+  const segments=useMemo(()=>{void relayed;void activity;return barSegments(clips.filter(c=>c.timelineId===timelineId&&c.projectId===projectId&&!c.disabled&&tracks.some(t=>t.id===c.trackId&&(audioOnly?t.kind==='audio'&&!t.muted:t.kind==='video'&&!t.hidden))).map(clip=>{
     const asset=media.find(m=>m.id===clip.mediaId);
     const local=clipFootageStatus(clip.id);
     const state:BarState=local.state==='red'||asset?.status==='failed'?'red':asset&&asset.status!=='ready'?'yellow':isTitle(clip)||isShape(clip)?'green':local.state;
     return {start:clip.start,end:clip.start+clip.duration,state};
-  }));
-  return <div className="render-bar" role="img" aria-label="Footage on this computer: gray queued, blue downloading, amber preparing a download, green saved locally, red failed">{segments.map((seg,i)=><i key={i} className={seg.state} style={{left:seg.start*pixels,width:Math.max(1,(seg.end-seg.start)*pixels)}}/>)}</div>;
-}
+  }));},[clips,media,tracks,timelineId,projectId,audioOnly,relayed,activity]);
+  return <div className="render-bar" role="img" style={{right:'auto',width:span*pixels}} aria-label="Footage on this computer: gray queued, blue downloading, amber preparing a download, green saved locally, red failed">{segments.map((seg,i)=><i key={i} className={seg.state} style={{left:`${seg.start/span*100}%`,width:`max(1px, ${(seg.end-seg.start)/span*100}%)`}}/>)}</div>;
+});
 
 const ClipActivityBar=memo(function ClipActivityBar({clipId,cacheable}:{clipId:string;cacheable:boolean}) {
   const activity=useClipActivity(clipId);
@@ -147,6 +154,73 @@ const ClipActivityBar=memo(function ClipActivityBar({clipId,cacheable}:{clipId:s
   }
   return <div className={`clip-preparing ${activity.status}`} role="status" title={activity.error??`${activity.kind} preparing`} style={{'--progress':`${Math.max(4,activity.progress)}%`} as CSSProperties}><span>{activity.status==='failed'?`${activity.kind} failed`:`${activity.kind} · ${activity.progress}%`}</span></div>;
 });
+
+
+/** What a clip row calls back into the timeline with; stable for the timeline's life so a clip re-renders only when it changed. */
+type ClipCallbacks = { down: (e: PointerEvent<HTMLDivElement>, clip: Clip, mode: 'move' | 'left' | 'right') => void; move: (e: PointerEvent<HTMLDivElement>) => void; up: () => void; cancel: () => void; lost: () => void; effect: (id: string | null) => void; menu: (x: number, y: number, id: string) => void };
+type ClipViewProps = { near: boolean; span: number; clip: Clip; asset?: MediaAsset; kind: string; locked: boolean; start: number; duration: number; className: string; selectionColor: string; selected: boolean; remoteName?: string; remoteColor?: string; ownerColor?: string; owned: boolean; cacheable: boolean; fps: number; tilePixels: number; keyframePixels: number; pixels: { current: number }; cb: ClipCallbacks };
+/**
+ * One clip on the timeline (`near`: within a screen of the viewport; clips further off are bare shells, so a zoom lays out and paints only what can be seen). Its place is a percentage of the clip layer (which is `span` seconds wide), so zooming only
+ * resizes that layer: the browser re-lays the clips out without recalculating their styles, and this component (with its
+ * filmstrip, waveform and fades) does not render again until something about the clip itself changes.
+ */
+const TimelineClipView = memo(function TimelineClipView({ near, span, clip, asset, kind, locked, start, duration, className, selectionColor, selected, remoteName, remoteColor, ownerColor, owned, cacheable, fps, tilePixels, keyframePixels, pixels, cb }: ClipViewProps) {
+  const actions = useEditorStore.getState;
+  return <div data-clip={clip.id} role="button" tabIndex={0} aria-label={`${clip.name}, ${timecode(clip.start)}, ${Math.round(clip.duration)} seconds`} aria-pressed={selected} className={className}
+    style={{ left: `${start / span * 100}%`, width: `max(12px, ${duration / span * 100}%)`, '--clip-color': clip.color, '--selection-color': selectionColor } as CSSProperties}
+    onDragOver={e => { if (e.dataTransfer.types.includes('application/x-frameline-effect')) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = locked ? 'none' : 'copy'; if (!locked) cb.effect(clip.id); } }}
+    onDragLeave={() => cb.effect(null)}
+    onDrop={e => { const name = e.dataTransfer.getData('application/x-frameline-effect'); if (!name) return; e.preventDefault(); e.stopPropagation(); cb.effect(null); if (!locked && acceptsEffect(clip, asset?.kind, name)) actions().addEffect(clip.id, name); }}
+    onPointerDown={e => cb.down(e, clip, 'move')} onPointerMove={cb.move} onPointerUp={cb.up} onPointerCancel={cb.cancel} onLostPointerCapture={cb.lost}
+    onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); if (e.key === 'Enter' && isComposition(clip)) actions().openComposition(clip.id); else actions().selectClip(clip.id); } if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); e.stopPropagation(); actions().moveClip(clip.id, clip.start + (e.key === 'ArrowRight' ? 1 : -1) / fps); } }}
+    onDoubleClick={e => { e.stopPropagation(); if (isComposition(clip)) actions().openComposition(clip.id); }}
+    onContextMenu={e => { e.preventDefault(); if (!actions().selectedClipIds.includes(clip.id)) actions().selectClip(clip.id); cb.menu(e.clientX, e.clientY, clip.id); }}>
+    {near && <>
+    {kind === 'video' && !isTitle(clip) && !isShape(clip) && !isComposition(clip) && asset?.kind !== 'audio' && <ClipFilmstrip asset={asset} clip={clip} pixels={tilePixels}/>}
+    <div className="clip-label">{isTitle(clip) ? <Type size={10}/> : isShape(clip) ? <Shapes size={10}/> : isComposition(clip) ? <Layers size={10}/> : kind === 'audio' ? <AudioLines size={10}/> : <Film size={10}/>}<span>{clip.name}</span>{clip.properties.linkGroup && <Link2 size={10} aria-label="Linked audio/video"/>}{remoteName && <span className="clip-remote-name" style={{ color: remoteColor }}>{remoteName}</span>}{owned && <span className="clip-activity" style={{ background: ownerColor }}/>}</div>
+    <ClipActivityBar clipId={clip.id} cacheable={cacheable}/>
+    {kind === 'audio' && <Waveform samples={asset?.waveform} from={clip.sourceIn / (asset?.duration || 1)} to={(clip.sourceIn + clip.duration * Number(clip.properties.speed || 100) / 100) / (asset?.duration || 1)} reverse={Boolean(clip.properties.reverse)}/>}
+    {keyframePixels > 0 && <KeyframeLanes inline clips={[clip]} pixels={keyframePixels} width={clip.duration * keyframePixels} visibleStart={0} visibleEnd={clip.duration * keyframePixels}/>}
+    <ClipFades clip={clip} audio={kind === 'audio'} pixels={pixels} fps={fps}/>
+    <div className="trim-handle trim-left" title="Trim start" onPointerDown={e => cb.down(e, clip, 'left')}/><div className="trim-handle trim-right" title="Trim end" onPointerDown={e => cb.down(e, clip, 'right')}/>
+    </>}
+  </div>;
+});
+
+
+type EditorState = ReturnType<typeof useEditorStore.getState>;
+type Overlay = Pick<Clip, 'start' | 'duration'> & { trackId: string };
+type TrackClipsProps = {
+  settled: boolean; track: EditorState['tracks'][number]; clips: Clip[]; assets: Map<string, MediaAsset>; draft: { id: string; start: number; duration: number; trackId?: string } | null; primary?: Clip; dragIds: Set<string> | null; dragMode?: 'move' | 'left' | 'right';
+  movePlacements: (Overlay & { id: string })[]; lanePlacement?: Overlay | null; selectedId: string | null; selectedIds: string[]; selectedLink?: Clip['properties'][string]; selectedBy: Record<string, string>; users: EditorState['users']; locks: EditorState['locks'];
+  ownColor: string; staleKey: string; staleCaptions: Set<string>; effectTarget: string | null; linked: boolean; fps: number; span: number; tilePixels: number; nearFrom: number; nearTo: number; keyframePixels: number; pixels: { current: number }; cb: ClipCallbacks;
+};
+const noClips: Clip[] = [];
+/**
+ * The clips of one track. While nothing is being dragged or dropped its output depends only on the clips and the coarse
+ * (bucketed) zoom, so it is skipped outright on every frame of a zoom gesture; during a drag it renders as it always did.
+ */
+const TrackClips = memo(function TrackClips({ track, clips, assets, draft, primary, dragIds, dragMode, movePlacements, lanePlacement, selectedId, selectedIds, selectedLink, selectedBy, users, locks, ownColor, staleCaptions, effectTarget, linked, fps, span, tilePixels, nearFrom, nearTo, keyframePixels, pixels, cb }: TrackClipsProps) {
+  // Nothing to cut around unless a drag or drop is showing where clips will land.
+  const overlays: Overlay[] = movePlacements.length ? movePlacements.filter(c => c.trackId === track.id) : lanePlacement?.trackId === track.id ? [lanePlacement] : [];
+  const selectedSet = new Set(selectedIds);
+  return <>{clips.flatMap(clip => (overlays.length && !dragIds?.has(clip.id) && clip.id !== draft?.id ? overlays.reduce<Clip[]>((parts, p) => parts.flatMap(part => uncoveredParts(part, p.start, p.start + p.duration)), [clip]) : [clip]).map((part, index) => ({ clip, part, index }))).map(({ clip, part, index }) => {
+    const asset = assets.get(clip.mediaId);
+    const partner = draft && dragMode === 'move' && dragIds?.has(clip.id) && clip.id !== draft.id || linked && draft && primary?.properties.linkGroup && primary.properties.linkGroup === clip.properties.linkGroup;
+    const position = draft?.id === clip.id ? (draft.trackId && draft.trackId !== clip.trackId ? clip : draft) : partner ? { ...part, start: clip.start + draft!.start - primary!.start, duration: clip.duration + draft!.duration - primary!.duration } : part;
+    const predicted = movePlacements.find(c => c.id === clip.id);
+    const selected = selectedId === clip.id || selectedSet.has(clip.id);
+    const linkedSelected = linked && clip.properties.linkGroup && clip.properties.linkGroup === selectedLink;
+    const collaborator = users.find(u => u.id === selectedBy[clip.id]);
+    const owner = locks.find(l => l.targetId === clip.id && l.field === 'manipulation');
+    const color = selected || linkedSelected ? ownColor : collaborator?.color;
+    const className = `timeline-clip ${staleCaptions.has(String(clip.properties.captionSet)) ? 'caption-stale' : ''} ${track.kind} ${selected ? 'selected' : ''} ${linkedSelected ? 'linked-selected' : ''} ${draft?.id === clip.id ? 'dragging' : ''} ${predicted && predicted.trackId !== clip.trackId || draft?.id === clip.id && draft.trackId && draft.trackId !== clip.trackId ? 'drag-origin' : ''} ${isComposition(clip) ? 'composition-clip' : ''} ${isShape(clip) ? 'shape-clip' : ''} ${clip.disabled ? 'clip-disabled' : ''} ${owner ? 'owned' : ''} ${effectTarget === clip.id ? 'effect-drop-target' : ''}`;
+    return <TimelineClipView key={`${clip.id}-${index}`} near={selected || !!predicted || draft?.id === clip.id || !!dragIds?.has(clip.id) || clip.start + clip.duration >= nearFrom && clip.start <= nearTo || position.start + position.duration >= nearFrom && position.start <= nearTo} span={span} clip={clip} asset={asset} kind={track.kind} locked={!!track.locked} start={predicted && predicted.trackId !== clip.trackId ? clip.start : position.start} duration={position.duration} className={className} selectionColor={color ?? 'transparent'} selected={selected}
+      remoteName={collaborator && !selected ? collaborator.name : undefined} remoteColor={collaborator?.color} owned={!!owner} ownerColor={owner ? users.find(u => u.id === owner.userId)?.color : undefined}
+      cacheable={!!asset && asset.kind !== 'image' && !clip.disabled && (track.kind === 'video' ? !track.hidden : !track.muted)} fps={fps} tilePixels={tilePixels} keyframePixels={clip.keyframes && Object.keys(clip.keyframes).length > 0 ? keyframePixels : 0} pixels={pixels} cb={cb}/>;
+  })}</>;
+}, (a, b) => a.settled && b.settled && a.track === b.track && a.clips === b.clips && a.assets === b.assets && a.selectedId === b.selectedId && a.selectedIds === b.selectedIds && a.selectedLink === b.selectedLink && a.selectedBy === b.selectedBy && a.users === b.users && a.locks === b.locks &&
+  a.ownColor === b.ownColor && a.staleKey === b.staleKey && a.effectTarget === b.effectTarget && a.linked === b.linked && a.fps === b.fps && a.span === b.span && a.tilePixels === b.tilePixels && a.nearFrom === b.nearFrom && a.nearTo === b.nearTo && a.keyframePixels === b.keyframePixels && a.cb === b.cb);
 
 // Memoized so the editor shell re-rendering (presence, save status) does not redraw ~400 clip rows.
 export default memo(Timeline);
@@ -192,7 +266,11 @@ function Timeline({ audioOnly = false }: { audioOnly?: boolean }) {
   const [trackMenu,setTrackMenu]=useState<{x:number;y:number;id:string}|null>(null);
   const [viewport,setViewport]=useState({left:0,width:1200});
   const timelineViews=useRef(new Map<string,number>());
-  const centerZoom=useRef(false),zoomRef=useRef(zoom);zoomRef.current=zoom;
+  // The ruler and keyframe lanes only need the viewport to within a screen; 128 px steps keep scrolling and zooming from rendering twice per frame.
+  // An expanded keyframe graph is drawn for exactly the visible window, so it needs the exact position.
+  const exactView=useRef(false);
+  const publishViewport=(el:HTMLElement)=>{const left=exactView.current?el.scrollLeft:Math.floor(el.scrollLeft/128)*128,width=el.clientWidth;setViewport(v=>v.left===left&&v.width===width?v:{left,width});};
+  const centerZoom=useRef(false),zoomRef=useRef(zoom),zoomTarget=useRef(zoom);zoomRef.current=zoom;
   const scrubPointer=useRef<number|null>(null);
   const [snapping, setSnapping] = useState(useEditorStore.getState().settings.defaultSnapping!==false);
   const linked = useEditorStore(s=>s.settings.linkSelection!==false);
@@ -229,41 +307,77 @@ function Timeline({ audioOnly = false }: { audioOnly?: boolean }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const dragHandlers = useRef({ move: moveDrag, finish: finishDrag });
   dragHandlers.current = { move: moveDrag, finish: finishDrag };
+  // Clip rows are memoized, so they reach the drag code through one stable object that always calls the latest closures.
+  const clipOps = useRef({ startDrag, moveDrag, finishDrag, setMenu, setEffectTarget });
+  clipOps.current = { startDrag, moveDrag, finishDrag, setMenu, setEffectTarget };
+  const clipCallbacks = useMemo<ClipCallbacks>(() => ({
+    down: (e, clip, mode) => clipOps.current.startDrag(e, clip, mode),
+    move: e => clipOps.current.moveDrag(e),
+    up: () => clipOps.current.finishDrag(),
+    cancel: () => clipOps.current.finishDrag(true),
+    lost: () => { if (drag.current) clipOps.current.finishDrag(true); },
+    effect: id => clipOps.current.setEffectTarget(id),
+    menu: (x, y, id) => clipOps.current.setMenu({ x, y, id }),
+  }), []);
   const boxStart=useRef<{x:number;y:number;ids:string[]}|null>(null);
   const [box,setBox]=useState<SelectionRect|null>(null);
   const pixels = 6 * zoom;
+  const pixelsRef = useRef(pixels); pixelsRef.current = pixels;
+  // Filmstrip tiles rebuild at low priority, so a zoom frame is never held up by them.
+  const tilePixels = useDeferredValue(tileBucket(pixels));
   const length = timeline?.duration ?? 180;
-  const width = Math.max(length, ...clips.filter(c=>c.timelineId===timelineId).map(c=>c.start+c.duration)) * pixels + viewport.width/2;
+  const endTime = useMemo(() => Math.max(length, ...clips.filter(c=>c.timelineId===timelineId).map(c=>c.start+c.duration)), [clips, timelineId, length]);
+  const width = endTime * pixels + viewport.width/2;
+  const span = Math.max(length, 1);
+  const assetById = useMemo(() => new Map(media.map(m => [m.id, m])), [media]);
+  const clipsByTrack = useMemo(() => { const map = new Map<string, Clip[]>(); for (const clip of clips) { const list = map.get(clip.trackId); if (list) list.push(clip); else map.set(clip.trackId, [clip]); } return map; }, [clips]);
+  const primary = clips.find(c => c.id === draft?.id), selectedClip = clips.find(c => c.id === selectedId);
+  const keyedTracks = useMemo(() => new Set(clips.filter(c => c.keyframes && Object.keys(c.keyframes).length > 0).map(c => c.trackId)), [clips]);
   const ownColor = users.find(u=>u.id===currentUserId)?.color ?? '#ec7b77';
   const audioPreview=dropDraft&&draggingIds.some(id=>{const m=media.find(a=>a.id===id);return m?.hasAudio&&m.kind==='video';})?companionAudioTrack(tracks,tracks.find(t=>t.id===dropDraft.trackId)!):null;
   const visibleTracks = [...tracks,...(audioPreview?.id==='pending-audio'?[audioPreview]:[])].filter(t=>t.timelineId===timelineId&&(!audioOnly||t.kind==='audio')).sort((a,b)=>Number(Boolean(b.captionSets))-Number(Boolean(a.captionSets))||(a.kind!==b.kind?(a.kind==='video'?-1:1):a.kind==='video'?b.number-a.number:a.number-b.number));
   const staleCaptions=new Set(tracks.filter(t=>t.timelineId===timelineId).flatMap(t=>t.captionSets??[]).filter(meta=>meta.signature!==captionSignature(clips,tracks,timelineId,meta.start,meta.end,meta.trackIds)).map(s=>s.id));
+  const staleKey=[...staleCaptions].join('|');
   const actions = useEditorStore.getState;
   useTimelineShortcuts(setTool, setSnapping);
   const screenPixels = () => pixels * ((scrollRef.current?.querySelector('.timeline-ruler')?.getBoundingClientRect().width ?? width) / width);
   const fps=project?.fps||24, usable=Math.max(100,viewport.width-164);
-  const changeZoom=(next:number)=>{centerZoom.current=true;const value=timelineZoom(next*6,usable,length,fps)/6;zoomRef.current=value;setZoom(value);};
+  const clampZoom=(next:number)=>timelineZoom(next*6,usable,length,fps)/6;
+  const changeZoom=(next:number)=>{const value=clampZoom(next);centerZoom.current=value!==zoomRef.current;zoomRef.current=value;zoomTarget.current=value;setZoom(value);};
   useLayoutEffect(()=>{
     const el=scrollRef.current;
     centerZoom.current=false;
     const value=timeline?.composition
       ? Math.max(100,(el?.clientWidth??viewport.width)-164)/(Math.max(length,1)*6)
       : timelineViews.current.get(timelineId)??1;
-    zoomRef.current=value;
+    zoomRef.current=value;zoomTarget.current=value;
     setZoom(value);
     if(el){el.scrollLeft=0;setViewport({left:0,width:el.clientWidth});}
     return()=>{timelineViews.current.set(timelineId,zoomRef.current);};
   },[timelineId]);
-  useLayoutEffect(()=>{if(centerZoom.current&&scrollRef.current){scrollRef.current.scrollLeft=Math.max(0,actions().playhead*pixels-usable/2);centerZoom.current=false;}},[pixels,usable]);
+  useLayoutEffect(()=>{if(centerZoom.current&&scrollRef.current){scrollRef.current.scrollLeft=Math.max(0,actions().playhead*pixels-usable/2);centerZoom.current=false;publishViewport(scrollRef.current);}},[pixels,usable]);
   useEffect(()=>{
     const el=scrollRef.current;if(!el)return;
-    const resize=new ResizeObserver(()=>setViewport({left:el.scrollLeft,width:el.clientWidth}));resize.observe(el);
-    let gestureZoom=zoomRef.current;
-    const wheel=(event:WheelEvent)=>{if(!event.metaKey&&!event.ctrlKey)return;event.preventDefault();const amount=(event.deltaY||event.deltaX)*(event.deltaMode===1?16:event.deltaMode===2?el.clientWidth:1);changeZoom(zoomRef.current*Math.exp(-Math.max(-300,Math.min(300,amount))*.006));};
-    const begin=(event:Event)=>{event.preventDefault();gestureZoom=zoomRef.current;};
-    const gesture=(event:Event)=>{event.preventDefault();const scale=(event as Event & {scale:number}).scale;if(Number.isFinite(scale))changeZoom(gestureZoom*scale);};
+    const resize=new ResizeObserver(()=>publishViewport(el));resize.observe(el);
+    // Wheel and pinch events only move the target; once a frame the zoom closes most of the gap and commits in that same frame
+    // (flushSync), so the scroll position and the picture never disagree and a notched wheel glides instead of jumping.
+    let frame=0,last=0,base=zoomRef.current;
+    const step=(now:number)=>{
+      frame=0;
+      const current=zoomRef.current,target=zoomTarget.current;
+      if(current===target)return;
+      const gap=Math.log(target/current),next=Math.abs(gap)<.003?target:current*Math.exp(gap*(1-Math.exp(-Math.max(0,Math.min(64,now-last))/50)));
+      last=now;centerZoom.current=true;zoomRef.current=next;
+      flushSync(()=>setZoom(next));
+      if(next!==target)frame=requestAnimationFrame(step);
+    };
+    const aim=(value:number)=>{zoomTarget.current=clampZoom(value);if(!frame){last=performance.now();frame=requestAnimationFrame(step);}};
+    const wheel=(event:WheelEvent)=>{if(!event.metaKey&&!event.ctrlKey)return;event.preventDefault();const amount=(event.deltaY||event.deltaX)*(event.deltaMode===1?16:event.deltaMode===2?el.clientWidth:1);aim((frame?zoomTarget.current:zoomRef.current)*Math.exp(-Math.max(-300,Math.min(300,amount))*.006));};
+    const begin=(event:Event)=>{event.preventDefault();base=zoomRef.current;};
+    const gesture=(event:Event)=>{event.preventDefault();const scale=(event as Event & {scale:number}).scale;if(Number.isFinite(scale))aim(base*scale);};
     el.addEventListener('wheel',wheel,{passive:false});el.addEventListener('gesturestart',begin,{passive:false});el.addEventListener('gesturechange',gesture,{passive:false});
-    return()=>{resize.disconnect();el.removeEventListener('wheel',wheel);el.removeEventListener('gesturestart',begin);el.removeEventListener('gesturechange',gesture);};
+    if(zoomTarget.current!==zoomRef.current)aim(zoomTarget.current); // a glide the previous registration was in the middle of
+    return()=>{cancelAnimationFrame(frame);resize.disconnect();el.removeEventListener('wheel',wheel);el.removeEventListener('gesturestart',begin);el.removeEventListener('gesturechange',gesture);};
   },[usable,length,fps]);
   useEffect(()=>{
     let frame=0,last=performance.now();
@@ -289,7 +403,13 @@ function Timeline({ audioOnly = false }: { audioOnly?: boolean }) {
     window.addEventListener('blur',cancel);
     return()=>{window.removeEventListener('blur',cancel);cancel();};
   },[timelineId]);
-  const step=rulerStep(pixels,fps),firstTick=Math.max(0,Math.floor((viewport.left-164)/pixels/step)),lastTick=Math.ceil((viewport.left+viewport.width)/pixels/step);
+  exactView.current=expandedTracks.length>0;
+  useEffect(()=>{if(scrollRef.current)publishViewport(scrollRef.current);},[expandedTracks.length]);
+  const viewLeft=centerZoom.current?Math.max(0,actions().playhead*pixels-usable/2):viewport.left;
+  // Filmstrips and waveforms are only built within a screen of the viewport on either side, so a zoom rebuilds a few dozen strips, not hundreds.
+  // Quantized to half a screen of time at the bucketed zoom, so the set of near clips changes a few times per gesture, not every frame.
+  const half=Math.max(1,viewport.width/tileBucket(pixels)/2),nearFrom=Math.floor((viewLeft-164-viewport.width)/pixels/half)*half,nearTo=Math.ceil((viewLeft+viewport.width*2)/pixels/half)*half;
+  const step=rulerStep(pixels,fps),firstTick=Math.max(0,Math.floor((viewLeft-164-viewport.width/2)/pixels/step)),lastTick=Math.ceil((viewLeft+viewport.width*1.5)/pixels/step);
 
   function startDrag(e:PointerEvent<HTMLDivElement>,clip:Clip,mode:'move'|'left'|'right') {
     if(e.button!==0)return;
@@ -426,12 +546,12 @@ function Timeline({ audioOnly = false }: { audioOnly?: boolean }) {
   return <section className={`timeline panel ${audioOnly?'timeline-audio':''} ${density==='compact'?'timeline-dense':''} ${forward?'timeline-forward':''}`} aria-label={audioOnly?'Audio timeline':'Timeline'} onKeyDownCapture={e=>{if(gap&&(e.key==='Delete'||e.key==='Backspace')&&!(e.target as HTMLElement).closest('input,select,textarea')){e.preventDefault();e.stopPropagation();actions().deleteGap(gap.trackId,gap.start,gap.end);setGap(null);}}}>
     {timelineMenu&&<ContextMenu {...timelineMenu} onClose={()=>setTimelineMenu(null)}><button role="menuitem" onClick={()=>{setTimelineMenu(null);actions().setModal('timeline-settings');}}>Timeline settings…</button></ContextMenu>}
     <div className="timeline-toolbar">{trail.length>0&&<nav className="composition-breadcrumb" aria-label="Composition navigation">{trail.map((entry,i)=><button key={i} onClick={()=>actions().leaveComposition(i)} aria-label={`Back to ${timelines.find(t=>t.id===entry.timelineId)?.name}`}><ArrowLeft size={12}/>{timelines.find(t=>t.id===entry.timelineId)?.name}</button>)}<b><Layers size={13}/>{timeline?.name}</b></nav>}<div className="timeline-tabs" hidden={trail.length>0}>{timelines.filter(t=>t.projectId===projectId&&!t.composition).map(t=><button key={t.id} className={t.id===timelineId?'active':''} onContextMenu={e=>{e.preventDefault();actions().setTimeline(t.id);setTimelineMenu({x:e.clientX,y:e.clientY});}} onClick={()=>actions().setTimeline(t.id)}><Film size={13}/>{t.name}{t.id===timelineId&&<span className="timeline-tab-dot"/>}</button>)}</div><span className="spacer"/><button className="text-button" onClick={async()=>{try{await connection.flush();const result=await api(`/projects/${projectId}/resolve-export?timelineId=${encodeURIComponent(timelineId)}`);const url=URL.createObjectURL(new Blob([JSON.stringify(result.otio,null,2)],{type:'application/json'})),link=document.createElement('a');link.href=url;link.download='SharedCut-timeline.otio';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);actions().notify('Resolve timeline exported','info',result.warnings.join(' '));}catch(error){actions().notify('Resolve export failed','error',(error as Error).message);}}}>Resolve OTIO</button><button title="Timeline settings" className="timeline-format mono text-button" onClick={()=>actions().setModal('timeline-settings')}>{project?.resolution} <span>·</span> {fpsLabel(project?.fps)} fps</button><IconButton label="Add track" onClick={()=>actions().createTrack(audioOnly?'audio':'video')}><Plus size={15}/></IconButton></div>
-    <div className="timeline-tools"><LiveTimecode className="timeline-time mono" style={{ color: ownColor }} fps={project?.fps}/><div className="tool-group"><IconButton label="Selection tool (V)" className={tool==='select'&&!textTool&&!shapeTool?'active':''} onClick={()=>{setTool('select');useEditorStore.setState({textTool:false,shapeTool:null});}}><MousePointer2 size={15}/></IconButton><IconButton label="Blade tool (B)" className={tool==='blade'?'active':''} onClick={()=>{setTool('blade');useEditorStore.setState({textTool:false,shapeTool:null});}}><Scissors size={15}/></IconButton><IconButton label="Select forward tool (A)" className={forward?'active':''} onClick={()=>{setTool('forward');useEditorStore.setState({textTool:false,shapeTool:null});}}><ArrowRightToLine size={15}/></IconButton><IconButton label="Text tool (T)" className={textTool?'active':''} onClick={()=>useEditorStore.setState({textTool:!textTool,shapeTool:null,playing:false})}><Type size={15}/></IconButton><IconButton label="Shape tool (S)" className={shapeTool&&shapeTool!=='pen'?'active':''} onClick={()=>useEditorStore.setState({shapeTool:shapeTool==='rectangle'?null:'rectangle',textTool:false,playing:false})}><Shapes size={15}/></IconButton><IconButton label="Pen tool (P)" className={shapeTool==='pen'?'active':''} onClick={()=>useEditorStore.setState({shapeTool:shapeTool==='pen'?null:'pen',textTool:false,playing:false})}><PenTool size={15}/></IconButton><span className="tool-separator"/><IconButton label="Snapping (N)" className={snapping?'active':''} onClick={()=>setSnapping(!snapping)}><Magnet size={15}/></IconButton><IconButton title="Select and edit linked audio/video together" label="Linked selection" className={linked?'active':''} onClick={()=>{setLinked(!linked);actions().notify(linked?'Linked selection off':'Linked selection on','info');}}><Link2 size={15}/></IconButton><IconButton label="Add marker at playhead (M)" onClick={()=>actions().addMarker()}><Flag size={14}/></IconButton><button className="range-mark-button" title="Mark In (I)" aria-label="Mark In at playhead" onClick={()=>actions().setRange(actions().playhead,rangeOut)}>[</button><button className="range-mark-button" title="Mark Out (O)" aria-label="Mark Out at playhead" onClick={()=>actions().setRange(rangeIn,actions().playhead)}>]</button><span className="tool-separator"/><IconButton label="Undo my action (⌘Z)" onClick={()=>actions().undo()}><Undo2 size={15}/></IconButton></div><span className="spacer"/><span className={`timeline-hint ${crossing?'has-action':''}`}>{forward&&!dropDraft?(lineAt===null?'Click a clip or empty space to select everything after it':forwardDrag?`Move ${clipCount(drag.current!.ids.length)} to ${timecode(lineX!,fps)}`:<>{clipCount(forwardStarts.length)} from {timecode(lineAt,fps)}{crossing>0&&<> · {crossing} cross the line <button title="Split the clips that cross the line and select their right halves" onClick={()=>actions().cutThrough(lineAt)}>Cut through</button></>}</>):placement?`Place at ${timecode(placement.start,project?.fps)} · release to overwrite`:'Shift-click or drag to select · ruler to scrub'}</span><div className="timeline-zoom"><IconButton label="Zoom timeline out" onClick={()=>changeZoom(zoom/1.4)}><Minus size={13}/></IconButton><input aria-label="Timeline zoom" aria-valuetext={`${Math.round(usable/pixels*fps)} frames visible`} title="Pinch or Command-scroll to zoom around the playhead" type="range" min={Math.log2(Math.min(6,usable/Math.max(length,1))/6)} max={Math.log2(usable*fps/15/6)} step="0.02" value={Math.log2(zoom)} onChange={e=>changeZoom(2**Number(e.target.value))}/><IconButton label="Zoom timeline in" onClick={()=>changeZoom(zoom*1.4)}><Plus size={13}/></IconButton><button className="text-button mono" onClick={()=>changeZoom(usable/(length*6))}>Fit</button><button className="text-button mono" onClick={()=>changeZoom(usable*fps/60/6)}>60f</button><button className="text-button mono" onClick={()=>changeZoom(usable*fps/30/6)}>30f</button></div></div>
-    <div className="timeline-scroll" data-cursor-surface="timeline" ref={scrollRef} onScroll={e=>setViewport({left:e.currentTarget.scrollLeft,width:e.currentTarget.clientWidth})}>
+    <div className="timeline-tools"><LiveTimecode className="timeline-time mono" style={{ color: ownColor }} fps={project?.fps}/><div className="tool-group"><IconButton label="Selection tool (V)" className={tool==='select'&&!textTool&&!shapeTool?'active':''} onClick={()=>{setTool('select');useEditorStore.setState({textTool:false,shapeTool:null});}}><MousePointer2 size={15}/></IconButton><IconButton label="Blade tool (B)" className={tool==='blade'?'active':''} onClick={()=>{setTool('blade');useEditorStore.setState({textTool:false,shapeTool:null});}}><Scissors size={15}/></IconButton><IconButton label="Select forward tool (A)" className={forward?'active':''} onClick={()=>{setTool('forward');useEditorStore.setState({textTool:false,shapeTool:null});}}><ArrowRightToLine size={15}/></IconButton><IconButton label="Text tool (T)" className={textTool?'active':''} onClick={()=>useEditorStore.setState({textTool:!textTool,shapeTool:null,playing:false})}><Type size={15}/></IconButton><IconButton label="Shape tool (S)" className={shapeTool&&shapeTool!=='pen'?'active':''} onClick={()=>useEditorStore.setState({shapeTool:shapeTool==='rectangle'?null:'rectangle',textTool:false,playing:false})}><Shapes size={15}/></IconButton><IconButton label="Pen tool (P)" className={shapeTool==='pen'?'active':''} onClick={()=>useEditorStore.setState({shapeTool:shapeTool==='pen'?null:'pen',textTool:false,playing:false})}><PenTool size={15}/></IconButton><span className="tool-separator"/><IconButton label="Snapping (N)" className={snapping?'active':''} onClick={()=>setSnapping(!snapping)}><Magnet size={15}/></IconButton><IconButton title="Select and edit linked audio/video together" label="Linked selection" className={linked?'active':''} onClick={()=>{setLinked(!linked);actions().notify(linked?'Linked selection off':'Linked selection on','info');}}><Link2 size={15}/></IconButton><IconButton label="Add marker at playhead (M)" onClick={()=>actions().addMarker()}><Flag size={14}/></IconButton><button className="range-mark-button" title="Mark In (I)" aria-label="Mark In at playhead" onClick={()=>actions().setRange(actions().playhead,rangeOut)}>[</button><button className="range-mark-button" title="Mark Out (O)" aria-label="Mark Out at playhead" onClick={()=>actions().setRange(rangeIn,actions().playhead)}>]</button><span className="tool-separator"/><IconButton label="Undo my action (⌘Z)" onClick={()=>actions().undo()}><Undo2 size={15}/></IconButton></div><span className="spacer"/><span className={`timeline-hint ${crossing?'has-action':''}`}>{forward&&!dropDraft?(lineAt===null?'Click a clip or empty space to select everything after it':forwardDrag?`Move ${clipCount(drag.current!.ids.length)} to ${timecode(lineX!,fps)}`:<>{clipCount(forwardStarts.length)} from {timecode(lineAt,fps)}{crossing>0&&<> · {crossing} cross the line <button title="Split the clips that cross the line and select their right halves" onClick={()=>actions().cutThrough(lineAt)}>Cut through</button></>}</>):placement?`Place at ${timecode(placement.start,project?.fps)} · release to overwrite`:'Shift-click or drag to select · ruler to scrub'}</span><div className="timeline-zoom"><IconButton label="Zoom timeline out" onClick={()=>changeZoom(zoomTarget.current/1.4)}><Minus size={13}/></IconButton><input aria-label="Timeline zoom" aria-valuetext={`${Math.round(usable/pixels*fps)} frames visible`} title="Pinch or Command-scroll to zoom around the playhead" type="range" min={Math.log2(Math.min(6,usable/Math.max(length,1))/6)} max={Math.log2(usable*fps/15/6)} step="0.02" value={Math.log2(zoom)} onChange={e=>changeZoom(2**Number(e.target.value))}/><IconButton label="Zoom timeline in" onClick={()=>changeZoom(zoomTarget.current*1.4)}><Plus size={13}/></IconButton><button className="text-button mono" onClick={()=>changeZoom(usable/(length*6))}>Fit</button><button className="text-button mono" onClick={()=>changeZoom(usable*fps/60/6)}>60f</button><button className="text-button mono" onClick={()=>changeZoom(usable*fps/30/6)}>30f</button></div></div>
+    <div className="timeline-scroll" data-cursor-surface="timeline" ref={scrollRef} onScroll={e=>publishViewport(e.currentTarget)}>
       <div className="timeline-content" style={{minWidth:width+164}}>
         <div className="timeline-ruler-row"><div className="timeline-track-heading"><span>TRACKS</span><ChevronDown size={12}/></div><div className="timeline-ruler" data-cursor-anchor="ruler" data-time-span={width/pixels} style={{width}} onPointerDown={scrub} onPointerMove={scrubMove} onContextMenu={e=>{e.preventDefault();const r=e.currentTarget.getBoundingClientRect();setRulerMenu({x:e.clientX,y:e.clientY,time:Math.max(0,Math.round((e.clientX-r.left)/screenPixels()*fps)/fps)});}}>
           <div className="timeline-range" title="Marked export range" style={{left:rangeIn*pixels,width:(rangeOut-rangeIn)*pixels}}/>
-          <FootageRelay/><RenderBar pixels={pixels} audioOnly={audioOnly}/>
+          <FootageRelay/><RenderBar audioOnly={audioOnly} span={span} pixels={pixels}/>
           {Array.from({length:Math.max(0,lastTick-firstTick+1)},(_,index)=>{const i=index+firstTick;return <div key={i} className="ruler-tick major" style={{left:i*step*pixels}}><span className="mono">{timecode(i*step,fps)}</span></div>;})}
           <TimelineMarkers pixels={pixels} fps={fps} snapping={snapping} screenPixels={screenPixels} rulerMenu={rulerMenu} closeRulerMenu={()=>setRulerMenu(null)}/>
         </div></div>
@@ -501,21 +621,13 @@ function Timeline({ audioOnly = false }: { audioOnly?: boolean }) {
               {livePreviews.flatMap(person => (person.preview?.clips ?? []).filter(c => c.trackId === track.id).map(c => <div key={`remote-${person.userId}-${c.id}`} className="timeline-drop-ghost" data-remote-preview={c.id} style={{left:c.start*pixels,width:Math.max(12,c.duration*pixels),pointerEvents:'none'}}><span>{users.find(u=>u.id===person.userId)?.name} · {clips.find(clip=>clip.id===c.id)?.name}</span></div>))}
               {pendingSounds.filter(item=>item.trackId===track.id).map(item=><div key={item.id} className="timeline-drop-ghost" role="status" style={{left:item.start*pixels,width:Math.max(12,item.duration*pixels)}}><AudioLines size={12}/><span>{item.name}<small>Adding sound…</small></span></div>)}
               {gap?.trackId===track.id&&<div className="timeline-gap" aria-label="Selected gap; Delete to close" style={{left:gap.start*pixels,width:(gap.end-gap.start)*pixels}}/>}
-              {clips.filter(c=>c.trackId===track.id).flatMap(clip=>(!dragIds?.has(clip.id)&&clip.id!==draft?.id?(movePlacements.length?movePlacements.filter(c=>c.trackId===track.id):lanePlacement?.trackId===track.id?[lanePlacement]:[]).reduce<Clip[]>((parts,p)=>parts.flatMap(part=>uncoveredParts(part,p.start,p.start+p.duration)),[clip]):[clip]).map((part,index)=>({clip,part,index}))).map(({clip,part,index})=>{const asset=media.find(m=>m.id===clip.mediaId);const primary=clips.find(c=>c.id===draft?.id),partner=draft&&drag.current?.mode==='move'&&dragIds?.has(clip.id)&&clip.id!==draft.id||linked&&draft&&primary?.properties.linkGroup&&primary.properties.linkGroup===clip.properties.linkGroup;const position=draft?.id===clip.id?(draft.trackId&&draft.trackId!==clip.trackId?clip:draft):partner?{...part,start:clip.start+draft.start-primary!.start,duration:clip.duration+draft.duration-primary!.duration}:part;const predicted=movePlacements.find(c=>c.id===clip.id);const selected=selectedId===clip.id||selectedSet.has(clip.id);const linkedSelected=linked&&clip.properties.linkGroup&&clip.properties.linkGroup===clips.find(c=>c.id===selectedId)?.properties.linkGroup;const collaborator=users.find(u=>u.id===selectedBy[clip.id]);const owner=locks.find(l=>l.targetId===clip.id&&l.field==='manipulation');const color=selected||linkedSelected?ownColor:collaborator?.color;return <div key={`${clip.id}-${index}`} data-clip={clip.id} role="button" tabIndex={0} aria-label={`${clip.name}, ${timecode(clip.start)}, ${Math.round(clip.duration)} seconds`} aria-pressed={selected} className={`timeline-clip ${staleCaptions.has(String(clip.properties.captionSet))?'caption-stale':''} ${track.kind} ${selected?'selected':''} ${linkedSelected?'linked-selected':''} ${draft?.id===clip.id?'dragging':''} ${predicted&&predicted.trackId!==clip.trackId||draft?.id===clip.id&&draft.trackId&&draft.trackId!==clip.trackId?'drag-origin':''} ${isComposition(clip)?'composition-clip':''} ${isShape(clip)?'shape-clip':''} ${clip.disabled?'clip-disabled':''} ${owner?'owned':''} ${effectTarget===clip.id?'effect-drop-target':''}`} style={{left:(predicted&&predicted.trackId!==clip.trackId?clip.start:position.start)*pixels,width:Math.max(12,position.duration*pixels),'--clip-color':clip.color,'--selection-color':color??'transparent'} as CSSProperties} onDragOver={e=>{if(e.dataTransfer.types.includes('application/x-frameline-effect')){e.preventDefault();e.stopPropagation();e.dataTransfer.dropEffect=track.locked?'none':'copy';if(!track.locked)setEffectTarget(clip.id);}}} onDragLeave={()=>setEffectTarget(null)} onDrop={e=>{const name=e.dataTransfer.getData('application/x-frameline-effect');if(!name)return;e.preventDefault();e.stopPropagation();setEffectTarget(null);if(!track.locked&&acceptsEffect(clip,asset?.kind,name))actions().addEffect(clip.id,name);}} onPointerDown={e=>startDrag(e,clip,'move')} onPointerMove={moveDrag} onPointerUp={()=>finishDrag()} onPointerCancel={()=>finishDrag(true)} onLostPointerCapture={()=>{if(drag.current)finishDrag(true);}} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();e.stopPropagation();if(e.key==='Enter'&&isComposition(clip))actions().openComposition(clip.id);else actions().selectClip(clip.id);}if(e.key==='ArrowLeft'||e.key==='ArrowRight'){e.preventDefault();e.stopPropagation();actions().moveClip(clip.id,clip.start+(e.key==='ArrowRight'?1:-1)/(project?.fps||24));}}} onDoubleClick={e=>{e.stopPropagation();if(isComposition(clip))actions().openComposition(clip.id);}} onContextMenu={e=>{e.preventDefault();if(!actions().selectedClipIds.includes(clip.id))actions().selectClip(clip.id);setMenu({x:e.clientX,y:e.clientY,id:clip.id});}}>
-                {track.kind==='video'&&!isTitle(clip)&&!isShape(clip)&&!isComposition(clip)&&asset?.kind!=='audio'&&<ClipFilmstrip asset={asset} clip={clip} pixels={pixels}/>}
-                <div className="clip-label">{isTitle(clip)?<Type size={10}/>:isShape(clip)?<Shapes size={10}/>:isComposition(clip)?<Layers size={10}/>:track.kind==='audio'?<AudioLines size={10}/>:<Film size={10}/>}<span>{clip.name}</span>{clip.properties.linkGroup&&<Link2 size={10} aria-label="Linked audio/video"/>}{collaborator&&!selected&&<span className="clip-remote-name" style={{color:collaborator.color}}>{collaborator.name}</span>}{owner&&<span className="clip-activity" style={{background:users.find(u=>u.id===owner.userId)?.color}}/>}</div>
-                <ClipActivityBar clipId={clip.id} cacheable={!!asset&&asset.kind!=='image'&&!clip.disabled&&(track.kind==='video'?!track.hidden:!track.muted)}/>
-                {track.kind==='audio'&&<Waveform samples={asset?.waveform} from={clip.sourceIn/(asset?.duration||1)} to={(clip.sourceIn+clip.duration*Number(clip.properties.speed||100)/100)/(asset?.duration||1)} reverse={Boolean(clip.properties.reverse)}/>}
-                {Object.keys(clip.keyframes??{}).length>0&&<KeyframeLanes inline clips={[clip]} pixels={pixels} width={clip.duration*pixels} visibleStart={0} visibleEnd={clip.duration*pixels}/>}
-                <ClipFades clip={clip} audio={track.kind==='audio'} pixels={pixels} fps={fps}/>
-<div className="trim-handle trim-left" title="Trim start" onPointerDown={e=>startDrag(e,clip,'left')}/><div className="trim-handle trim-right" title="Trim end" onPointerDown={e=>startDrag(e,clip,'right')}/>
-              </div>;})}
+              <div className="clip-layer" style={{width:span*pixels}}><TrackClips settled={!draft&&!dropDraft&&!lanePlacement&&!movePlacements.length} track={track} clips={clipsByTrack.get(track.id)??noClips} assets={assetById} draft={draft} primary={primary} dragIds={dragIds} dragMode={drag.current?.mode} movePlacements={movePlacements} lanePlacement={lanePlacement} selectedId={selectedId} selectedIds={selectedIds} selectedLink={selectedClip?.properties.linkGroup} selectedBy={selectedBy} users={users} locks={locks} ownColor={ownColor} staleKey={staleKey} staleCaptions={staleCaptions} effectTarget={effectTarget} linked={linked} fps={fps} span={span} tilePixels={tilePixels} nearFrom={nearFrom} nearTo={nearTo} keyframePixels={keyedTracks.has(track.id)?pixels:0} pixels={pixelsRef} cb={clipCallbacks}/></div>
               {movePlacements.filter(c=>c.id!==draft?.id&&c.trackId===track.id&&c.trackId!==clips.find(original=>original.id===c.id)?.trackId).map(c=><div key={`ghost-${c.id}`} className="timeline-drop-ghost" aria-label={`Place ${c.name} at ${timecode(c.start,project?.fps)}`} style={{left:c.start*pixels,width:Math.max(12,c.duration*pixels)}}><Layers size={12}/><span>{c.name}<small>{timecode(c.start,project?.fps)}</small></span></div>)}
               {lanePlacement&&lanePlacement.trackId===track.id&&(dropDraft||draft?.trackId&&draft.trackId!==moved?.trackId)&&<div className="timeline-drop-ghost" aria-label={`Place ${lanePlacement.name} at ${timecode(lanePlacement.start,project?.fps)}`} style={{left:lanePlacement.start*pixels,width:Math.max(12,lanePlacement.duration*pixels)}}>{track.kind==='audio'?<AudioLines size={12}/>:draggingMediaId?.startsWith('title:')||moved&&isTitle(moved)?<Type size={12}/>:<Film size={12}/>}<span>{lanePlacement.name}<small>{timecode(lanePlacement.start,project?.fps)} · {lanePlacement.duration.toFixed(2)}s</small></span></div>}
               {track.kind==='video'&&<TransitionChips trackId={track.id} timelineId={timelineId} pixels={pixels}/>}
               {cutTarget?.trackId===track.id&&<div className={`transition-chip ghost ${cutTarget.fits?'':'clamped'}`} style={{left:cutTarget.start*pixels,width:Math.max(10,cutTarget.duration*pixels)}} aria-hidden="true"><span className="transition-chip-bowtie"/><span className="transition-chip-label">{cutTarget.fits?cutTarget.name:'No handles'}</span></div>}
             </div>
-          </div>{expandedTracks.includes(track.id)&&<KeyframeLanes clips={clips.filter(c=>c.trackId===track.id)} pixels={pixels} width={width} visibleStart={Math.max(0,viewport.left-164)} visibleEnd={Math.min(width,viewport.left+viewport.width-164)}/>}</Fragment>;})}
+          </div>{expandedTracks.includes(track.id)&&<KeyframeLanes clips={clips.filter(c=>c.trackId===track.id)} pixels={pixels} width={width} visibleStart={Math.max(0,viewLeft-164)} visibleEnd={Math.min(width,viewLeft+viewport.width-164)}/>}</Fragment>;})}
           {snapLine!==undefined&&<div className="timeline-snap-line" aria-hidden="true" style={{left:164,transform:`translateX(${snapLine*pixels}px)`}}/>}
           {forward&&lineX!==null&&<div className="timeline-forward-line" aria-hidden="true" style={{left:164,transform:`translateX(${lineX*pixels}px)`,'--user-color':ownColor} as CSSProperties}/>}
           <TimelinePlayheads pixels={pixels} color={ownColor} scrub={scrub} scrubMove={scrubMove} scroller={scrollRef}/>

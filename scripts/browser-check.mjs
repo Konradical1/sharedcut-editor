@@ -230,7 +230,7 @@ try {
 
 
   for(let i=0;i<8;i++)await page.getByRole('button',{name:'Zoom timeline in',exact:true}).click();
-  const overwriteLane=page.locator('.timeline-clip').first().locator('..');
+  const overwriteLane=page.locator('.track-lane').filter({has:page.locator('.timeline-clip')}).first();
   const zoomedPixels=await page.locator('.timeline-ruler').evaluate(el=>el.getBoundingClientRect().width/Number(el.dataset.timeSpan));
   await page.locator('.media-asset').first().dragTo(overwriteLane,{targetPosition:{x:10*zoomedPixels,y:20}});
   await page.waitForFunction(()=>document.querySelectorAll('.timeline-clip').length===4);

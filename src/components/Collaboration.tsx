@@ -59,11 +59,13 @@ export function RemoteCursors() {
   const showCursors = useEditorStore(s => s.settings.showCursors !== false);
   const layer = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    let pointer: { x: number; y: number } | null = null, frame = 0, hitDue = false, hitAt = 0, remoteAt = 0, shown = false;
+    let pointer: { x: number; y: number } | null = null, frame = 0, hitDue = false, hitAt = 0, scrollAt = -1e9, remoteAt = 0, shown = false;
     const motions = new WeakMap<HTMLElement, { context: string; layout: string; value: CursorMotion }>();
     const preference = window.matchMedia('(prefers-reduced-motion: reduce)');
     const move = (e: globalThis.PointerEvent) => { pointer = { x: e.clientX, y: e.clientY }; hitDue = true; };
     const stale = () => { hitDue = true; };
+    // A scroll or zoom gesture fires every frame; hit-testing every one of them forced a layout per frame, so it runs at 10 Hz meanwhile.
+    const scrolled = () => { hitDue = true; scrollAt = performance.now(); };
     const clear = () => { pointer = null; useEditorStore.setState({ cursor: null }); };
     const leave = (e: globalThis.PointerEvent) => { if (!e.relatedTarget) clear(); };
     // elementFromPoint forces a layout and hit-tests every timeline element. The answer only changes when the pointer or
@@ -84,7 +86,8 @@ export function RemoteCursors() {
     const draw = () => {
       const now = performance.now(), paints: (() => void)[] = [];
       const state = useEditorStore.getState(), wait = state.playing ? CURSOR_PLAYING_MS : 0;
-      if (pointer && (hitDue && now - hitAt >= wait || !state.playing && now - hitAt >= CURSOR_REFRESH_MS)) { hitDue = false; hitAt = now; hitTest(state); }
+      const hitWait = state.playing ? wait : now - scrollAt < 200 ? 100 : 0;
+      if (pointer && (hitDue && now - hitAt >= hitWait || !state.playing && now - hitAt >= CURSOR_REFRESH_MS)) { hitDue = false; hitAt = now; hitTest(state); }
       // Alone in the project there is nothing to place; one more pass after the last collaborator leaves hides them.
       const remote = state.presence.some(p => p.online && p.userId !== state.currentUserId && p.projectId === state.projectId);
       const container = (remote || shown) && now - remoteAt >= wait ? layer.current : null;
@@ -140,12 +143,12 @@ export function RemoteCursors() {
     document.addEventListener('pointermove', move);
     document.addEventListener('pointerout', leave);
     document.addEventListener('visibilitychange', clear);
-    document.addEventListener('scroll', stale, { capture: true, passive: true });
+    document.addEventListener('scroll', scrolled, { capture: true, passive: true });
     window.addEventListener('resize', stale);
     window.addEventListener('blur', clear);
     frame = requestAnimationFrame(draw);
     return () => { cancelAnimationFrame(frame); document.removeEventListener('pointermove', move); document.removeEventListener('pointerout', leave);
-      document.removeEventListener('visibilitychange', clear); document.removeEventListener('scroll', stale, { capture: true }); window.removeEventListener('resize', stale);
+      document.removeEventListener('visibilitychange', clear); document.removeEventListener('scroll', scrolled, { capture: true }); window.removeEventListener('resize', stale);
       window.removeEventListener('blur', clear); clear(); };
   }, []);
   return <div className="remote-cursor-layer" ref={layer} aria-hidden="true">{showCursors && users.filter(user => user.id !== currentUserId).map(user => {
