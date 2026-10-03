@@ -11,7 +11,11 @@ export function uncoveredParts(clip: Clip, start: number, end: number): Clip[] {
     // behind puts an invisible clip on the track that still counts as the neighbour at the cut, so
     // transitions there find no handles. 1/120s is under one frame at every rate we support.
     .filter(([a, b]) => b - a > 1 / 120)
-    .map(([a, b]) => ({ ...clip, start: a, duration: b - a, sourceIn: clip.sourceIn + (clip.properties.freeze ? 0 : (clip.properties.reverse ? clipEnd - b : a - clip.start) * Number(clip.properties.speed || 100) / 100), ...trimAnimation(clip,a,b-a) }));
+    .map(([a, b]) => clipPart(clip, a, b));
+}
+/** The part of a clip between timeline times `a` and `b`, showing the same source frames there. */
+export function clipPart(clip: Clip, a: number, b: number): Clip {
+  return { ...clip, start: a, duration: b - a, sourceIn: clip.sourceIn + (clip.properties.freeze ? 0 : (clip.properties.reverse ? clip.start + clip.duration - b : a - clip.start) * Number(clip.properties.speed || 100) / 100), ...trimAnimation(clip, a, b - a) };
 }
 
 export function timelineZoom(pixels: number, viewport: number, duration: number, fps: number) {

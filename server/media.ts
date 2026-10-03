@@ -18,7 +18,7 @@ import { effectDefinitions, effectValue, effectEnabled, loudnessTarget } from '.
 import { eqBiquads } from '../src/services/audioDsp.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
 import { blendModeOf } from '../src/services/blendModes.ts';
-import { uncoveredParts } from '../src/services/timeline.ts';
+import { clipPart, uncoveredParts } from '../src/services/timeline.ts';
 import { isLeakMedia, leakRange, leakIdOf, motionGap, motionSamples, timelineTransitions, transitionDefinitions, type TransitionRecord } from '../src/services/transitions.ts';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -746,7 +746,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&c.mediaId==='frameline-composition'&&!c.disabled))return renderCompositions(request);
   if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c)))return renderStabilizedTimeline(request);
   if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&c.properties.opticalFlow))return renderFlowTimeline(request);
-  if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&depthEffect(c)))return renderDepthTimeline(request);
+  if(!request.sampledFrame&&depthClips(request).length)return renderDepthTimeline(request);
   // Animated titles and shapes (a title attached to a motion track, say) are drawn frame by frame into one movie,
   // as the preview draws them, instead of rendering the whole timeline once per frame.
   if(!request.sampledFrame&&animationWork(request).some(streamableGraphic)) {
@@ -1375,9 +1375,21 @@ function depthEffect(clip: Clip) {
     return (Number(effect.amount) > 0 || keyed.includes(`effects.${effect.id}.amount`)) && DEPTH_SECTIONS.some(key => effectValue(clip, effect, key) > 0 || keyed.includes(`effects.${effect.id}.parameters.${key}`));
   });
 }
+const exportRange = (request: RenderRequest) => ({ rangeIn: Number(request.settings.rangeIn) || 0, rangeOut: Number(request.settings.rangeOut ?? request.timeline.duration) || request.timeline.duration });
+/** The Depth clips this render shows: on a visible video track, reaching into the range (with their transitions).
+ *  One on a hidden track or outside the range is left alone; there Depth draws nothing and has no sound. */
+function depthClips(request: RenderRequest) {
+  const own = request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && depthEffect(c));
+  if (!own.length) return own;
+  const records = timelineTransitions(request.clips.filter(c => c.projectId === request.project.id), request.timeline.id, request.assets.map(a => a.asset)), { rangeIn, rangeOut } = exportRange(request);
+  return own.filter(clip => {
+    const track = request.tracks.find(t => t.id === clip.trackId), span = clipSpan(clip, records);
+    return track?.kind === 'video' && !track.hidden && span.start < rangeOut - 1e-6 && span.end > rangeIn + 1e-6;
+  });
+}
 /** Refused by name before anything is decoded or baked. */
 function rejectDepth(request: RenderRequest) {
-  for (const clip of request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && depthEffect(c))) {
+  for (const clip of depthClips(request)) {
     if (clip.mediaId === 'frameline-composition' || clip.properties.compositionId || isTitle(clip) || isShape(clip) || isCaption(clip)) throw new Error(`${clip.name}: Depth works on video and image clips, not on compositions or titles. Remove Depth from this clip.`);
     if (clip.properties.opticalFlow) throw new Error(`${clip.name}: Depth and optical flow cannot share a clip yet; it needs warped depth. Disable optical flow or remove Depth.`);
     if (clip.effects.filter(e => depthOn(clip, e)).length > 1) throw new Error(`${clip.name}: a clip takes one Depth effect. Remove the extra one.`);
@@ -1398,9 +1410,18 @@ async function renderDepthTimeline(request: RenderRequest) {
     let nodes = request.nodes;
     const fps = finite(request.settings.fps || request.project.fps, 'Frame rate', 1, 120);
     const records = timelineTransitions(clips.filter(c => c.projectId === request.project.id), request.timeline.id, assets.map(a => a.asset));
-    const candidates = clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && depthEffect(c));
+    const candidates = depthClips(request), { rangeIn, rangeOut } = exportRange(request);
     const python = process.env.FRAME_LINE_DEPTH_PYTHON || venvPython('.venv-mask'), script = fileURLToPath(new URL('../scripts/depth-fx.py', import.meta.url));
-    for (const [index, clip] of candidates.entries()) {
+    for (const [index, whole] of candidates.entries()) {
+      // Bake only what this render shows (a 4 s timeline preview, an In/Out export): the range, widened to the clip's
+      // transitions that reach into it. The parts outside stay on the timeline as they were, unrendered, so the
+      // neighbours keep their cuts and handles; neither side of the new cuts takes a transition.
+      let lo = rangeIn, hi = rangeOut;
+      for (const record of records) if ((record.outgoingId === whole.id || record.incomingId === whole.id) && record.start < hi && record.end > lo) { lo = Math.min(lo, record.start); hi = Math.max(hi, record.end); }
+      const end = whole.start + whole.duration, from = lo - whole.start > 1 / 120 ? lo : whole.start, to = end - hi > 1 / 120 ? hi : end;
+      const clip: Clip = from === whole.start && to === end ? whole : { ...clipPart(whole, from, to), transition: from === whole.start ? whole.transition : '' };
+      if (to !== end) clip.properties = { ...clip.properties, transitionOut: '' };
+      const outside = uncoveredParts(whole, from, to).filter(part => part !== whole).map((part, i) => ({ ...part, id: `${whole.id}-outside-${i}`, transition: part.start === whole.start ? whole.transition : '', properties: { ...part.properties, transitionOut: part.start === whole.start ? '' : whole.properties.transitionOut, audioDetached: true } }));
       const effect = depthEffect(clip)!, at = clip.effects.indexOf(effect), before = clip.effects.slice(0, at).filter(e => e.name !== 'Stabilize');
       const source = assets.find(a => a.asset.id === clip.mediaId), track = tracks.find(t => t.id === clip.trackId);
       if (!source || !['video', 'image'].includes(source.asset.kind) || !track) throw new Error(`${clip.name}: Depth needs a video or image source.`);
@@ -1414,7 +1435,8 @@ async function renderDepthTimeline(request: RenderRequest) {
       if (width < 16 || height < 16 || width % 2 || height % 2 || width > 4096 || height > 4096) throw new Error(`${clip.name}: Depth export needs an even source size up to 4096 pixels; this source is ${width} × ${height}.`);
       const original = request.stabilized?.get(clip.id), offset = original?.offset ?? 0, originalAsset = original?.source.asset ?? source.asset;
       const sourceFps = image ? fps : source.asset.fps || metadata.fps;
-      const span = clipSpan(clip, records), geo = extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start));
+      const handles = clipSpan(whole, records), span = { start: from === whole.start ? handles.start : from, end: to === end ? handles.end : to };
+      const geo = extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start));
       const range = image ? { from: 0, to: 1 } : stabilizeRange(geo, sourceFps, source.asset.duration);
       const report = (fraction: number) => request.onProgress?.((index + Math.max(0, Math.min(1, fraction))) / candidates.length * 45);
       request.onStage?.(`Analyzing depth · ${clip.name}`);
@@ -1488,20 +1510,21 @@ async function renderDepthTimeline(request: RenderRequest) {
       const replacement: Clip = { ...clip, mediaId, sourceIn: image ? clip.sourceIn : clip.sourceIn - origin, effects: clip.effects.slice(at + 1),
         keyframes: Object.fromEntries(Object.entries(clip.keyframes ?? {}).filter(([key]) => !key.startsWith('nodes.') && !dropped.some(id => key.startsWith(`effects.${id}.`)))),
         properties: { ...Object.fromEntries(Object.entries(clip.properties).filter(([key]) => !['colorPipeline', 'inputProfile', 'inputGamut', 'inputExposure', 'inputTemperature', 'resolveLookUrl', 'bypassResolveLook', 'yuvMatrix', 'dataLevels'].includes(key))), audioDetached: true } };
-      clips[clips.indexOf(clip)] = replacement;
+      clips[clips.indexOf(whole)] = replacement;
+      clips.push(...outside);
       nodes = nodes.filter(node => node.clipId !== clip.id);
       // Mattes below Depth now read the bake, whose clock starts `origin` later than the media it replaced.
       for (const document of activeSmartMasks(replacement, [])) {
         if (!request.smartMaskDir) break;
-        const key = `${clip.id}:${document.id}`, artifact: { directory: string; manifest: SmartMaskManifest; offset?: number } = maskArtifacts.get(key) ?? resolveSmartMaskArtifact(request.smartMaskDir, clip, document, source.path, source.asset);
+        const key = `${clip.id}:${document.id}`, artifact: { directory: string; manifest: SmartMaskManifest; offset?: number } = maskArtifacts.get(key) ?? resolveSmartMaskArtifact(request.smartMaskDir, whole, document, source.path, source.asset);
         maskArtifacts.set(key, { ...artifact, offset: (artifact.offset ?? 0) + origin });
       }
-      const explicitAudio = request.clips.some(other => other.id !== clip.id && tracks.find(t => t.id === other.trackId)?.kind === 'audio' && other.mediaId === clip.mediaId && other.start === clip.start && other.sourceIn === clip.sourceIn && other.duration === clip.duration);
-      if (source.asset.hasAudio && !clip.properties.audioDetached && !explicitAudio && request.settings.audio !== 'Disabled') {
-        const audioId = `depth-audio-${clip.id}`;
+      const explicitAudio = request.clips.some(other => other.id !== whole.id && tracks.find(t => t.id === other.trackId)?.kind === 'audio' && other.mediaId === whole.mediaId && other.start === whole.start && other.sourceIn === whole.sourceIn && other.duration === whole.duration);
+      if (source.asset.hasAudio && !whole.properties.audioDetached && !explicitAudio && request.settings.audio !== 'Disabled') {
+        const audioId = `depth-audio-${whole.id}`;
         tracks.push({ ...track, id: audioId, kind: 'audio' });
-        // The original carries the sound; the bake is picture only.
-        clips.push({ ...clip, id: audioId, trackId: audioId, transition: '', properties: { ...clip.properties, transitionOut: '', audioDetached: false }, keyframes: Object.fromEntries(Object.entries(clip.keyframes ?? {}).filter(([key]) => timingPaths.includes(key) || /^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(key) || key.startsWith('effects.'))), effects: clip.effects.filter(e => ['EQ', 'Compressor', 'Limiter', 'Noise Reduction'].includes(e.name)) });
+        // The original, whole clip carries the sound; the bake is picture only.
+        clips.push({ ...whole, id: audioId, trackId: audioId, transition: '', properties: { ...whole.properties, transitionOut: '', audioDetached: false }, keyframes: Object.fromEntries(Object.entries(whole.keyframes ?? {}).filter(([key]) => timingPaths.includes(key) || /^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(key) || key.startsWith('effects.'))), effects: whole.effects.filter(e => ['EQ', 'Compressor', 'Limiter', 'Noise Reduction'].includes(e.name)) });
       }
     }
     await renderTimeline({ ...request, clips, assets, tracks, nodes, maskArtifacts, onProgress: p => request.onProgress?.(45 + p * .55) });

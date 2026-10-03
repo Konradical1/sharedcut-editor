@@ -137,6 +137,38 @@ test('a Smart Mask above Depth keeps the picture and its depth on the same frame
   } finally { await f.close(); }
 });
 
+// A timeline preview is a 4 s range of the whole project: it baked every Depth clip whole, hidden ones included.
+test('only the Depth this render shows is analysed and baked, and only over the range', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
+  const f = fixture('range');
+  try {
+    // Hidden, or outside the range: Depth draws nothing there, so no analysis is needed and nothing fails.
+    await renderTimeline(f.request([f.clip], 2, { tracks: [{ ...f.track, hidden: true }], depth: undefined }));
+    const early = f.request([{ ...f.clip, duration: 1 }], 2, { depth: undefined });
+    await renderTimeline({ ...early, settings: { ...early.settings, rangeIn: '1.2' } });
+    // A range inside the clip bakes that range alone, on the right frames.
+    const asked: { from: number; to: number }[] = [], request = f.request([f.clip], 2, { depth: { ready: (job, signal, progress) => { asked.push(job); return f.depth.ready(job, signal, progress); } } });
+    await renderTimeline({ ...request, settings: { ...request.settings, rangeIn: '1', rangeOut: '1.6' } });
+    assert.equal(asked.length, 1);
+    assert.ok(asked[0].from >= .95 && asked[0].to <= 1.7, `analysed ${asked[0].from}..${asked[0].to} s for a 1..1.6 s range`);
+    for (const time of [0, .3, .56]) {
+      const at = await luma(request.outputPath, time), cut = boundary(at), expected = 60 + 4 * Math.round((1 + time) * FPS);
+      assert.ok(Math.abs(cut - expected) <= 1, `at ${time} s the picture is source frame ${Math.round((1 + time) * FPS)} (edge at ${expected}): ${cut}`);
+      assert.ok(detail(at, cut - 12, cut - 2) > 12 && detail(at, cut + 3, cut + 13) < 4, `at ${time} s the depth edge sits on the picture's`);
+    }
+  } finally { await f.close(); }
+});
+
+test('a Depth switched on by a keyframe is baked', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
+  const f = fixture('keyed-on');
+  try {
+    const clip = { ...f.clip, effects: [{ ...f.clip.effects[0], enabled: false }], keyframes: { 'effects.depth.enabled': [{ id: 'on', time: 0, value: true, interpolation: 'hold' as const }] } };
+    const request = f.request([clip], 2);
+    await renderTimeline(request);
+    const at = await luma(request.outputPath, 1), cut = boundary(at), source = await luma(f.source, 1);
+    assert.ok(detail(at, cut + 12, 300) < .3 * detail(source, cut + 12, 300), `far is blurred: ${detail(at, cut + 12, 300)} of ${detail(source, cut + 12, 300)}`);
+  } finally { await f.close(); }
+});
+
 test('cancelling a Depth export stops the bake and removes its files', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
   const f = fixture('cancel'), scratch = path.join(f.dir, 'tmp'), previous = process.env.TMPDIR;
   mkdirSync(scratch);
