@@ -6,7 +6,12 @@ export type SmartMaskSource = { mediaId: string; fps: number; width: number; hei
 /** Source seconds, normalized source coordinates, radius as a fraction of the shorter source dimension. */
 export type SmartMaskPrompt = { id: string; time: number; kind: 'include' | 'exclude'; points: SmartMaskPoint[]; radius: number };
 export type SmartMaskRepair = Omit<SmartMaskPrompt, 'kind'> & { kind: 'foreground' | 'background' | 'unknown' };
-export type SmartMaskBinding = { id: string; enabled: boolean; invert: boolean; amount: number };
+export type SmartMaskBinding = { source?: undefined; id: string; enabled: boolean; invert: boolean; amount: number };
+/** A grade node keyed by the clip's own depth analysis instead of a subject: distances 0 (nearest) to 100 (farthest).
+ *  The key is 1 inside [near, far] and eases to 0 over `softness` beyond each end (depthKeyAlpha in depth.ts). */
+export type DepthKeyBinding = { source: 'depth'; enabled: boolean; invert: boolean; amount: number; near: number; far: number; softness: number };
+/** One mask per node: a Smart Mask subject or a depth key. */
+export type NodeMask = SmartMaskBinding | DepthKeyBinding;
 export type SmartMaskDocument = {
   version: 1; id: string; name: string; source: SmartMaskSource;
   range: { start: number; end: number };
@@ -63,14 +68,23 @@ export function validateSmartMask(value: unknown): asserts value is SmartMaskDoc
 export function validateSmartMaskBinding(value:unknown): asserts value is SmartMaskBinding {
   if(!object(value)||!validId(value.id)||typeof value.enabled!=='boolean'||typeof value.invert!=='boolean'||!number(value.amount,0,100))throw Error('Invalid node mask binding.');
 }
+export const isDepthKey=(mask:NodeMask|undefined):mask is DepthKeyBinding=>mask?.source==='depth';
+export function validateNodeMask(value:unknown): asserts value is NodeMask {
+  if(!object(value)||value.source!=='depth'){validateSmartMaskBinding(value);return;}
+  if(Object.keys(value).some(k=>!['source','enabled','invert','amount','near','far','softness'].includes(k))||typeof value.enabled!=='boolean'||typeof value.invert!=='boolean'||!number(value.amount,0,100)||!number(value.near,0,100)||!number(value.far,Number(value.near),100)||!number(value.softness,0,100))throw Error('Invalid depth key.');
+}
+/** The key a node's matte goes by in preview and export: the subject's id, or `depth:<node>` (a subject id has no colon). */
+export const nodeMaskId=(node:Pick<GradeNode,'id'|'mask'>)=>isDepthKey(node.mask)?`depth:${node.id}`:node.mask?.id;
+/** The clip's enabled nodes whose depth key changes the picture: these need its depth analysis. */
+export const activeDepthKeys=(clip:Pick<Clip,'id'>,nodes:GradeNode[])=>nodes.filter((n):n is GradeNode&{mask:DepthKeyBinding}=>n.clipId===clip.id&&n.enabled&&isDepthKey(n.mask)&&n.mask.enabled&&n.mask.amount>0);
 export function validateSmartMaskBindings(clip:Clip,nodes:GradeNode[]) {
   if(clip.smartMasks!==undefined&&(!Array.isArray(clip.smartMasks)||clip.smartMasks.length>32))throw Error('Too many smart masks on a clip.');
   const ids=new Set<string>();
   for(const mask of clip.smartMasks??[]){validateSmartMask(mask);if(mask.source.mediaId!==clip.mediaId||ids.has(mask.id))throw Error('Smart mask source does not match its clip.');ids.add(mask.id);}
   for(const effect of clip.effects)if(effect.maskId!==undefined){if(effect.name!=='Smart Mask'||!ids.has(effect.maskId))throw Error('Effect references a missing smart mask.');}
   for(const node of nodes.filter(n=>n.clipId===clip.id))if(node.mask!==undefined){
-    validateSmartMaskBinding(node.mask);
-    if(!ids.has(node.mask.id))throw Error('Node references a missing smart mask.');
+    validateNodeMask(node.mask);
+    if(!isDepthKey(node.mask)&&!ids.has(node.mask.id))throw Error('Node references a missing smart mask.');
     if(node.mask.enabled&&node.effects?.some(e=>e.enabled&&e.type==='cst'))throw Error('Keep color-space transforms on an unmasked node.');
   }
 }

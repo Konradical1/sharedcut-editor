@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { DEPTH_SEGMENT, depthAnalysisSize, depthDistance, depthFrameAt, depthRange, depthSegmentFor, depthValue } from './depth.ts';
+import { DEPTH_SEGMENT, depthAnalysisSize, depthDistance, depthFrameAt, depthKeyAlpha, depthKeyTable, depthRange, depthSegmentFor, depthValue } from './depth.ts';
+import { activeDepthKeys, nodeMaskId, validateNodeMask, validateSmartMaskBindings, type DepthKeyBinding } from './smartMask.ts';
+import type { Clip, GradeNode } from '../state/models.ts';
 
 test('analysis size: short side 518, multiples of 14, narrower beyond 16:9', () => {
   assert.deepEqual(depthAnalysisSize(1920, 1080), { width: 924, height: 518 });
@@ -68,4 +70,39 @@ test('presets: six named looks, every value a real Depth parameter inside its ra
   assert.ok(pop.bgExposure < 0 && pop.bgWarmth < 0 && pop.blur > 0 && pop.blur <= 25, 'Subject pop: background darker and cooler, slight blur');
   const mini = depthPresets.find(p => p.name === 'Miniature')!.values;
   assert.ok(mini.nearBlur === 100 && mini.range <= 10 && mini.blur >= 50, 'Miniature: a thin focus slice, both sides blurred');
+});
+
+test('depth key: 1 inside [near, far], smooth edges of width softness outside it, and the same table for preview and export', () => {
+  const key = { near: 40, far: 70, softness: 10 };
+  for (const d of [40, 55, 70]) assert.equal(depthKeyAlpha(key, d), 1);
+  for (const d of [0, 30, 80, 100]) assert.equal(depthKeyAlpha(key, d), 0);
+  assert.equal(depthKeyAlpha(key, 35), .5);
+  assert.equal(depthKeyAlpha(key, 75), .5);
+  assert.ok(depthKeyAlpha(key, 32) < depthKeyAlpha(key, 34) && depthKeyAlpha(key, 76) > depthKeyAlpha(key, 78), 'edges ramp monotonically');
+  // The ends of the scale key everything; softness 0 is a hard edge.
+  for (const d of [0, 50, 100]) assert.equal(depthKeyAlpha({ near: 0, far: 100, softness: 25 }, d), 1);
+  assert.deepEqual([49.9, 50, 70, 70.1].map(d => depthKeyAlpha({ near: 50, far: 70, softness: 0 }, d)), [0, 1, 1, 0]);
+  // Stored value 0.8 is distance 0 and 0.2 is 100; codes follow v = code / (levels - 1), clamped outside the run.
+  const run = { near: .8, far: .2 }, far = { near: 50, far: 100, softness: 5 }, eight = depthKeyTable(run, far, 256), ten = depthKeyTable(run, far, 1024);
+  assert.equal(eight.length, 256); assert.equal(ten.length, 1024);
+  assert.equal(eight[255], 0); assert.equal(eight[0], 1); assert.equal(ten[Math.round(.2 * 1023)], 1);
+  assert.equal(ten[Math.round(.5 * 1023)], Math.fround(depthKeyAlpha(far, depthDistance(run, Math.round(.5 * 1023) / 1023))));
+  // Both tables sample the one key function; they differ only by the depth codes they are read at.
+  for (let code = 0; code < 256; code++) assert.equal(eight[code], Math.fround(depthKeyAlpha(far, depthDistance(run, code / 255))), `code ${code}`);
+});
+
+test('depth key binding: validated at the boundary, keyed by node, active only when it changes the picture', () => {
+  const mask: DepthKeyBinding = { source: 'depth', enabled: true, invert: false, amount: 100, near: 50, far: 100, softness: 10 };
+  validateNodeMask(mask);
+  for (const bad of [{ ...mask, far: 40 }, { ...mask, near: -1 }, { ...mask, softness: 101 }, { ...mask, amount: Number.NaN }, { ...mask, id: 'subject' }, { ...mask, enabled: 'yes' }])
+    assert.throws(() => validateNodeMask(bad), /Invalid depth key/);
+  validateNodeMask({ id: 'subject', enabled: true, invert: false, amount: 100 });
+  const clip = { id: 'clip', mediaId: 'media', effects: [], properties: {} } as unknown as Clip;
+  const node = { id: 'n1', clipId: 'clip', enabled: true, mask } as GradeNode;
+  // A depth key needs no subject on the clip, unlike a Smart Mask binding; a CST still has to stay unmasked.
+  validateSmartMaskBindings(clip, [node]);
+  assert.throws(() => validateSmartMaskBindings(clip, [{ ...node, mask: { id: 'missing', enabled: true, invert: false, amount: 100 } }]), /missing smart mask/);
+  assert.throws(() => validateSmartMaskBindings(clip, [{ ...node, effects: [{ id: 'cst', type: 'cst', enabled: true } as never] }]), /color-space/);
+  assert.equal(nodeMaskId(node), 'depth:n1');
+  assert.deepEqual(activeDepthKeys(clip, [node, { ...node, id: 'off', enabled: false }, { ...node, id: 'zero', mask: { ...mask, amount: 0 } }, { ...node, id: 'other', clipId: 'x' }]).map(n => n.id), ['n1']);
 });

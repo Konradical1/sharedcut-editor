@@ -1,4 +1,4 @@
-import { createSmartMask, validateSmartMask, smartMaskSignature, type SmartMaskDocument } from '../services/smartMask.ts';
+import { createSmartMask, isDepthKey, validateSmartMask, smartMaskSignature, type SmartMaskDocument } from '../services/smartMask.ts';
 import { createMotionTracker, MAX_TRACKERS, validateMotionTracker, type MotionTracker, type MotionTrackerLink } from '../services/motionTracker.ts';
 import { starterGrade, primaryDefaults, interpretation, validateGradeNode, acesOutputUpgrade } from '../services/color.ts';
 import { eligibility, proposedNodes, type AssistantMode, type BalanceValues, type LookOption, type ShotNote } from '../services/colorAssistant.ts';
@@ -1434,7 +1434,8 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const masks=sameSource?structuredClone(source.clip.smartMasks??[]):[];
       const maskIds=new Map(masks.map(mask=>[mask.id,createId('mask')]));
       for(const mask of masks)mask.id=maskIds.get(mask.id)!;
-      for(const node of nodes)if(node.mask){const id=maskIds.get(node.mask.id);if(id)node.mask={...node.mask,id};else delete node.mask;}
+      // A depth key reads the target's own analysis, so it travels with the grade; a subject belongs to its source.
+      for(const node of nodes)if(node.mask&&!isDepthKey(node.mask)){const id=maskIds.get(node.mask.id);if(id)node.mask={...node.mask,id};else delete node.mask;}
       const value:Record<string,unknown>={...(masks.length?{smartMasks:[...(clip.smartMasks??[]),...masks]}:{}),keyframes:{...Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>!isGrade(path))),...copy.keyframes}};
       const unset:string[]=[];
       for(const key of fields){if(source.clip.properties[key]===undefined)unset.push(`properties.${key}`);else value[`properties.${key}`]=source.clip.properties[key];}
@@ -1513,7 +1514,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       try{validateGradeNode({...node,...patch});}catch(error){get().notify((error as Error).message,'error');return;}
       const value: Record<string, unknown> = {};
       const unset='mask' in patch&&!patch.mask?['mask']:[];
-      if(patch.mask){if(!get().clips.find(c=>c.id===node.clipId)?.smartMasks?.some(m=>m.id===patch.mask!.id))return;value.mask=patch.mask;}
+      if(patch.mask){const mask=patch.mask;if(!isDepthKey(mask)&&!get().clips.find(c=>c.id===node.clipId)?.smartMasks?.some(m=>m.id===mask.id))return;value.mask=mask;}
       if(patch.position)value.position=patch.position;
       if(patch.curves)value.curves=patch.curves;
       if(patch.effects)value.effects=patch.effects;

@@ -4,6 +4,7 @@ import type {GradeNode} from '../state/models';
 import {useStoreWithoutPlayhead} from '../state/store';
 import {IconButton,Button} from '../components/ui';
 import {createId} from '../services';
+import {isDepthKey} from '../services/smartMask';
 export function ColorNodes({nodes,clipId,selected,thumbnail,onAdd,onEffect,toolbar}:{nodes:GradeNode[];clipId?:string;selected?:string;thumbnail:string;toolbar?:ReactNode;onAdd:()=>void;onEffect:(id:string,type:string)=>void}){
   const s=useStoreWithoutPlayhead(),view=useRef<HTMLDivElement>(null),[viewport,setViewport]=useState({zoom:.85,pan:{x:0,y:0}}),[moving,setMoving]=useState<{id:string;x:number;y:number}|null>(null),[context,setContext]=useState<{id:string;x:number;y:number}|null>(null),[insert,setInsert]=useState<string|null|undefined>(undefined);
   const clip=s.clips.find(c=>c.id===clipId),look=clip?.properties.resolveLookUrl;
@@ -36,7 +37,7 @@ export function ColorNodes({nodes,clipId,selected,thumbnail,onAdd,onEffect,toolb
           onPointerDown={e=>{e.stopPropagation();start(e,n.id);}} onClick={()=>s.selectNode(n.id)} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();e.stopPropagation();s.selectNode(n.id);}}}
           onContextMenu={e=>{e.preventDefault();s.selectNode(n.id);const box=view.current!.getBoundingClientRect();setContext({id:n.id,x:Math.min(e.clientX-box.left,box.width-170),y:Math.min(e.clientY-box.top,box.height-140)});}}
           onDragOver={e=>{if((e.dataTransfer.types.includes('application/frameline-color-effect')||e.dataTransfer.types.includes('application/x-frameline-effect'))){e.preventDefault();e.currentTarget.classList.add('effect-drop');}}} onDragLeave={e=>e.currentTarget.classList.remove('effect-drop')} onDrop={e=>{e.preventDefault();e.currentTarget.classList.remove('effect-drop');onEffect(n.id,e.dataTransfer.getData('application/x-frameline-effect')==='Smart Mask'?'smart-mask':e.dataTransfer.getData('application/frameline-color-effect'));}}>
-          <span className="node-port input"/><div className="node-top"><span>{String(i+1).padStart(2,'0')}</span><span className="node-type">{n.mask?.enabled?'MASK':n.effects?.some(e=>e.type==='cst')?'CST':n.effects?.some(e=>e.type==='lut')?'LUT':'CORRECTOR'}</span><i className="node-led"/></div><div className="node-thumbnail" style={thumbnail?{backgroundImage:`url(${JSON.stringify(thumbnail)})`}:undefined}/><span className="node-title">{n.name}</span><span className="node-port output"/>{!n.enabled&&<span className="bypass-label">Bypassed</span>}
+          <span className="node-port input"/><div className="node-top"><span>{String(i+1).padStart(2,'0')}</span><span className="node-type">{n.mask?.enabled?isDepthKey(n.mask)?'DEPTH':'MASK':n.effects?.some(e=>e.type==='cst')?'CST':n.effects?.some(e=>e.type==='lut')?'LUT':'CORRECTOR'}</span><i className="node-led"/></div><div className="node-thumbnail" style={thumbnail?{backgroundImage:`url(${JSON.stringify(thumbnail)})`}:undefined}/><span className="node-title">{n.name}</span><span className="node-port output"/>{!n.enabled&&<span className="bypass-label">Bypassed</span>}
         </div>;})}
         <span className="graph-terminal" style={{left:(nodes.length?position(nodes.at(-1)!,nodes.length-1).x:60)+190,top:(nodes.length?position(nodes.at(-1)!,nodes.length-1).y:80)+33}}>OUT</span>
       </div>
