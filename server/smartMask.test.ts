@@ -222,4 +222,15 @@ test('clip-bound manifest rejects changed input interpretation while historical 
     const historical = await request(path);
     assert.equal(historical.status, 200); assert.match(historical.headers.get('cache-control')!, /immutable/);
   } finally { await app.close(); rmSync(f.directory, { recursive: true, force: true }); }
+    // Depth's focus track is measured for the analysis the editor names, not for whichever subject is saved when the
+    // poll lands: here the Depth has moved on to another mask, and a poll still out for the first must measure the first.
+    state = (await request('/state')).data;
+    state.state.clips[0].smartMasks = [f.mask, { ...f.mask, id: 'other', name: 'Other subject', result: { key: 'b'.repeat(64), signature: f.signature } }];
+    state.state.clips[0].effects = [{ id: 'depth', name: 'Depth', enabled: true, amount: 100, parameters: { blur: 50, followSubject: 1 }, maskId: 'other' }];
+    assert.equal((await request('/state', 'PUT', state)).status, 200);
+    const focus = (maskKey: string) => request(`/depth/${'c'.repeat(64)}/focus?projectId=project&clipId=clip&maskKey=${maskKey}`);
+    const named = await focus(f.key);
+    assert.equal(named.status, 404, `the named mask resolves, and only the depth run is missing: ${named.data.error}`);
+    assert.match((await focus('b'.repeat(64))).data.error, /Other subject/);
+    assert.match((await focus('d'.repeat(64))).data.error, /no longer on the clip/);
 });

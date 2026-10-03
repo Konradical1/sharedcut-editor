@@ -183,7 +183,8 @@ export function depthFocusTrack(clip: Pick<Clip, 'id' | 'projectId'>, maskKey: s
       try {
         // The server reads the subject from the saved workspace: one picked a moment ago may not be there yet.
         await connection.flush();
-        const value = await api<DepthFocusTrack | { status: 'processing' }>(`/depth/${run.key}/focus?projectId=${encodeURIComponent(clip.projectId)}&clipId=${encodeURIComponent(clip.id)}`, { signal });
+        // Named by its analysis key: the server measures that mask, never whichever subject is saved when this poll lands.
+        const value = await api<DepthFocusTrack | { status: 'processing' }>(`/depth/${run.key}/focus?projectId=${encodeURIComponent(clip.projectId)}&clipId=${encodeURIComponent(clip.id)}&maskKey=${encodeURIComponent(maskKey)}`, { signal });
         if (signal.aborted) return;
         if (value.status === 'ready') { entry.value = { state: 'ready', track: value }; changed(); return; }
       } catch (error) {

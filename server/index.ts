@@ -1360,10 +1360,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (depthRoute) {
           const projectId = textField(url.searchParams.get('projectId'), 160, true); requireProject(projectId, userId, method === 'DELETE');
           if (depthRoute[3] && method === 'GET') {
-            // Focus follows subject for one clip: its Depth's subject mask, as the export resolves it (current analysis only).
+            // Focus follows subject for one clip: the analysis the editor names (maskKey) of one of the clip's masks, resolved as
+            // the export resolves it. Named, not "the current subject": a poll for subject A must never come back with B's track.
             const clip = state.clips.find(item => item.id === url.searchParams.get('clipId') && item.projectId === projectId) ?? fail(404, 'Clip not found.');
-            const effect = clip.effects.find(item => item.name === 'Depth' && item.maskId);
-            const mask = clip.smartMasks?.find(item => item.id === effect?.maskId) ?? fail(409, 'This Depth effect has no subject.');
+            const maskKey = textField(url.searchParams.get('maskKey'), 64, true);
+            const mask = clip.smartMasks?.find(item => item.result?.key === maskKey) ?? fail(409, 'This subject mask is no longer on the clip, or was analyzed again.');
             const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === projectId) ?? fail(404, 'Media not found.');
             if (!existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
             const subject = resolveSmartMaskArtifact(join(dataDir, 'smart-masks'), clip, mask, originalPath(asset.id), asset);
