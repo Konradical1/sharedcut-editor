@@ -1,6 +1,7 @@
 // Isolated copy of a real project; the live database and camera originals are never edited.
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,symlink,readFile,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
+import {copyFolder,linkMediaFolder} from './media-copy.mjs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -25,7 +26,7 @@ try{
  const clip={...structuredClone(original),start:0,duration:3,keyframes:{},properties:{...original.properties,zoom:100,x:0,y:0,opacity:100}};
  Object.assign(state,{projects:[project],media:[asset],clips:[clip],tracks:live.tracks.filter(t=>t.timelineId===clip.timelineId),timelines:live.timelines.filter(t=>t.id===clip.timelineId).map(t=>({...t,duration:3})),nodes:live.nodes.filter(n=>n.clipId===clip.id),comments:[],operations:[],snapshots:[],renderJobs:[],settings:{...state.settings,performanceMode:'On'}});
  db.prepare('insert into workspace(id,revision,state) values(1,1,?) on conflict(id) do update set state=excluded.state').run(JSON.stringify(state));db.close();
- await mkdir(join(temp,'media'));await symlink(resolve('data/media',asset.id),join(temp,'media',asset.id));await mkdir(join(temp,'resolve'));await symlink(resolve('data/resolve',project.id),join(temp,'resolve',project.id));
+ await linkMediaFolder(resolve('data/media',asset.id),join(temp,'media',asset.id));await copyFolder(resolve('data/resolve',project.id),join(temp,'resolve',project.id));
  app=createFrameLineServer({dataDir:temp,distDir:resolve('dist')});await listen();
  const saved=async()=> (await(await context.request.get(url+'/api/state')).json()).state;
  const settled=()=>page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');

@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import {execFile} from 'node:child_process';
 import {promisify} from 'node:util';
 const run=promisify(execFile);
-import {mkdtemp,readFile,rm,symlink,mkdir,writeFile,copyFile,cp} from 'node:fs/promises';
+import {mkdtemp,readFile,rm,mkdir,writeFile,copyFile,cp} from 'node:fs/promises';
+import {copyFolder,linkMediaFolder} from './media-copy.mjs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -21,8 +22,8 @@ try {
   state.projects=[imported.project];for(const k of ['media','timelines','tracks','clips','nodes'])state[k]=imported[k];
   db.prepare('insert into workspace(id,revision,state) values(1,1,?) on conflict(id) do update set state=excluded.state').run(JSON.stringify(state));db.close();
   await mkdir(join(temp,'media'));await mkdir(join(temp,'resolve'));
-  for(const asset of imported.media)await symlink(join(sourceData,'media',asset.id),join(temp,'media',asset.id));
-  await symlink(join(sourceData,'resolve',imported.project.id),join(temp,'resolve',imported.project.id));
+  for(const asset of imported.media)await linkMediaFolder(join(sourceData,'media',asset.id),join(temp,'media',asset.id));
+  await copyFolder(join(sourceData,'resolve',imported.project.id),join(temp,'resolve',imported.project.id));
   app=createFrameLineServer({dataDir:temp,distDir:join(temp,'dist')});await listen();
   // Cookies are host scoped and survive a change of localhost port.
   const page=await a.newPage(),second=await b.newPage();const errors=[];page.on('pageerror',e=>errors.push(e.message));

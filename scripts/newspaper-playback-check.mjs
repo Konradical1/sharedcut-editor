@@ -59,8 +59,9 @@ try {
     const deadline = Date.now() + 180000;
     for (;;) {
       const current = (await (await context.request.get(apiUrl + '/api/state')).json()).state;
-      if (current.media.filter(m => m.kind === 'video').every(m => m.proxyVariants?.StreamLow)) break;
-      assert.ok(Date.now() < deadline, 'Existing imports must acquire smaller preview streams.');
+      // Storage v3: older imports are migrated one at a time at startup; wait for every opaque video's stream-low-v2.
+      if (current.media.filter(m => m.kind === 'video').every(m => m.hasAlpha ? m.proxyVariants?.StreamLow : m.proxyVariants?.StreamLow?.includes('/stream-low-v2.mp4'))) break;
+      assert.ok(Date.now() < deadline, 'Existing imports must be migrated to the v3 preview set.');
       await new Promise(r => setTimeout(r, 500));
     }
   }

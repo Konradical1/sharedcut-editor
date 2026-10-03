@@ -1,14 +1,15 @@
 // Read-only diagnosis of camera/proxy decoding using the real GPU renderer.
 import {DatabaseSync} from 'node:sqlite';
 import {readWorkspace} from './workspace-db.mjs';
-import {mkdir,writeFile,symlink} from 'node:fs/promises';
+import {mkdir,writeFile,link,copyFile,constants} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {createServer} from 'vite';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
 const db=new DatabaseSync('data/frameline.sqlite',{readOnly:true});
 const state=readWorkspace(db).state;db.close();
 const out=resolve(process.env.COLOR_CHECK_OUT||'artifacts/qa/color-reference/baseline');await mkdir(out,{recursive:true});
-for(const asset of state.media.filter(m=>['C0852.MP4','C0363.MP4'].includes(m.name)))await symlink(resolve('data/media',asset.id,'original'),resolve(out,asset.id+'.mp4')).catch(e=>{if(e.code!=='EEXIST')throw e;});
+// Hard links (copies across volumes), never symlinks: Windows needs elevation for those.
+for(const asset of state.media.filter(m=>['C0852.MP4','C0363.MP4'].includes(m.name)))await link(resolve('data/media',asset.id,'original'),resolve(out,asset.id+'.mp4')).catch(e=>e.code==='EEXIST'?undefined:copyFile(resolve('data/media',asset.id,'original'),resolve(out,asset.id+'.mp4'),constants.COPYFILE_FICLONE));
 const server=await createServer({server:{port:0,host:'127.0.0.1'}});await server.listen();
 const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH});
 try {
@@ -17,7 +18,7 @@ try {
  for(const name of (process.env.COLOR_CHECK_SKY?['C0363.MP4']:process.env.COLOR_CHECK_PRECISION?['C0852.MP4']:['C0852.MP4','C0363.MP4'])){
   const asset=state.media.find(m=>m.name===name),clip=state.clips.find(c=>c.mediaId===asset.id&&c.properties.colorPipeline),nodes=structuredClone(state.nodes.filter(n=>n.clipId===clip.id));
   for(const n of nodes)for(const e of n.effects??[])if(e.type==='cst'&&['shoulder','aces2'].includes(e.toneMapping)){e.toneMapping=process.env.COLOR_CHECK_ACES?'aces2':'shoulder';e.gamutMapping=process.env.COLOR_CHECK_ACES?'none':'compress';}
-  for(const file of (process.env.COLOR_CHECK_PRECISION?['precision']:['original','prepared/color-v1.mp4','prepared/proxy.mp4']))for(const time of process.env.COLOR_CHECK_SKY?[.1,2]:name==='C0852.MP4'?[1,4,6]:[6,8,10]){
+  for(const file of (process.env.COLOR_CHECK_PRECISION?['precision']:['original','prepared/full-v3.mp4','prepared/stream-v2.mp4']))for(const time of process.env.COLOR_CHECK_SKY?[.1,2]:name==='C0852.MP4'?[1,4,6]:[6,8,10]){
    const result=await page.evaluate(async({asset,clip,nodes,file,time,outRelative})=>{
     const {createColorPreview,ColorPending}=await import('/src/services/colorPreview.ts');
     const video=document.createElement('video');video.muted=true;video.src=file==='precision'?'/artifacts/qa/color-reference/baseline/precision-h264.mp4':file==='original'?'/'+outRelative+'/'+asset.id+'.mp4':'/data/media/'+asset.id+'/'+file;

@@ -1,7 +1,8 @@
 // Real imported media, isolated accounts/database; never edits the live project.
 // PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs node scripts/playback-browser-check.mjs [data] [report.json]
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, rm, symlink, writeFile, readdir, cp, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, symlink, writeFile, cp, realpath } from 'node:fs/promises';
+import { copyFolder, linkMediaFolder } from './media-copy.mjs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -35,27 +36,24 @@ try {
   for (const k of ['media', 'timelines', 'tracks', 'clips', 'nodes']) state[k] = imported[k];
   db.prepare('UPDATE workspace SET state=?, revision=revision+1 WHERE id=1').run(JSON.stringify(state)); db.close();
   await mkdir(join(temp, 'media'), { recursive: true }); await mkdir(join(temp, 'resolve'), { recursive: true });
-  for (const asset of imported.media) {
-    const original = join(sourceData, 'media', asset.id), local = join(temp, 'media', asset.id);
-    await mkdir(join(local, 'prepared'), { recursive: true });
-    await symlink(join(original, 'original'), join(local, 'original'));
-    for (const file of await readdir(join(original, 'prepared'))) if (!file.startsWith('.')) await symlink(join(original, 'prepared', file), join(local, 'prepared', file));
-  }
-  await symlink(join(sourceData, 'resolve', project.id), join(temp, 'resolve', project.id));
+  for (const asset of imported.media) await linkMediaFolder(join(sourceData, 'media', asset.id), join(temp, 'media', asset.id));
+  await copyFolder(join(sourceData, 'resolve', project.id), join(temp, 'resolve', project.id));
   app = createFrameLineServer({ dataDir: temp, distDir: join(temp, 'dist') }); apiUrl = await listen();
   if (process.env.QA_BASELINE !== '1') {
     const deadline = Date.now() + 180000;
     for (;;) {
       const current = (await (await context.request.get(apiUrl + '/api/state')).json()).state;
-      if (current.media.filter(m => m.kind === 'video').every(m => m.proxyVariants)) break;
-      assert.ok(Date.now() < deadline, 'Existing imports must acquire smaller preview streams.');
+      // Storage v3: older imports are migrated one at a time at startup; wait for every opaque video's 480 px stream.
+      if (current.media.filter(m => m.kind === 'video').every(m => m.hasAlpha ? m.proxyVariants : m.proxyVariants?.['1/4']?.includes('/stream-low-v2.mp4'))) break;
+      assert.ok(Date.now() < deadline, 'Existing imports must be migrated to the v3 preview set.');
       await new Promise(r => setTimeout(r, 500));
     }
   }
   // A stable UI snapshot keeps concurrent workspace edits/HMR out of measured frame times.
   const ui = join(temp, 'ui'); await mkdir(ui);
   for (const file of ['src', 'index.html', 'package.json']) await cp(resolve(file), join(ui, file), { recursive: true });
-  await symlink(resolve('node_modules'), join(ui, 'node_modules'));
+  // A junction on Windows needs no elevation; the type is ignored elsewhere.
+  await symlink(resolve('node_modules'), join(ui, 'node_modules'), 'junction');
   vite = await createServer({ root: ui, configFile: resolve('vite.config.ts'), server: { port: 0, host: '127.0.0.1', fs: { allow: [ui, resolve('.')] }, proxy: { '/api': apiUrl } } }); await vite.listen();
   const page = await context.newPage(), errors = [];
   const cdp = await context.newCDPSession(page);
@@ -158,7 +156,7 @@ try {
   if (fatal.length < errors.length) console.warn('Ignored transient dev-proxy errors:', errors.length - fatal.length);
   assert.deepEqual(fatal, []);
   if (process.env.QA_BASELINE !== '1') for (const r of results) {
-    if (r.quality === '1/4') assert.ok(r.media.filter(m => m.tag === 'VIDEO').every(m => m.width <= 480 && m.url === 'proxy-quarter-v1.mp4'), 'Quarter quality must reduce decoding, not just canvas size.');
+    if (r.quality === '1/4') assert.ok(r.media.filter(m => m.tag === 'VIDEO').every(m => m.width <= 480 && m.url.split('?')[0] === 'stream-low-v2.mp4'), 'Quarter quality must reduce decoding, not just canvas size.');
     assert.ok(r.playback.fps > 20, 'Display real decoded frames near the 23.976 fps source rate.');
     assert.ok(r.playback.maxGapMs < 250, 'Playback must not freeze at cuts.');
     assert.ok(r.scrub.fps > 20, 'Scrubbing must keep delivering new pictures.');
