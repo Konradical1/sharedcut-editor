@@ -535,6 +535,23 @@ test('Depth subject: picks one of the clip\'s Smart Masks or none, undoably, and
   for (const e of clip().effects.filter(e => e.name === 'Depth' || e.name === 'Smart Mask')) state().updateEffect('c3', e.id, null);
 });
 
+// A5: a Smart Mask picked as the Depth subject used to need a Smart Mask effect, which cut the clip out.
+test('Depth: New subject adds a mask the Depth effect names, with no cutout, in one undo', () => {
+  state().addEffect('c3', 'Depth');
+  const depth = () => clip().effects.find(e => e.name === 'Depth')!, masks = clip().smartMasks?.length ?? 0, cutouts = () => clip().effects.filter(e => e.name === 'Smart Mask').length;
+  const id = state().addSmartMask('c3', depth().id);
+  assert.ok(id);
+  assert.equal(clip().smartMasks!.length, masks + 1);
+  assert.equal(depth().maskId, id);
+  assert.equal(cutouts(), 0, 'the clip is not cut out');
+  state().undo();
+  assert.equal(clip().smartMasks?.length ?? 0, masks);
+  assert.equal('maskId' in depth(), false, 'one undo removes the mask and the subject');
+  assert.equal(state().addSmartMask('c3', 'not-a-target'), undefined, 'an unknown target adds nothing');
+  assert.equal(clip().smartMasks?.length ?? 0, masks);
+  state().updateEffect('c3', depth().id, null);
+});
+
 test('a color-wheel gesture undoes together without replacing another parameter',()=>{
   state().selectClip('c3');state().addNode('Wheel',{liftR:0,liftG:0,contrast:1});const id=state().selectedNodeId!;
   state().updateNode(id,{parameters:{liftR:.05,liftG:.02}},'wheel-drag');

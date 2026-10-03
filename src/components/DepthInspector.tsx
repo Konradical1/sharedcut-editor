@@ -1,5 +1,5 @@
 import { useEffect, useState, useSyncExternalStore, type RefObject } from 'react';
-import { Crosshair, Layers, RotateCw, Trash2 } from 'lucide-react';
+import { Crosshair, Layers, PenTool, Plus, RotateCw, Trash2 } from 'lucide-react';
 import { useEditorStore } from '../state/store';
 import type { Clip, Effect } from '../state/models';
 import type { DepthKeyBinding } from '../services/smartMask';
@@ -9,6 +9,7 @@ import { effectDefinitions } from '../services/effects';
 import { depthPresets, type DepthCapabilities } from '../services/depth';
 import { depthAtCanvas, depthAtSource, depthClipReady, depthFocusTrack, depthState, depthUi, depthVersion, retryDepth, subscribeDepth } from '../services/depthPreview';
 import { smartMaskSignature } from '../services/smartMask';
+import { openMaskEditor } from '../services/smartMaskClient';
 import { Property, Section } from './Inspector';
 import './depth.css';
 
@@ -54,9 +55,8 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
   const masks = clip.smartMasks ?? [], subject = masks.find(m => m.id === effect.maskId), following = Number(effect.parameters?.followSubject ?? 0) >= .5;
   const current = !!subject?.result && subject.result.signature === smartMaskSignature(subject);
   const follow = subject && current && following ? depthFocusTrack(clip, subject.result!.key) : undefined;
-  const subjectNote = !masks.length ? 'Add a Smart Mask to this clip to pick a subject.'
-    : !subject ? undefined
-    : !subject.result ? 'Analyze the subject mask: until then its edges are not protected.'
+  const subjectNote = !subject ? (asset?.kind === 'video' ? 'New subject draws a mask that Lens blur keeps sharp. It does not cut the clip out.' : undefined)
+    : !subject.result ? 'Select the subject, then Analyze: until then its edges are not protected.'
     : !current ? 'The subject mask changed since its analysis. Analyze it again.'
     : !following ? 'Lens blur keeps the subject sharp and off the background.'
     : follow?.state === 'failed' ? follow.error
@@ -69,6 +69,10 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
     <Property effectId={effect.id} name="amount" label="Mix" initial={100} min={0} max={100} suffix="%"/>
     <div className="depth-subject">
       <label className="inspector-select-row"><span>Subject</span><select aria-label="Depth subject" value={subject?.id ?? ''} disabled={!masks.length} onChange={e => s().attachSmartMask(clip.id, e.target.value, effect.id)}><option value="">None</option>{masks.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</select></label>
+      {asset?.kind === 'video' && <div className="depth-subject-actions">
+        <button className="depth-pick" onClick={() => { const id = s().addSmartMask(clip.id, effect.id); if (id) openMaskEditor(clip.id, id); }}><Plus size={12}/>New subject</button>
+        {subject && <button className="depth-pick" onClick={() => openMaskEditor(clip.id, subject.id)}><PenTool size={12}/>Refine subject</button>}
+      </div>}
       {subject && <label className="inspector-checks"><input type="checkbox" aria-label="Follow subject" checked={following} onChange={e => s().updateEffect(clip.id, effect.id, { parameters: { followSubject: e.target.checked ? 1 : 0 } })}/>Follow subject <span className="depth-hint">focus stays on it</span></label>}
       {subjectNote && <p className="depth-hint depth-subject-note">{subjectNote}</p>}
     </div>

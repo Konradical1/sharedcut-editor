@@ -137,6 +137,22 @@ test('Depth: the map fills in, Lens blur softens only the far region, the focus 
   for (let i = 0; i < 100 && (blurredNear = await probe(page, near)).detail > sharpNear.detail * .35; i++) await page.waitForTimeout(100);
   assert.ok(blurredNear.detail < sharpNear.detail * .35, `focused far, the near box blurs: ${blurredNear.detail.toFixed(2)}`);
 
+  // New subject: a mask the Depth effect alone uses, opened in the mask editor. Unanalysed, it leaves the picture as it was;
+  // it never cuts the clip out the way a Smart Mask effect would.
+  const unprotected = await probe(page, far);
+  await page.getByRole('button', { name: 'New subject', exact: true }).click();
+  await page.getByRole('button', { name: 'Close mask editor' }).waitFor();
+  let made = (await server()).state.clips.find(c => c.id === 'shot')!;
+  for (let i = 0; i < 50 && !made.smartMasks?.length; i++) { await page.waitForTimeout(100); made = (await server()).state.clips.find(c => c.id === 'shot')!; }
+  assert.equal(made.smartMasks?.length, 1, 'New subject saves a mask');
+  assert.equal(made.effects.find(e => e.name === 'Depth')!.maskId, made.smartMasks![0].id, 'and names it the subject');
+  assert.ok(!made.effects.some(e => e.name === 'Smart Mask'), 'without a Smart Mask cutout');
+  await page.getByRole('button', { name: 'Close mask editor' }).click();
+  await page.locator('.depth-subject-note', { hasText: 'Analyze' }).waitFor();
+  await page.waitForTimeout(500);
+  const shown = (await probe(page, far)).mean;
+  assert.ok(shown.every((v, c) => Math.abs(v - unprotected.mean[c]) <= 4), `the surround still shows: ${unprotected.mean} → ${shown}`);
+
   // Subject: an analysed Smart Mask on the near box. Its analysis is written as the mask worker would (no SAM here), which
   // the server reads at start, so the clip is saved with the subject, the server restarted on the same data, the page reloaded.
   const before = await server(), shot = before.state.clips.find(c => c.id === 'shot')!, source = before.state.media[0], key = 'a'.repeat(64), frames = 72;

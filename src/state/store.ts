@@ -101,7 +101,8 @@ export interface EditorStore extends PersistedState {
   removeTransition(clipId: string, side: TransitionSide): void;
   expandTransitionAudio(clipId: string, side: TransitionSide): void;
   applyTransitionAtPlayhead(name?: string, params?: TransitionParams): void;
-  addSmartMask(clipId:string,nodeId?:string):void;
+  /** `targetId` names a grade node or a Depth effect to take the new mask (no cutout either way); without one it adds a Smart Mask cutout effect. Returns the new mask's id. */
+  addSmartMask(clipId:string,targetId?:string):string|undefined;
   updateSmartMask(clipId:string,maskId:string,patch:Partial<SmartMaskDocument>,gesture?:string):void;
   attachSmartMask(clipId:string,maskId:string,targetId:string):void;
   addMotionTracker(clipId:string,at?:{x:number;y:number;time:number}):string|undefined;
@@ -1284,19 +1285,23 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (!best) { state.notify('No cut near the playhead', 'info'); return; }
       get().addTransition(best.id, best.side, chosen, params ? { params } : undefined);
     },
-    addSmartMask(clipId,nodeId) {
+    addSmartMask(clipId,targetId) {
       const state=get(),clip=editableClip(clipId,'smartMasks'),asset=state.media.find(m=>m.id===clip?.mediaId);
       if(!clip||!asset||asset.kind!=='video')return;
-      const node=nodeId?state.nodes.find(n=>n.id===nodeId&&n.clipId===clipId):undefined;
-      if(nodeId&&(!node||!editableClip(clipId,'grade')||!available(nodeId,'*')))return;
-      if(!nodeId&&!editableClip(clipId,'effects'))return;
+      const node=targetId?state.nodes.find(n=>n.id===targetId&&n.clipId===clipId):undefined,depth=targetId&&!node?clip.effects.find(e=>e.id===targetId&&e.name==='Depth'):undefined;
+      if(targetId&&!node&&!depth)return;
+      if(node&&(!editableClip(clipId,'grade')||!available(node.id,'*')))return;
+      if(!node&&!editableClip(clipId,'effects'))return;
       if((clip.smartMasks?.length??0)>=32){state.notify('A clip supports up to 32 subject masks','info');return;}
       if(node?.effects?.some(e=>e.enabled&&e.type==='cst')){state.notify('Use a correction node without color-space transforms for a mask','info');return;}
       const mask=createSmartMask(clip,asset,createId('mask'));
-      const changes:Change[]=[{collection:'clips',id:clipId,value:{smartMasks:[...(clip.smartMasks??[]),mask],...(!nodeId?{effects:[...clip.effects,{id:createId('effect'),name:'Smart Mask',enabled:true,amount:100,maskId:mask.id}]}:{})}}];
+      // A Depth subject, like a node's mask, is a document its user names: only a plain Smart Mask adds the cutout effect.
+      const effects=node?undefined:depth?clip.effects.map(e=>e.id===depth.id?{...e,maskId:mask.id}:e):[...clip.effects,{id:createId('effect'),name:'Smart Mask',enabled:true,amount:100,maskId:mask.id}];
+      const changes:Change[]=[{collection:'clips',id:clipId,value:{smartMasks:[...(clip.smartMasks??[]),mask],...(effects?{effects}:{})}}];
       if(node)changes.push({collection:'nodes',id:node.id,value:{mask:{id:mask.id,enabled:true,invert:false,amount:100}}});
-      commit('EffectAdded',clipId,`added Smart Mask to ${node?.name??clip.name}`,changes);
+      commit('EffectAdded',clipId,depth?`added a Depth subject to ${clip.name}`:`added Smart Mask to ${node?.name??clip.name}`,changes);
       set({selectedClipId:clipId,...(node?{selectedNodeId:node.id}:{sidePanel:'inspector' as const,inspectorTab:'Effects'})});
+      return mask.id;
     },
     updateSmartMask(clipId,maskId,patch,gesture) {
       const clip=editableClip(clipId,'smartMasks'),original=clip?.smartMasks?.find(m=>m.id===maskId);if(!clip||!original)return;
