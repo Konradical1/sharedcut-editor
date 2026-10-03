@@ -1330,7 +1330,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (path === '/api/depth/capabilities' && method === 'GET') { const { workerIdentity, ...capabilities } = await depthCapabilities(); send(res, 200, capabilities); return; }
         if (path === '/api/depth' && method === 'POST') {
           const body = await jsonBody(req), clip = state.clips.find(item => item.id === textField(body.clipId, 160, true) && (body.projectId === undefined || item.projectId === body.projectId)) ?? fail(404, 'Clip not found.');
-          requireProject(clip.projectId, userId, true);
+          // Every member's viewer asks; only an editor's request may start a run, the rest join one.
+          const editor = ['Owner', 'Editor'].includes(roleFor(requireProject(clip.projectId, userId), userId) ?? '');
           const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId);
           if (!asset || !['video', 'image'].includes(asset.kind)) fail(400, 'Depth works on video and image clips.');
           if (!existsSync(originalPath(asset!.id))) fail(409, 'Depth reads the original media, which is not on this server.');
@@ -1339,13 +1340,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const span = clipSpan(clip, records), geometry = extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start));
           let range = { from: 0, to: 1 };
           if (asset!.kind === 'video') { try { range = stabilizeRange(geometry, asset!.fps, asset!.duration); } catch (error) { fail(400, (error as Error).message); } }
-          const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: originalPath(asset!.id), ...range });
+          const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: originalPath(asset!.id), ...range, joinOnly: !editor });
           send(res, run.status === 'ready' ? 200 : 202, run); return;
         }
         const depthRoute = /^\/api\/depth\/([a-f0-9]{64})(?:\/preview\/(\d+)\.mp4)?$/.exec(path);
         if (depthRoute) {
           const projectId = textField(url.searchParams.get('projectId'), 160, true); requireProject(projectId, userId, method === 'DELETE');
-          if (!depthRoute[2] && method === 'GET') { send(res, 200, depth.get(projectId, depthRoute[1], Number(url.searchParams.get('after') ?? 0))); return; }
+          if (!depthRoute[2] && method === 'GET') { send(res, 200, depth.get(projectId, depthRoute[1], Number(url.searchParams.get('after') ?? 0), url.searchParams.get('times') !== '0')); return; }
           if (!depthRoute[2] && method === 'DELETE') { depth.cancel(projectId, depthRoute[1]); send(res, 200, { ok: true }); return; }
           if (depthRoute[2] && ['GET', 'HEAD'].includes(method)) { streamFile(req, res, depth.preview(projectId, depthRoute[1], Number(depthRoute[2])), 'video/mp4', undefined, true); return; }
         }

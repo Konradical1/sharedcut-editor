@@ -61,6 +61,9 @@ test('two clips of one take share a run; a ready run covering the range is reuse
     await until(() => service.get('project', first.key).status === 'ready');
     const split = await service.enqueue({ clip: clip('b'), asset, sourcePath: f.source, from: 5, to: 7 });
     assert.equal(split.key, first.key); assert.equal(split.status, 'ready');
+    // A viewer or reviewer joins a covering run but never starts one.
+    assert.equal((await service.enqueue({ clip: clip('v'), asset, sourcePath: f.source, from: 5, to: 7, joinOnly: true })).key, first.key);
+    await assert.rejects(service.enqueue({ clip: clip('v'), asset, sourcePath: f.source, from: 15, to: 16, joinOnly: true }), (error: Error & { status?: number }) => error.status === 409 && /editor/.test(error.message));
     const later = await service.enqueue({ clip: clip('c'), asset, sourcePath: f.source, from: 15, to: 18 });
     assert.notEqual(later.key, first.key);
     await until(() => service.get('project', later.key).status === 'ready');
@@ -83,6 +86,7 @@ test('segments are served once recorded, by cursor, and only to projects bound t
     const running = service.get('project', job.key);
     assert.deepEqual(Object.keys(running).sort(), ['far', 'first', 'frames', 'height', 'hi', 'key', 'lo', 'mediaId', 'near', 'next', 'progress', 'segments', 'status', 'times', 'width'], 'nothing server-side (projects, base, used, bytes) leaks');
     assert.equal(service.get('project', job.key, 99).times.length, 128, 'a cursor past the end is from an earlier run of the key and starts over');
+    assert.deepEqual(service.get('project', job.key, 0, false).times, [], 'a poller that has the times does not get them again');
     assert.equal(running.status, 'processing'); assert.equal(running.next, 1); assert.equal(running.lo, -1); assert.equal(running.near, 5 / 6);
     assert.equal(readFileSync(service.preview('project', job.key, 0))[0], 1);
     assert.throws(() => service.preview('project', job.key, 1), /not found/, 'an unrecorded segment is not served');
@@ -261,7 +265,7 @@ test('the real worker with the synthetic engine analyses a clip into decodable s
   }
 });
 
-test('HTTP routes need editor rights to start or cancel and project membership to read', async () => {
+test('HTTP routes need editor rights to cancel and project membership to read or join', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'frameline-depth-http-'));
   const app = createFrameLineServer({ dataDir: directory });
   await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve));
@@ -280,7 +284,9 @@ test('HTTP routes need editor rights to start or cancel and project membership t
     state.state.clips = [{ ...clip('clip'), timelineId: 'timeline', trackId: 'track', mediaId: 'frameline-shape', name: 'Shape', color: '#fff', disabled: false, properties: { shapeDocument: JSON.stringify(defaultShape()) } }];
     assert.equal((await request(owner.cookie, '/state', 'PUT', state)).status, 200);
     assert.equal((await request(owner.cookie, '/depth/capabilities')).data.available !== undefined, true);
-    assert.equal((await request(viewer.cookie, '/depth', 'POST', { projectId: 'project', clipId: 'clip' })).status, 403);
+    // A viewer's POST may join a run (the service refuses to start one for it), so it reaches the clip checks.
+    assert.equal((await request(viewer.cookie, '/depth', 'POST', { projectId: 'project', clipId: 'clip' })).status, 400);
+    assert.equal((await request(viewer.cookie, '/depth', 'POST', { projectId: 'private', clipId: 'clip' })).status, 404, 'a clip outside the project body is not found');
     assert.equal((await request(owner.cookie, '/depth', 'POST', { projectId: 'project', clipId: 'clip' })).status, 400, 'a shape has no source to analyse');
     assert.equal((await request(viewer.cookie, `/depth/${'a'.repeat(64)}?projectId=project`, 'DELETE')).status, 403);
     assert.equal((await request(viewer.cookie, `/depth/${'a'.repeat(64)}?projectId=project`)).status, 404);

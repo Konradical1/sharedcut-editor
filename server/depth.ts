@@ -113,12 +113,13 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
     if (!job || !job.projects.includes(projectId)) fail(404, 'Depth analysis not found.');
     job!.used = Date.now(); return job!;
   };
-  const view = (job: Job, after = 0): DepthRun => {
+  /** `withTimes` false leaves out `times` (up to 36,000 numbers) for a poller that already has them. */
+  const view = (job: Job, after = 0, withTimes = true): DepthRun => {
     // ponytail: a cursor past the end is from an earlier run of this key (it failed and was re-asked), so start over;
     // add a per-run id to DepthRun if the new run can overtake a poller's cursor between two polls.
     const from = after > job.segments.length ? 0 : Math.max(0, Math.floor(after) || 0);
     const { base, projects, used, bytes, ...run } = job;
-    return { ...run, times: from ? [] : job.times, segments: job.segments.slice(from), next: job.segments.length };
+    return { ...run, times: from || !withTimes ? [] : job.times, segments: job.segments.slice(from), next: job.segments.length };
   };
 
   async function analyse(job: Job, controller: AbortController, input: { sourcePath: string; sourceFingerprint: string; lut: string; dataLevels: string; yuvMatrix: string; seek: number | null; image: boolean; workerIdentity: unknown }) {
@@ -166,9 +167,10 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
   }
 
   return {
-    get(projectId: string, key: string, after = 0) { return view(get(projectId, key), after); },
-    /** Start (or join) the analysis covering `from`..`to` source seconds of the clip's original, plus handles. */
-    async enqueue(request: { clip: Clip; asset: MediaAsset; sourcePath: string; from: number; to: number }): Promise<DepthRun> {
+    get(projectId: string, key: string, after = 0, withTimes = true) { return view(get(projectId, key), after, withTimes); },
+    /** Start (or join) the analysis covering `from`..`to` source seconds of the clip's original, plus handles.
+     *  `joinOnly` (a viewer or reviewer) joins a covering run but never starts one. */
+    async enqueue(request: { clip: Clip; asset: MediaAsset; sourcePath: string; from: number; to: number; joinOnly?: boolean }): Promise<DepthRun> {
       const { clip, asset, sourcePath } = request;
       if (closed) fail(503, 'The server is stopping.');
       if (asset.id !== clip.mediaId || !['video', 'image'].includes(asset.kind)) fail(400, 'Depth works on video and image clips.');
@@ -192,6 +194,7 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
         if (!covering.projects.includes(clip.projectId)) { covering.projects.push(clip.projectId); save(covering); }
         covering.used = Date.now(); return view(covering);
       }
+      if (request.joinOnly) fail(409, 'Depth for this clip is not analyzed yet. It starts when an editor opens the project.');
       if (controllers.has(key)) fail(409, 'The previous depth analysis is still stopping. Retry shortly.');
       if ([...jobs.values()].filter(job => ['queued', 'processing'].includes(job.status)).length >= 8) fail(429, 'The depth queue is full. Retry shortly.');
       makeRoom(range.frames * BYTES_PER_FRAME);
