@@ -1,6 +1,8 @@
 import { createTimelinePreview } from './timelinePreview.ts';
 import { createSmartMaskPreview, activeSmartMasks, fittedSmartMask, lumaAlphaFilter, SmartMaskPending, unanalyzedSmartMask, type SmartMaskPixels } from './smartMaskPreview.ts';
 import { createMotionPreview } from './motionPreview.ts';
+import { createDepthPreview, depthUi, rememberDepth, subscribeDepth } from './depthPreview.ts';
+import { createDepthFx, depthFxKeys, depthTapBudget, type DepthFxParams } from './depthFx.ts';
 import { blendModeOf } from './blendModes.ts';
 import { transformMotion, drawMotionPose, motionArtwork } from './motionBlur.ts';
 import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, trimAnimation } from './animation.ts';
@@ -303,6 +305,10 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   const flowStatuses = new Map<string,string>();
   const stabilizePreview = createStabilizePreview(() => { dirty = true; });
   const stabilizeStatuses = new Map<string,string>();
+  // Depth: decoded depth frames for this viewer, its WebGL pass, and a repaint whenever an analysis moves on.
+  const depthFrames = createDepthPreview(() => { dirty = true; });
+  let depthFx: ReturnType<typeof createDepthFx> | undefined;
+  const unsubscribeDepth = subscribeDepth(() => { dirty = true; });
   // Warping the layer in place needs the picture it is about to overwrite; one scratch canvas serves every clip.
   const warpScratch = document.createElement('canvas');
   let stalled = false;
@@ -908,6 +914,26 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
             if(warp)layerContext.setTransform(...warpTransform(warp));
             layerContext.drawImage(cut,0,0);layerContext.restore();
           }
+        } else if(effect.name==='Depth') {
+          // After colour and Stabilize, before flip and transform; frames the analysis has not reached play plain.
+          if(clip.properties.opticalFlow){warning='Depth · needs warped depth · disable optical flow for this clip';continue;}
+          const depth=depthFrames.frame(clip.id,Number(sourceTimestamp)||0);
+          if(depth.state==='failed'){warning=`Depth unavailable · ${depth.error}`;continue;}
+          if(depth.state==='none'||depth.state==='analyzing'){warning='Analyzing depth';continue;}
+          if(depth.state==='loading')continue;
+          const [sourceWidth,sourceHeight]=sourceSize(asset),matrix=warp?warpTransform(warp):undefined;
+          depthFx??=createDepthFx();
+          const result=depthFx.render(layer,{params:Object.fromEntries(depthFxKeys.map(key=>[key,effectValue(clip,effect,key)])) as DepthFxParams,depth:depth.pixels,near:depth.run.near,far:depth.run.far,sourceWidth,sourceHeight,warp:matrix,taps:depthTapBudget(options.quality,options.original,state.playing),view:depthUi.showMap(effect)?'map':'effect'});
+          if(!result){warning='Depth preview needs WebGL2 · export is not affected';continue;}
+          layerContext.save();layerContext.globalCompositeOperation='copy';layerContext.drawImage(result,0,0);layerContext.restore();
+          // The focus picker: viewer pixel → layer (undo the transform and flip) → original frame (undo Stabilize) → source box.
+          const poses=transformMotion(clip,time,project?.fps??24,projectWidth,projectHeight),pose=poses[poses.length>>1];
+          const fit=Math.min(width/sourceWidth,height/sourceHeight),boxWidth=sourceWidth*fit,boxHeight=sourceHeight*fit,[a,b,c,d,e,f]=matrix??[1,0,0,1,0,0],det=a*d-b*c;
+          rememberDepth(clip.id,{pixels:depth.pixels,near:depth.run.near,far:depth.run.far,toSource:(x,y)=>{
+            const dx=x-width/2-pose.x*width/projectWidth,dy=y-height/2-pose.y*height/projectHeight,cos=Math.cos(pose.rotation),sin=Math.sin(pose.rotation);
+            const lx=flip?width/2-(cos*dx+sin*dy)/pose.scaleX:(cos*dx+sin*dy)/pose.scaleX+width/2,ly=(cos*dy-sin*dx)/pose.scaleY+height/2;
+            return [((d*(lx-e)-c*(ly-f))/det-(width-boxWidth)/2)/boxWidth,((a*(ly-f)-b*(lx-e))/det-(height-boxHeight)/2)/boxHeight];
+          }});
         } else if(effect.name==='Gaussian blur') {
           layerContext.filter=`blur(${amount/100*effectValue(clip,effect,'radius')*ratio}px)`;
           layerContext.globalCompositeOperation='copy';layerContext.drawImage(layer,0,0);layerContext.globalCompositeOperation='source-over';layerContext.filter='none';
@@ -1091,6 +1117,6 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       for (const decoder of decoders.values()) decoder.blocked = false;
       dirty = true;
     },
-    dispose() { disposed = true; for (const scrub of scrubs.values()) scrub.frames.dispose(); scrubs.clear(); timelinePreview.dispose();maskPreview.dispose();fittedMasks.clear();maskCuts.clear();motion?.dispose(); flowPreview.dispose(); stabilizePreview.dispose(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',scopeRequested); color?.dispose(); cancelAnimationFrame(frame); for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); } decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
+    dispose() { disposed = true; for (const scrub of scrubs.values()) scrub.frames.dispose(); scrubs.clear(); timelinePreview.dispose();maskPreview.dispose();depthFrames.dispose();depthFx?.dispose();unsubscribeDepth();fittedMasks.clear();maskCuts.clear();motion?.dispose(); flowPreview.dispose(); stabilizePreview.dispose(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',scopeRequested); color?.dispose(); cancelAnimationFrame(frame); for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); } decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
   };
 }
