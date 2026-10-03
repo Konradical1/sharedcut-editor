@@ -103,6 +103,7 @@ npm run test:browser
 npm run test:captions
 npm run test:optical-flow
 npm run test:depth
+npm run test:depth:inference
 npm run test:optical-flow:browser
 npm run test:masks
 npm run test:masks:inference

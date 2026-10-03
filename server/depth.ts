@@ -2,7 +2,7 @@ import { runWorkerProcess } from './processTree.ts';
 import { gpuJob, heavyJob } from './workQueue.ts';
 import { venvPython } from './platform.ts';
 import { atomicJson, commitFolder, inputMatrix, maskAnalysis, maskSourceFingerprint } from './smartMask.ts';
-import { run } from './media.ts';
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statfsSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -46,6 +46,20 @@ async function checkCapabilities(python: string, worker: string): Promise<Capabi
   } catch (error) { return { available: false, reason: (error as Error).message }; }
 }
 
+/** FFmpeg's raw output as bytes, at most `limit` of them. Kept here (not media.ts's `run`) so the depth service and its
+ *  inference check load without the media pipeline's native modules. */
+function rawFrames(args: string[], limit: number) {
+  return new Promise<Buffer>((resolve, reject) => {
+    const child = spawn(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-nostdin', ...args], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const chunks: Buffer[] = [];
+    let size = 0, errors = '';
+    child.stdout.on('data', (chunk: Buffer) => { size += chunk.length; if (size > limit) child.kill(); else chunks.push(chunk); });
+    child.stderr.on('data', (chunk: Buffer) => { errors = (errors + chunk).slice(-2000); });
+    child.on('error', reject);
+    child.on('close', code => code === 0 && size <= limit ? resolve(Buffer.concat(chunks)) : reject(new Error(`Could not decode for focus: ${errors.trim() || `exit ${code}`}`)));
+  });
+}
+
 /** The subject's resolved mask analysis (resolveSmartMaskArtifact): its folder and verified manifest. */
 export type DepthSubject = { directory: string; manifest: SmartMaskManifest };
 /**
@@ -54,7 +68,7 @@ export type DepthSubject = { directory: string; manifest: SmartMaskManifest };
  * ones when it has none), both scaled onto the depth grid, one 64-frame segment at a time.
  */
 async function measureFocus(job: Pick<DepthRun, 'key' | 'first' | 'frames' | 'times' | 'width' | 'height' | 'near' | 'far' | 'segments'>, masters: string, subject: DepthSubject): Promise<DepthFocusTrack> {
-  const { manifest } = subject, ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg', size = job.width * job.height;
+  const { manifest } = subject, size = job.width * job.height;
   const times = manifest.sourceTimes ?? [];
   // Both index the same decoded source timestamps; a mismatch means one of them was made from another decode.
   if (job.times.some((time, i) => i % 16 === 0 && Math.abs((times[job.first + i] ?? Infinity) - time) > 1e-4)) fail(409, 'The subject mask and the depth analysis disagree on frame timing. Analyze the mask again.');
@@ -64,8 +78,8 @@ async function measureFocus(job: Pick<DepthRun, 'key' | 'first' | 'frames' | 'ti
     const wanted = Array.from({ length: segment.count }, (_, i) => segment.first + i).filter(index => analysed.has(index));
     if (!wanted.length) continue;
     // Mask frames have no gaps (validateMaskManifest), so the wanted ones are one run of indices.
-    const depth = await run(ffmpeg, ['-v', 'error', '-nostdin', '-i', join(masters, `${segment.n}.mkv`), '-f', 'rawvideo', '-pix_fmt', 'gray10le', '-'], { binary: true, maxBytes: segment.count * size * 2 + 1 });
-    const matte = await run(ffmpeg, ['-v', 'error', '-nostdin', '-framerate', '30', '-start_number', String(wanted[0]), '-i', pattern, '-frames:v', String(wanted.length), '-vf', `scale=${job.width}:${job.height}:flags=area`, '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { binary: true, maxBytes: wanted.length * size + 1 });
+    const depth = await rawFrames(['-i', join(masters, `${segment.n}.mkv`), '-f', 'rawvideo', '-pix_fmt', 'gray10le', '-'], segment.count * size * 2);
+    const matte = await rawFrames(['-framerate', '30', '-start_number', String(wanted[0]), '-i', pattern, '-frames:v', String(wanted.length), '-vf', `scale=${job.width}:${job.height}:flags=area`, '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], wanted.length * size);
     if (depth.length !== segment.count * size * 2 || matte.length !== wanted.length * size) fail(500, 'Could not read the depth or the subject mask to measure focus.');
     const all = new Uint16Array(depth.buffer.slice(depth.byteOffset, depth.byteOffset + depth.length)); // Aligned for 16-bit reads.
     wanted.forEach((index, k) => {
@@ -180,6 +194,7 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
           if (![lo, hi, near, far].every(Number.isFinite) || !((hi as number) > (lo as number))) throw new Error('The depth worker returned an invalid value mapping.');
           Object.assign(job, { lo, hi, near, far });
         }
+        if (message.telemetry && typeof message.telemetry === 'object') job.telemetry = message.telemetry as DepthRun['telemetry'];
         if (message.segment !== undefined) {
           const n = job.segments.length, first = job.first + n * DEPTH_SEGMENT, count = Math.min(DEPTH_SEGMENT, job.frames - n * DEPTH_SEGMENT);
           if (message.segment !== n || message.first !== first || message.count !== count || !regularFile(join(temporary, 'preview', `${n}.mp4`)) || !regularFile(join(temporary, 'master', `${n}.mkv`))) throw new Error('The depth worker returned segments out of order.');

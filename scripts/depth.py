@@ -57,6 +57,9 @@ def replace(source, target):
             time.sleep(.05 * 2 ** attempt)
 
 
+STATS = {}  # Filled by the run for the final telemetry line: analysis time without model loading, peak GPU memory.
+
+
 def emit(**message):
     with _out:
         print(json.dumps(message, allow_nan=False), flush=True)
@@ -395,6 +398,7 @@ def run_vda(job, caps, writer, progress):
         state = dict(micro=4, retried=False)
         if device == "cuda":
             torch.cuda.reset_peak_memory_stats()
+        began = time.monotonic()
 
         def infer(x):
             # The vendored forward, with the head's spatial mini-batch exposed for the out-of-memory retry.
@@ -454,8 +458,9 @@ def run_vda(job, caps, writer, progress):
                     emit(mapping=values)
                 write(aligner.push(list(depth)))
             write(aligner.finish())
+        STATS.update(analysisSeconds=round(time.monotonic() - began, 2), microBatch=state["micro"])
         if device == "cuda":
-            emit(peakVram=round(torch.cuda.max_memory_allocated() / 2**30, 3), reservedVram=round(torch.cuda.max_memory_reserved() / 2**30, 3))
+            STATS.update(peakVram=round(torch.cuda.max_memory_allocated() / 2**30, 3), reservedVram=round(torch.cuda.max_memory_reserved() / 2**30, 3))
         return values
     finally:
         decoder.close()
@@ -473,6 +478,7 @@ def main(job):
     output = Path(job["output"])
     writer = Writer(job)
     emit(progress=1, stage="Analyzing depth")
+    started = time.monotonic()
     report = lambda done: emit(progress=round(2 + 96 * done / total, 1), stage="Analyzing depth")
     values = (run_synthetic(job, writer, report) if ENGINE == "synthetic" else run_vda(job, caps, writer, report))
     segments = writer.finish()
@@ -481,6 +487,11 @@ def main(job):
     manifest = dict(version=1, key=job.get("key"), engine=caps["engine"], workerIdentity=caps["workerIdentity"],
                     width=width, height=height, first=job["first"], frames=total, segments=segments,
                     preview=dict(codec="h264", pix_fmt="yuvj420p", rate=RATE), master=dict(MASTER, rate=RATE), **values)
+    # One telemetry line last: frames per second end to end (model load and encode included) and of the analysis alone.
+    seconds = time.monotonic() - started
+    analysis = STATS.get("analysisSeconds") or seconds
+    emit(telemetry=dict(frames=total, seconds=round(seconds, 2), fps=round(total / max(seconds, 1e-6), 1), analysisFps=round(total / max(analysis, 1e-6), 1),
+                        engine=caps["engine"], device=caps.get("device"), **STATS))
     temporary = output / ".manifest.json.tmp"
     temporary.write_text(json.dumps(manifest, allow_nan=False))
     replace(temporary, output / "manifest.json")

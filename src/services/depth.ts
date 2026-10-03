@@ -19,7 +19,10 @@ export type DepthRun = {
   near: number; far: number;                            // stored values where distance 0 and 100 sit (first-window p99 and p1)
   segments: DepthSegment[];                             // with ?after=n only the new ones
   next: number;                                         // cursor for ?after
+  telemetry?: DepthTelemetry;                           // the worker's last line, once it finished
 };
+/** Frames per second end to end and of the analysis alone (model loading left out), and the CUDA peak in GB. */
+export type DepthTelemetry = { frames: number; seconds: number; fps: number; analysisFps: number; engine?: string; device?: string; peakVram?: number; reservedVram?: number; microBatch?: number };
 export type DepthCapabilities = { available: boolean; reason?: string; engine?: string; device?: string };
 
 /** Video Depth Anything's input size: short side 518, both sides multiples of 14, narrower beyond 16:9 to bound memory. */

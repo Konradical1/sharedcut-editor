@@ -263,6 +263,7 @@ test('the real worker with the synthetic engine analyses a clip into decodable s
     assert.equal(done.status, 'ready', done.error);
     assert.deepEqual(done.segments, [{ n: 0, first: 0, count: 64 }, { n: 1, first: 64, count: 8 }]);
     assert.ok(done.hi > done.lo && done.near > done.far);
+    assert.ok(done.telemetry?.frames === 72 && done.telemetry.fps > 0 && /synthetic/i.test(done.telemetry.engine ?? ''), `the worker's last line is kept: ${JSON.stringify(done.telemetry)}`);
     const probe = JSON.parse(execFileSync(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-count_frames', '-show_entries', 'stream=width,height,pix_fmt,color_range,nb_read_frames', '-of', 'json', service.preview('project', job.key, 1)], { encoding: 'utf8' })).streams[0];
     assert.deepEqual([probe.width, probe.height, probe.pix_fmt, probe.color_range, probe.nb_read_frames], [924, 518, 'yuvj420p', 'pc', '8']);
   } finally {
