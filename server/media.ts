@@ -16,6 +16,7 @@ import { isTitle, getText, drawText, validateText } from '../src/services/text.t
 import { isShape, getShape, drawShape, validateShape } from '../src/services/shapes.ts';
 import { effectValue, effectEnabled } from '../src/services/effects.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
+import { blendModeOf } from '../src/services/blendModes.ts';
 import { uncoveredParts } from '../src/services/timeline.ts';
 import { isLeakMedia, leakRange, leakIdOf, motionGap, motionSamples, timelineTransitions, transitionDefinitions, type TransitionRecord } from '../src/services/transitions.ts';
 import { spawn } from 'node:child_process';
@@ -761,6 +762,18 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   let windowIndex = 0;
   const overlayPlace = (shiftX: number, shiftY: number) => `overlay=format=${request.transparent ? 'rgb' : 'yuv444p10'}:alpha=straight:x=(W-w)/2+${shiftX}:y=(H-h)/2+${shiftY}:eof_action=pass:repeatlast=0`;
 
+  // Blend modes: park the clip on a transparent canvas, blend it with the picture in float RGB (FFmpeg 8.1's 16-bit
+  // blend overflows on dark pictures), then fade the blended result in by the clip's own alpha.
+  // ponytail: the base's own alpha is kept as is; a blend over a transparent export does not add to it.
+  const blendFilters = (base: string, clipLabel: string, out: string, n: number, mode: string, shiftX: number, shiftY: number, visible: string) => [
+    `color=c=black@0:s=${width}x${height}:r=${fps}:d=${duration},format=rgba[bcv${n}]`,
+    `[bcv${n}][${clipLabel}]overlay=format=rgb:alpha=straight:x=(W-w)/2+${shiftX}:y=(H-h)/2+${shiftY}:eof_action=pass:repeatlast=0,format=gbrapf32le,split[btc${n}][btz${n}]`,
+    `[btz${n}]alphaextract[bam${n}]`,
+    `[${base}]format=gbrapf32le,split[bba${n}][bbb${n}]`,
+    `[bba${n}][btc${n}]blend=all_mode=${mode}:c3_opacity=0[bbl${n}]`,
+    `[bbb${n}][bbl${n}][bam${n}]maskedmerge=enable='${visible}',scale=out_color_matrix=bt709:out_range=tv,format=${request.transparent ? 'rgba' : 'yuv444p10le'},setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[${out}]`,
+  ];
+
   // Placement is decided on whole output frames. Comparing float seconds against `t`, and setpts truncating
   // `offset/TB`, each dropped a frame at clip edges seemingly at random (a black flash at most cuts).
   const frameAt = (seconds: number) => Math.round(seconds * fps);
@@ -900,7 +913,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     const explicitAudio = clips.some(other => other.id !== clip.id && tracks.find(t => t.id === other.trackId)?.kind === 'audio' && other.mediaId === clip.mediaId && other.start === clip.start && other.sourceIn === clip.sourceIn && other.duration === clip.duration);
     const audible = audio !== 'Disabled' && source.asset.hasAudio && !p.freeze && !track.muted && (!solo || track.solo) && !(track.kind === 'video' && (clip.properties.audioDetached || explicitAudio));
     if (!visual && !audible || request.only && !request.only.has(clip.id)) continue;
-    if (p.blendMode && p.blendMode !== 'Normal') throw new Error(`${clip.name}: ${p.blendMode} blending is not available. Choose Normal.`);
+    const blend = blendModeOf(p.blendMode).ffmpeg;
 
     const speed = property('speed', 100, 1, 800) / 100;
     const localStart = Math.max(rangeIn - geo.start, 0), localEnd = Math.min(geo.duration, rangeOut - geo.start), length = localEnd - localStart;
@@ -1048,7 +1061,9 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       if(motion)filters.push(...motionBlurFilters(`motionbase${index}`,`clipv${index}`,poses,width,height,projectWidth,projectHeight,fps,length));
       const touching = transitions.filter(record => record.outgoingId === clip.id || record.incomingId === clip.id);
       const visible = onScreen(offset, offset + length);
-      if (!touching.length) filters.push(`[${currentVideo}][clipv${index}]${overlayPlace(shiftedX, shiftedY)}:enable='${visible}'[v${index}]`);
+      if (blend && touching.length) throw new Error(`${clip.name}: ${p.blendMode} blending cannot be combined with a transition yet. Choose Normal or remove the transition.`);
+      if (blend) filters.push(...blendFilters(currentVideo, `clipv${index}`, `v${index}`, index, blend, shiftedX, shiftedY, visible));
+      else if (!touching.length) filters.push(`[${currentVideo}][clipv${index}]${overlayPlace(shiftedX, shiftedY)}:enable='${visible}'[v${index}]`);
       else {
         // One branch per window plus the body, so the clip outside its transitions is untouched.
         const branches = touching.map((_, n) => `w${index}_${n}`);

@@ -1,6 +1,7 @@
 import { createTimelinePreview } from './timelinePreview.ts';
 import { createSmartMaskPreview, activeSmartMasks, fittedSmartMask, lumaAlphaFilter, SmartMaskPending, unanalyzedSmartMask, type SmartMaskPixels } from './smartMaskPreview.ts';
 import { createMotionPreview } from './motionPreview.ts';
+import { blendModeOf } from './blendModes.ts';
 import { transformMotion, drawMotionPose, motionArtwork } from './motionBlur.ts';
 import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, trimAnimation } from './animation.ts';
 import { bloomPass, leakRange, isLeakMedia, leakIdOf, timelineTransitions, transitionDefinitions, transitionProgress, type TransitionRecord } from './transitions.ts';
@@ -436,7 +437,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     const p=clip.properties;
     const poses=transformMotion(clip,time,fps,projectWidth,projectHeight);
     target.save();target.globalAlpha=Math.max(0,Math.min(1,Number(p.opacity??100)/100))*fadeLevel(clip,time);
-    target.globalCompositeOperation=({Normal:'source-over',Multiply:'multiply',Screen:'screen',Overlay:'overlay','Soft light':'soft-light',Add:'lighter'} as Record<string,GlobalCompositeOperation>)[String(p.blendMode)]??'source-over';
+    target.globalCompositeOperation=blendModeOf(p.blendMode).canvas;
     if(poses.length===1)drawMotionPose(target,layer,poses[0],clip,width,height,projectWidth,projectHeight);
     else {
       motion??=createMotionPreview();
