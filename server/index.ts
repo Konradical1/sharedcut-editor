@@ -262,7 +262,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const flowDirectory = join(dataDir, 'optical-flow');
   const masks = smartMaskService(join(dataDir, 'smart-masks'));
   const motionTrackers = motionTrackerService(join(dataDir, 'motion-trackers'));
-  const depth = depthService(join(dataDir, 'depth'), { sourceTimes: masks.sourceTimes });
+  const depth = depthService(join(dataDir, 'depth'), { sourceTimes: masks.sourceTimes, freeGpu: () => masks.stopIdlePreview() });
   const colorAssistant = colorAssistantService(dataDir);
   const flowJobs = new Map<string, FlowPreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
   let flowQueue = Promise.resolve();

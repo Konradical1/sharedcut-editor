@@ -109,13 +109,13 @@ function folderBytes(path: string) {
  * frame range, the analysis LUT and the worker), never by clip, so split or duplicated clips of one take share it.
  * Segments are served while the run is still going; the finished run is committed under its key, manifest last.
  */
-export function depthService(directory: string, options: { sourceTimes: (clip: Clip, asset: MediaAsset, sourcePath: string) => Promise<number[]>; python?: string; worker?: string; freeBytes?: () => number }) {
+export function depthService(directory: string, options: { sourceTimes: (clip: Clip, asset: MediaAsset, sourcePath: string) => Promise<number[]>; python?: string; worker?: string; freeBytes?: () => number; freeGpu?: () => void }) {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const python = options.python ?? defaultPython(), worker = options.worker ?? defaultWorker;
   const freeBytes = options.freeBytes ?? (() => { const disk = statfsSync(directory); return disk.bavail * disk.bsize; });
   const jobs = new Map<string, Job>(), controllers = new Map<string, AbortController>(), partials = new Map<string, string>(), holds = new Map<string, number>();
   const focusTasks = new Map<string, { promise: Promise<DepthFocusTrack>; retryAt?: number }>();
-  let queue = Promise.resolve(), closed = false;
+  let queue = Promise.resolve(), closed = false, device: string | undefined;
   const save = (job: Job) => { jobs.set(job.key, job); atomicJson(join(directory, `${job.key}.job.json`), job); };
   const manifestPath = (key: string) => join(directory, key, 'manifest.json');
   /** A cancelled queued run gives its key up at once, so a stale queue entry must not drop a newer run's controller. */
@@ -191,6 +191,7 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       mkdirSync(temporary, { mode: 0o700 });
       partials.set(job.key, temporary);
       job.status = 'processing'; save(job);
+      service.freeGpu();
       writeFileSync(join(temporary, 'analysis.cube'), input.lut, { mode: 0o600 });
       atomicJson(join(temporary, 'job.json'), { version: 1, key: job.key, input: input.sourcePath, output: temporary, ffmpeg: process.env.FFMPEG_PATH || 'ffmpeg', first: job.first, frames: job.frames, seek: input.seek, image: input.image, width: job.width, height: job.height, analysisLutPath: join(temporary, 'analysis.cube'), dataLevels: input.dataLevels, yuvMatrix: input.yuvMatrix, workerIdentity: input.workerIdentity });
       await runWorkerProcess(python, [worker, join(temporary, 'job.json')], controller.signal, value => { job.progress = Math.round(value); }, 'Depth', message => {
@@ -245,6 +246,7 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       const capabilities = await depthCapabilities(python, worker);
       if (closed) fail(503, 'The server is stopping.');
       if (!capabilities.available) fail(503, capabilities.reason || 'Depth analysis is unavailable.');
+      device = capabilities.device;
       const size = depthAnalysisSize(Number(dimensions![1]), Number(dimensions![2]));
       const analysis = maskAnalysis(clip, asset), sourceFingerprint = maskSourceFingerprint(sourcePath);
       const base = hash([sourceFingerprint, analysis.identity, capabilities.workerIdentity, size, image]);
@@ -317,6 +319,9 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
         }
       } catch (error) { release(); throw error; }
     },
+    /** Spec section 3: before a CUDA run or bake, an idle Smart Mask preview worker gives its VRAM back (it starts again on
+     *  the next click). `device` is the one the last capability check reported. */
+    freeGpu() { if (device === 'cuda') options.freeGpu?.(); },
     /**
      * The focus track for a ready run and a subject (focus follows subject), measured once and kept beside the run until
      * it is evicted. Concurrent asks share one measurement; a failed one is answered as such for 30 seconds.

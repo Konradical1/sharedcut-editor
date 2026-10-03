@@ -665,7 +665,7 @@ export interface RenderRequest {
   /** Internal: thread budget when several FFmpeg passes share the export. */
   threads?: number;
   /** Depth analysis: clips with a Depth effect start or join their run and wait for it. */
-  depth?: Pick<ReturnType<typeof depthService>, 'ready' | 'focus'>;
+  depth?: Pick<ReturnType<typeof depthService>, 'ready' | 'focus'> & Partial<Pick<ReturnType<typeof depthService>, 'freeGpu'>>;
   /** Internal: the camera original behind a Stabilize bake, keyed by clip, for a Depth that reads its analysis. */
   stabilized?: Map<string, { clip: Clip; source: { asset: MediaAsset; path: string }; offset: number; solve: StabilizeSolve }>;
   /** Internal: hand over the finished FFmpeg command, which writes the lone clip's layer as raw rgba64le on stdout,
@@ -1535,7 +1535,7 @@ async function renderDepthTimeline(request: RenderRequest) {
         decoder: async command => {
           await writeFile(job, JSON.stringify({ ffmpeg: ffmpeg(), decoder: command, width, height, frames, fps: image ? String(fps) : metadata.frameRate || String(sourceFps), output, image, alpha, threads: Number(exportThreads), taps: Number(process.env.FRAME_LINE_DEPTH_TAPS) || 96, params, animated, warps, matte, layer: dimensions(request.project.resolution),
             depth: { masters: segments.map(segment => path.join(masters, `${segment.n}.mkv`)), width: analysis.width, height: analysis.height, near: analysis.near, far: analysis.far, indices: Array.from({ length: frames }, (_, k) => base + k - segments[0].first) } }));
-          await gpuJob(() => run(python, [script, job], { signal: request.signal, jsonProgress: 'stderr', onProgress: p => { request.onStage?.(`Baking depth · ${clip.name} · ${Math.floor(p)}%`); report(.3 + p / 100 * .7); } }), request.signal);
+          await gpuJob(() => { request.depth?.freeGpu?.(); return run(python, [script, job], { signal: request.signal, jsonProgress: 'stderr', onProgress: p => { request.onStage?.(`Baking depth · ${clip.name} · ${Math.floor(p)}%`); report(.3 + p / 100 * .7); } }); }, request.signal);
         } });
       const mediaId = `depth-${clip.id}`, dropped = clip.effects.slice(0, at + 1).map(e => e.id);
       assets.push({ path: output, asset: { ...source.asset, id: mediaId, kind: image ? 'image' : 'video', duration: image ? source.asset.duration : duration, fps: image ? 0 : sourceFps, resolution: `${width} × ${height}`, hasAudio: false, hasAlpha: alpha, colorRange: 'tv', colorMatrix: 'bt709', colorTransfer: undefined, inputProfile: 'Rec.709', inputGamut: 'Rec.709' } });

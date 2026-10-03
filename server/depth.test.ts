@@ -17,12 +17,12 @@ const clip = (id: string, projectId = 'project') => ({ id, projectId, mediaId: '
 const times = Array.from({ length: 500 }, (_, i) => i / 25);
 
 /** A stand-in for scripts/depth.py: same arguments, JSON lines and files, no model. */
-function fakeWorker(directory: string, behaviour: { gate?: string; grandchild?: string; bytes?: number } = {}) {
+function fakeWorker(directory: string, behaviour: { gate?: string; grandchild?: string; bytes?: number; device?: string } = {}) {
   const path = join(directory, 'fake-depth.cjs');
   writeFileSync(path, `
 const fs = require('node:fs'), path = require('node:path');
 const say = value => console.log(JSON.stringify(value));
-if (process.argv[2] === '--check') { say({ available: true, engine: 'Fake', device: 'cpu', workerIdentity: { engine: 'fake' } }); process.exit(0); }
+if (process.argv[2] === '--check') { say({ available: true, engine: 'Fake', device: ${JSON.stringify(behaviour.device ?? 'cpu')}, workerIdentity: { engine: 'fake' } }); process.exit(0); }
 const job = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 fs.appendFileSync(${JSON.stringify(join(directory, 'runs.log'))}, job.first + ':' + job.frames + '\\n');
 ${behaviour.grandchild ? `require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(`setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(behaviour.grandchild)},'ran'),1200);setInterval(()=>{},1000)`)}], { stdio: 'ignore' });` : ''}
@@ -214,6 +214,22 @@ test('an export waiting for a run keeps it: an editor cancelling it meanwhile (a
     service.cancel('project', next.key);
     assert.equal(service.get('project', next.key).status, 'cancelled');
   } finally { writeFileSync(gate, ''); await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+
+test('a CUDA run or bake first stops an idle Smart Mask preview worker; a CPU one leaves it running', async () => {
+  for (const device of ['cuda', 'cpu']) {
+    const f = fixture(`gpu-${device}`);
+    let freed = 0;
+    const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory, { device }), sourceTimes: async () => times, freeGpu: () => { freed++; } });
+    try {
+      const job = await service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 0, to: 1 });
+      await until(() => service.get('project', job.key).status === 'ready');
+      assert.equal(freed, device === 'cuda' ? 1 : 0, `${device} run`);
+      service.freeGpu(); // The export bake asks the same way.
+      assert.equal(freed, device === 'cuda' ? 2 : 0, `${device} bake`);
+    } finally { await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
+  }
 });
 
 

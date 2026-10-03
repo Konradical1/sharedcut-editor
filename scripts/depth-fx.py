@@ -22,6 +22,8 @@ import sys
 import tempfile
 import threading
 
+# Set before torch starts CUDA: less fragmentation on a GPU shared with the desktop and Smart Mask (spec section 1).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -31,6 +33,7 @@ DEFAULTS = dict(amount=100, blur=0, focus=30, range=10, nearBlur=60, bokeh=40, f
                 fogHue=210, fogSaturation=10, fogBrightness=85, fogHorizon=30, glow=0, glowThreshold=70, glowRadius=30,
                 glowStart=40, light=0, lightStart=40, lightSoftness=30, bgExposure=0, bgSaturation=100, bgWarmth=0,
                 bgContrast=100, followSubject=0)
+GATHER_CHUNK = 24  # Gather steps sampled at once; fx_retrying drops it after an out-of-memory.
 
 
 def pick_device():
@@ -225,7 +228,7 @@ def gather_taps(Rb, taps):
     return out
 
 
-def gather(Ls, Ds, cc, Rb, bokeh, taps, alpha=None, chunk=24):
+def gather(Ls, Ds, cc, Rb, bokeh, taps, alpha=None, chunk=None):
     """Section 4's gather loop. Each step is acc = g * acc + beta with g = 1 + (1 - m) w / wsum and
     beta = m w L(sp), so a chunk of steps sampled at once folds into acc_end = P (acc + sum(beta / P_n)), P the running
     product of g: the same sum as one step at a time (see the selftest), in a few dozen GPU passes, not thousands."""
@@ -236,7 +239,7 @@ def gather(Ls, Ds, cc, Rb, bokeh, taps, alpha=None, chunk=24):
     weigh = lambda col: 1 + bokeh * (lum(col) - .7).clamp(min=0)
     wsum = weigh(Ls)
     acc = Ls * wsum
-    steps = gather_taps(Rb, taps)
+    steps, chunk = gather_taps(Rb, taps), chunk or GATHER_CHUNK
     for start in range(0, len(steps), chunk):
         part = steps[start:start + chunk]
         n = len(part)
@@ -322,6 +325,21 @@ def depth_fx(I, depth, p, near, far, taps=96, warp=None, layer=None, matte=None)
 # --- Bake ---
 
 PIPE_CHUNK = 1 << 20  # Windows pipes move a 66 MB 4K frame five times faster in 1 MB reads and writes than in one.
+
+
+def fx_retrying(*args):
+    """depth_fx with the spec's one retry on a CUDA out-of-memory (the GPU is shared with the desktop and Smart Mask): a
+    smaller gather chunk from then on. A second one fails as GPU busy, which the export can be retried after."""
+    global GATHER_CHUNK
+    try:
+        return depth_fx(*args)
+    except torch.OutOfMemoryError:
+        if GATHER_CHUNK <= 4:
+            raise ValueError("GPU busy: not enough graphics memory to bake Depth. Try the export again.")
+        GATHER_CHUNK = 4
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return fx_retrying(*args)
 
 
 def read_exact(stream, size):
@@ -474,7 +492,7 @@ def render(job):
                     elif item[1] is not None:
                         matte = (item[0], torch.from_numpy(item[1]).to(device))
                 params = {**static, **{key: values[k] for key, values in animated.items()}}
-                rgb = depth_fx(rgba[:3].contiguous(), depth, params, near, far, taps, warps[k] if warps else None, job.get("layer"), matte[1])
+                rgb = fx_retrying(rgba[:3].contiguous(), depth, params, near, far, taps, warps[k] if warps else None, job.get("layer"), matte[1])
                 # Interleave on the GPU: a strided tensor crossed to the CPU element by element (240 ms a 4K frame).
                 out = (torch.cat([rgb, rgba[3:]]) * 65535 + .5).clamp(0, 65535).to(torch.int32).to(torch.uint16).permute(1, 2, 0).contiguous()
                 written.put(out.cpu().numpy().tobytes())
@@ -558,6 +576,7 @@ def gather_reference(Ls, Ds, cc, Rb, bokeh, taps, alpha=None):
 
 
 def selftest():
+    global depth_fx, GATHER_CHUNK  # The out-of-memory check stands a failing depth_fx in for the real one.
     device, checks = pick_device(), []
     generator = torch.Generator(device="cpu").manual_seed(7)
     Ls, Ds, cc = torch.rand(3, 40, 60, generator=generator), torch.rand(40, 60, generator=generator), torch.rand(40, 60, generator=generator) * 9
@@ -581,6 +600,24 @@ def selftest():
     with torch.inference_mode():
         same = depth_fx(I, depth, {}, near, far)
         assert torch.equal(same, I), "every section off must leave the picture alone"
+        real, chunks = depth_fx, []
+        def flaky(*args):
+            chunks.append(GATHER_CHUNK)
+            if len(chunks) < 3:
+                raise torch.OutOfMemoryError("selftest")
+            return real(*args)
+        depth_fx = flaky
+        try:
+            try:
+                fx_retrying(I, depth, {}, near, far)
+                raise AssertionError("a second out-of-memory must fail the bake")
+            except ValueError as error:
+                assert "GPU busy" in str(error) and chunks == [24, 4], f"one retry, with a smaller chunk: {chunks}"
+            GATHER_CHUNK = 24
+            assert torch.equal(fx_retrying(I, depth, {}, near, far), I) and chunks == [24, 4, 24], "and a passing frame is kept"
+        finally:
+            depth_fx, GATHER_CHUNK = real, 24
+        checks.append("out-of-memory retry")
         quiet = depth_fx(I, depth, {"light": 0, "fog": 0, "blur": 0, "glow": 0, "amount": 100}, near, far)
         assert torch.equal(quiet, I)
         D = upsample_depth(I, depth, near, far)[0]

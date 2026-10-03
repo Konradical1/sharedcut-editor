@@ -253,6 +253,8 @@ export function smartMaskService(directory: string) {
       try {
         const active = previewWorkerFor();
         if (!active.pending.size) { clearTimeout(active.idle); active.idle = setTimeout(() => { if (!active.pending.size) stopPreviewWorker('Idle.'); }, 600_000); active.idle.unref(); }
+    /** Depth is about to take the GPU: an idle preview worker (SAM2, held for ten minutes after the last click) gives its VRAM back. */
+    stopIdlePreview() { if (previewWorker && !previewWorker.pending.size) stopPreviewWorker('Stopped to free the GPU for depth.'); },
       } catch { /* Not installed; the editor already reports that from capabilities. */ }
     },
     /** One analysis-graded source frame. `native` is the full-resolution frame the model and zoomed views read;
