@@ -43,6 +43,14 @@ the table.
 - `D(p) = Σ ws wr dist(depth_t) / Σ ws wr`.
 - If `Σ ws wr < 1e-6`, use bilinear `dist(depth(q))`.
 
+**Edges and choices the export must copy** (the preview made them; PyTorch's defaults differ):
+- A tap is clamped to the texture edge first, and the clamped `t` is used for `ws` and the guide position too.
+- Outside the letterbox box an explicit `inside` mask turns every stage off. `D = 0` alone would not: with Focus far,
+  blur would still apply there.
+- With Stabilize, the guide is sampled at the forward-warped tap centre.
+- `floor(q)` at an exact integer swaps which taps are the outer ones; expect isolated outliers at depth edges (one
+  pixel measured 12/255 between GPU float32 and float64). The parity check uses a percentile tolerance, not a maximum.
+
 ## 2. Background light (`light > 0`)
 
 - `a = light/100 × smoothstep(ls, ls + max(lightSoftness/100,.01), D)`, where `ls = lightStart/100`.
@@ -59,7 +67,7 @@ the table.
 - `kd = 1 + 9 × fogDensity/100`.
 - `base = 1 - exp(-kd × max(0, D - fs) / max(1 - fs, .05))`.
 - `hz = 1 + 2 × fogHorizon/100 × (1 - v)²`. Here `v` is 0 at the top and 1 at the bottom, so fog is
-  thicker toward the top.
+  thicker toward the top. `v` is the output pixel's row after the Stabilize warp, not the source row.
 - `f = clamp(fog/100 × base × hz, 0, 1)`.
 - Fog colour: `hsv(fogHue, fogSaturation/100, fogBrightness/100)` converted to RGB (display), then
   `lin`.
@@ -75,8 +83,10 @@ the table.
 - `coc(p) = R × clamp((|δ| - band) / .35, 0, 1) × (δ < 0 ? nearBlur/100 : 1)`.
 
 **Working resolution:**
-- `Wb = min(W, 960)`, `s = Wb/W`, `Hb = round(H × s)`.
-- Downsample `L2`, `D` and `coc` to `Wb×Hb` with an area or box filter.
+- `Wb = min(W, 960)`, `s = Wb/W`, `Hb = max(1, round(H × s))` with JS `Math.round` (halves round up; Python's
+  `round` rounds them to even).
+- Downsample `L2`, `D` and `coc` to `Wb×Hb` with an exact area filter (fractional pixel overlap weights). The
+  letterbox is averaged in as zeros, so at the box edge coc and D drop (about halve) in the straddling pixels.
 - In working pixels, `cocW = coc × s` and `Rb = R × s`.
 
 **Gather.** This is Gustafsson's single-pass bokeh with highlight weights. For each working pixel c:
@@ -104,19 +114,25 @@ B(c) = acc / wsum
   - Export: 96.
 - With the same `N`, both paths sample identical points. The parity check runs both at `N = 48`.
 - If `Rb < 1`, skip the gather (`B = L2` at working resolution).
+- Gather samples are bilinear with half-pixel centres, and positions outside the working image clamp to the edge
+  pixel (`grid_sample` pads with zeros by default: use `padding_mode='border'`, `align_corners=False`).
 
 **Composite at output resolution:**
 - `b = clamp(coc(p) × s, 0, 1)`.
-- `L3 = mix(L2(p), bilinear_up(B)(p), b)`.
+- `L3 = mix(L2(p), bilinear_up(B)(p), b)`. Upsampling is bilinear with half-pixel centres (`align_corners=False`) and
+  edge clamping.
 
 ## 5. Glow (`glow > 0`)
 
 - `th = glowThreshold/100`.
 - Bright pass: `G = L3 × clamp((lum(enc(L3)) - th) / max(1 - th, .01), 0, 1) × smoothstep(gs, gs + .15, D)`,
   where `gs = glowStart/100`.
-- Working resolution `Wq = min(W, 480)`.
-- Separable Gaussian with `σ = glowRadius/100 × .04 × W × (Wq/W)` working pixels, truncated at 3σ.
-- Upsample bilinearly to `W×H`.
+- The bright pass runs per full-resolution pixel, then the area filter of section 4 takes it to the working
+  resolution `Wq = min(W, 480)`, `Hq = max(1, round(H × Wq/W))` (JS `Math.round`).
+- Separable Gaussian with `σ = glowRadius/100 × .04 × W × (Wq/W)` working pixels, truncated at `floor(3σ)` taps
+  (at most 63) and normalised over the taps kept. Pixels beyond the edge repeat the edge pixel (`conv2d` pads with
+  zeros, which darkens the edges: pad with `replicate`).
+- Upsample bilinearly to `W×H` (half-pixel centres, edge clamped).
 - Result: `L4 = L3 + glow/100 × 1.5 × G_blur`.
 
 ## 6. Output

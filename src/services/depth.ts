@@ -78,6 +78,7 @@ export const depthPresets: { name: string; description: string; values: Record<s
   { name: 'Morning mist', description: 'Cool, dense mist that swallows the background; nothing defocused.', values: { fog: 75, fogStart: 25, fogDensity: 60, fogHue: 205, fogSaturation: 8, fogBrightness: 92, fogHorizon: 60, light: 30, lightStart: 35, lightSoftness: 40, bgExposure: .2, bgSaturation: 80, bgWarmth: -20, bgContrast: 80 } },
   { name: 'Dreamy glow', description: 'A soft background bloom with bright bokeh and a faint rose haze.', values: { blur: 25, range: 20, nearBlur: 50, bokeh: 70, glow: 60, glowThreshold: 55, glowRadius: 55, glowStart: 30, fog: 20, fogStart: 40, fogDensity: 30, fogHue: 330, fogSaturation: 10, fogBrightness: 95, fogHorizon: 20 } },
   { name: 'Subject pop', description: 'Background darker and cooler with a slight blur, so the subject stands out.', values: { blur: 15, range: 15, nearBlur: 50, bokeh: 30, light: 70, lightStart: 30, lightSoftness: 25, bgExposure: -.8, bgSaturation: 75, bgWarmth: -35, bgContrast: 90 } },
-  // Light from distance 0 with the narrowest softness grades the whole picture: the toy-like saturation and contrast.
-  { name: 'Miniature', description: 'Tilt-shift: a thin slice in focus, everything nearer and farther blurred, colours like a toy.', values: { blur: 70, range: 6, nearBlur: 100, bokeh: 20, light: 40, lightStart: 0, lightSoftness: 1, bgExposure: .15, bgSaturation: 140, bgContrast: 120 } },
+  // Light from distance 0 grades all but the very nearest objects (it is 0 at distance 0); a softness of 15 fades it in
+  // over the nearest 15 % instead of drawing a hard edge there.
+  { name: 'Miniature', description: 'Tilt-shift: a thin slice in focus, everything nearer and farther blurred, colours like a toy.', values: { blur: 70, range: 6, nearBlur: 100, bokeh: 20, light: 40, lightStart: 0, lightSoftness: 15, bgExposure: .15, bgSaturation: 140, bgContrast: 120 } },
 ];
