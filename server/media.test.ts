@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -29,22 +30,29 @@ test('real media preparation and timeline export preserve picture, sound, timing
     assert.ok(Math.abs(prepared.duration - 3) < .05); assert.equal(prepared.resolution, '320 × 180');
     assert.ok(prepared.waveform.length >= 600); assert.equal(prepared.waveformVersion, 2); assert.ok(Math.max(...prepared.waveform) > .03, 'Waveform must capture the actual audible tone.');
     assert.ok((await stat(path.join(dir, 'prepared', 'thumbnail.jpg'))).size > 100);
-    assert.ok((await probeMedia(path.join(dir, 'prepared', 'proxy.mp4'))).hasAudio);
+    // Storage v3: one 1920 file for Full and Color, the unchanged Stream, and a short-GOP 480 file for 1/4 and scrubbing.
+    assert.equal(prepared.proxyUrl, '/api/media/test/files/full-v3.mp4'); assert.equal(prepared.colorProxyUrl, prepared.proxyUrl);
+    assert.deepEqual(prepared.proxyVariants, { Stream: '/api/media/test/files/stream-v2.mp4', '1/2': '/api/media/test/files/stream-v2.mp4', StreamLow: '/api/media/test/files/stream-low-v2.mp4', '1/4': '/api/media/test/files/stream-low-v2.mp4' });
+    assert.deepEqual((await readdir(path.join(dir, 'prepared'))).sort(), ['audio-v1.m4a', 'filmstrip.jpg', 'full-v3.mp4', 'stream-low-v2.mp4', 'stream-v2.mp4', 'thumbnail.jpg'], 'no old proxy names and no temp folders are left');
+    const keyframes = async (file: string) => (await exec(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=key_frame,pix_fmt', '-of', 'csv=p=0', file])).stdout.trim().split(/\s+/).map(line => line.split(','));
+    const gaps = (frames: string[][]) => { const keys = frames.flatMap(([key], i) => key === '1' ? [i] : []); return [...keys.slice(1), frames.length].map((key, i) => key - keys[i]); };
+    const full = path.join(dir, 'prepared', 'full-v3.mp4'), fullFrames = await keyframes(full), fullProbe = await probeMedia(full);
+    assert.ok(fullProbe.hasAudio); assert.equal(fullProbe.colorRange, 'tv'); assert.equal(fullProbe.width, 320);
+    assert.ok(fullFrames.every(([, format]) => format === 'yuv422p10le'), 'full-v3 keeps the grading proxy\'s 10-bit 4:2:2');
+    assert.ok(Math.max(...gaps(fullFrames)) <= 12 && fullFrames.some(([key]) => key === '0'), 'full-v3 has a half-second GOP, not all-intra');
     for (const [quality, url] of Object.entries(prepared.proxyVariants!)) {
       const file = path.join(dir, 'prepared', path.basename(url));
       const variant = await probeMedia(file);
       assert.equal(variant.fps, prepared.fps);
       assert.ok(Math.abs(variant.duration - prepared.duration) < .05);
-      assert.ok(variant.width! <= (quality === '1/2' ? 960 : 480));
-      assert.equal(variant.colorRange, prepared.colorRange === 'pc' ? 'pc' : 'tv');
+      assert.ok(variant.width! <= (quality === 'Stream' || quality === '1/2' ? 960 : 480));
+      assert.equal(variant.colorRange, 'tv');
       assert.ok(variant.hasAudio, 'Embedded sound must survive lower-resolution preview.');
-      const frames = await exec(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=key_frame', '-of', 'csv=p=0', file]);
-      const keys = frames.stdout.trim().split(/\s+/).map(frame => frame.replace(',', ''));
-      assert.ok(quality.startsWith('Stream') ? keys.includes('0') : keys.every(frame => frame === '1'));
+      const frames = await keyframes(file);
+      assert.ok(frames.every(([, format]) => format === 'yuv420p'));
+      assert.ok(Math.max(...gaps(frames)) <= (quality === 'Stream' || quality === '1/2' ? 48 : 12), `${quality} GOP`);
     }
     assert.equal((await probeMedia(path.join(dir, 'prepared', path.basename(prepared.audioProxyUrl!)))).kind, 'audio');
-    const keyframes = await exec(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'frame=key_frame', '-of', 'csv=p=0', path.join(dir, 'prepared', 'proxy.mp4')]);
-    assert.ok(keyframes.stdout.trim().split(/\s+/).every(frame => frame.replace(',', '') === '1'), 'Every proxy frame must be independently seekable.');
     const asset: MediaAsset = { id: 'asset', projectId: 'project', name: 'source.mp4', kind: 'video', binId: 'all', duration: 3, fps: 24, resolution: '320 × 180', size: '10 KB', status: 'ready', progress: 100, thumbnail: prepared.thumbnail, hasAudio: true };
     const project = { id: 'project', resolution: '320 × 180', fps: 24 } as Project;
     const track = (id: string, number: number, kind: 'video' | 'audio' = 'video'): Track => ({ id, timelineId: 'timeline', number, kind, name: id, muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 });
@@ -147,16 +155,16 @@ test('text titles export at their timeline range with visible colored glyphs', a
   } finally { await rm(dir,{recursive:true,force:true}); }
 });
 
-test('full-range untagged Sony proxies preserve range and RGB balance',async()=>{
+test('full-range untagged Sony footage becomes video-range full-v3 without shifting RGB',async()=>{
   const dir=await mkdtemp(path.join(tmpdir(),'frameline-log-range-'));
   try{
     const source=path.join(dir,'log.mp4');
     await ff(['-f','lavfi','-i','nullsrc=s=320x180:r=24:d=0.25','-vf',"format=yuv444p10le,geq=lum='400+100*X/W':cb='490+20*Y/H':cr='540-30*X/W'",'-c:v','libx264','-crf','0','-color_range','pc','-metadata','comment=S-Log3/S-Gamut3.Cine',source]);
     const metadata=await prepareMedia({inputPath:source,outputDir:path.join(dir,'prepared'),baseUrl:'/files'});
     assert.equal(metadata.inputProfile,'S-Log3');assert.equal(metadata.colorMatrix,'bt709');
-    assert.equal((await probeMedia(path.join(dir,'prepared/proxy.mp4'))).colorRange,'pc');
+    assert.equal((await probeMedia(path.join(dir,'prepared/full-v3.mp4'))).colorRange,'tv');
     const pixels=async(file:string)=>(await ff(['-i',file,'-vf','scale=in_color_matrix=bt709,format=gbrpf32le,scale=32:18:flags=area','-frames:v','1','-f','rawvideo','-pix_fmt','rgb24','pipe:1'])).stdout;
-    const [a,b]=await Promise.all([pixels(source),pixels(path.join(dir,'prepared/proxy.mp4'))]);const bias=[0,0,0];for(let i=0;i<a.length;i++)bias[i%3]+=b[i]-a[i];
+    const [a,b]=await Promise.all([pixels(source),pixels(path.join(dir,'prepared/full-v3.mp4'))]);const bias=[0,0,0];for(let i=0;i<a.length;i++)bias[i%3]+=b[i]-a[i];
     for(const channel of bias)assert.ok(Math.abs(channel/(a.length/3))<.8,`Proxy channel bias: ${bias.map(x=>x/(a.length/3))}`);
   }finally{await rm(dir,{recursive:true,force:true});}
 });
@@ -230,7 +238,7 @@ test('audio envelopes fade gain and preserve their position in partial exports',
  } finally {await rm(dir,{recursive:true,force:true});}
 });
 
-test('playable footage is published before color preparation and survives a later failure', { timeout: 30000 }, async () => {
+test('full-v3 is published as the playable and grading picture before the smaller previews, and survives a later failure', { timeout: 30000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'frameline-early-ready-'));
   const controller = new AbortController();
   let playable = false;
@@ -239,11 +247,11 @@ test('playable footage is published before color preparation and survives a late
     const source = path.join(dir, 'source.mp4'), outputDir = path.join(dir, 'prepared');
     await ff(['-f','lavfi','-i','testsrc2=size=320x180:rate=24:duration=1','-c:v','libx264','-pix_fmt','yuv420p',source]);
     await assert.rejects(prepareMedia({ inputPath: source, outputDir, baseUrl: '/media', signal: controller.signal,
-      onPlayable: asset => { playable = true; assert.equal(asset.duration, 1); assert.equal(asset.proxyUrl, '/media/proxy.mp4'); assert.ok(!stages.includes('Creating high-precision color preview')); },
-      onStage: stage => { stages.push(stage); if (stage === 'Creating high-precision color preview') { assert.ok(playable); controller.abort(); } }
+      onPlayable: asset => { playable = true; assert.equal(asset.duration, 1); assert.equal(asset.proxyUrl, '/media/full-v3.mp4'); assert.equal(asset.colorProxyUrl, asset.proxyUrl); assert.ok(!stages.includes('Creating smaller playback previews')); },
+      onStage: stage => { stages.push(stage); if (stage === 'Creating smaller playback previews') { assert.ok(playable); controller.abort(); } }
     }), /Canceled/);
-    assert.ok((await stat(path.join(outputDir, 'proxy.mp4'))).size > 0, 'background failure must preserve the playable preview');
-    assert.ok(stages.includes('Creating smaller playback previews'));
+    assert.ok((await stat(path.join(outputDir, 'full-v3.mp4'))).size > 0, 'background failure must preserve the playable preview');
+    assert.ok(!existsSync(path.join(outputDir, 'stream-low-v2.mp4')), 'a cancelled variant is never published half-written');
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
@@ -385,8 +393,9 @@ test('vertical reels: rotated probes, portrait stills, flips, aspect guard and H
   await ff(['-f','lavfi','-i','testsrc2=s=128x72:r=24:d=0.25','-vf','setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc','-pix_fmt','yuv420p10le','-c:v','libx264','-color_primaries','bt2020','-color_trc','arib-std-b67','-colorspace','bt2020nc',hlg]);
   const hdr=await probeMedia(hlg);assert.equal(hdr.colorTransfer,'arib-std-b67');
   const proxied=await prepareMedia({inputPath:hlg,outputDir:path.join(dir,'hlg'),baseUrl:'/f'});
-  assert.ok('colorProxyUrl' in proxied&&proxied.colorProxyUrl,'the grading proxy is tone-mapped too');assert.equal((await probeMedia(path.join(dir,'hlg','proxy.mp4'))).colorTransfer,'bt709','previews are SDR');
-  assert.equal((await probeMedia(path.join(dir,'hlg','color-v1.mp4'))).colorTransfer,'bt709','the grading proxy is not tagged HLG, or the browser tone-maps it again');
+  assert.ok('colorProxyUrl' in proxied&&proxied.colorProxyUrl,'the grading picture is tone-mapped too');
+  assert.equal((await probeMedia(path.join(dir,'hlg','full-v3.mp4'))).colorTransfer,'bt709','full-v3 is SDR and not tagged HLG, or the browser tone-maps it again');
+  assert.equal((await probeMedia(path.join(dir,'hlg','stream-low-v2.mp4'))).colorTransfer,'bt709','previews are SDR');
   const video=(tags:object)=>({id:'v',projectId:'p',name:'HLG',kind:'video',duration:hdr.duration,status:'ready',progress:100,binId:'',thumbnail:'',fps:24,resolution:'128 × 72',size:'',colorMatrix:'bt2020nc',...tags}) as any;
   const wide={...project,resolution:'128 × 72'},shot={...clip,mediaId:'v',properties:{},duration:.25};
   const stats=async(tags:object,name:string)=>{
@@ -437,7 +446,7 @@ test('ProRes 4444 graphics keep their alpha in previews and composite over foota
   await ff(['-f','lavfi','-i','color=red:s=64x64:r=24:d=0.5,format=rgba,geq=r=255:g=0:b=0:a=if(lt(X\\,32)\\,255\\,0)','-c:v','prores_ks','-profile:v','4444','-pix_fmt','yuva444p10le',graphic]);
   const probed=await probeMedia(graphic);assert.equal(probed.hasAlpha,true,'a yuva ProRes is detected as alpha');
   const prepared=await prepareMedia({inputPath:graphic,outputDir:path.join(dir,'prepared'),baseUrl:'/f'});
-  assert.equal(prepared.hasAlpha,true);assert.equal(prepared.proxyUrl,'/f/proxy-alpha-v1.webm');assert.ok(!('colorProxyUrl' in prepared&&prepared.colorProxyUrl),'no opaque grading proxy');
+  assert.equal(prepared.hasAlpha,true);assert.equal(prepared.proxyUrl,'/f/proxy-alpha-v1.webm');assert.ok('colorProxyUrl' in prepared&&prepared.colorProxyUrl===undefined,'no opaque grading proxy, and an old one is cleared by name');
   for(const url of [prepared.proxyUrl,...Object.values(prepared.proxyVariants!)]){
    const file=path.join(dir,'prepared',path.basename(url));
    assert.ok((await probeMedia(file)).hasAlpha,`${url} carries alpha`);

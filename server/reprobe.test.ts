@@ -35,6 +35,7 @@ test('a startup re-probe of an old HLG phone clip reports it upright and re-prep
     await exec(process.execPath, ['scripts/import-folder.mjs', '--name', 'Reel', footage], { env: { ...process.env, FRAME_LINE_COOKIE: cookie, FRAME_LINE_URL: base } });
     const first = await asset(a => a.status === 'ready' && a.colorProxyUrl && !a.preparationStage);
     assert.equal(first.resolution, '72 × 128'); assert.ok(!first.proxyUrl.includes('?'), 'a first preparation keeps plain URLs');
+    assert.match(first.proxyUrl, /\/full-v3\.mp4$/); assert.equal(first.colorProxyUrl, first.proxyUrl, 'Full and Color share full-v3');
     await app.close();
 
     // What an asset imported before PROBE_VERSION 2 looks like: landscape, no transfer, no probe version.
@@ -45,7 +46,7 @@ test('a startup re-probe of an old HLG phone clip reports it upright and re-prep
 
     ({ app, base } = await start());
     const again = await asset(a => a.probeVersion === PROBE_VERSION && a.status === 'ready' && a.proxyUrl.includes('?v=') && a.colorProxyUrl?.includes('?v=') && !a.preparationStage);
-    assert.equal(again.resolution, '72 × 128'); assert.equal(again.colorTransfer, 'arib-std-b67');
+    assert.equal(again.resolution, '72 × 128'); assert.equal(again.colorTransfer, 'arib-std-b67'); assert.equal(again.colorProxyUrl, again.proxyUrl);
     for (const url of [again.proxyUrl, again.thumbnail, again.colorProxyUrl, ...Object.values(again.proxyVariants)] as string[]) {
       assert.match(url, /\?v=/, `${url} is a new URL, not the cached one`);
       assert.equal((await fetch(base + url, { headers: { cookie } })).status, 200, url);
