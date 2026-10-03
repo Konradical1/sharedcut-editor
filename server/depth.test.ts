@@ -174,18 +174,25 @@ test('the cache stays under its cap by evicting the least recently used run, nev
   }
 });
 
-test('a new run is refused when it would take the disk below the free-space floor', async () => {
-  const f = fixture('disk');
-  let free = 1.9 * 1024 ** 3;
+test('a new run is refused when it would take the disk below the free-space floor, never under the server reserve', async () => {
+  const f = fixture('disk'), previous = process.env.FRAME_LINE_MIN_FREE_GB;
+  let free = 4.9 * 1024 ** 3;
   const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory), sourceTimes: async () => times, freeBytes: () => free });
   try {
+    // Under the server's 5 GB reserve uploads fail and /api/health reports the disk low, so depth stops there too.
+    await assert.rejects(service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 10, to: 11 }), (error: Error & { status?: number }) => error.status === 507 && /4\.9 GB free.*keeps 5\.0 GB/.test(error.message));
+    process.env.FRAME_LINE_MIN_FREE_GB = '1'; // A smaller reserve still leaves depth its own 2 GB floor.
+    free = 1.9 * 1024 ** 3;
     await assert.rejects(service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 10, to: 11 }), (error: Error & { status?: number }) => error.status === 507 && /1\.9 GB free.*keeps 2\.0 GB/.test(error.message));
     assert.equal(runs(f.directory).length, 0, 'no worker started');
     free = 2.5 * 1024 ** 3;
     const job = await service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 10, to: 11 });
     await until(() => service.get('project', job.key).status === 'ready');
     assert.equal(runs(f.directory).length, 1);
-  } finally { await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
+  } finally {
+    if (previous === undefined) delete process.env.FRAME_LINE_MIN_FREE_GB; else process.env.FRAME_LINE_MIN_FREE_GB = previous;
+    await service.close(); rmSync(f.directory, { recursive: true, force: true });
+  }
 });
 
 test('an export waiting for a run keeps it: an editor cancelling it meanwhile (a trim, the effect removed) fails nothing', async () => {

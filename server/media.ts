@@ -34,7 +34,7 @@ import { renderStabilized, stabilizeSolve, stabilizeWarpMattes } from './stabili
 import { stabilizeEffect, stabilizeMatrixAt, stabilizeRange, stabilizeSettings, type StabilizeSolve } from '../src/services/stabilize.ts';
 import { flowFrames, timingPaths } from '../src/services/opticalFlow.ts';
 import { gpuJob } from './workQueue.ts';
-import type { depthService } from './depth.ts';
+import { depthDiskFloor, type depthService } from './depth.ts';
 import { depthFocusAt } from '../src/services/depth.ts';
 
 type ProcessOptions = { signal?: AbortSignal; onProgress?: (percent: number) => void; duration?: number; binary?: boolean; maxBytes?: number; jsonProgress?: boolean | 'stderr' };
@@ -1474,8 +1474,8 @@ async function renderDepthTimeline(request: RenderRequest) {
       // A matte above Depth sends the pre-depth pass through color-render.py first, which keeps a 16-bit RGBA FFV1 copy of the
       // whole bake in the temp folder until the bake ends: 8 bytes a pixel, about half that after FFV1.
       const matted = activeSmartMasks({ ...clip, effects: before }, nodes).length > 0;
-      const need = frames * (DEPTH_BAKE_BYTES_4K / (3840 * 2160) + (matted ? 4 : 0)) * width * height + 512 * 1024 ** 2, disk = statfsSync(directory), free = disk.bavail * disk.bsize;
-      if (free < need) throw new Error(`${clip.name}: not enough disk space to bake Depth: about ${(need / 1024 ** 3).toFixed(1)} GB needed, ${(free / 1024 ** 3).toFixed(1)} GB free.`);
+      const need = frames * (DEPTH_BAKE_BYTES_4K / (3840 * 2160) + (matted ? 4 : 0)) * width * height + 512 * 1024 ** 2, disk = statfsSync(directory), free = disk.bavail * disk.bsize, floor = depthDiskFloor();
+      if (free - need < floor) throw new Error(`${clip.name}: not enough disk space to bake Depth: about ${(need / 1024 ** 3).toFixed(1)} GB needed, ${(free / 1024 ** 3).toFixed(1)} GB free, and ${(floor / 1024 ** 3).toFixed(1)} GB is kept free.`);
       const keys = effectDefinitions.Depth.parameters.map(parameter => parameter.key);
       const params = Object.fromEntries(keys.map(key => [key, effectValue(clip, effect, key)]));
       let animated: Record<string, number[]> | undefined;

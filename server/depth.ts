@@ -21,6 +21,12 @@ const fail = (status: number, message: string): never => { throw new DepthError(
 const remove = (path: string) => rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 const regularFile = (path: string) => { try { const file = lstatSync(path); return file.isFile() && file.size > 0; } catch { return false; } };
 const gigabytes = (name: string, fallback: number) => { const value = Number(process.env[name]); return (Number.isFinite(value) && value > 0 ? value : fallback) * 1024 ** 3; };
+/** Free space depth (runs and export bakes) never takes the disk below: its own floor, and never under the server's reserve
+ *  (FRAME_LINE_MIN_FREE_GB, default 5), below which uploads fail and /api/health reports the disk low. */
+export function depthDiskFloor() {
+  const reserve = Number(process.env.FRAME_LINE_MIN_FREE_GB ?? 5);
+  return Math.max(gigabytes('FRAME_LINE_DEPTH_MIN_FREE_GB', 2), (Number.isFinite(reserve) && reserve >= 0 ? reserve : 5) * 1024 ** 3);
+}
 /** Measured on the Dell: about 18 KB of master and 5 KB of preview per frame; busier pictures cost more. */
 const BYTES_PER_FRAME = 40 * 1024;
 
@@ -154,7 +160,7 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
     for (const job of evictable()) { if (total + need <= cap) break; if (job.key === keep) continue; total -= job.bytes ?? 0; evict(job); }
   };
   const makeRoom = (need: number) => {
-    const floor = gigabytes('FRAME_LINE_DEPTH_MIN_FREE_GB', 2);
+    const floor = depthDiskFloor();
     const check = (free: number) => { if (free - need < floor) fail(507, `The server is low on disk space: ${(free / 1024 ** 3).toFixed(1)} GB free, and depth analysis keeps ${(floor / 1024 ** 3).toFixed(1)} GB free. Free some space and try again.`); };
     // The disk can be low for reasons depth cannot fix: then refuse without throwing the cache away for nothing.
     const reclaimable = evictable().reduce((sum, job) => sum + (job.bytes ?? 0), 0);
