@@ -90,6 +90,18 @@ test('a trimmed, fast, reversed clip takes the depth of the frame it shows', { t
   } finally { await f.close(); }
 });
 
+test('a keyframed rack focus changes the focus frame by frame', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
+  const f = fixture('rack');
+  try {
+    const clip = { ...f.clip, sourceIn: .4, keyframes: { 'effects.depth.parameters.focus': [{ id: 'a', time: 0, value: 0, interpolation: 'linear' as const }, { id: 'b', time: .4, value: 0, interpolation: 'linear' as const }, { id: 'c', time: 1.6, value: 100, interpolation: 'linear' as const }] } };
+    const request = f.request([clip], 2);
+    await renderTimeline(request);
+    const early = await luma(request.outputPath, .2), late = await luma(request.outputPath, 1.8), a = boundary(early), b = boundary(late);
+    assert.ok(detail(early, 20, a - 6) > 12 && detail(early, a + 4, Math.min(W, a + 60)) < 4, 'focused near at the start');
+    assert.ok(detail(late, 20, b - 6) < 6 && detail(late, b + 4, W) > 12, 'focused far at the end');
+  } finally { await f.close(); }
+});
+
 test('cancelling a Depth export stops the bake and removes its files', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
   const f = fixture('cancel'), scratch = path.join(f.dir, 'tmp'), previous = process.env.TMPDIR;
   mkdirSync(scratch);
@@ -109,7 +121,7 @@ test('Depth export refuses what it cannot bake, by name', { timeout: 300_000, sk
   try {
     await assert.rejects(renderTimeline(f.request([{ ...f.clip, properties: { ...f.clip.properties, opticalFlow: true } }], 2)), /needs warped depth/);
     await assert.rejects(renderTimeline(f.request([{ ...f.clip, mediaId: 'frameline-composition', properties: { ...f.clip.properties, compositionId: 'nested' } }], 2)), /not on compositions or titles/);
-    await assert.rejects(renderTimeline(f.request([{ ...f.clip, effects: [{ id: 'blur', name: 'Gaussian blur', enabled: true, amount: 50 }, ...f.clip.effects], keyframes: { 'effects.blur.amount': [{ time: 0, value: 0, interpolation: 'linear' }, { time: 1, value: 50, interpolation: 'linear' }] } as Clip['keyframes'] }], 2)), /keyframed grades or effects above Depth/);
+    await assert.rejects(renderTimeline(f.request([{ ...f.clip, effects: [{ id: 'blur', name: 'Gaussian blur', enabled: true, amount: 50 }, ...f.clip.effects], keyframes: { 'effects.blur.amount': [{ id: 'k0', time: 0, value: 0, interpolation: 'linear' }, { id: 'k1', time: 1, value: 50, interpolation: 'linear' }] } }], 2)), /keyframed grades or effects above Depth/);
     // Variable frame rate: every third frame lands 12 ms late.
     const vfr = path.join(f.dir, 'vfr.mp4');
     execFileSync(ffmpeg, ['-v', 'error', '-y', '-f', 'lavfi', '-i', `testsrc2=s=${W}x${H}:r=${FPS}:d=3`, '-vf', "settb=1/1000,setpts='PTS+if(eq(mod(N,3),0),12,0)'", '-fps_mode', 'passthrough', '-enc_time_base', '1/1000', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', vfr]);
