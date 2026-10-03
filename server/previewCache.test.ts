@@ -5,10 +5,10 @@ import path from 'node:path';
 import test from 'node:test';
 import { createPreviewCache } from './previewCache.ts';
 import type { RenderRequest } from './media.ts';
-import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
+import type { Clip, GradeNode, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
 
-test('timeline previews skip a range with an active Depth clip and render the rest', async () => {
+test('timeline previews skip a range with an active Depth clip or depth key and render the rest', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'frameline-preview-cache-'));
   try {
     const rendered: string[] = [], scheduled: Promise<void>[] = [];
@@ -36,6 +36,11 @@ test('timeline previews skip a range with an active Depth clip and render the re
     nested.clips[1].trackId = 'mv'; nested.clips[2].trackId = 'iv';
     assert.equal(cache.request(nested).status, 'skipped', 'a Depth inside a nested composition is never baked for a preview');
     await Promise.all(scheduled);
-    assert.deepEqual(rendered.sort(), ['0', '4'], 'only the chunks without an active Depth reached the renderer');
+    // A depth key grades from the clip's depth run, which a viewer's preview must never start or wait for in a media slot.
+    const key = { id: 'n', clipId: 'deep', projectId: 'p', name: 'Key', enabled: true, order: 1, parameters: {}, mask: { source: 'depth', enabled: true, invert: false, amount: 100, near: 0, far: 40, softness: 10 } } as unknown as GradeNode;
+    assert.equal(cache.request({ ...snapshot(4, [clip('plain', 0), clip('deep', 4)]), nodes: [key] }).status, 'skipped', 'a depth-keyed range is not rendered either');
+    assert.equal(cache.request({ ...snapshot(4, [clip('plain', 0), clip('deep', 4)]), nodes: [{ ...key, mask: { ...key.mask!, enabled: false } } as GradeNode] }).status, 'preparing', 'a key switched off reads no depth');
+    await Promise.all(scheduled);
+    assert.deepEqual(rendered.sort(), ['0', '4', '4'], 'only the chunks without active depth reached the renderer');
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

@@ -193,8 +193,18 @@ function applyChanges(state: ProjectState, changes: Change[]): ProjectState & {t
 }
 const overlap = (a: Change, b: Change) => a.collection === b.collection && a.id === b.id && (a.replace || b.replace || [...Object.keys(a.value ?? {}), ...a.unset ?? []].some(key => [...Object.keys(b.value ?? {}), ...b.unset ?? []].some(other => key === other || key.startsWith(`${other}.`) || other.startsWith(`${key}.`))));
 // Undo and Redo never leave a clip without its track or timeline, a grade node without its clip, or a composition loop.
-const intact = (restored: ProjectState, timelines: Timeline[]) => {
+/** Effects (a Smart Mask cut, a Depth subject) and nodes naming a mask their clip lacks: the server refuses every save of one. */
+const danglingMasks = (state: ProjectState) => {
+  const masks = new Map(state.clips.map(clip => [clip.id, new Set((clip.smartMasks ?? []).map(mask => mask.id))]));
+  return new Set([...state.clips.flatMap(clip => clip.effects.filter(effect => effect.maskId !== undefined && !masks.get(clip.id)!.has(effect.maskId)).map(effect => `${clip.id}:${effect.id}`)),
+    ...state.nodes.filter(node => node.mask && !isDepthKey(node.mask) && !masks.get(node.clipId)?.has(node.mask.id)).map(node => node.id)]);
+};
+/** `current`: what an undo or redo starts from; it may not leave a mask reference behind that is not dangling already (an
+ *  undone grade paste taking the mask a collaborator made the Depth subject since). */
+const intact = (restored: ProjectState, timelines: Timeline[], current: ProjectState) => {
   if (!restored.clips.every(clip => (restored.timelines ?? timelines).some(t => t.id === clip.timelineId) && restored.tracks.some(track => track.id === clip.trackId && track.timelineId === clip.timelineId)) || !restored.nodes.every(node => restored.clips.some(clip => clip.id === node.clipId))) return false;
+  const before = danglingMasks(current);
+  if ([...danglingMasks(restored)].some(reference => !before.has(reference))) return false;
   try { validateCompositions(restored.clips, restored.timelines ?? timelines); return true; } catch { return false; }
 };
 /** Applying `changes` would leave every entity they touch exactly as it is now. */
@@ -1563,7 +1573,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
           if(!unchanged){blocked=true;return false;}
           restored=applyChanges(restored,candidate.oldState as Change[]);
         }
-        if(!intact(restored,state.timelines)){blocked=true;return false;}
+        if(!intact(restored,state.timelines,state)){blocked=true;return false;}
         group=candidates;changes=candidates.flatMap(o=>o.oldState as Change[]);return true;
       });
       if (!operation) { state.notify(blocked ? 'Cannot undo without overwriting a newer change' : 'No personal actions to undo', 'info'); return; }
@@ -1587,7 +1597,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const undone=redoable.find(op=>op.projectId===state.projectId&&op.userId===state.currentUserId);
       if(!undone){state.notify('Nothing to redo','info');return;}
       const forward=structuredClone(undone.oldState as Change[]);
-      if(!settled(state,undone.newState as Change[])||!intact(applyChanges(state,forward),state.timelines)){state.notify('Cannot redo without overwriting a newer change','info');return;}
+      if(!settled(state,undone.newState as Change[])||!intact(applyChanges(state,forward),state.timelines,state)){state.notify('Cannot redo without overwriting a newer change','info');return;}
       if(forward.some(change=>change.collection!=='comments')&&!writable())return;
       if(forward.some(change=>!available(change.id,'*')))return;
       const rest=redoable.filter(op=>op!==undone),description=undone.description.replace(/^undid: (redid: )?/,'');

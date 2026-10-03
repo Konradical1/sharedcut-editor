@@ -962,6 +962,22 @@ test('duplicated Smart Mask intent is independent and same-source grade paste re
   assert.ok(state().clips.find(c=>c.id===duplicate.id)!.smartMasks!.some(m=>m.id===copiedMask));
 });
 
+test('undoing a grade paste never takes a mask a collaborator has since made the Depth subject', () => {
+  state().addEffect('c3','Smart Mask');
+  state().duplicateClip('c3');
+  const duplicate=state().clips.find(c=>c.id===state().selectedClipId)!;
+  state().copyGrade('c3');state().pasteGrade(duplicate.id);
+  const pasted=clip(duplicate.id).smartMasks!.at(-1)!;
+  state().setCurrentUser('ashley');
+  state().addEffect(duplicate.id,'Depth');
+  const depth=clip(duplicate.id).effects.find(e=>e.name==='Depth')!;
+  state().attachSmartMask(duplicate.id,pasted.id,depth.id);
+  assert.equal(clip(duplicate.id).effects.find(e=>e.id===depth.id)!.maskId,pasted.id);
+  state().setCurrentUser('kyle');
+  state().undo();
+  assert.ok(clip(duplicate.id).smartMasks!.some(m=>m.id===pasted.id),'the paste stays: the subject keeps its mask, so saves keep working');
+});
+
 test('a trim stops at the neighbour, and the drag preview clamps exactly where the commit does', () => {
   const neighbour = structuredClone(clip('c4'));
   assert.deepEqual(state().fitTrim('c3', 30, 40), { start: 30, duration: 35 });

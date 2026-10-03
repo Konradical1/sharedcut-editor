@@ -69,13 +69,13 @@ test('depth frames come from the decoded picture timestamp; a missing frame fall
   preview.frame('c', at(64 + 50));
   await until(() => downloads.some(url => url.includes('/preview/1.mp4')));
 
-  // A trim inside the one-second handles keeps the run; a slip past them asks again.
+  // Every trim asks the server, which alone picks the clip's run (the one its exports read); the run shown keeps playing
+  // while it is asked, and stays when the server keeps it.
   ensureDepthRun({ ...clip, sourceIn: 4 }, asset);
-  await tick();
-  assert.equal(posts.length, 1);
-  ensureDepthRun({ ...clip, sourceIn: 7 }, asset);
-  await until(() => posts.length === 2);
-  await until(() => depthState('c')?.status === 'ready');
+  assert.equal(depthState('c')?.status, 'ready'); assert.equal(depthState('c')?.run?.key, run.key);
+  assert.equal(preview.frame('c', at(74)).state, 'ready', 'no gap in the picture while the server is asked');
+  await until(() => posts.length === 2 && !depthState('c')!.asking);
+  assert.equal(depthState('c')?.run?.key, run.key);
 
   // The focus picker reads the frame drawn last.
   rememberDepth('c', { pixels: { data: new Uint8Array([230, 230, 25, 25, 230, 230, 25, 25]), width: 4, height: 2, key: 'x' }, near: .9, far: .1 });
@@ -201,7 +201,43 @@ test('a Depth clip keeps its run while the effect is off or another project is o
   assert.equal(depthState('cw'), undefined); assert.deepEqual(deletes, [], 'opening another project stops watching, nothing more');
   set({ projectId: 'p' });
   await until(() => posts === 2 && depthState('cw')?.status === 'queued');
+  // A transition widens the run by its handles (depthSpan), so the server is asked again.
+  set({ clips: [clipOf('cw', { transition: 'Cross dissolve' })] });
+  await until(() => posts === 3);
   set({ clips: [clipOf('cw', { effects: [] })] });
   assert.equal(depthState('cw'), undefined);
   assert.deepEqual(deletes, [`/api/depth/${run.key}?projectId=p`], 'removing Depth frees the GPU');
+});
+
+test('the server picks the run: a trim keeps or replaces it as told, and a run someone else cancelled is asked for again', async () => {
+  const queued = (letter: string) => runOf(letter, { status: 'queued', progress: 0, segments: [], next: 0 });
+  const first = queued('h'), ready = runOf('j'), other = queued('k');
+  let answer: DepthRun = first, posts = 0, cancelled = false;
+  const deletes: string[] = [];
+  globalThis.fetch = (async (url: string, init?: RequestInit) => {
+    if (url === '/api/depth' && init?.method === 'POST') { posts++; return json(answer); }
+    if (init?.method === 'DELETE') { deletes.push(url); return json({ ok: true }); }
+    if (url.startsWith(`/api/depth/${first.key}?`)) return json({ ...first, times: [], ...cancelled ? { status: 'cancelled', error: 'Cancelled.' } : {} });
+    if (url.startsWith(`/api/depth/${other.key}?`)) return json({ ...other, times: [] });
+    return json({ error: 'Depth analysis not found.' }, 404);
+  }) as typeof fetch;
+  const clip = clipOf('cq');
+  ensureDepthRun(clip, videoAsset);
+  await until(() => depthState('cq')?.status === 'queued');
+  // The server keeps the queued run for the trimmed clip: nothing is cancelled and it never shows as starting.
+  ensureDepthRun({ ...clip, sourceIn: 4 }, videoAsset);
+  assert.equal(depthState('cq')?.status, 'queued');
+  await until(() => posts === 2 && !depthState('cq')!.asking);
+  assert.equal(depthState('cq')?.run?.key, first.key); assert.deepEqual(deletes, []);
+  // Another editor's trim cancels it: this clip still needs a run, so it asks and gets the one the server picks now.
+  answer = ready; cancelled = true;
+  await until(() => posts === 3 && depthState('cq')?.status === 'ready', 3000);
+  assert.equal(depthState('cq')?.run?.key, ready.key); assert.deepEqual(deletes, [], 'a run someone else cancelled is not cancelled again');
+  // Replaced by a run still queued, then back: the queued one nothing reads any more gives the GPU up.
+  answer = other; ensureDepthRun({ ...clip, sourceIn: 5 }, videoAsset);
+  await until(() => posts === 4 && depthState('cq')?.run?.key === other.key);
+  assert.deepEqual(deletes, [], 'a ready run it leaves costs nothing');
+  answer = ready; ensureDepthRun({ ...clip, sourceIn: 4 }, videoAsset);
+  await until(() => posts === 5 && depthState('cq')?.run?.key === ready.key);
+  assert.deepEqual(deletes, [`/api/depth/${other.key}?projectId=p`]);
 });

@@ -21,7 +21,8 @@ function processFile(command:string,args:string[],signal:AbortSignal,progress?:(
     child.on('error',reject);child.on('close',code=>{signal.removeEventListener('abort',abort);code===0?resolve():reject(new Error(signal.aborted?'Cancelled':error.trim()||`Speech worker exited (${code}).`));});
   });
 }
-export async function transcribeTimeline(request:RenderRequest,trackIds:string[],progress:(stage:string,value:number)=>void):Promise<CaptionWord[]> {
+/** `leaveQueue` runs once the audio is rendered, before the transcription waits for the GPU. */
+export async function transcribeTimeline(request:RenderRequest,trackIds:string[],progress:(stage:string,value:number)=>void,leaveQueue?:()=>void):Promise<CaptionWord[]> {
   if(!captionAvailable())throw new Error('Local speech models are not installed. Run npm run setup:captions on the server.');
   const signal=request.signal!,start=Number(request.settings.rangeIn),end=Number(request.settings.rangeOut);
   const directory=await mkdtemp(join(tmpdir(),'frameline-transcription-'));
@@ -39,6 +40,7 @@ export async function transcribeTimeline(request:RenderRequest,trackIds:string[]
     const list=join(directory,'audio.txt'),audio=join(directory,'audio.wav'),result=join(directory,'words.json');
     await writeFile(list,files.join('\n'));
     await processFile(process.env.FFMPEG_PATH||'ffmpeg',['-v','error','-y','-f','concat','-safe','0','-i',list,'-vn','-ac','1','-ar','16000','-c:a','pcm_s16le','-t',String(end-start),audio],signal);
+    leaveQueue?.();
     await gpuJob(()=>processFile(captionPython(),[resolve('scripts/transcribe.py'),audio,result],signal,progress),signal);
     const parsed=JSON.parse(await readFile(result,'utf8'));validateWords(parsed.words);
     return parsed.words.map((w:CaptionWord)=>({...w,start:w.start+start,end:Math.min(end,w.end+start)})).filter((w:CaptionWord)=>w.end>w.start);

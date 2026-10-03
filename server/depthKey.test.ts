@@ -108,3 +108,12 @@ test('an export waits for the editor\'s whole-clip runs of its Depth and depth-k
   const cut = depthRuns({ ...request, clips: [{ ...clip, start: 4, duration: 1, sourceIn: 6 }], wholeClips: [clip] });
   assert.deepEqual(cut.map(r => [r.clip.duration, r.from, r.to]), [[6, runs[0].from, runs[0].to]]);
 });
+
+test('an export also waits for the depth runs inside the compositions it shows, whatever range the parent shows', () => {
+  const { asset, clip } = fixture('source.mp4', 160, 90, 25, 10, { duration: 6, sourceIn: 2 });
+  const parent: Clip = { ...clip, id: 'parent', mediaId: 'frameline-composition', properties: { ...defaultProperties, compositionId: 'nested' } };
+  const inner: Clip = { ...clip, id: 'inner', timelineId: 'nested', trackId: 'nv', start: 3 };
+  const request = { ...exportOf('', 'source.mp4', asset, parent, [{ ...keyNode, clipId: 'inner' }], 'nested', { fps: '25', rangeIn: '0', rangeOut: '1' }, undefined),
+    clips: [parent, inner], tracks: [track, { ...track, id: 'nv', timelineId: 'nested' }], timelines: [{ id: 'timeline', projectId: 'project', name: 'test', duration: 6 }, { id: 'nested', projectId: 'project', name: 'nested', duration: 9, composition: true }] };
+  assert.deepEqual(depthRuns(request).map(r => r.clip.id), ['inner'], 'a depth-keyed clip a composition holds is waited for before the render queue');
+});

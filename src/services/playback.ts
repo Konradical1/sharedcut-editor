@@ -856,7 +856,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         const nodes = evaluateNodes(nodesOf(state.nodes, clip.id),focusing?.clip??clip,focusing?.time??time).filter(node=>node.enabled);
         const maskCount=activeSmartMasks(clip,nodes).length,depthKeys=activeDepthKeys(clip,nodes);
         if(maskCount&&clip.properties.opticalFlow)throw Error('Smart Mask and optical-flow retiming need a shared warped matte. Disable optical flow for this clip.');
-        if(depthKeys.length&&clip.properties.opticalFlow)throw Error('A depth key and optical-flow retiming need warped depth. Disable optical flow for this clip.');
+        if(depthKeys.length&&clip.properties.opticalFlow)throw Error('A depth key cannot follow optical-flow retiming yet. Disable optical flow for this clip.');
         /** Source-box alpha letterboxed onto the layer, as the source RGB is; one entry per frame, matte and layer size. */
         const fit=(matte:SmartMaskPixels,sourceWidth:number,sourceHeight:number)=>{
           const key=`${matte.key}:${width}:${height}:${sourceWidth}:${sourceHeight}`;
@@ -939,7 +939,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           }
         } else if(effect.name==='Depth') {
           // After colour and Stabilize, before flip and transform; frames the analysis has not reached play plain.
-          if(clip.properties.opticalFlow){warning='Depth · needs warped depth · disable optical flow for this clip';continue;}
+          if(clip.properties.opticalFlow){warning='Depth cannot follow optical-flow retiming yet · disable optical flow for this clip';continue;}
           const depth=depthFrames.frame(clip.id,Number(sourceTimestamp)||0);
           if(depth.state==='failed'){warning=`Depth unavailable · ${depth.error}`;continue;}
           if(depth.state==='none'||depth.state==='analyzing'){warning='Analyzing depth';continue;}
@@ -951,7 +951,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           const subject=params.blur>0&&effect.maskId?clip.smartMasks?.find(m=>m.id===effect.maskId):undefined;
           let matte:DepthFxInput['matte'];
           if(subject){
-            if(!subject.result||subject.result.signature!==smartMaskSignature(subject))warning=subject.result?'Depth · the subject mask was edited · analyze it again for clean edges':'Depth · analyze the subject mask for clean edges';
+            if(!subject.result||subject.result.signature!==smartMaskSignature(subject))warning=subject.result?'Depth · the subject mask was edited · analyze it again before exporting':'Depth · analyze the subject mask before exporting';
             else{
               try{
                 const pixels=maskPreview.readDoc(clip,subject,Number(sourceTimestamp)||0,asset);

@@ -16,8 +16,9 @@ const defaultWorker = fileURLToPath(new URL('../scripts/depth.py', import.meta.u
 const defaultPython = () => process.env.FRAME_LINE_DEPTH_PYTHON || venvPython('.venv-mask');
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const validKey = (key: string) => /^[a-f0-9]{64}$/.test(key);
-export class DepthError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status; } }
-const fail = (status: number, message: string): never => { throw new DepthError(status, message); };
+/** `retry`: the refusal clears by itself (a full queue, a key still stopping), so an export waits it out. */
+export class DepthError extends Error { status: number; retry: boolean; constructor(status: number, message: string, retry = false) { super(message); this.status = status; this.retry = retry; } }
+const fail = (status: number, message: string, retry = false): never => { throw new DepthError(status, message, retry); };
 const remove = (path: string) => rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 const regularFile = (path: string) => { try { const file = lstatSync(path); return file.isFile() && file.size > 0; } catch { return false; } };
 const gigabytes = (name: string, fallback: number) => { const value = Number(process.env[name]); return (Number.isFinite(value) && value > 0 ? value : fallback) * 1024 ** 3; };
@@ -31,8 +32,10 @@ export function depthDiskFloor() {
 const BYTES_PER_FRAME = 40 * 1024;
 
 type Capabilities = DepthCapabilities & { workerIdentity?: unknown };
-export type DepthRequest = { clip: Clip; asset: MediaAsset; sourcePath: string; from: number; to: number; joinOnly?: boolean };
-type Job = Omit<DepthRun, 'next'> & { base: string; projects: string[]; used: number; bytes?: number };
+/** `bind`: an editor asking for its clip's run (POST /api/depth), which every later reader of that clip then prefers. */
+export type DepthRequest = { clip: Clip; asset: MediaAsset; sourcePath: string; from: number; to: number; joinOnly?: boolean; bind?: boolean };
+/** `clips`: the clips whose editor run this is (bind). */
+type Job = Omit<DepthRun, 'next'> & { base: string; projects: string[]; used: number; bytes?: number; clips?: string[] };
 
 const capabilityChecks = new Map<string, { request: Promise<Capabilities>; expiry: number }>();
 /** `--check` starts Python and imports torch (seconds): a success holds for ten minutes, a failure is retried after 30 seconds. */
@@ -120,6 +123,12 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
   const manifestPath = (key: string) => join(directory, key, 'manifest.json');
   /** A cancelled queued run gives its key up at once, so a stale queue entry must not drop a newer run's controller. */
   const release = (key: string, controller: AbortController) => { if (controllers.get(key) === controller) controllers.delete(key); };
+  /** The editor's run for a clip, which every reader of the clip (an export, a depth key, the focus track) then prefers
+   *  while it covers: two covering runs set their own near/far, so the export must read the one the editor shows. */
+  const bind = (job: Job, clipId: string) => {
+    for (const other of jobs.values()) if (other !== job && other.clips?.includes(clipId)) { other.clips = other.clips.filter(id => id !== clipId); save(other); }
+    if (!job.clips?.includes(clipId)) { job.clips = [...job.clips ?? [], clipId]; save(job); }
+  };
 
   // Nothing runs before the service starts: every partial folder is an interrupted run, and every queued or
   // processing record is one that died with the last server.
@@ -131,8 +140,8 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       const job = JSON.parse(readFileSync(path, 'utf8')) as Job;
       // A failure already shown before this start has been seen; its record (with up to 36,000 times) goes.
       if (['failed', 'cancelled'].includes(job.status)) { rmSync(path, { force: true }); continue; }
-      if (['queued', 'processing'].includes(job.status)) Object.assign(job, { status: 'failed', error: 'The server restarted. Analyze depth again.', segments: [] });
-      else if (job.status === 'ready' && !regularFile(manifestPath(job.key))) Object.assign(job, { status: 'failed', error: 'This depth analysis is missing. Analyze depth again.', segments: [] });
+      if (['queued', 'processing'].includes(job.status)) Object.assign(job, { status: 'failed', error: 'The server restarted. Click Retry.', segments: [] });
+      else if (job.status === 'ready' && !regularFile(manifestPath(job.key))) Object.assign(job, { status: 'failed', error: 'This depth analysis is missing. Click Retry.', segments: [] });
       if (job.status === 'ready') job.bytes ??= folderBytes(join(directory, job.key));
       save(job);
     } catch { /* A corrupt record is ignored; its folder goes below. */ }
@@ -141,7 +150,8 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
   // Focus tracks are named `<run key>-<id>.json` and go with their run.
   const focusDirectory = join(directory, 'focus');
   mkdirSync(focusDirectory, { recursive: true, mode: 0o700 });
-  const dropFocus = (keep: (name: string) => boolean) => { for (const name of readdirSync(focusDirectory)) if (!keep(name)) rmSync(join(focusDirectory, name), { force: true }); };
+  // A file Defender or the indexer holds open stays until the next start rather than stopping this one.
+  const dropFocus = (keep: (name: string) => boolean) => { for (const name of readdirSync(focusDirectory)) if (!keep(name)) { try { rmSync(join(focusDirectory, name), { force: true }); } catch { /* Retried next start. */ } } };
   dropFocus(name => !name.endsWith('.tmp') && jobs.get(name.slice(0, 64))?.status === 'ready');
 
   /** Record first, then files: a folder a Windows handle keeps has no ready record, so it is never served and the
@@ -179,7 +189,7 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
     // ponytail: a cursor past the end is from an earlier run of this key (it failed and was re-asked), so start over;
     // add a per-run id to DepthRun if the new run can overtake a poller's cursor between two polls.
     const from = after > job.segments.length ? 0 : Math.max(0, Math.floor(after) || 0);
-    const { base, projects, used, bytes, ...run } = job;
+    const { base, projects, used, bytes, clips, ...run } = job;
     return { ...run, times: from || !withTimes ? [] : job.times, segments: job.segments.slice(from), next: job.segments.length };
   };
 
@@ -251,19 +261,23 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       const analysis = maskAnalysis(clip, asset), sourceFingerprint = maskSourceFingerprint(sourcePath);
       const base = hash([sourceFingerprint, analysis.identity, capabilities.workerIdentity, size, image]);
       const key = hash([base, range.first, range.frames]);
-      // No awaits from here on: a second request for the same source sees this one's job.
+      // No awaits from here on: a second request for the same source sees this one's job. Ready first (a trim back
+      // inside a ready run plays at once), then the clip's editor run, then the smallest.
+      const bound = (job: Job) => Number(!!job.clips?.includes(clip.id));
       const covering = [...jobs.values()].filter(job => job.base === base && ['ready', 'queued', 'processing'].includes(job.status) && job.first <= range.first && job.first + job.frames >= range.first + range.frames && (job.status !== 'ready' || regularFile(manifestPath(job.key))))
-        .sort((a, b) => Number(b.status === 'ready') - Number(a.status === 'ready') || a.frames - b.frames)[0];
+        .sort((a, b) => Number(b.status === 'ready') - Number(a.status === 'ready') || bound(b) - bound(a) || a.frames - b.frames)[0];
       if (covering) {
         if (!covering.projects.includes(clip.projectId)) { covering.projects.push(clip.projectId); save(covering); }
+        if (request.bind) bind(covering, clip.id);
         covering.used = Date.now(); return view(covering);
       }
       if (request.joinOnly) fail(409, 'Depth for this clip is not analyzed yet. It starts when an editor opens the project.');
-      if (controllers.has(key)) fail(409, 'The previous depth analysis is still stopping. Retry shortly.');
-      if ([...jobs.values()].filter(job => ['queued', 'processing'].includes(job.status)).length >= 8) fail(429, 'The depth queue is full. Retry shortly.');
+      if (controllers.has(key)) fail(409, 'The previous depth analysis is still stopping.', true);
+      if ([...jobs.values()].filter(job => ['queued', 'processing'].includes(job.status)).length >= 8) fail(429, 'The depth queue is full.', true);
       makeRoom(range.frames * BYTES_PER_FRAME);
       const job: Job = { key, base, status: 'queued', progress: 0, mediaId: asset.id, first: range.first, frames: range.frames, times: times.slice(range.first, range.first + range.frames), width: size.width, height: size.height, lo: 0, hi: 1, near: 1, far: 0, segments: [], projects: [clip.projectId], used: Date.now() };
       save(job);
+      if (request.bind) bind(job, clip.id);
       const controller = new AbortController(); controllers.set(key, controller);
       const input = { sourcePath, sourceFingerprint, lut: analysis.text, dataLevels: String(clip.properties.dataLevels || 'auto'), yuvMatrix: inputMatrix(clip, asset), seek: range.first > 0 ? (times[range.first - 1] + times[range.first]) / 2 : null, image, workerIdentity: capabilities.workerIdentity };
       // ponytail: one depth process per server, behind any running GPU job; a device-aware pool only for multi-GPU hosts.
@@ -285,7 +299,8 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       controller?.abort();
       // A queued run has no worker to wait for: free the key now rather than when the queue reaches it.
       if (controller && job.status === 'queued') release(key, controller);
-      Object.assign(job, { status: 'cancelled', error: 'Cancelled by you.', segments: [] }); save(job);
+      // Neutral: it may be another editor's trim, and a viewer still needing the run asks for it again.
+      Object.assign(job, { status: 'cancelled', error: 'Cancelled.', segments: [] }); save(job);
     },
     /** One preview segment, only once the worker has recorded it and only for a project bound to the run. */
     preview(projectId: string, key: string, n: number) {
@@ -301,7 +316,18 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
      * folder of master segments. Leaving (signal) does not cancel the run: the editor still wants it.
      */
     async ready(request: DepthRequest, signal?: AbortSignal, onProgress?: (percent: number) => void) {
-      const { key } = await service.enqueue(request);
+      // A full queue or a key still stopping clears by itself: wait here, outside the render queue when awaitDepth asks.
+      let started: DepthRun | undefined;
+      while (!started) {
+        try { started = await service.enqueue(request); }
+        catch (error) {
+          if (!(error instanceof DepthError && error.retry)) throw error;
+          if (signal?.aborted) throw new Error('Canceled by you');
+          onProgress?.(0);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+      const { key } = started;
       // Held from the start, not once ready: an editor's cancel (a trim, the effect removed) and eviction both leave it alone.
       const release = service.hold(key);
       try {
@@ -313,7 +339,7 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
             job!.used = Date.now();
             return { run: view(job!), masters: join(directory, key, 'master'), release };
           }
-          if (job!.status === 'failed' || job!.status === 'cancelled') fail(409, `Depth analysis ${job!.status === 'failed' ? 'failed' : 'was cancelled'}: ${job!.error ?? 'analyze depth again.'}`);
+          if (job!.status === 'failed' || job!.status === 'cancelled') fail(409, `Depth analysis ${job!.status === 'failed' ? 'failed' : 'was cancelled'}: ${job!.error ?? 'click Retry in the Depth panel.'}`);
           onProgress?.(job!.progress);
           await new Promise(resolve => setTimeout(resolve, 250));
         }

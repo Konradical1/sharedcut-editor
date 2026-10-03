@@ -387,8 +387,11 @@ export function smartMaskService(directory: string) {
           job.status = 'ready'; job.progress = 100; job.manifestUrl = `/api/smart-masks/${key}/manifest?projectId=${encodeURIComponent(clip.projectId)}`; save(job);
         } catch (error) { job.status = controller.signal.aborted ? 'cancelled' : 'failed'; job.error = (error as Error).message; save(job); }
         finally { controllers.delete(key); try { remove(temporary); } catch { /* A locked leftover is harmless; it is never served. */ } }
-      }))).catch(error => {
-        job.status = controller.signal.aborted ? 'cancelled' : 'failed'; job.error = (error as Error).message; controllers.delete(key);
+      }, controller.signal), controller.signal)).catch(error => {
+        // Cancelled while waiting for the GPU (behind a depth run): the key frees now, so Analyze works again at once.
+        if (controllers.get(key) === controller) controllers.delete(key);
+        if (job.status === 'cancelled') return;
+        job.status = controller.signal.aborted ? 'cancelled' : 'failed'; job.error = (error as Error).message;
         try { save(job); } catch { /* Keep the in-memory failure visible if the cache volume is full. */ }
       });
       return job;

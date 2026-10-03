@@ -238,7 +238,9 @@ test('cancelling a Depth export stops the bake and removes its files', { timeout
 test('Depth export refuses what it cannot bake, by name', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
   const f = fixture('reject');
   try {
-    await assert.rejects(renderTimeline(f.request([{ ...f.clip, properties: { ...f.clip.properties, opticalFlow: true } }], 2)), /needs warped depth/);
+    await assert.rejects(renderTimeline(f.request([{ ...f.clip, properties: { ...f.clip.properties, opticalFlow: true } }], 2)), /Depth and optical flow cannot share a clip/);
+    // Camera exposure goes into the bake once, statically: a keyframe on it would be applied a second time over the bake.
+    await assert.rejects(renderTimeline(f.request([{ ...f.clip, keyframes: { 'properties.inputExposure': [{ id: 'k0', time: 0, value: 0, interpolation: 'linear' }, { id: 'k1', time: 1, value: 1, interpolation: 'linear' }] } }], 2)), /keyframed grades or effects above Depth/);
     await assert.rejects(renderTimeline(f.request([{ ...f.clip, mediaId: 'frameline-composition', properties: { ...f.clip.properties, compositionId: 'nested' } }], 2)), /not on compositions or titles/);
     await assert.rejects(renderTimeline(f.request([{ ...f.clip, effects: [{ id: 'blur', name: 'Gaussian blur', enabled: true, amount: 50 }, ...f.clip.effects], keyframes: { 'effects.blur.amount': [{ id: 'k0', time: 0, value: 0, interpolation: 'linear' }, { id: 'k1', time: 1, value: 50, interpolation: 'linear' }] } }], 2)), /keyframed grades or effects above Depth/);
     // Variable frame rate: every third frame lands 12 ms late.

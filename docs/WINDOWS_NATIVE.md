@@ -101,6 +101,8 @@ Mask preview worker, and a bake retries once on out-of-memory. Variables: `FRAME
 `FRAME_LINE_DEPTH_MIN_FREE_GB` (2, never under the 5 GB reserve), `FRAME_LINE_DEPTH_TAPS` and
 `FRAME_LINE_DEPTH_ENGINE=synthetic` for tests. Routes are under `/api/depth` (see the README). Export needs
 constant-frame-rate sources up to 4096 wide and refuses optical flow; a depth key also refuses Stabilize.
+A build without Depth refuses every save once a Depth subject or depth key exists (backups included), so roll forward,
+never back past Depth.
 Depth-assisted Smart Mask cleanup (cut SAM leaks at depth jumps, fill holes at the subject's depth) was tried on the soccer and hurdles clips and rejected: at every threshold it cut off hands, feet and arms, while leaks onto players at the same distance stayed and hole filling made them solid.
 
 ## Verification

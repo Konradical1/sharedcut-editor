@@ -10,6 +10,7 @@ import { depthPresets, type DepthCapabilities } from '../services/depth';
 import { depthAtCanvas, depthAtSource, depthClipReady, depthFocusTrack, depthState, depthUi, depthVersion, retryDepth, subscribeDepth } from '../services/depthPreview';
 import { smartMaskSignature } from '../services/smartMask';
 import { openMaskEditor } from '../services/smartMaskClient';
+import { stabilizeEffect } from '../services/stabilize';
 import { Property, Section } from './Inspector';
 import './depth.css';
 
@@ -44,6 +45,9 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
     s().updateEffect(clip.id, effect.id, { amount: 100, parameters: next });
   };
   const picking = depthUi.picking?.effectId === effect.id;
+  // The picker covers the viewer: it goes with this panel (another clip selected, the effect or clip gone, a page change).
+  useEffect(() => () => { if (depthUi.picking?.effectId === effect.id && depthUi.picking.clipId === clip.id) depthUi.setPicking(null); }, [clip.id, effect.id]);
+  const editMask = (id: string) => { depthUi.setPicking(null); openMaskEditor(clip.id, id); };
   const status = capability?.available === false ? capability.reason ?? 'Depth analysis is unavailable on this server.'
     : !state ? 'Starting depth analysis…'
     : state.status === 'failed' || state.status === 'cancelled' ? state.error ?? 'Depth analysis failed.'
@@ -56,8 +60,8 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
   const current = !!subject?.result && subject.result.signature === smartMaskSignature(subject);
   const follow = subject && current && following ? depthFocusTrack(clip, subject.result!.key) : undefined;
   const subjectNote = !subject ? (asset?.kind === 'video' ? 'New subject draws a mask that Lens blur keeps sharp. It does not cut the clip out.' : undefined)
-    : !subject.result ? 'Select the subject, then Analyze: until then its edges are not protected.'
-    : !current ? 'The subject mask changed since its analysis. Analyze it again.'
+    : !subject.result ? 'Select the subject, then Analyze. Until then its edges are not protected, and export with Lens blur waits for it.'
+    : !current ? 'The subject mask changed since its analysis. Analyze it again before exporting.'
     : !following ? 'Lens blur keeps the subject sharp and off the background.'
     : follow?.state === 'failed' ? follow.error
     : follow?.state === 'ready' ? (follow.track.values.length ? 'Focus follows the subject; Focus keyframes are ignored.' : 'The subject is not found in its mask, so Focus applies.')
@@ -70,8 +74,8 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
     <div className="depth-subject">
       <label className="inspector-select-row"><span>Subject</span><select aria-label="Depth subject" value={subject?.id ?? ''} disabled={!masks.length} onChange={e => s().attachSmartMask(clip.id, e.target.value, effect.id)}><option value="">None</option>{masks.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</select></label>
       {asset?.kind === 'video' && <div className="depth-subject-actions">
-        <button className="depth-pick" onClick={() => { const id = s().addSmartMask(clip.id, effect.id); if (id) openMaskEditor(clip.id, id); }}><Plus size={12}/>New subject</button>
-        {subject && <button className="depth-pick" onClick={() => openMaskEditor(clip.id, subject.id)}><PenTool size={12}/>Refine subject</button>}
+        <button className="depth-pick" onClick={() => { const id = s().addSmartMask(clip.id, effect.id); if (id) editMask(id); }}><Plus size={12}/>New subject</button>
+        {subject && <button className="depth-pick" onClick={() => editMask(subject.id)}><PenTool size={12}/>Refine subject</button>}
       </div>}
       {subject && <label className="inspector-checks"><input type="checkbox" aria-label="Follow subject" checked={following} onChange={e => s().updateEffect(clip.id, effect.id, { parameters: { followSubject: e.target.checked ? 1 : 0 } })}/>Follow subject <span className="depth-hint">focus stays on it</span></label>}
       {subjectNote && <p className="depth-hint depth-subject-note">{subjectNote}</p>}
@@ -120,5 +124,6 @@ export function DepthKeyInspector({ clip, nodeId, mask, change }: { clip: Clip; 
     <Parameter name="Softness" value={mask.softness} min={0} max={100} step={1} onChange={softness => patch({ softness })}/>
     <Parameter name="Node influence %" value={mask.amount} min={0} max={100} step={1} onChange={amount => patch({ amount })}/>
     <small className="depth-hint">Distance 0 is the nearest point of the shot, 100 the farthest.</small>
+    {stabilizeEffect(clip) && <small className="depth-hint">Export does not take a depth key on a stabilized clip yet. Remove Stabilize or the key before exporting.</small>}
   </div>;
 }

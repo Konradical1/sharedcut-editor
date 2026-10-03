@@ -495,7 +495,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       finally { if (aborters.get(id) === controller) aborters.delete(id); queued.delete(job); ended(); done?.(); } }, render, prepare && (() => prepare(controller.signal)));
   };
   /** An export's depth runs (Depth clips' and depth keys'), awaited (and held, until `releases` run) before the export joins the render queue:
-   *  waiting there for minutes would hold every other export and all media preparation. Failures are left to the export. */
+   *  waiting there for minutes would hold every other export and all media preparation. A run that fails fails the export here,
+   *  at once: the render would only start the whole analysis again inside the queue. */
   const awaitDepth = async (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>, signal: AbortSignal, releases: (() => void)[]) => {
     const requests = depthRuns(snapshot);
     if (!requests.length) return;
@@ -504,8 +505,14 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     show();
     const results = await Promise.allSettled(requests.map((request, i) => depth.ready(request, signal, p => { percents[i] = p; show(); })));
     for (const result of results) if (result.status === 'fulfilled') releases.push(result.value.release);
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (!failure || signal.aborted || closed) return;
+    updateJob(job.id, { status: 'failed', remaining: 'Export failed', error: (failure.reason as Error)?.message || 'Depth analysis failed.' });
+    db.prepare('DELETE FROM render_snapshots WHERE id=?').run(job.id);
+    aborters.get(job.id)?.abort();
   };
-  const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,depth,overlayPath:id=>overlays.path(id)} ));
+  // No depth service: a preview never reads depth (readsDepth skips those ranges), and must never start a run for a viewer.
+  const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)} ));
   const startRender = (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>) => {
     db.prepare('INSERT OR REPLACE INTO render_snapshots(id,data) VALUES(?,?)').run(job.id, JSON.stringify(snapshot));
     const releases: (() => void)[] = [];
@@ -1270,15 +1277,22 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const job:CaptionJob={wordsPerLine,removeSets,preset:body.preset??'highlight',...(body.replaceSet?{replaceSet:textField(body.replaceSet,160,true)}:{}),id:`caption-${randomUUID()}`,projectId:project.id,timelineId:timeline.id,start,end,trackIds:body.trackIds,signature:body.signature===undefined?captionSignature(state.clips,state.tracks,timeline.id,start,end,body.trackIds):textField(body.signature,100,true),status:'waiting',stage:'Queued',progress:0};
           const snapshot=structuredClone({project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips:state.clips.filter(c=>c.projectId===project.id),tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:[],assets:state.media.filter(a=>a.projectId===project.id).map(asset=>({asset,path:originalPath(asset.id)})),settings:{rangeIn:String(start),rangeOut:String(end)}});
           saveCaptionJob(job);
-          addWork(job.id,async signal=>{
-            try {
-              job.status='running';saveCaptionJob(job);
-              job.words=await transcribeTimeline({...snapshot,outputPath:'',signal},job.trackIds,(stage,progress)=>{if(!closed&&!signal.aborted){job.stage=stage;job.progress=progress;saveCaptionJob(job);}});
-              if(signal.aborted)throw new Error('Cancelled');
-              job.status='complete';job.stage=job.words.length?'Ready':'No speech detected';job.progress=100;
-            }catch(error){job.status=signal.aborted?'cancelled':'failed';job.stage=signal.aborted?'Cancelled':'Transcription failed';job.error=(error as Error).message;}
-            if(!closed)saveCaptionJob(job);
-          });
+          // The media slot is held only while the audio renders: the transcription then waits for the GPU (behind a depth run
+          // or a Smart Mask) outside the queue, still cancellable under the job's id.
+          addWork(job.id,queueSignal=>new Promise<void>(leave=>{
+            const controller=new AbortController(),signal=controller.signal;
+            if(queueSignal.aborted)controller.abort();else queueSignal.addEventListener('abort',()=>controller.abort(),{once:true});
+            void (async()=>{
+              try {
+                job.status='running';saveCaptionJob(job);
+                job.words=await transcribeTimeline({...snapshot,outputPath:'',signal},job.trackIds,(stage,progress)=>{if(!closed&&!signal.aborted){job.stage=stage;job.progress=progress;saveCaptionJob(job);}},()=>{aborters.set(job.id,controller);leave();});
+                if(signal.aborted)throw new Error('Cancelled');
+                job.status='complete';job.stage=job.words.length?'Ready':'No speech detected';job.progress=100;
+              }catch(error){job.status=signal.aborted?'cancelled':'failed';job.stage=signal.aborted?'Cancelled':'Transcription failed';job.error=(error as Error).message;}
+              finally{leave();if(aborters.get(job.id)===controller)aborters.delete(job.id);}
+              if(!closed)saveCaptionJob(job);
+            })();
+          }));
           send(res,202,{job});return;
         }
         const captionRoute=/^\/api\/captions\/([a-zA-Z0-9_-]+)$/.exec(path);
@@ -1362,7 +1376,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (!existsSync(originalPath(asset!.id))) fail(409, 'Depth reads the original media, which is not on this server.');
           let range = { from: 0, to: 1 };
           try { range = depthSpan(clip, asset!, state.clips, state.media); } catch (error) { fail(400, (error as Error).message); }
-          const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: originalPath(asset!.id), ...range, joinOnly: !editor });
+          const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: originalPath(asset!.id), ...range, joinOnly: !editor, bind: editor });
           send(res, run.status === 'ready' ? 200 : 202, run); return;
         }
         const depthRoute = /^\/api\/depth\/([a-f0-9]{64})(?:\/preview\/(\d+)\.mp4|\/(focus))?$/.exec(path);

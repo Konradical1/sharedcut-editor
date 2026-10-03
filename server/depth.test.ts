@@ -132,6 +132,8 @@ test('a restart fails interrupted runs and removes partial and orphaned folders'
   record(running, 'processing'); record(ready, 'ready'); record(missing, 'ready'); record(old, 'failed');
   // Focus tracks go with their run: a ready run keeps its own, a failed one's and a half-written one go.
   mkdirSync(join(f.cache, 'focus')); for (const name of [`${ready}-a.json`, `${running}-a.json`, `${ready}-b.json.1.tmp`]) writeFileSync(join(f.cache, 'focus', name), '{}');
+  // One it cannot delete (on Windows, a file Defender holds open) stays for the next start; it never stops this one.
+  mkdirSync(join(f.cache, 'focus', `${running}-locked.json`));
   const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory), sourceTimes: async () => times });
   try {
     assert.equal(service.get('project', running).status, 'failed');
@@ -140,7 +142,7 @@ test('a restart fails interrupted runs and removes partial and orphaned folders'
     assert.equal(service.get('project', ready).status, 'ready');
     assert.equal(service.get('project', missing).status, 'failed');
     assert.deepEqual(readdirSync(f.cache).filter(name => !name.endsWith('.job.json') && name !== 'focus').sort(), [ready]);
-    assert.deepEqual(readdirSync(join(f.cache, 'focus')), [`${ready}-a.json`]);
+    assert.deepEqual(readdirSync(join(f.cache, 'focus')).sort(), [`${running}-locked.json`, `${ready}-a.json`]);
     assert.equal(JSON.parse(readFileSync(join(f.cache, `${running}.job.json`), 'utf8')).status, 'failed');
     assert.throws(() => service.get('project', old), /not found/, 'a failure already shown before this start is dropped');
     assert.ok(!existsSync(join(f.cache, `${old}.job.json`)));
@@ -289,6 +291,50 @@ test('a cancelled queued run can be asked for again at once; a shared run surviv
     writeFileSync(gate, '');
     await until(() => service.get('other', running.key).status === 'ready' && service.get('project', again.key).status === 'ready');
     assert.deepEqual(runs(f.directory), ['0:128', '256:128']);
+  } finally { writeFileSync(gate, ''); await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+test('a clip keeps the run its editor was given: every later reader prefers it while it covers, across a restart', async () => {
+  const f = fixture('bind'), service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory), sourceTimes: async () => times });
+  let again: ReturnType<typeof depthService> | undefined;
+  try {
+    // Two runs of one take cover 4..6 s, each with its own near/far: the clip's In point went earlier, then came back.
+    const small = await service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 4, to: 6, bind: true });
+    await until(() => service.get('project', small.key).status === 'ready');
+    const wide = await service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 1, to: 6, bind: true });
+    assert.notEqual(wide.key, small.key);
+    await until(() => service.get('project', wide.key).status === 'ready');
+    // The editor trims back: it keeps the run it shows, and an export (no bind) reads that one, not the smaller.
+    assert.equal((await service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 4, to: 6, bind: true })).key, wide.key);
+    assert.equal((await service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 4, to: 6 })).key, wide.key);
+    assert.equal((await service.ready({ clip: clip('a'), asset, sourcePath: f.source, from: 4, to: 6 })).run.key, wide.key);
+    // Another clip of the take with no run of its own gets the smallest covering one.
+    assert.equal((await service.enqueue({ clip: clip('b'), asset, sourcePath: f.source, from: 4, to: 6 })).key, small.key);
+    await service.close();
+    again = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory), sourceTimes: async () => times });
+    assert.equal((await again.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 4, to: 6 })).key, wide.key, 'the binding survives a restart');
+    assert.ok(!('clips' in again.get('project', wide.key)), 'and stays on the server');
+  } finally { await service.close(); await again?.close(); rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+test('an export waits out a full depth queue rather than failing', async () => {
+  const f = fixture('full'), gate = join(f.directory, 'gate');
+  const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory, { gate }), sourceTimes: async () => times });
+  try {
+    const queued = [];
+    for (let k = 0; k < 8; k++) queued.push(await service.enqueue({ clip: clip(`c${k}`), asset, sourcePath: f.source, from: k * 2.6, to: k * 2.6 + .1 }));
+    assert.equal(new Set(queued.map(run => run.key)).size, 8);
+    // Another analysis look: a run of its own, which no queued one covers.
+    const request = { clip: { ...clip('late'), properties: { inputProfile: 'S-Log3', inputGamut: 'S-Gamut3.Cine' } }, asset, sourcePath: f.source, from: 5, to: 5.1 };
+    await assert.rejects(service.enqueue(request), (error: Error & { status?: number }) => error.status === 429);
+    const progress: number[] = [];
+    const waiting = service.ready(request, undefined, p => progress.push(p));
+    await delay(300);
+    service.cancel('project', queued[7].key);
+    writeFileSync(gate, '');
+    const { run, release } = await waiting;
+    release();
+    assert.equal(run.status, 'ready'); assert.equal(progress[0], 0);
   } finally { writeFileSync(gate, ''); await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
 });
 

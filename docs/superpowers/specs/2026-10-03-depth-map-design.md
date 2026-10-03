@@ -413,10 +413,11 @@ The structure copies `render()` in `color-render.py`.
 - **Missing analysis:** export starts or waits for missing depth analysis instead of failing.
 - **Audio:** add `Depth` to the audio skip list. `fitFirst` already turns off for pixel effects.
 - **Rejected by name**, in the same style as masks:
-  - Depth + optical flow: "needs warped depth".
+  - Depth + optical flow: "cannot share a clip yet" (it would need warped depth).
   - Depth on VFR sources: the staged path is CFR.
-- **Timeline previews** skip any 4-s chunk holding an active Depth clip (status `skipped`): a bake there took about 90 s for
-  4K60 and held a media slot, often waiting on analysis, while the editor draws Depth live in WebGL anyway.
+- **Timeline previews** skip any 4-s chunk holding an active Depth clip or depth key, compositions included (status
+  `skipped`): a bake there took about 90 s for 4K60 and held a media slot, often waiting on analysis (which any viewer
+  would start), while the editor draws both live in WebGL anyway. Previews render with no depth service at all.
 
 ## 5. Smart Mask together with depth
 

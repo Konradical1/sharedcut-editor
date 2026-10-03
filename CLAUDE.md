@@ -105,5 +105,8 @@ Only one server may open a data folder: a second `npm start` beside the live one
 - Media storage v3 (`server/mediaMigration.ts`) deletes `proxy.mp4`, `color-v1.mp4`, the all-intra
   half/quarter files and `stream-low-v1.mp4` once an asset is migrated. Any build older than storage v3
   then 404s on those clips: do not roll back past it, fix forward.
+- Depth saves Depth subjects (`maskId` on a Depth effect) and depth keys (`mask.source: 'depth'`), which the save check of
+  any build without Depth rejects. Once either exists, even in a restore backup, such a build refuses every save on the
+  server: do not roll back past Depth, fix forward.
 - `node scripts/remote-playback-check.mjs` plays a timeline on sharedcut.com as a signed-in user and
   reports pictures/s, freezes and loading time; run it before and after any playback change.

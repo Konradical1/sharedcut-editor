@@ -7,10 +7,13 @@ import { DEPTH_SEGMENT, depthDistance, depthFrameAt, depthKeyTable, depthSegment
 import { effectEnabled } from './effects.ts';
 import { isDepthKey, type DepthKeyBinding } from './smartMask.ts';
 import type { SmartMaskPixels } from './smartMaskPreview.ts';
-import { stabilizeRange } from './stabilize.ts';
+import { timelineTransitions } from './transitions.ts';
 
-/** `clip` and `asset` are the latest seen, so a run can be re-checked (or re-asked) without the store. */
-export type DepthClipState = { clipId: string; projectId: string; status: 'starting' | DepthRun['status']; progress: number; error?: string; run?: DepthRun; signature: string; context: string; controller: AbortController; clip: Clip; asset: MediaAsset };
+/** `clip`, `asset` and `handles` are the latest seen, so a run can be re-checked (or re-asked) without the store. `asking`:
+ *  a request for the clip's run is out (the run it had keeps playing meanwhile). */
+export type DepthClipState = { clipId: string; projectId: string; status: 'starting' | DepthRun['status']; progress: number; error?: string; run?: DepthRun; signature: string; context: string; controller: AbortController; clip: Clip; asset: MediaAsset; handles: Handles; asking: boolean };
+/** Each transition the clip takes part in, relative to the clip's start: its run includes their handles (depthSpan on the server). */
+type Handles = [number, number][];
 const runs = new Map<string, DepthClipState>(), listeners = new Set<() => void>();
 let version = 0;
 const POLL_MS = 400;
@@ -31,14 +34,9 @@ export const depthState = (clipId: string) => runs.get(clipId);
 
 /** What the clip's frames depend on beyond geometry: the colour interpretation the analysis LUT is built from. */
 const contextOf = (clip: Clip, asset: MediaAsset) => { const p = clip.properties; return JSON.stringify([asset.id, p.inputProfile ?? null, p.inputGamut ?? null, p.dataLevels ?? null, p.yuvMatrix ?? null, asset.inputProfile ?? null, asset.inputGamut ?? null, asset.colorMatrix ?? null]); };
-const signatureOf = (clip: Clip) => { const p = clip.properties; return JSON.stringify([clip.sourceIn, clip.duration, p.speed ?? 100, !!p.reverse, !!p.freeze, clip.keyframes?.['properties.speed'] ?? null]); };
-/** Whether the run still holds every source frame the clip reads (it has one-second handles, so most trims fit). */
-function covers(run: DepthRun | undefined, clip: Clip, asset: MediaAsset) {
-  if (!run?.times.length) return false;
-  if (asset.kind === 'image') return true;
-  try { const range = stabilizeRange(clip, asset.fps, asset.duration); return depthFrameAt(run, range.from) >= 0 && depthFrameAt(run, Math.max(range.from, range.to - 1e-6)) >= 0; }
-  catch { return true; }
-}
+/** What decides the source span of the clip's run (depthSpan on the server): its timing and its transitions. Any change
+ *  asks the server again, which alone picks the run, so the editor shows the run every export of the clip reads. */
+const signatureOf = (clip: Clip, handles: Handles) => { const p = clip.properties; return JSON.stringify([clip.sourceIn, clip.duration, p.speed ?? 100, !!p.reverse, !!p.freeze, clip.keyframes?.['properties.speed'] ?? null, handles]); };
 /** Fold a server view into what this clip knows. Polls leave `times` out once known (?times=0); a cursor behind ours
  *  means the server started this key over, so its segments replace ours. */
 function merge(state: DepthClipState, next: DepthRun) {
@@ -56,27 +54,34 @@ function cancelRun(projectId: string, key: string) {
 }
 const running = (status: DepthClipState['status']) => status === 'queued' || status === 'processing';
 
-function start(clip: Clip, asset: MediaAsset, signature: string, context: string) {
+/** Ask the server for the clip's run and poll it. `fresh` drops the run shown so far (a retry, a run the server lost); otherwise
+ *  it keeps playing until the server answers, and is cancelled only if the server picked another. */
+function start(clip: Clip, asset: MediaAsset, signature: string, context: string, handles: Handles, fresh = false) {
   const previous = runs.get(clip.id);
   previous?.controller.abort();
-  const state: DepthClipState = { clipId: clip.id, projectId: clip.projectId, status: 'starting', progress: 0, signature, context, controller: new AbortController(), clip, asset };
+  const kept = !fresh && previous?.context === context && previous.run && previous.status !== 'failed' && previous.status !== 'cancelled' ? previous : undefined;
+  const state: DepthClipState = { clipId: clip.id, projectId: clip.projectId, status: kept?.status ?? 'starting', progress: kept?.progress ?? 0, run: kept?.run, signature, context, controller: new AbortController(), clip, asset, handles, asking: true };
   runs.set(clip.id, state); publish(state);
   // The run this replaces (another colour interpretation, or a range it no longer covers) would hold the GPU queue.
-  if (previous?.run && running(previous.status)) cancelRun(previous.projectId, previous.run.key);
+  let replaced = previous?.run && running(previous.status) ? previous.run.key : undefined;
+  if (replaced && !kept) { cancelRun(previous!.projectId, replaced); replaced = undefined; }
   const { signal } = state.controller;
   void (async () => {
     let delay = 1000;
     for (;;) {
       try {
-        if (state.status === 'starting') {
+        if (state.asking) {
           // The server reads the clip from the saved workspace: an unsaved trim would analyse the old range.
           await connection.flush();
           // Not abortable: a superseded request still names the run it queued, and that run is cancelled.
           const run = await api<DepthRun>('/depth', { method: 'POST', body: JSON.stringify({ projectId: clip.projectId, clipId: clip.id }) });
           if (signal.aborted) { if (signal.reason !== 'keep' && running(run.status)) cancelRun(clip.projectId, run.key); return; }
+          state.asking = false;
           merge(state, run);
+          if (replaced && replaced !== run.key) cancelRun(previous!.projectId, replaced);
+          replaced = undefined;
           // A trim made while the request was out is checked now there is a run to check it against.
-          ensureDepthRun(state.clip, state.asset);
+          ensureDepthRun(state.clip, state.asset, state.handles);
           if (signal.aborted) return;
         }
         while (running(state.status)) {
@@ -85,7 +90,10 @@ function start(clip: Clip, asset: MediaAsset, signature: string, context: string
           merge(state, await api<DepthRun>(`/depth/${state.run!.key}?projectId=${encodeURIComponent(clip.projectId)}&after=${state.run!.next}&times=0`, { signal }));
           delay = 1000;
         }
-        return;
+        // Nothing here cancels a run this clip still reads (cancelRun checks), so someone else did (their trim, a late
+        // cancel landing on a restarted key): ask again for the run this clip needs.
+        if (state.status !== 'cancelled') return;
+        state.asking = true;
       } catch (error) {
         if (signal.aborted || runs.get(clip.id) !== state) return;
         const message = (error as Error).message || 'Depth analysis failed.', retry = transient(error);
@@ -100,21 +108,19 @@ function start(clip: Clip, asset: MediaAsset, signature: string, context: string
   return state;
 }
 
-/** Start or keep the clip's analysis. Re-asks the server only when the colour interpretation changed, or the clip
- *  now reads source frames its run does not hold. Idempotent: call it as often as the clip changes. */
-export function ensureDepthRun(clip: Clip, asset: MediaAsset) {
+/** Start or keep the clip's analysis. Asks the server again whenever the colour interpretation, the clip's timing or its
+ *  transitions change; the server keeps the clip's run while it covers. Idempotent: call it as often as the clip changes. */
+export function ensureDepthRun(clip: Clip, asset: MediaAsset, handles: Handles = []) {
   if (typeof fetch === 'undefined') return undefined;
-  const signature = signatureOf(clip), context = contextOf(clip, asset), current = runs.get(clip.id);
+  const signature = signatureOf(clip, handles), context = contextOf(clip, asset), current = runs.get(clip.id);
   if (current && current.context === context) {
-    Object.assign(current, { clip, asset });
-    // While the request is out there is no run to check: start() checks the latest clip once it arrives.
-    if (current.signature === signature || current.status === 'starting') return current;
-    current.signature = signature;
-    if (current.status !== 'failed' && current.status !== 'cancelled' && covers(current.run, clip, asset)) return current;
+    Object.assign(current, { clip, asset, handles });
+    // While a request is out the next one waits: start() checks the latest clip once it is answered.
+    if (current.signature === signature || current.asking) return current;
   }
-  return start(clip, asset, signature, context);
+  return start(clip, asset, signature, context, handles);
 }
-export function retryDepth(clip: Clip, asset: MediaAsset) { return start(clip, asset, signatureOf(clip), contextOf(clip, asset)); }
+export function retryDepth(clip: Clip, asset: MediaAsset) { const handles = runs.get(clip.id)?.handles ?? []; return start(clip, asset, signatureOf(clip, handles), contextOf(clip, asset), handles, true); }
 /** Stop watching a clip. `cancel` also frees the server run (the effect or the clip is gone); otherwise the run goes on
  *  and the next look joins it (another project opened). */
 function release(clipId: string, cancel: boolean) {
@@ -127,7 +133,7 @@ function release(clipId: string, cancel: boolean) {
 }
 /** A ready run whose segments the server no longer has (its cache evicted it, or it went missing in a restart). */
 function rerun(key: string) {
-  for (const state of [...runs.values()]) if (state.status === 'ready' && state.run?.key === key) start(state.clip, state.asset, state.signature, state.context);
+  for (const state of [...runs.values()]) if (state.status === 'ready' && state.run?.key === key) start(state.clip, state.asset, state.signature, state.context, state.handles, true);
 }
 /** Seconds into the clip that analysed depth reaches (forward clips; undefined before the first segment or when reversed). */
 export function depthClipReady(clip: Clip, run: DepthRun) {
@@ -151,14 +157,18 @@ export function watchDepthClips(store: EditorLike) {
     if (state.clips === clips && state.media === media && state.nodes === nodes && state.projectId === project) return;
     clips = state.clips; media = state.media; nodes = state.nodes; project = state.projectId;
     const assets = new Map(state.media.map(asset => [asset.id, asset])), open = new Set<string>(), kept = new Set<string>();
-    const keyed = new Set((state.nodes ?? []).filter(node => isDepthKey(node.mask)).map(node => node.clipId));
+    const keyed = new Set((state.nodes ?? []).filter(node => isDepthKey(node.mask)).map(node => node.clipId)), transitions = new Map<string, ReturnType<typeof timelineTransitions>>();
+    const handles = (clip: Clip): Handles => {
+      if (!transitions.has(clip.timelineId)) transitions.set(clip.timelineId, timelineTransitions(state.clips.filter(c => c.projectId === clip.projectId), clip.timelineId, state.media));
+      return transitions.get(clip.timelineId)!.filter(r => r.outgoingId === clip.id || r.incomingId === clip.id).map(r => [r.start - clip.start, r.end - clip.start]);
+    };
     for (const clip of state.clips) {
       if (!clip.effects.some(e => e.name === 'Depth') && !keyed.has(clip.id)) continue;
       kept.add(clip.id);
       const asset = assets.get(clip.mediaId);
       if (clip.projectId !== state.projectId || !asset || !['video', 'image'].includes(asset.kind)) continue;
       open.add(clip.id);
-      if (asset.status === 'ready') ensureDepthRun(clip, asset);
+      if (asset.status === 'ready') ensureDepthRun(clip, asset, handles(clip));
     }
     for (const id of [...runs.keys()]) if (!open.has(id)) release(id, !kept.has(id));
   };
