@@ -1365,10 +1365,12 @@ async function renderStabilizedTimeline(request: RenderRequest) {
 }
 const DEPTH_SECTIONS = ['blur', 'fog', 'glow', 'light'];
 const depthKeyed = (clip: Clip, effect: Effect) => Object.keys(clip.keyframes ?? {}).filter(key => key.startsWith(`effects.${effect.id}.`) && clip.keyframes![key].length);
+/** Switched on, or switched on by a keyframe somewhere (the bake reads the `enabled` channel frame by frame). */
+const depthOn = (clip: Clip, effect: Effect) => effect.name === 'Depth' && effectEnabled(clip, { ...effect, enabled: effect.enabled || depthKeyed(clip, effect).includes(`effects.${effect.id}.enabled`) });
 /** The clip's Depth when it changes the picture: some Mix and a section on (or keyframed). With every section off it is the identity. */
 function depthEffect(clip: Clip) {
   return clip.effects.find(effect => {
-    if (effect.name !== 'Depth' || !effectEnabled(clip, effect)) return false;
+    if (!depthOn(clip, effect)) return false;
     const keyed = depthKeyed(clip, effect);
     return (Number(effect.amount) > 0 || keyed.includes(`effects.${effect.id}.amount`)) && DEPTH_SECTIONS.some(key => effectValue(clip, effect, key) > 0 || keyed.includes(`effects.${effect.id}.parameters.${key}`));
   });
@@ -1378,7 +1380,7 @@ function rejectDepth(request: RenderRequest) {
   for (const clip of request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && depthEffect(c))) {
     if (clip.mediaId === 'frameline-composition' || clip.properties.compositionId || isTitle(clip) || isShape(clip) || isCaption(clip)) throw new Error(`${clip.name}: Depth works on video and image clips, not on compositions or titles. Remove Depth from this clip.`);
     if (clip.properties.opticalFlow) throw new Error(`${clip.name}: Depth and optical flow cannot share a clip yet; it needs warped depth. Disable optical flow or remove Depth.`);
-    if (clip.effects.filter(e => e.name === 'Depth' && effectEnabled(clip, e)).length > 1) throw new Error(`${clip.name}: a clip takes one Depth effect. Remove the extra one.`);
+    if (clip.effects.filter(e => depthOn(clip, e)).length > 1) throw new Error(`${clip.name}: a clip takes one Depth effect. Remove the extra one.`);
   }
 }
 /** The bake (ProRes 4444, qscale 4) measured 0.4 MB a 4K frame on Sony footage and 1.1 MB on a test pattern on the Dell; the estimate leans high. */
@@ -1439,7 +1441,10 @@ async function renderDepthTimeline(request: RenderRequest) {
       const segments = analysis.segments.filter(segment => segment.first + segment.count > base && segment.first < base + frames).sort((a, b) => a.n - b.n);
       if (frames < 1 || !segments.length || segments[0].first > base) throw new Error(`${clip.name}: the depth analysis does not cover this clip. Analyze depth again.`);
       const output = path.join(directory, `${index}.${image ? 'png' : 'mov'}`), alpha = Boolean(source.asset.hasAlpha) || before.some(e => e.name === 'Smart Mask' && effectEnabled(clip, e) && e.amount > 0);
-      const need = frames * DEPTH_BAKE_BYTES_4K * width * height / (3840 * 2160) + 512 * 1024 ** 2, disk = statfsSync(directory), free = disk.bavail * disk.bsize;
+      // A matte above Depth sends the pre-depth pass through color-render.py first, which keeps a 16-bit RGBA FFV1 copy of the
+      // whole bake in the temp folder until the bake ends: 8 bytes a pixel, about half that after FFV1.
+      const matted = activeSmartMasks({ ...clip, effects: before }, nodes).length > 0;
+      const need = frames * (DEPTH_BAKE_BYTES_4K / (3840 * 2160) + (matted ? 4 : 0)) * width * height + 512 * 1024 ** 2, disk = statfsSync(directory), free = disk.bavail * disk.bsize;
       if (free < need) throw new Error(`${clip.name}: not enough disk space to bake Depth: about ${(need / 1024 ** 3).toFixed(1)} GB needed, ${(free / 1024 ** 3).toFixed(1)} GB free.`);
       const keys = effectDefinitions.Depth.parameters.map(parameter => parameter.key);
       const params = Object.fromEntries(keys.map(key => [key, effectValue(clip, effect, key)]));
