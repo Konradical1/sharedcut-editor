@@ -1514,7 +1514,15 @@ async function renderDepthTimeline(request: RenderRequest) {
         const following = animated?.followSubject ?? [];
         if (params.followSubject >= .5 || following.some(value => value >= .5)) {
           request.onStage?.(`Measuring subject focus · ${clip.name}`);
-          const track = await request.depth.focus(clip.projectId, analysis.key, subject);
+          // Cancelling stops waiting at once; the measurement goes on and is kept for the editor, which wants it too.
+          const measuring = request.depth.focus(clip.projectId, analysis.key, subject);
+          measuring.catch(() => {});
+          const track = await new Promise<Awaited<typeof measuring>>((resolve, reject) => {
+            const stop = () => reject(new Error('Canceled by you'));
+            if (request.signal?.aborted) return stop();
+            request.signal?.addEventListener('abort', stop, { once: true });
+            measuring.then(resolve, reject).finally(() => request.signal?.removeEventListener('abort', stop));
+          });
           // A subject never found in its mask leaves Focus as set, as the preview does.
           if (track.values.length) animated = { ...animated, focus: Array.from({ length: frames }, (_, k) => (following[k] ?? params.followSubject) >= .5 ? depthFocusAt(track, base + k)! : animated?.focus?.[k] ?? params.focus) };
         }

@@ -192,6 +192,24 @@ test('only the Depth this render shows is analysed and baked, and only over the 
 });
 
 test('a Depth switched on by a keyframe is baked', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
+// Measuring the subject's distance takes minutes on a long run, behind other heavy jobs: a cancel must not wait for it.
+test('cancelling an export stops waiting for the subject focus measurement', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
+  const f = fixture('focus-cancel');
+  try {
+    const clip: Clip = { ...f.clip, effects: [{ ...f.clip.effects[0], parameters: { blur: 100, focus: 0, range: 20, followSubject: 1 }, maskId: 'subject' }] };
+    fullMatte(f, clip, x => x >= 250);
+    const controller = new AbortController();
+    let measuring = false;
+    const rendering = renderTimeline(f.request([clip], 2, { signal: controller.signal, depth: { ready: f.depth.ready, focus: () => new Promise(() => {}) }, onStage: stage => { if (stage.startsWith('Measuring subject focus')) measuring = true; } }));
+    rendering.catch(() => {});
+    for (let i = 0; i < 1200 && !measuring; i++) await delay(100);
+    assert.ok(measuring, 'the export reached the focus measurement');
+    controller.abort();
+    const outcome = await Promise.race([rendering.then(() => 'finished', (error: Error) => error.message), delay(5000).then(() => 'still waiting')]);
+    assert.match(outcome, /cancel/i);
+  } finally { await f.close(); }
+});
+
   const f = fixture('keyed-on');
   try {
     const clip = { ...f.clip, effects: [{ ...f.clip.effects[0], enabled: false }], keyframes: { 'effects.depth.enabled': [{ id: 'on', time: 0, value: true, interpolation: 'hold' as const }] } };
