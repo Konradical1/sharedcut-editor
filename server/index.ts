@@ -487,7 +487,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     queue.add(async () => { try { if (!closed && !controller.signal.aborted) await work(controller.signal); }
       finally { if (aborters.get(id) === controller) aborters.delete(id); } }, render);
   };
-  const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)} ));
+  const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,depth,overlayPath:id=>overlays.path(id)} ));
   const startRender = (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>) => {
     db.prepare('INSERT OR REPLACE INTO render_snapshots(id,data) VALUES(?,?)').run(job.id, JSON.stringify(snapshot));
     addWork(job.id, async signal => {
@@ -499,7 +499,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
               const quiet = Math.floor((Date.now() - advancedAt) / 1000);
               updateJob(job.id, { progress: progressValue, remaining: `${stage} · ${elapsed}s elapsed${quiet >= 30 ? ` · No new frames for ${quiet}s` : ''}` }, false); };
             const heartbeat = setInterval(report, 250);
-            try { let previous = -1; await renderTimeline({ ...snapshot, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { stage = next; advancedAt = Date.now(); report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
+            try { let previous = -1; await renderTimeline({ ...snapshot, depth, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { stage = next; advancedAt = Date.now(); report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
             catch (error) { rmSync(outputPath, { force: true }); if (!closed) updateJob(job.id, { status: 'failed', remaining: signal.aborted ? 'Cancelled' : 'Export failed', error: signal.aborted ? 'Cancelled by user.' : error instanceof Error ? error.message : 'Export failed.' }); }
             finally { clearInterval(heartbeat); if (!closed) db.prepare('DELETE FROM render_snapshots WHERE id=?').run(job.id); }
     }, true);
