@@ -23,6 +23,7 @@ const gigabytes = (name: string, fallback: number) => { const value = Number(pro
 const BYTES_PER_FRAME = 40 * 1024;
 
 type Capabilities = DepthCapabilities & { workerIdentity?: unknown };
+export type DepthRequest = { clip: Clip; asset: MediaAsset; sourcePath: string; from: number; to: number };
 type Job = Omit<DepthRun, 'next'> & { base: string; projects: string[]; used: number; bytes?: number };
 
 const capabilityChecks = new Map<string, { request: Promise<Capabilities>; expiry: number }>();
@@ -165,10 +166,10 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
     }
   }
 
-  return {
+  const service = {
     get(projectId: string, key: string, after = 0) { return view(get(projectId, key), after); },
     /** Start (or join) the analysis covering `from`..`to` source seconds of the clip's original, plus handles. */
-    async enqueue(request: { clip: Clip; asset: MediaAsset; sourcePath: string; from: number; to: number }): Promise<DepthRun> {
+    async enqueue(request: DepthRequest): Promise<DepthRun> {
       const { clip, asset, sourcePath } = request;
       if (closed) fail(503, 'The server is stopping.');
       if (asset.id !== clip.mediaId || !['video', 'image'].includes(asset.kind)) fail(400, 'Depth works on video and image clips.');
@@ -228,6 +229,25 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       if (!path || !regularFile(path)) fail(404, 'Depth segment not found.');
       return path!;
     },
+    /**
+     * For export: start or join the run covering the range, wait until it is ready, and hold it. `masters` is its
+     * folder of master segments. Leaving (signal) does not cancel the run: the editor still wants it.
+     */
+    async ready(request: DepthRequest, signal?: AbortSignal, onProgress?: (percent: number) => void) {
+      const { key } = await service.enqueue(request);
+      for (;;) {
+        if (signal?.aborted) throw new Error('Canceled by you');
+        const job = jobs.get(key);
+        if (!job) fail(410, 'The depth analysis was removed. Export again.');
+        if (job!.status === 'ready') {
+          job!.used = Date.now();
+          return { run: view(job!), masters: join(directory, key, 'master'), release: service.hold(key) };
+        }
+        if (job!.status === 'failed' || job!.status === 'cancelled') fail(409, `Depth analysis ${job!.status === 'failed' ? 'failed' : 'was cancelled'}: ${job!.error ?? 'analyze depth again.'}`);
+        onProgress?.(job!.progress);
+        await new Promise(resolve => setTimeout(resolve, 250));
+      }
+    },
     /** Keeps a ready run from eviction while an export reads its masters; call the returned function when done. */
     hold(key: string) {
       holds.set(key, (holds.get(key) ?? 0) + 1);
@@ -240,4 +260,5 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       await queue;
     },
   };
+  return service;
 }
