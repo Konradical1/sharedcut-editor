@@ -42,7 +42,7 @@ import { motionTrackerCapabilities, motionTrackerService } from './motionTracker
 import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } from './colorAssistant.ts';
 import { validateMotionTrackers } from '../src/services/motionTracker.ts';
 import { readCameraColor } from './cameraMetadata.ts';
-import { FILMSTRIP_VERSION, FULL_VARIANT, MEDIA_CONCURRENCY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, exportAspect, PROBE_VERSION, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, prepareWaveform, renderTimeline, renderSoundEffect } from './media.ts';
+import { FILMSTRIP_VERSION, FULL_VARIANT, MEDIA_CONCURRENCY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, exportAspect, PROBE_VERSION, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, prepareWaveform, renderTimeline, renderSoundEffect, depthSpan } from './media.ts';
 import { migrateAsset, needsMigration, removeLeftovers, sweepPreparedTemp } from './mediaMigration.ts';
 
 const scrypt = promisify(scryptCallback);
@@ -1348,11 +1348,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId);
           if (!asset || !['video', 'image'].includes(asset.kind)) fail(400, 'Depth works on video and image clips.');
           if (!existsSync(originalPath(asset!.id))) fail(409, 'Depth reads the original media, which is not on this server.');
-          // The span the clip actually reads, speed ramps, reverse, freeze and transition handles included.
-          const records = timelineTransitions(state.clips.filter(c => c.projectId === clip.projectId), clip.timelineId, state.media);
-          const span = clipSpan(clip, records), geometry = extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start));
           let range = { from: 0, to: 1 };
-          if (asset!.kind === 'video') { try { range = stabilizeRange(geometry, asset!.fps, asset!.duration); } catch (error) { fail(400, (error as Error).message); } }
+          try { range = depthSpan(clip, asset!, state.clips, state.media); } catch (error) { fail(400, (error as Error).message); }
           const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: originalPath(asset!.id), ...range, joinOnly: !editor });
           send(res, run.status === 'ready' ? 200 : 202, run); return;
         }

@@ -444,6 +444,8 @@ Ranked by value:
        R8 mask atlas, like a Smart Mask) and export (`color-render.py` reads the 10-bit masters). No guided upsample:
        a grading key's edges are as soft as the depth's. Preview keys the 8-bit preview segments, export the masters.
      - A node using one starts the clip's depth analysis. Before a frame is analyzed the node grades nothing.
+     - Export asks for the clip's whole span (`depthSpan` in `server/media.ts`, the same call as `POST /api/depth`),
+       so a pass, an In/Out range or a per-frame render joins the editor's run and its near/far, never a smaller one.
      - Export refuses a depth key with Stabilize or optical flow (it would need warped depth), and on VFR sources.
 4. **Depth helping SAM.** This is an experiment.
    - Cut SAM leaks across depth jumps, such as a teammate standing behind the player, and fill holes

@@ -671,6 +671,19 @@ export interface RenderRequest {
   /** Internal: hand over the finished FFmpeg command, which writes the lone clip's layer as raw rgba64le on stdout,
    *  instead of running it (the Depth bake reads its pre-depth frames this way). */
   decoder?: (command: string[]) => Promise<void>;
+  /** Internal: the clips as the render started. A depth key analyses the whole clip from these, as the editor does,
+   *  however a pass, an In/Out range, a preview chunk or a per-frame render cuts it. */
+  wholeClips?: Clip[];
+}
+
+/** The source span the editor analyses a clip's depth over (POST /api/depth): everything it reads, speed ramps,
+ *  reverse, freeze and transition handles included. An export asking for this span joins the editor's run, whose
+ *  near/far the preview keys with; a smaller span could join a stale run that normalises differently. */
+export function depthSpan(clip: Clip, asset: MediaAsset, clips: Clip[], media: MediaAsset[]) {
+  if (asset.kind !== 'video') return { from: 0, to: 1 };
+  const records = timelineTransitions(clips.filter(c => c.projectId === clip.projectId), clip.timelineId, media);
+  const span = clipSpan(clip, records), geometry = extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start));
+  return stabilizeRange(geometry, asset.fps, asset.duration);
 }
 
 /**
@@ -741,6 +754,7 @@ export function exportAspect(resolution: string | undefined, projectResolution: 
 
 export async function renderTimeline(request: RenderRequest): Promise<void> {
   exportAspect(request.settings.resolution, request.project.resolution);
+  if (!request.wholeClips) request = { ...request, wholeClips: request.clips };
   if (!request.pass) {
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&isCaption(c)))return renderCaptionTimeline(request);
   rejectDepth(request);
@@ -1030,12 +1044,13 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
           if(shift)document={...document,range:{start:document.range.start-shift,end:document.range.end-shift}};
           return {document,sourceTimes:times,files:Object.fromEntries(manifest.frames.map(f=>[String(f.index),path.join(artifact.directory,f.file)])),...(clip.effects.some(e=>e.maskId===document.id&&effectEnabled(clip,e)&&e.amount>0)?{output:path.join(lutDir,`${index}-${document.id}.mkv`)}:{})};
         });
-        // A depth key reads the clip's depth analysis of the span decoded here (the editor's run, which has handles).
+        // A depth key reads the editor's run: the whole clip as the render started, not the part this pass decodes.
         const image=source.asset.kind==='image';let depth:Awaited<ReturnType<NonNullable<RenderRequest['depth']>['ready']>>|undefined;
         if(depthKeys.length){
           if(!request.depth)throw Error(`${clip.name}: depth analysis is not available on this server.`);
           request.onStage?.(`Analyzing depth · ${clip.name}`);
-          depth=await request.depth.ready({clip,asset:source.asset,sourcePath:source.path,from:seek,to:seek+Math.max(decoded,sourceStep)},request.signal,p=>request.onStage?.(`Analyzing depth · ${clip.name} · ${Math.round(p)}%`));
+          const whole=request.wholeClips?.find(c=>c.id===clip.id)??clip;
+          depth=await request.depth.ready({clip:whole,asset:source.asset,sourcePath:source.path,...depthSpan(whole,source.asset,request.wholeClips??request.clips,request.assets.map(a=>a.asset))},request.signal,p=>request.onStage?.(`Analyzing depth · ${clip.name} · ${Math.round(p)}%`));
           depthHolds.push(depth.release);
         }
         // The Depth bake (decoder) seeks half a frame early and wants the frame at or after it, as the plain -ss path gives.

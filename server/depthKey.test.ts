@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { renderTimeline, run, type RenderRequest } from './media.ts';
+import { depthSpan, renderTimeline, run, type RenderRequest } from './media.ts';
 import { depthService } from './depth.ts';
 import { smartMaskService } from './smartMask.ts';
 import { venvPython } from './platform.ts';
@@ -47,5 +47,35 @@ test('a node keyed to the far region grades only the far pixels in export', { ti
     }
     // Stabilize would need warped depth: refused by name before anything is baked.
     await assert.rejects(() => renderTimeline({ ...keyedRequest, clips: [{ ...clip, effects: [{ id: 'stab', name: 'Stabilize', enabled: true, amount: 100 }] }] }), /depth key and Stabilize/);
+  } finally { await Promise.all([depth.close(), masks.close()]); rmSync(dir, { recursive: true, force: true }); }
+});
+
+const track: Track = { id: 'v1', timelineId: 'timeline', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
+const keyNode: GradeNode = { id: 'key', projectId: 'project', clipId: 'clip', kind: 'primary', name: 'Key', enabled: true, parameters: {}, mask: { source: 'depth', enabled: true, invert: false, amount: 100, near: 0, far: 100, softness: 5 } };
+const fixture = (source: string, w: number, h: number, fps: number, duration: number, clip: Partial<Clip>) => {
+  const asset: MediaAsset = { id: 'asset', projectId: 'project', name: 'source.mp4', kind: 'video', binId: 'all', duration, fps, resolution: `${w} × ${h}`, size: '1 MB', status: 'ready', progress: 100, thumbnail: '', hasAudio: false, inputProfile: 'Rec.709', inputGamut: 'Rec.709' };
+  return { asset, clip: { id: 'clip', projectId: 'project', timelineId: 'timeline', mediaId: 'asset', name: 'Clip', trackId: 'v1', start: 0, duration: 1, sourceIn: 0, color: 'red', disabled: false, properties: { ...defaultProperties }, effects: [], ...clip } as Clip };
+};
+const exportOf = (dir: string, source: string, asset: MediaAsset, clip: Clip, nodes: GradeNode[], name: string, settings: Record<string, string>, depth: RenderRequest['depth']): RenderRequest => {
+  const [w, h] = asset.resolution.split(' × ');
+  return { project: { id: 'project', resolution: asset.resolution, fps: Number(settings.fps) } as Project, timeline: { id: 'timeline', projectId: 'project', name: 'test', duration: clip.start + clip.duration }, tracks: [track], clips: [clip], nodes, assets: [{ asset, path: source }],
+    settings: { resolution: `${w} × ${h}`, codec: 'Apple ProRes 422 HQ', audio: 'Disabled', ...settings }, outputPath: path.join(dir, `${name}.mov`), depth, smartMaskDir: path.join(dir, 'masks') };
+};
+
+test('a depth-keyed In/Out export joins the editor\'s depth run, not a smaller stale one', { timeout: 300_000, skip: !existsSync(colorPython) && 'the colour worker (npm run setup:color) is not installed' }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'frameline-depth-key-run-')), source = path.join(dir, 'long.mp4');
+  execFileSync(ffmpeg, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=160x90:r=25:d=10', '-c:v', 'libx264', '-qp', '0', '-pix_fmt', 'yuv444p', '-g', '25', source]);
+  const masks = smartMaskService(path.join(dir, 'masks')), depth = depthService(path.join(dir, 'depth'), { sourceTimes: masks.sourceTimes, python: depthPython });
+  try {
+    const { asset, clip } = fixture(source, 160, 90, 25, 10, { duration: 6, sourceIn: 2 });
+    // An older trim left a ready run over part of the take; each run sets its own near/far.
+    const stale = await depth.ready({ clip, asset, sourcePath: source, from: 6, to: 6.2 });
+    const editor = await depth.ready({ clip, asset, sourcePath: source, ...depthSpan(clip, asset, [clip], [asset]) });
+    stale.release(); editor.release();
+    assert.notEqual(stale.run.key, editor.run.key);
+    const used: string[] = [];
+    const spy: RenderRequest['depth'] = { ready: async (...args) => { const held = await depth.ready(...args); used.push(held.run.key); return held; } };
+    await renderTimeline(exportOf(dir, source, asset, clip, [keyNode], 'inout', { fps: '25', rangeIn: '4', rangeOut: '4.2' }, spy));
+    assert.deepEqual(used, [editor.run.key], 'the export keys with the run the editor previews');
   } finally { await Promise.all([depth.close(), masks.close()]); rmSync(dir, { recursive: true, force: true }); }
 });
