@@ -165,5 +165,10 @@ test('Depth: the map fills in, Lens blur softens only the far region, the focus 
   await page.waitForFunction(() => { const c = document.querySelector('.viewer-frame canvas') as HTMLCanvasElement, [r, g, b] = c.getContext('2d')!.getImageData(Math.round(c.width * .1), c.height >> 1, 1, 1).data; return r > 240 && g > 240 && b > 240; }, undefined, { timeout: 15000 });
   const keyNear = await probe(page, near), keyFar = await probe(page, far);
   assert.ok(keyFar.mean.every(v => v > 240) && keyNear.mean.every(v => v < 15), `the key view: far ${keyFar.mean}, near ${keyNear.mean}`);
+  // Inverted, the node grades the near box, and the key view follows.
+  await page.locator('.depth-key-inspector').getByRole('checkbox', { name: 'Invert' }).check();
+  await page.waitForFunction(() => { const c = document.querySelector('.viewer-frame canvas') as HTMLCanvasElement, [r] = c.getContext('2d')!.getImageData(Math.round(c.width * .1), c.height >> 1, 1, 1).data; return r < 15; }, undefined, { timeout: 15000 });
+  const invertedNear = await probe(page, near), invertedFar = await probe(page, far);
+  assert.ok(invertedNear.mean.every(v => v > 240) && invertedFar.mean.every(v => v < 15), `the inverted key view: near ${invertedNear.mean}, far ${invertedFar.mean}`);
   assert.deepEqual(errors, []);
 });

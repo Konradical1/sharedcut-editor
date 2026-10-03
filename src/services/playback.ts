@@ -890,9 +890,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           if(element)sourceTimestamp=result.dataset.sourceTimestamp ?? '';
           canvas.dataset.colorPrecision=result.dataset.colorPrecision??'8-bit RGB fallback';
           layerContext.clearRect(0,0,width,height); layerContext.drawImage(result,0,0);
-          // Show key (viewer only): the depth key the node grades through, white where it grades fully.
+          // Show key (viewer only): where the node grades, white where it grades fully (Invert included).
           const shown=depthKeys.find(n=>depthUi.showKey(n.id)),key=shown&&masks.get(nodeMaskId(shown)!);
-          if(key){const image=layerContext.createImageData(width,height);for(let i=0;i<key.data.length;i++){image.data[i*4]=image.data[i*4+1]=image.data[i*4+2]=key.data[i];image.data[i*4+3]=255;}layerContext.putImageData(image,0,0);}
+          if(key){const image=layerContext.createImageData(width,height),flip=shown.mask.invert?255:0;for(let i=0;i<key.data.length;i++){image.data[i*4]=image.data[i*4+1]=image.data[i*4+2]=Math.abs(flip-key.data[i]);image.data[i*4+3]=255;}layerContext.putImageData(image,0,0);}
         }
       } catch (cause) { if(cause instanceof ColorPending||cause instanceof SmartMaskPending){loading=true;footageCache.setDecoderStatus(clip.id,asset.proxyUrl??'',`${asset.name} · ${cause instanceof ColorPending?'Preparing color frame':'Preparing mask'}`);const pending=seeks.findIndex(([media])=>media===element);if(pending>=0)seeks.splice(pending,1);}else {const message=cause instanceof Error?cause.message:'Color preview unavailable.';skipped.set(clip.id,`${clip.name} (${message})`);footageCache.setDecoderStatus(clip.id,asset.proxyUrl??'',`${asset.name}: ${message}`,true);} layerContext.clearRect(0,0,width,height);return; }
       // Stabilize goes first. Grading and node masks read the frame the camera shot; from here on every
