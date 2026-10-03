@@ -25,6 +25,10 @@ test('preview quality selects a smaller stream, audio selects its own stream, an
   assert.equal(playbackUrl({ ...asset, proxyVariants: { '1/4': '/quarter' } } as unknown as MediaAsset, { original: false, quality: 'Stream' }, true), '/quarter');
   assert.equal(playbackUrl({ ...asset, proxyVariants: undefined }, { original: false, quality: 'Stream' }, true), '/full');
   assert.equal(playbackUrl(streamed, { original: false, quality: 'Stream' }, false), '/audio');
+  // Storage v3: Full and Color share full-v3, 1/2 is the Stream file and 1/4 the low stream. Every quality is a field.
+  const v3 = { sourceUrl: '/original', proxyUrl: '/full-v3.mp4?v=1', colorProxyUrl: '/full-v3.mp4?v=1', audioProxyUrl: '/audio-v1.m4a', proxyVariants: { Stream: '/stream-v2.mp4', '1/2': '/stream-v2.mp4', StreamLow: '/stream-low-v2.mp4?v=1', '1/4': '/stream-low-v2.mp4?v=1' } } as unknown as MediaAsset;
+  for (const [quality, url] of [['Full', '/full-v3.mp4?v=1'], ['Color', '/full-v3.mp4?v=1'], ['1/2', '/stream-v2.mp4'], ['Stream', '/stream-v2.mp4'], ['1/4', '/stream-low-v2.mp4?v=1']] as const) assert.equal(playbackUrl(v3, { original: false, quality }, true), url, quality);
+  assert.equal(playbackUrl(v3, { original: false, quality: 'Color' }, false), '/audio-v1.m4a');
 });
 
 test('timeline preview obeys source trims, speed, reverse, freeze, routing, and SDR values', () => {
@@ -344,6 +348,20 @@ async function streamChoice(settings: Record<string, unknown> = {}, stalled = ne
   const fake = await fakeBrowser(state, 'Stream', { VideoDecoder: class {}, Worker: decodeWorker(stalled), location: { href: 'http://localhost/' } }, () => answer.slow);
   return { ...fake, state, answer, play: (to: number) => { state.playhead = to; fake.tick(); fake.tick(); } };
 }
+
+test('the automatic low stream follows the row when the storage migration gives StreamLow a new address', async () => {
+  const fake = await streamChoice({ footageCache: false }, new Set(['/stream.mp4']));
+  try {
+    fake.answer.slow = undefined;
+    fake.tick(); fake.tick(1300); fake.tick(50);
+    assert.equal(fake.live('/low.mp4').length, 1);
+    // Migrated: stream-low-v1 is deleted and the row names stream-low-v2.
+    Object.assign(fake.state.media[0], { proxyVariants: { Stream: '/stream.mp4', StreamLow: '/low-v2.mp4?v=1' } });
+    fake.play(4.5); fake.play(8.5);
+    assert.deepEqual([fake.live('/low.mp4').length, fake.live('/stream.mp4').length], [0, 0], 'never the deleted address, and no fall back to full Stream');
+    assert.ok(fake.live('/low-v2.mp4?v=1').length >= 1);
+  } finally { fake.restore(); }
+});
 
 test('a long wait moves a Stream picture to the low stream only on a line too slow for it, or one nothing measures', async () => {
   const fake = await streamChoice({}, new Set(['/stream.mp4']));

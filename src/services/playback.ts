@@ -78,8 +78,8 @@ export function playbackUrl(asset: MediaAsset, options: Pick<PreviewOptions, 'or
   if(visual&&options.quality==='Full'&&asset.colorProxyUrl)return asset.colorProxyUrl;
   if(options.quality==='Color')return asset.colorProxyUrl||asset.sourceUrl||asset.proxyUrl;
   // An import that predates the upgrade pass has no streaming variant yet. Half resolution is the
-  // closest substitute; falling straight through to the all-intra full proxy would hand a remote
-  // viewer an ~80 Mbit/s stream, which is the one thing this quality exists to avoid.
+  // closest substitute; falling straight through to the 1920 full-v3 file would hand a remote viewer
+  // a 10-bit stream several times Stream's bitrate, which is the one thing this quality exists to avoid.
   for (const quality of options.quality === 'Stream' ? ['Stream', '1/2', '1/4'] : [options.quality]) {
     const url = asset.proxyVariants?.[quality];
     if (url) return url;
@@ -283,14 +283,16 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   };
   const leaks = new Map<string, { element: HTMLVideoElement; source?: MediaElementAudioSourceNode; gain?: GainNode; lastUsed: number }>();
   const decoders = new Map<string, Decoder>();
-  // Paused only: quarter-proxy stand-ins while a playback decoder seeks. Dropped the moment playback starts.
+  // Paused only: 480 px stand-ins (the 1/4 file) while a playback decoder seeks. Dropped the moment playback starts.
   const scrubs = new Map<string, { frames: ReturnType<typeof createScrubFrames>; media: HTMLVideoElement }>();
   let loadingSince: number | undefined;
   const streamFallbacks = new Map<string, string>();
-  const automaticStreams = new Map<string,string>();
+  // Assets the automatic rule moved to their low stream. The address is read from the row each time: the storage migration
+  // gives StreamLow a new one, and the old file is deleted.
+  const automaticStreams = new Set<string>();
   const selectedUrl = (asset: MediaAsset, options: PreviewOptions, visual: boolean) => {
     const url = playbackUrl(asset, options, visual);
-    return url ? streamFallbacks.get(url) ?? (visual&&!options.original&&options.quality==='Stream'?automaticStreams.get(asset.id):undefined) ?? url : url;
+    return url ? streamFallbacks.get(url) ?? (visual&&!options.original&&options.quality==='Stream'&&automaticStreams.has(asset.id)?asset.proxyVariants?.StreamLow:undefined) ?? url : url;
   };
   const groups = new Map<string, { canvas: HTMLCanvasElement; reference: HTMLCanvasElement; audio: AudioRoute }>();
   let color: ReturnType<typeof createColorPreview> | undefined;
@@ -354,7 +356,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // still opens low on a slow line, and the asset is back on Stream at its next decoder once the background fill has
     // saved what that one reads. While nothing measures the line (no answer: cache off, no controlling footage worker, no
     // rate yet) a stall's low stream stands.
-    if (automatic && !open) { const slow = preferLowStream(requestedUrl); if (slow) automaticStreams.set(asset.id, low); else if (slow === false) automaticStreams.delete(asset.id); }
+    if (automatic && !open) { const slow = preferLowStream(requestedUrl); if (slow) automaticStreams.add(asset.id); else if (slow === false) automaticStreams.delete(asset.id); }
     const url = automatic && (open?.url === requestedUrl || open?.url === low && open.automaticLow) ? open!.url : selectedUrl(asset, options, visual), audioOnly = !visual || asset.kind === 'audio';
     const fallback = !url && visual && asset.thumbnail;
     if (!url && !fallback) return;
@@ -512,17 +514,18 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     const skipped = new Map<string, string>();
     const scrubIds = new Set<string>();
     /**
-     * While paused, the all-intra quarter proxy stands in for a playback decoder that is still seeking
-     * (a long-GOP seek decodes up to two seconds of frames first). Opened for every visible clip so a
-     * scrub answers on its first move, but asked for a frame only on a miss: each ask is a decode.
-     * Only for proxies from the same pass; the colour proxy and camera originals are interpreted differently.
+     * While paused, the 480 px stream-low-v2 (the asset's 1/4) stands in for a playback decoder that is still
+     * seeking: full-v3 and Stream decode a GOP of 1920 or 960 frames first. Opened for every visible clip so a
+     * scrub answers on its first move, but asked for a frame only on a miss; each ask decodes one small GOP.
+     * Only for files from the same pass, all BT.709 video range; camera originals are interpreted differently,
+     * and Color keeps its 10-bit picture (and precision label) rather than flash 8-bit stand-ins.
      */
     const scrubFor = (clip: Clip, asset: MediaAsset, decoder: Decoder) => {
       const url = asset.proxyVariants?.['1/4'];
       // The scrub worker demuxes MP4 only; an alpha WebM seeks through its video element instead.
       if (url && !/\.mp4(?:\?|$)/i.test(url)) return undefined;
       // A frame editor loops one clip: each lap starts with a backward seek, which the stand-in covers while playing too.
-      if (state.playing && !focusing || !url || decoder.url === url || (decoder.url !== asset.proxyUrl && !Object.values(asset.proxyVariants ?? {}).includes(decoder.url)) || typeof VideoDecoder === 'undefined' || typeof Worker === 'undefined') return undefined;
+      if (state.playing && !focusing || !url || options.quality === 'Color' || decoder.url === url || (decoder.url !== asset.proxyUrl && !Object.values(asset.proxyVariants ?? {}).includes(decoder.url)) || typeof VideoDecoder === 'undefined' || typeof Worker === 'undefined') return undefined;
       // Keyed by file: pictures are source frames, so every cut from one take shares a decoder.
       // A graded clip reads each picture back through the colour pipeline; start that copy as it lands.
       const scrub = scrubs.get(url) ?? { media: decoder.element as HTMLVideoElement, frames: createScrubFrames(url, asset.fps || 24, frame => { dirty = true; if (frame && color) color.prepare(scrub.media, frame); }, state.settings.footageCache !== false) };
@@ -749,7 +752,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           // saved). A slow decode, or a cold start on a fast line, would trade quality for nothing: that wait used to drop
           // any not-yet-cached clip to the low stream. While nothing measures the line (no answer: cache off, no controlling
           // footage worker, no rate yet) the wait is the signal.
-          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow&&preferLowStream(decoder.url)!==false){automaticStreams.set(asset.id,asset.proxyVariants.StreamLow);cleanup(decoder);decoders.delete(decoderId);dirty=true;holdLayer();continue;}
+          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow&&preferLowStream(decoder.url)!==false){automaticStreams.add(asset.id);cleanup(decoder);decoders.delete(decoderId);dirty=true;holdLayer();continue;}
           // Failed codecs switch through buffered() immediately. A network timeout remains visible.
           if(performance.now()-decoder.waitingSince>30000){decoder.framesFailed=true;frames.dispose();decoder.frames=undefined;dirty=true;}
           holdLayer();footageCache.setDecoderStatus(clip.id,decoder.url,`${asset.name} · ${frames.ahead?'Decoding requested frame':'Buffering video'}`);continue;

@@ -43,7 +43,7 @@ function worker(file: Buffer, truncated = false) {
 test('ranges are assembled from 1 MiB chunks, cached, and replayed without the network', async () => {
   const file = randomBytes(3.5 * 1024 * 1024);
   const sw = worker(file);
-  const path = '/api/media/media-1/files/stream-v1.mp4';
+  const path = '/api/media/media-1/files/stream-v2.mp4';
 
   const first = await sw.request(path, 'bytes=100-2500000');
   assert.equal(first!.status, 206);
@@ -73,7 +73,7 @@ test('ranges are assembled from 1 MiB chunks, cached, and replayed without the n
 test('a short range on a miss streams the bytes while the whole chunk still lands in the cache', async () => {
   const file = randomBytes(1.5 * 1024 * 1024);
   const sw = worker(file);
-  const path = '/api/media/media-2/files/stream-v1.mp4';
+  const path = '/api/media/media-2/files/stream-v2.mp4';
   const short = await sw.request(path, 'bytes=100-200');
   assert.ok(Buffer.from(await short!.arrayBuffer()).equals(file.subarray(100, 201)));
   assert.equal(sw.network(), 1);

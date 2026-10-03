@@ -145,7 +145,7 @@ Rejected:
 - **Input frames:**
   - **Range:** the clip's source range plus 1 s handles, snapped to the segment grid.
   - **Decode route:** chosen per asset and recorded in the job identity.
-    1. The 960 px `1/2` proxy, when its frame count and PTS match the source table. H.264 is cheap
+    1. The 960 px `1/2` proxy (`stream-v2.mp4` since media storage v3), when its frame count and PTS match the source table. H.264 is cheap
        to decode, and the proxy is already at least as big as the analysis size. The stabilize notes
        say a proxy once lost 8% of frames, so this is checked per asset, never assumed.
     2. Otherwise the original, using NVDEC if a trial decode proves it works. Check stderr: on 4:2:2,

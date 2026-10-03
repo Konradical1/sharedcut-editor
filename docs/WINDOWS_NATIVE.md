@@ -57,6 +57,15 @@ RTX 4070 cannot decode 4:2:2 footage, so Sony 4:2:2 decodes on the CPU here; the
 Lenovo's Blackwell GPU decodes it. Optical flow bakes at the project's canvas size
 and is reused when the same export runs again before the server restarts.
 
+Preview files stay on libx264 (NVENC spends about twice the bits for the same
+quality, and previews are what fill the disk). Storage v3 keeps three per video:
+`full-v3.mp4`, `stream-v2.mp4` and `stream-low-v2.mp4`. The first start of a v3
+build migrates older imports one at a time in the background and deletes the
+files they replace; the log shows `Media storage v3:` lines with the space freed.
+An asset is skipped (and retried at the next start) while free space is under
+its estimated output plus the 5 GB disk reserve (`FRAME_LINE_MIN_FREE_GB`). Rolling back to an older build after that makes
+migrated clips 404, so roll forward instead.
+
 Optical flow runs on the CPU and uses bounded motion-estimation resolution; it
 does not require NVIDIA hardware. It is an offline preparation step, not a
 promise of real-time 4K rendering. Its H.264 previews use the browser-supported

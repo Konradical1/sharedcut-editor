@@ -1,6 +1,7 @@
 // Isolated copy of a real project; the live database and camera originals are never edited.
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,symlink,readFile,writeFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,readFile,writeFile,rm} from 'node:fs/promises';
+import {copyFolder,linkMediaFolder} from './media-copy.mjs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
@@ -14,7 +15,8 @@ const asset=live.media.find(m=>m.name==='C0852.MP4');assert.ok(asset,'Test needs
 const original=live.clips.find(c=>c.mediaId===asset.id),project=structuredClone(live.projects.find(p=>p.id===asset.projectId));
 let app=createFrameLineServer({dataDir:temp,distDir:resolve('dist')}),url='';
 const listen=async()=>{await new Promise(r=>app.server.listen(0,'127.0.0.1',r));url=`http://127.0.0.1:${app.server.address().port}`;};await listen();
-const browser=await chromium.launch({headless:true,executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH});
+// Installed Chrome: full-v3 is H.264 High 4:2:2 10-bit, which Playwright's bundled Chromium has no decoder for.
+const browser=await chromium.launch({headless:true,...(process.env.PLAYWRIGHT_EXECUTABLE_PATH?{executablePath:process.env.PLAYWRIGHT_EXECUTABLE_PATH}:{channel:'chrome'})});
 const context=await browser.newContext({viewport:{width:1600,height:1000}}),page=await context.newPage();
 const errors=[];page.on('pageerror',e=>errors.push(e.message));
 await page.addInitScript(()=>{window.colorVideos=[];const create=document.createElement.bind(document);document.createElement=(name,...args)=>{const e=create(name,...args);if(name==='video')window.colorVideos.push(e);return e;};const NativeAudio=window.AudioContext;window.AudioContext=class extends NativeAudio{constructor(options={}){super({...options,sinkId:{type:'none'}});}};});
@@ -23,12 +25,15 @@ try{
  const db=new DatabaseSync(join(temp,'frameline.sqlite'));const row=db.prepare('select state from workspace where id=1').get();const state=row?JSON.parse(row.state):{projects:[],media:[],clips:[],tracks:[],nodes:[],timelines:[],comments:[],operations:[],snapshots:[],renderJobs:[],users:[],currentUserId:'',settings:{}};
  project.members=[{userId:user.id,role:'Owner'}];project.shared=false;
  const clip={...structuredClone(original),start:0,duration:3,sourceIn:3,keyframes:{},properties:{...original.properties,zoom:100,x:0,y:0,opacity:100}};
- Object.assign(state,{projects:[project],media:[{...asset,colorProxyUrl:`/api/media/${asset.id}/files/color-v1.mp4`}],clips:[clip],tracks:live.tracks.filter(t=>t.timelineId===clip.timelineId),timelines:live.timelines.filter(t=>t.id===clip.timelineId).map(t=>({...t,duration:3})),nodes:live.nodes.filter(n=>n.clipId===clip.id),comments:[],operations:[],snapshots:[],renderJobs:[],settings:{...state.settings,performanceMode:'On'}});
+ // Storage v3: Color reads full-v3 (10-bit 4:2:2, half-second GOP) through colorProxyUrl. An asset not migrated yet is
+ // migrated by this copy's server before its first picture.
+ Object.assign(state,{projects:[project],media:[asset],clips:[clip],tracks:live.tracks.filter(t=>t.timelineId===clip.timelineId),timelines:live.timelines.filter(t=>t.id===clip.timelineId).map(t=>({...t,duration:3})),nodes:live.nodes.filter(n=>n.clipId===clip.id),comments:[],operations:[],snapshots:[],renderJobs:[],settings:{...state.settings,performanceMode:'On'}});
  for(const n of state.nodes)for(const e of n.effects??[])if(e.type==='cst'&&e.toneMapping==='aces2'){e.toneMapping='shoulder';e.gamutMapping='compress';}
  db.prepare('insert into workspace(id,revision,state) values(1,1,?) on conflict(id) do update set state=excluded.state').run(JSON.stringify(state));db.close();
- await mkdir(join(temp,'media'));await symlink(resolve('data/media',asset.id),join(temp,'media',asset.id));await mkdir(join(temp,'resolve'));await symlink(resolve('data/resolve',project.id),join(temp,'resolve',project.id));
+ await linkMediaFolder(resolve('data/media',asset.id),join(temp,'media',asset.id));await copyFolder(resolve('data/resolve',project.id),join(temp,'resolve',project.id));
  app=createFrameLineServer({dataDir:temp,distDir:resolve('dist')});await listen();
  const saved=async()=> (await(await context.request.get(url+'/api/state')).json()).state;
+ for(const until=Date.now()+300000;!(await saved()).media[0].colorProxyUrl?.includes('/full-v3.mp4');){assert.ok(Date.now()<until,'the copy migrates the asset to full-v3');await new Promise(r=>setTimeout(r,500));}
  const settled=()=>page.waitForFunction(()=>document.querySelector('.save-status')?.textContent==='Saved');
  await page.goto(url+'/project/'+project.id);await page.getByRole('navigation',{name:'Editor workspaces'}).getByRole('button',{name:'Color',exact:true}).click();
  await page.waitForFunction(()=>document.querySelector('.viewer-frame canvas')?.dataset.hasPicture==='true');

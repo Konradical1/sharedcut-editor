@@ -109,7 +109,7 @@ await context.addInitScript(() => {
     let busy = 0, end = -Infinity, bytes = 0;
     for (const [from, to, n] of spans) { bytes += n; busy += Math.max(0, to - Math.max(from, end)); end = Math.max(end, to); }
     const savedMB = {};
-    for (const [at, url, size] of window.qaNet.stored) if (at >= since) { const kind = /stream-low/.test(url) ? 'streamLow' : /stream-v\d/.test(url) ? 'stream' : /\.webm/.test(url) ? 'webm' : /audio/.test(url) ? 'audioProxy' : 'other'; savedMB[kind] = +((savedMB[kind] ?? 0) + size / 1e6).toFixed(1); }
+    for (const [at, url, size] of window.qaNet.stored) if (at >= since) { const kind = /stream-low/.test(url) ? 'streamLow' : /stream-v\d/.test(url) ? 'stream' : /full-v\d/.test(url) ? 'full' : /\.webm/.test(url) ? 'webm' : /audio/.test(url) ? 'audioProxy' : 'other'; savedMB[kind] = +((savedMB[kind] ?? 0) + size / 1e6).toFixed(1); }
     const slowestChunkMs = spans.map(([from, to]) => Math.round(to - from)).sort((a, b) => b - a).slice(0, 5);
     return { workerMbps: busy ? +(bytes * 8 / 1e3 / busy).toFixed(2) : 0, workerMB: +(bytes / 1e6).toFixed(1), savedMB, slowestChunkMs };
   };
