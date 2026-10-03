@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { venvPython } from '../server/platform.ts';
 import { flowWorker, flowEngineLabel } from '../server/opticalFlow.ts';
 import { smartMaskCapabilities } from '../server/smartMask.ts';
+import { depthCapabilities } from '../server/depth.ts';
 import { stabilizeCapabilities } from '../server/stabilize.ts';
 import { motionTrackerCapabilities } from '../server/motionTracker.ts';
 import { captionPython } from '../server/captions.ts';
@@ -17,6 +18,7 @@ const python=(command,code)=>JSON.parse(execFileSync(command,['-c',code],{encodi
 await check('media',()=>getMediaCapabilities());
 await check('opticalFlow',async()=>({available:!!await flowWorker(),engine:flowEngineLabel()}));
 await check('smartMask',async()=>{const {workerIdentity,...caps}=await smartMaskCapabilities();return caps;});
+await check('depth',async()=>{const {workerIdentity,...caps}=await depthCapabilities();return caps;});
 await check('stabilize',stabilizeCapabilities);
 await check('motionTracker',motionTrackerCapabilities);
 await check('captions',()=>python(captionPython(),"import json,torch,ctranslate2; from faster_whisper import WhisperModel; from whisperx.alignment import load_align_model; from silero_vad import load_silero_vad; print(json.dumps(dict(available=True,torch=torch.__version__,alignmentGpu=torch.cuda.is_available(),transcriptionGpus=ctranslate2.get_cuda_device_count())))"));

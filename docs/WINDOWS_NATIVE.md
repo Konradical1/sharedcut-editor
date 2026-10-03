@@ -39,6 +39,7 @@ FFMPEG_PATH and FFPROBE_PATH.
 | Captions | faster-whisper large-v3 + WhisperX | NVIDIA transcription and word timing; CPU fallback when a GPU is unavailable |
 | Optical flow | OpenCV bidirectional dense motion estimation | Exact requested timestamps, freezes, reverse, direction changes, 1% speed; native 16-bit processing and 10-bit export |
 | Smart Mask | SAM 2.1 Large on NVIDIA | Interactive preview, forward/backward tracking, local repairs, clip and color-node masks, tracked-selection export |
+| Depth | Video Depth Anything Small (Apache-2.0) on NVIDIA, in `.venv-mask` | Depth maps per source range, streamed in 64-frame segments while analysis runs; about 25 frames a second on the Dell's 4070 Laptop at 2.7 GB of VRAM |
 | Stabilization | OpenCV + SciPy | Analysis, cached previews and original-media export |
 | Motion tracking | OpenCV pattern tracker (feature box + search box) | Tracks points on the original frames, forward/backward/one frame at a time; attaches layers or makes the camera follow as keyframes |
 | Color | OpenColorIO 2.5.2 | Existing reference color pipeline and masked export |
@@ -76,7 +77,7 @@ Dell a 4K 10-bit 4:2:2 HEVC shot tracks at about 20–40 frames a second. Tracks
 content-addressed sample files in `data/motion-trackers/` and travel with project bundles.
 
 `npm run doctor` checks each local worker. Individual installers are
-`setup:captions`, `setup:flow`, `setup:masks`, `setup:stabilize`, `setup:tracker`, `setup:color`, and
+`setup:captions`, `setup:flow`, `setup:masks`, `setup:depth`, `setup:stabilize`, `setup:tracker`, `setup:color`, and
 `setup:imports`. Each has a FRAME_LINE_*_PYTHON override; optical flow uses
 FRAME_LINE_FLOW_PYTHON. FRAME_LINE_CAPTION_DEVICE accepts auto (default), cpu,
 or cuda (GPU required, useful for tests). The default caption model is large-v3;
@@ -92,6 +93,7 @@ npx playwright install chromium
 npm run test:browser
 npm run test:captions
 npm run test:optical-flow
+npm run test:depth
 npm run test:optical-flow:browser
 npm run test:masks
 npm run test:masks:inference
