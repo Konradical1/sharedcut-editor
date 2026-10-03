@@ -45,10 +45,18 @@ test('completed mask resolver rejects cross-project reuse, stale edits/source/co
     assert.throws(() => validateMaskManifest(missing, f, f.root), /coverage/);
     assert.throws(() => validateMaskManifest({ ...missing, range: { start: .5, end: 1 } }, { ...f, direction: 'both', anchorTime: 0 }, f.root), /requested direction and range/);
     assert.throws(() => validateMaskManifest({ ...f.manifest, frames: [{ ...f.manifest.frames[0], file: '../original' }, f.manifest.frames[1]] }, f, f.root), /incomplete/);
-    const png = readFileSync(join(f.root, 'frames', '1.png')); png[24] = 8; writeFileSync(join(f.root, 'frames', '1.png'), png);
-    assert.throws(() => resolveSmartMaskArtifact(f.directory, clip, f.mask, f.source, asset), /16-bit/);
-    rmSync(join(f.root, 'frames', '1.png'));
-    assert.throws(() => resolveSmartMaskArtifact(f.directory, clip, f.mask, f.source, asset), /incomplete/);
+    // Frames are checked the first time an analysis is resolved: a fresh one with a bad or missing frame is refused.
+    const g = fixture();
+    try {
+      const png = readFileSync(join(g.root, 'frames', '1.png')); png[24] = 8; writeFileSync(join(g.root, 'frames', '1.png'), png);
+      assert.throws(() => resolveSmartMaskArtifact(g.directory, clip, g.mask, g.source, asset), /16-bit/);
+      rmSync(join(g.root, 'frames', '1.png'));
+      assert.throws(() => resolveSmartMaskArtifact(g.directory, clip, g.mask, g.source, asset), /incomplete/);
+    } finally { rmSync(g.directory, { recursive: true, force: true }); }
+    // A finished analysis never changes, so once checked it is not read frame by frame again (the depth focus route
+    // resolves on every poll); the cheap checks still run on every resolve.
+    rmSync(join(f.root, 'source', '1.jpg'));
+    assert.equal(resolveSmartMaskArtifact(f.directory, clip, f.mask, f.source, asset).directory, f.root);
     writeFileSync(f.source, 'changed original source');
     assert.throws(() => resolveSmartMaskArtifact(f.directory, clip, f.mask, f.source, asset), /stale/);
   } finally { rmSync(f.directory, { recursive: true, force: true }); }
@@ -214,14 +222,6 @@ test('clip-bound manifest rejects changed input interpretation while historical 
     const path = `/smart-masks/${f.key}/manifest?projectId=project`;
     const before = await request(`${path}&clipId=clip`);
     assert.equal(before.status, 200); assert.equal(before.headers.get('cache-control'), 'private, no-cache');
-    state = (await request('/state')).data;
-    state.state.clips[0].properties = { inputProfile: 'S-Log3', inputGamut: 'S-Gamut3.Cine' };
-    assert.equal((await request('/state', 'PUT', state)).status, 200);
-    const stale = await request(`${path}&clipId=clip`);
-    assert.equal(stale.status, 409); assert.match(stale.data.error, /stale/);
-    const historical = await request(path);
-    assert.equal(historical.status, 200); assert.match(historical.headers.get('cache-control')!, /immutable/);
-  } finally { await app.close(); rmSync(f.directory, { recursive: true, force: true }); }
     // Depth's focus track is measured for the analysis the editor names, not for whichever subject is saved when the
     // poll lands: here the Depth has moved on to another mask, and a poll still out for the first must measure the first.
     state = (await request('/state')).data;
@@ -233,4 +233,12 @@ test('clip-bound manifest rejects changed input interpretation while historical 
     assert.equal(named.status, 404, `the named mask resolves, and only the depth run is missing: ${named.data.error}`);
     assert.match((await focus('b'.repeat(64))).data.error, /Other subject/);
     assert.match((await focus('d'.repeat(64))).data.error, /no longer on the clip/);
+    state = (await request('/state')).data;
+    state.state.clips[0].properties = { inputProfile: 'S-Log3', inputGamut: 'S-Gamut3.Cine' };
+    assert.equal((await request('/state', 'PUT', state)).status, 200);
+    const stale = await request(`${path}&clipId=clip`);
+    assert.equal(stale.status, 409); assert.match(stale.data.error, /stale/);
+    const historical = await request(path);
+    assert.equal(historical.status, 200); assert.match(historical.headers.get('cache-control')!, /immutable/);
+  } finally { await app.close(); rmSync(f.directory, { recursive: true, force: true }); }
 });

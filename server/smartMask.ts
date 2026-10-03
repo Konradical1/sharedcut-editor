@@ -104,6 +104,9 @@ export function validateMaskManifest(manifest: Manifest, expected: { key: string
   }
 }
 
+/** Manifests already checked frame by frame, by folder and signature. A finished analysis never changes, so it is checked
+ *  once: a 36,000-frame check is 100,000+ blocking file calls, and the depth focus route resolves on every poll. */
+const validated = new Map<string, Manifest>();
 // Completed assets are immutable and retained for undo/snapshots, including after cancellation.
 export function resolveSmartMaskArtifact(directory: string, clip: Clip, mask: SmartMaskDocument, sourcePath: string, asset: MediaAsset) {
   const result = mask.result;
@@ -113,8 +116,13 @@ export function resolveSmartMaskArtifact(directory: string, clip: Clip, mask: Sm
   const binding = json(join(root, 'binding.json')) as Binding;
   // A copied mask can share immutable pixels when project, source and exact intent match.
   if (binding.projectId !== clip.projectId || binding.signature !== result!.signature || binding.sourceFingerprint !== maskSourceFingerprint(sourcePath) || binding.analysisIdentity !== maskAnalysis(clip, asset).identity) fail(409, `${mask.name}: the analyzed mask is stale or belongs to another source.`);
+  const id = `${root}\n${result!.signature}`, known = validated.get(id);
+  if (known) return { directory: root, manifest: known };
   const manifest = json(join(root, 'manifest.json')) as Manifest;
   validateMaskManifest(manifest, { key: result!.key, signature: result!.signature, mask, direction: binding.direction, anchorTime: binding.anchorTime }, root);
+  // ponytail: 32 manifests (a 36,000-frame one is a few MB); raise if many long masks are resolved in turn.
+  if (validated.size >= 32) validated.delete(validated.keys().next().value!);
+  validated.set(id, manifest);
   return { directory: root, manifest };
 }
 
@@ -245,6 +253,8 @@ export function smartMaskService(directory: string) {
   return {
     get,
     sourceTimes,
+    /** Depth is about to take the GPU: an idle preview worker (SAM2, held for ten minutes after the last click) gives its VRAM back. */
+    stopIdlePreview() { if (previewWorker && !previewWorker.pending.size) stopPreviewWorker('Stopped to free the GPU for depth.'); },
     /** Opening the mask editor loads the model while the person finds their subject, so the first click
      *  previews in about a second instead of waiting for Python, torch and SAM to start. */
     warm() {
@@ -253,8 +263,6 @@ export function smartMaskService(directory: string) {
       try {
         const active = previewWorkerFor();
         if (!active.pending.size) { clearTimeout(active.idle); active.idle = setTimeout(() => { if (!active.pending.size) stopPreviewWorker('Idle.'); }, 600_000); active.idle.unref(); }
-    /** Depth is about to take the GPU: an idle preview worker (SAM2, held for ten minutes after the last click) gives its VRAM back. */
-    stopIdlePreview() { if (previewWorker && !previewWorker.pending.size) stopPreviewWorker('Stopped to free the GPU for depth.'); },
       } catch { /* Not installed; the editor already reports that from capabilities. */ }
     },
     /** One analysis-graded source frame. `native` is the full-resolution frame the model and zoomed views read;
