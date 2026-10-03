@@ -1331,6 +1331,9 @@ async function renderStabilizedTimeline(request: RenderRequest) {
     // Moving the mattes owns the front fifth of this clip's slice; the bake owns the rest.
     const mattes=documents.length?.2:0;
     const report=(fraction:number)=>request.onProgress?.((index+Math.max(0,Math.min(1,fraction)))/candidates.length*45);
+    // The bake's frame k is the source frame nearest to range.from + k/fps (a tie goes to the earlier one), so a
+    // matte's clock moves by that frame's time, not by range.from itself: a trim between frames is otherwise one off.
+    const step=1/sourceFps,matteOffset=(times?:number[])=>times?.find(t=>t>=range.from-step/2-1e-6)??range.from;
     for(const [order,document] of documents.entries()) {
       if(!request.smartMaskDir)throw Error(`${clip.name}: Smart Mask storage is unavailable.`);
       const artifact=resolveSmartMaskArtifact(request.smartMaskDir,clip,document,source.path,source.asset);
@@ -1339,7 +1342,7 @@ async function renderStabilizedTimeline(request: RenderRequest) {
       await stabilizeWarpMattes({input:source.path,directory:request.stabilizeDir??directory,range,settings,signal:request.signal,
         onProgress:p=>report(mattes*(order+p/100)/documents.length),
         frames:artifact.manifest.frames.map(f=>({input:path.join(artifact.directory,f.file),output:path.join(warped,f.file),time:f.time}))});
-      maskArtifacts.set(`${clip.id}:${document.id}`,{directory:warped,manifest:artifact.manifest,offset:range.from});
+      maskArtifacts.set(`${clip.id}:${document.id}`,{directory:warped,manifest:artifact.manifest,offset:matteOffset(artifact.manifest.sourceTimes)});
     }
     request.onStage?.(`Stabilizing · ${clip.name}`);
     const baked=await renderStabilized({input:source.path,directory,analysisDirectory:request.stabilizeDir,range,from:range.from,to:range.to,settings,preview:false,signal:request.signal,onProgress:p=>report(mattes+(1-mattes)*p/100)});
