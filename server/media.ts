@@ -1382,10 +1382,10 @@ function depthEffect(clip: Clip) {
     return (Number(effect.amount) > 0 || keyed.includes(`effects.${effect.id}.amount`)) && DEPTH_SECTIONS.some(key => effectValue(clip, effect, key) > 0 || keyed.includes(`effects.${effect.id}.parameters.${key}`));
   });
 }
-const exportRange = (request: RenderRequest) => ({ rangeIn: Number(request.settings.rangeIn) || 0, rangeOut: Number(request.settings.rangeOut ?? request.timeline.duration) || request.timeline.duration });
+const exportRange = (request: Pick<RenderRequest, 'settings' | 'timeline'>) => ({ rangeIn: Number(request.settings.rangeIn) || 0, rangeOut: Number(request.settings.rangeOut ?? request.timeline.duration) || request.timeline.duration });
 /** The Depth clips this render shows: on a visible video track, reaching into the range (with their transitions).
  *  One on a hidden track or outside the range is left alone; there Depth draws nothing and has no sound. */
-function depthClips(request: RenderRequest) {
+export function depthClips(request: Pick<RenderRequest, 'clips' | 'tracks' | 'assets' | 'timeline' | 'project' | 'settings'>) {
   const own = request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && depthEffect(c));
   if (!own.length) return own;
   const records = timelineTransitions(request.clips.filter(c => c.projectId === request.project.id), request.timeline.id, request.assets.map(a => a.asset)), { rangeIn, rangeOut } = exportRange(request);

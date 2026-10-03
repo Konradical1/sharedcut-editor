@@ -64,7 +64,7 @@ test('Depth lens blur exports: the far side loses detail, the near side keeps it
     const sharp = detail(source, 20, 140);
     assert.ok(detail(at, 20, cut - 8) > .9 * sharp, `near stays sharp: ${detail(at, 20, cut - 8)} of ${sharp}`);
     assert.ok(detail(at, cut + 12, 300) < .3 * detail(source, cut + 12, 300), `far is blurred: ${detail(at, cut + 12, 300)} of ${detail(source, cut + 12, 300)}`);
-    // A timeline preview is an ordinary render at a smaller size and H.264.
+    // A small H.264 export bakes the same way (timeline previews skip Depth ranges; the editor draws them live).
     const preview = path.join(f.dir, 'preview.mp4');
     await renderTimeline({ ...request, outputPath: preview, settings: { ...request.settings, resolution: '160 × 90', codec: 'H.264' } });
     const small = await luma(preview, 1, 160, 90);

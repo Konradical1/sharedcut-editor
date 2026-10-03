@@ -415,7 +415,8 @@ The structure copies `render()` in `color-render.py`.
 - **Rejected by name**, in the same style as masks:
   - Depth + optical flow: "needs warped depth".
   - Depth on VFR sources: the staged path is CFR.
-- **Timeline previews** get depth with no extra work, because they render through `renderTimeline`.
+- **Timeline previews** skip any 4-s chunk holding an active Depth clip (status `skipped`): a bake there took about 90 s for
+  4K60 and held a media slot, often waiting on analysis, while the editor draws Depth live in WebGL anyway.
 
 ## 5. Smart Mask together with depth
 

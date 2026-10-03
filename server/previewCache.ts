@@ -3,10 +3,10 @@ import { existsSync, statSync } from 'node:fs';
 import { mkdir, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { trimFlowCache } from './opticalFlow.ts';
-import type { RenderRequest } from './media.ts';
+import { depthClips, type RenderRequest } from './media.ts';
 
 type Snapshot = Omit<RenderRequest, 'outputPath' | 'signal' | 'onProgress'>;
-export type TimelinePreview = { key: string; status: 'preparing' | 'ready' | 'failed'; progress: number; from: number; duration: number; fps: number; url?: string; error?: string };
+export type TimelinePreview = { key: string; status: 'preparing' | 'ready' | 'failed' | 'skipped'; progress: number; from: number; duration: number; fps: number; url?: string; error?: string };
 /** Reuses the export renderer in short, versioned windows. Never changes source media or the edit. */
 export function createPreviewCache(directory: string, schedule: (id: string, work: (signal: AbortSignal) => Promise<void>) => void, render: (request: RenderRequest) => Promise<void>) {
   const jobs = new Map<string, { projectId: string; value: TimelinePreview }>();
@@ -18,6 +18,9 @@ export function createPreviewCache(directory: string, schedule: (id: string, wor
       const key = createHash('sha256').update(JSON.stringify(['timeline-preview-v1', snapshot, files])).digest('hex');
       const file = join(directory, `${key}.mp4`), projectId = snapshot.project.id;
       const url = `/api/timeline-previews/${key}/video.mp4?projectId=${encodeURIComponent(projectId)}`;
+      // A Depth clip would bake at source resolution (a 4K60 clip took 90 s a chunk) holding a media slot, often waiting on
+      // its analysis; the editor draws Depth live in WebGL instead, so such a range is never rendered here.
+      if (depthClips(snapshot).length) return { key, from, duration, fps, progress: 0, status: 'skipped', error: 'Depth plays live in the editor.' };
       const previous = jobs.get(key);
       if (previous && (previous.value.status !== 'ready' || existsSync(file))) return previous.value;
       if ([...jobs.values()].filter(job => job.value.status === 'preparing').length >= 2) throw new Error('Preview queue busy');
