@@ -35,3 +35,7 @@ export function limiter(limit: number) {
 // Smart Mask, motion tracking, optical flow and Stabilize each saturate the GPU or every core; across
 // types only this many run at once. Exports and media preparation stay on their own queue, so none waits on the other.
 export const heavyJob = limiter(Math.max(1, Math.floor(Number(process.env.FRAME_LINE_HEAVY_JOBS)) || 2));
+// One job on the GPU at a time: depth analysis, Smart Mask tracking and caption transcription each want most of
+// the Dell's 8 GB laptop GPU, which the desktop already holds 3 GB of. Always taken innermost (inside heavyJob)
+// so no job ever holds the GPU while it waits for a CPU slot.
+export const gpuJob = limiter(1);

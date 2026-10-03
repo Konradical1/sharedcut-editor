@@ -1,5 +1,5 @@
 import { killProcessTree, runWorkerProcess } from './processTree.ts';
-import { heavyJob } from './workQueue.ts';
+import { gpuJob, heavyJob } from './workQueue.ts';
 import { venvPython, filterPath, locked, renameWithRetry, renameWithRetrySync } from './platform.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -346,7 +346,7 @@ export function smartMaskService(directory: string) {
       const job: Job = { key, signature, projectId: clip.projectId, clipId: clip.id, maskId: mask.id, status: 'queued', progress: 0 };
       save(job);
       // ponytail: one model process per server; add a device-aware pool only for multi-GPU deployment.
-      queue = queue.then(() => heavyJob(async () => {
+      queue = queue.then(() => heavyJob(() => gpuJob(async () => {
         if (closed || controller.signal.aborted) { controllers.delete(key); return; }
         const temporary = join(directory, `.partial-${key}-${randomUUID()}`);
         try {
@@ -377,7 +377,7 @@ export function smartMaskService(directory: string) {
           job.status = 'ready'; job.progress = 100; job.manifestUrl = `/api/smart-masks/${key}/manifest?projectId=${encodeURIComponent(clip.projectId)}`; save(job);
         } catch (error) { job.status = controller.signal.aborted ? 'cancelled' : 'failed'; job.error = (error as Error).message; save(job); }
         finally { controllers.delete(key); try { remove(temporary); } catch { /* A locked leftover is harmless; it is never served. */ } }
-      })).catch(error => {
+      }))).catch(error => {
         job.status = controller.signal.aborted ? 'cancelled' : 'failed'; job.error = (error as Error).message; controllers.delete(key);
         try { save(job); } catch { /* Keep the in-memory failure visible if the cache volume is full. */ }
       });

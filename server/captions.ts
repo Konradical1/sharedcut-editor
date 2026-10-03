@@ -7,6 +7,7 @@ import { existsSync } from 'node:fs';
 import { renderTimeline, type RenderRequest } from './media.ts';
 import { validateWords, type CaptionWord } from '../src/services/captions.ts';
 import { killProcessTree } from './processTree.ts';
+import { gpuJob } from './workQueue.ts';
 
 export const captionPython=()=>process.env.FRAME_LINE_CAPTION_PYTHON||venvPython('.venv-captions');
 export const captionAvailable=()=>existsSync(captionPython());
@@ -38,7 +39,7 @@ export async function transcribeTimeline(request:RenderRequest,trackIds:string[]
     const list=join(directory,'audio.txt'),audio=join(directory,'audio.wav'),result=join(directory,'words.json');
     await writeFile(list,files.join('\n'));
     await processFile(process.env.FFMPEG_PATH||'ffmpeg',['-v','error','-y','-f','concat','-safe','0','-i',list,'-vn','-ac','1','-ar','16000','-c:a','pcm_s16le','-t',String(end-start),audio],signal);
-    await processFile(captionPython(),[resolve('scripts/transcribe.py'),audio,result],signal,progress);
+    await gpuJob(()=>processFile(captionPython(),[resolve('scripts/transcribe.py'),audio,result],signal,progress));
     const parsed=JSON.parse(await readFile(result,'utf8'));validateWords(parsed.words);
     return parsed.words.map((w:CaptionWord)=>({...w,start:w.start+start,end:Math.min(end,w.end+start)})).filter((w:CaptionWord)=>w.end>w.start);
   } finally {await rm(directory,{recursive:true,force:true});}
