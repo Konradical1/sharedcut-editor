@@ -28,6 +28,13 @@ test('timeline previews skip a range with an active Depth clip and render the re
     // Depth with every section off draws nothing, so it does not count; neither does one switched off.
     assert.equal(cache.request(snapshot(4, [clip('plain', 0), clip('deep', 4, [{ ...depth, parameters: { blur: 0 } }])])).status, 'preparing');
     assert.equal(cache.request(snapshot(0, clips)).status, 'preparing', 'the chunk before it renders as usual');
+    // A composition renders its whole inner timeline, so a Depth clip two levels down skips the chunk too, wherever it sits.
+    const nested = { ...snapshot(0, [clip('parent', 0), clip('middle', 0), { ...clip('inner', 8, [depth]), timelineId: 'inner' }]), timelines: [{ id: 't', projectId: 'p', name: 't', duration: 12 }, { id: 'middle', projectId: 'p', name: 'middle', duration: 4, composition: true }, { id: 'inner', projectId: 'p', name: 'inner', duration: 12, composition: true }] };
+    nested.clips[0] = { ...nested.clips[0], mediaId: 'frameline-composition', properties: { ...defaultProperties, compositionId: 'middle' } };
+    nested.clips[1] = { ...nested.clips[1], timelineId: 'middle', mediaId: 'frameline-composition', properties: { ...defaultProperties, compositionId: 'inner' } };
+    nested.tracks = [track, { ...track, id: 'mv', timelineId: 'middle' }, { ...track, id: 'iv', timelineId: 'inner' }];
+    nested.clips[1].trackId = 'mv'; nested.clips[2].trackId = 'iv';
+    assert.equal(cache.request(nested).status, 'skipped', 'a Depth inside a nested composition is never baked for a preview');
     await Promise.all(scheduled);
     assert.deepEqual(rendered.sort(), ['0', '4'], 'only the chunks without an active Depth reached the renderer');
   } finally { await rm(directory, { recursive: true, force: true }); }

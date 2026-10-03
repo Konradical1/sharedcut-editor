@@ -3,7 +3,7 @@ import { existsSync, statSync } from 'node:fs';
 import { mkdir, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { trimFlowCache } from './opticalFlow.ts';
-import { depthClips, type RenderRequest } from './media.ts';
+import { bakesDepth, type RenderRequest } from './media.ts';
 
 type Snapshot = Omit<RenderRequest, 'outputPath' | 'signal' | 'onProgress'>;
 export type TimelinePreview = { key: string; status: 'preparing' | 'ready' | 'failed' | 'skipped'; progress: number; from: number; duration: number; fps: number; url?: string; error?: string };
@@ -19,8 +19,9 @@ export function createPreviewCache(directory: string, schedule: (id: string, wor
       const file = join(directory, `${key}.mp4`), projectId = snapshot.project.id;
       const url = `/api/timeline-previews/${key}/video.mp4?projectId=${encodeURIComponent(projectId)}`;
       // A Depth clip would bake at source resolution (a 4K60 clip took 90 s a chunk) holding a media slot, often waiting on
-      // its analysis; the editor draws Depth live in WebGL instead, so such a range is never rendered here.
-      if (depthClips(snapshot).length) return { key, from, duration, fps, progress: 0, status: 'skipped', error: 'Depth plays live in the editor.' };
+      // its analysis; the editor draws Depth live in WebGL instead, so such a range is never rendered here. A composition renders
+      // its whole timeline whatever the range, so a Depth anywhere inside one counts too.
+      if (bakesDepth(snapshot)) return { key, from, duration, fps, progress: 0, status: 'skipped', error: 'Depth plays live in the editor.' };
       const previous = jobs.get(key);
       if (previous && (previous.value.status !== 'ready' || existsSync(file))) return previous.value;
       if ([...jobs.values()].filter(job => job.value.status === 'preparing').length >= 2) throw new Error('Preview queue busy');

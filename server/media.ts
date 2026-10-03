@@ -1395,6 +1395,17 @@ export function depthClips(request: Pick<RenderRequest, 'clips' | 'tracks' | 'as
     return track?.kind === 'video' && !track.hidden && span.start < rangeOut - 1e-6 && span.end > rangeIn + 1e-6;
   });
 }
+/** Whether rendering this request bakes Depth anywhere: on its own timeline, or inside a composition, which renders its
+ *  whole timeline (renderCompositions), whatever range the parent shows. */
+export function bakesDepth(request: Pick<RenderRequest, 'clips' | 'tracks' | 'assets' | 'timeline' | 'timelines' | 'project' | 'settings'>, seen = new Set<string>()): boolean {
+  if (depthClips(request).length) return true;
+  seen.add(request.timeline.id);
+  return request.clips.some(parent => {
+    if (parent.timelineId !== request.timeline.id || parent.mediaId !== 'frameline-composition' || parent.disabled) return false;
+    const timeline = request.timelines?.find(t => t.id === parent.properties.compositionId && t.projectId === request.project.id);
+    return !!timeline && !seen.has(timeline.id) && bakesDepth({ ...request, timeline, settings: { ...request.settings, rangeIn: '0', rangeOut: String(timeline.duration) } }, seen);
+  });
+}
 /** Refused by name before anything is decoded or baked. */
 function rejectDepth(request: RenderRequest) {
   for (const clip of depthClips(request)) {
