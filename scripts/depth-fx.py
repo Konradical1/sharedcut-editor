@@ -82,8 +82,9 @@ def sample(image, x, y):
 
 
 def upsample_depth(I, depth, near, far, warp=None):
-    """Section 1: joint-bilateral upsample of the w x h depth onto the H x W picture, as distance. `warp` is a
-    row-major 2x3 source -> output pixel matrix (Stabilize); output pixels map back through its inverse."""
+    """Section 1: joint-bilateral upsample of the w x h depth onto the H x W picture, as distance, and where the picture
+    is (None: everywhere). `warp` is a row-major 2x3 source -> output pixel matrix (Stabilize); output pixels map back
+    through its inverse, and outside the warped frame D is 0 and every effect a no-op."""
     _, H, W = I.shape
     h, w = depth.shape
     device, f32 = I.device, torch.float32
@@ -115,7 +116,7 @@ def upsample_depth(I, depth, near, far, warp=None):
         weak = den < 1e-6
         if weak.any():
             D = torch.where(weak, distance(sample(depth[None], qx[None].expand(H, W), qy[:, None].expand(H, W))[0], near, far), D)
-        return D
+        return D, None
     y, x = torch.meshgrid(torch.arange(H, device=device, dtype=f32), torch.arange(W, device=device, dtype=f32), indexing="ij")
     a, b, c, d, e, f = [float(v) for v in warp]
     det = a * e - b * d
@@ -141,7 +142,7 @@ def upsample_depth(I, depth, near, far, warp=None):
     weak = den < 1e-6
     if weak.any():
         D = torch.where(weak, distance(sample(depth[None], qx, qy)[0], near, far), D)
-    return torch.where(inside, D, torch.zeros_like(D))
+    return torch.where(inside, D, torch.zeros_like(D)), inside
 
 
 def area(image, height, width):
@@ -152,15 +153,20 @@ def bilinear(image, height, width):
     return image if image.shape[-2:] == (height, width) else F.interpolate(image[None], size=(height, width), mode="bilinear", align_corners=False)[0]
 
 
-def lens_blur(L2, D, p, taps):
-    """Section 4: circle of confusion, then Gustafsson's single-pass gather at <= 960 px wide."""
+def lens_blur(L2, D, p, taps, inside=None, layer_width=None, fit=1.0):
+    """Section 4: circle of confusion, then Gustafsson's single-pass gather at <= 960 px wide. The spec measures both on
+    the layer: a source fitted at `fit` into a `layer_width` canvas blurs by .025 of the canvas width, at the scale the
+    canvas works at, so a letterboxed source gets the preview's blur."""
     _, H, W = L2.shape
-    R, focus, band = p["blur"] / 100 * .025 * W, p["focus"] / 100, p["range"] / 100 * .5
+    layer_width = layer_width or W
+    R, focus, band = p["blur"] / 100 * .025 * layer_width / fit, p["focus"] / 100, p["range"] / 100 * .5
     delta = D - focus
     coc = R * ((delta.abs() - band) / .35).clamp(0, 1) * torch.where(delta < 0, p["nearBlur"] / 100, 1.0)
-    Wb = min(W, 960)
+    if inside is not None:
+        coc = coc * inside  # Off the stabilized frame there is nothing to blur, not a black foreground.
+    Wb = max(1, round(W * min(layer_width, 960) / layer_width * fit))
     s = Wb / W
-    Hb = round(H * s)
+    Hb = max(1, round(H * s))
     small = area(torch.cat([L2, D[None], coc[None]]), Hb, Wb)
     Ls, Ds, cc, Rb = small[:3], small[3], small[4] * s, R * s
     B = Ls if Rb < 1 else gather(Ls, Ds, cc, Rb, p["bokeh"] / 100 * 8, taps)
@@ -211,14 +217,16 @@ def gather(Ls, Ds, cc, Rb, bokeh, taps, chunk=24):
     return acc / wsum
 
 
-def glow(L3, D, p):
-    """Section 5: bright pass weighted to the far side, separable Gaussian at <= 480 px wide, added."""
+def glow(L3, D, p, layer_width=None, fit=1.0):
+    """Section 5: bright pass weighted to the far side, separable Gaussian at <= 480 px wide (of the layer), added."""
     _, H, W = L3.shape
+    layer_width = layer_width or W
     th, start = p["glowThreshold"] / 100, p["glowStart"] / 100
     G = L3 * ((lum(enc(L3)) - th) / max(1 - th, .01)).clamp(0, 1) * smoothstep(start, start + .15, D)
-    Wq = min(W, 480)
-    Hq = round(H * Wq / W)
-    sigma = p["glowRadius"] / 100 * .04 * W * (Wq / W)
+    Wl = min(layer_width, 480)
+    Wq = max(1, round(W * Wl / layer_width * fit))
+    Hq = max(1, round(H * Wq / W))
+    sigma = p["glowRadius"] / 100 * .04 * Wl  # .04 of the layer width, in the layer's working pixels.
     radius = min(63, math.floor(3 * sigma))  # Taps |k| <= 3 sigma, at most 63 a side: the preview's limit.
     kernel = torch.exp(-torch.arange(-radius, radius + 1, device=L3.device, dtype=torch.float32) ** 2 / (2 * sigma * sigma))
     kernel = (kernel / kernel.sum()).repeat(3, 1, 1)
@@ -228,13 +236,16 @@ def glow(L3, D, p):
     return L3 + p["glow"] / 100 * 1.5 * bilinear(g, H, W)
 
 
-def depth_fx(I, depth, p, near, far, taps=96, warp=None):
-    """The whole effect on one frame: I display RGB 0..1 (3,H,W), depth the stored values 0..1 (h,w)."""
+def depth_fx(I, depth, p, near, far, taps=96, warp=None, layer=None):
+    """The whole effect on one frame: I display RGB 0..1 (3,H,W), depth the stored values 0..1 (h,w). `layer` is the
+    (width, height) canvas the clip is fitted into, centred; the spec's W x H. None: the picture is the layer."""
     p = {**DEFAULTS, **p}
     if not any(p[key] > 0 for key in ("light", "fog", "blur", "glow")) or p["amount"] <= 0:
         return I
-    _, H, _ = I.shape
-    D = upsample_depth(I, depth, near, far, warp)
+    _, H, W = I.shape
+    LW, LH = layer or (W, H)
+    fit = min(LW / W, LH / H)
+    D, inside = upsample_depth(I, depth, near, far, warp)
     L = lin(I)
     if p["light"] > 0:
         start = p["lightStart"] / 100
@@ -248,15 +259,15 @@ def depth_fx(I, depth, p, near, far, taps=96, warp=None):
     if p["fog"] > 0:
         start, kd = p["fogStart"] / 100, 1 + 9 * p["fogDensity"] / 100
         base = 1 - torch.exp(-kd * (D - start).clamp(min=0) / max(1 - start, .05))
-        v = (torch.arange(H, device=I.device, dtype=torch.float32) + .5) / H
+        v = ((LH - H * fit) / 2 + (torch.arange(H, device=I.device, dtype=torch.float32) + .5) * fit) / LH  # On the layer.
         horizon = (1 + 2 * p["fogHorizon"] / 100 * (1 - v) ** 2)[:, None]
         f = (p["fog"] / 100 * base * horizon).clamp(0, 1)
         colour = lin(torch.tensor(hsv(p["fogHue"], p["fogSaturation"] / 100, p["fogBrightness"] / 100), device=I.device).view(3, 1, 1))
         L = L + (colour - L) * f
     if p["blur"] > 0:
-        L = lens_blur(L, D, p, taps)
+        L = lens_blur(L, D, p, taps, inside, LW, fit)
     if p["glow"] > 0:
-        L = glow(L, D, p)
+        L = glow(L, D, p, LW, fit)
     return (I + (enc(L) - I) * p["amount"] / 100).clamp(0, 1)
 
 
@@ -385,7 +396,7 @@ def render(job):
                 rgba = torch.from_numpy(np.frombuffer(data, np.uint16).reshape(H, W, 4)).to(device).permute(2, 0, 1).float() / 65535
                 depth = torch.from_numpy(np.frombuffer(current, np.uint16).reshape(spec["height"], spec["width"])).to(device).float() / 1023
                 params = {**static, **{key: values[k] for key, values in animated.items()}}
-                rgb = depth_fx(rgba[:3].contiguous(), depth, params, near, far, taps, warps[k] if warps else None)
+                rgb = depth_fx(rgba[:3].contiguous(), depth, params, near, far, taps, warps[k] if warps else None, job.get("layer"))
                 # Interleave on the GPU: a strided tensor crossed to the CPU element by element (240 ms a 4K frame).
                 out = (torch.cat([rgb, rgba[3:]]) * 65535 + .5).clamp(0, 65535).to(torch.int32).to(torch.uint16).permute(1, 2, 0).contiguous()
                 written.put(out.cpu().numpy().tobytes())
@@ -435,7 +446,7 @@ def parity(params_path, rgb_path, depth_path, out_path):
     rgb = torch.from_numpy(read_png(rgb_path, 3)[..., :3].copy()).to(device).permute(2, 0, 1)
     depth = torch.from_numpy(read_png(depth_path, 1).copy()).to(device)
     with torch.inference_mode():
-        out = depth_fx(rgb, depth, spec.get("params", {}), float(spec["near"]), float(spec["far"]), int(spec.get("taps", 96)), spec.get("warp"))
+        out = depth_fx(rgb, depth, spec.get("params", {}), float(spec["near"]), float(spec["far"]), int(spec.get("taps", 96)), spec.get("warp"), spec.get("layer"))
     image = (out.permute(1, 2, 0).cpu().numpy()[..., [2, 1, 0]] * 65535 + .5).clip(0, 65535).astype(np.uint16)
     if not cv2.imwrite(str(out_path), image):
         raise ValueError(f"Could not write {out_path}.")
@@ -485,10 +496,10 @@ def selftest():
         assert torch.equal(same, I), "every section off must leave the picture alone"
         quiet = depth_fx(I, depth, {"light": 0, "fog": 0, "blur": 0, "glow": 0, "amount": 100}, near, far)
         assert torch.equal(quiet, I)
-        D = upsample_depth(I, depth, near, far)
+        D = upsample_depth(I, depth, near, far)[0]
         assert float(D[:, :70].max()) < 1e-3 and float(D[:, 90:].min()) > .999, "depth keeps its order and halves"
-        assert torch.allclose(D, upsample_depth(I, depth, near, far, [1, 0, 0, 0, 1, 0]), atol=1e-5), "identity warp is no warp"
-        shifted = upsample_depth(I, depth, near, far, [1, 0, 20, 0, 1, 0])  # Picture moved 20 px right: so is its depth.
+        assert torch.allclose(D, upsample_depth(I, depth, near, far, [1, 0, 0, 0, 1, 0])[0], atol=1e-5), "identity warp is no warp"
+        shifted = upsample_depth(I, depth, near, far, [1, 0, 20, 0, 1, 0])[0]  # Picture moved 20 px right: so is its depth.
         assert float(shifted[:, :15].max()) == 0 and float(shifted[:, 25:90].max()) < 1e-3 and float(shifted[:, 110:].min()) > .999
         checks.append("depth upsample")
         blurred = depth_fx(I, depth, {"blur": 100, "focus": 0, "range": 10}, near, far)
@@ -498,11 +509,22 @@ def selftest():
         assert abs(float(blurred[:, :, 90:].mean()) - float(I[:, :, 90:].mean())) < .1, "blur keeps the brightness"
         refocused = depth_fx(I, depth, {"blur": 100, "focus": 100, "range": 10, "nearBlur": 100}, near, far)
         assert detail(refocused[:, :, 90:]) > .99 * detail(I[:, :, 90:]) and detail(refocused[:, :, :70]) < .25 * detail(I[:, :, :70]), "focus far blurs the near half"
+        lens = {"blur": 50, "focus": 0, "range": 10}
+        assert torch.equal(depth_fx(I, depth, lens, near, far, layer=(W, H)), depth_fx(I, depth, lens, near, far)), "a picture that fills its layer is the plain case"
+        assert detail(depth_fx(I, depth, lens, near, far, layer=(2 * W, H))[:, :, 90:]) < .8 * detail(depth_fx(I, depth, lens, near, far)[:, :, 90:]), "a source letterboxed into a canvas twice as wide blurs by the canvas width"
+        # Stabilized: left of the warped frame is black border with D = 0; focused far, it must not smear in as a near subject.
+        border = I.clone()
+        border[:, :, :20] = 0
+        edge = depth_fx(border, depth, {"blur": 100, "focus": 100, "range": 10, "nearBlur": 100}, near, far, warp=[1, 0, 20, 0, 1, 0])
+        assert float(edge[:, :, :19].max()) < 1e-3 and float(edge[:, :, 21:24].mean()) > .9 * float(edge[:, :, 30:60].mean()), f"the border stays out of the picture ({float(edge[:, :, 21:24].mean())} of {float(edge[:, :, 30:60].mean())})"
         checks.append("lens blur")
         fogged = depth_fx(I, depth, {"fog": 100, "fogStart": 30, "fogHorizon": 0}, near, far)
         target = torch.tensor(hsv(210, .1, .85), device=device).view(3, 1)
         assert torch.allclose(fogged[:, :, :70], I[:, :, :70], atol=1e-5), "fog leaves the near half alone"
         assert float((fogged[:, :, 100:].reshape(3, -1) - target).abs().mean()) < .05, "thick fog turns the far half the fog colour"
+        haze = {"fog": 30, "fogStart": 0, "fogHorizon": 100}
+        thin = lambda out: float((out[:, 0, 100:] - I[:, 0, 100:]).abs().mean())  # Fog on the top row of the far half.
+        assert thin(depth_fx(I, depth, haze, near, far, layer=(W, 3 * H))) < .8 * thin(depth_fx(I, depth, haze, near, far)), "in a tall canvas the horizon is measured on the canvas"
         dim = I * .5
         lit = depth_fx(dim, depth, {"light": 100, "lightStart": 40, "lightSoftness": 10, "bgExposure": 1}, near, far)
         ratio = lin(lit[:, :, 100:]) / lin(dim[:, :, 100:])

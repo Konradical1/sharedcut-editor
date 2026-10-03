@@ -1500,7 +1500,7 @@ async function renderDepthTimeline(request: RenderRequest) {
         settings: { ...request.settings, resolution: `${width} × ${height}`, fps: String(sourceFps), rangeIn: '0', rangeOut: String(duration), codec: 'Apple ProRes 4444', audio: 'Disabled' },
         outputPath: output, onProgress: undefined,
         decoder: async command => {
-          await writeFile(job, JSON.stringify({ ffmpeg: ffmpeg(), decoder: command, width, height, frames, fps: image ? String(fps) : metadata.frameRate || String(sourceFps), output, image, alpha, threads: Number(exportThreads), taps: Number(process.env.FRAME_LINE_DEPTH_TAPS) || 96, params, animated, warps,
+          await writeFile(job, JSON.stringify({ ffmpeg: ffmpeg(), decoder: command, width, height, frames, fps: image ? String(fps) : metadata.frameRate || String(sourceFps), output, image, alpha, threads: Number(exportThreads), taps: Number(process.env.FRAME_LINE_DEPTH_TAPS) || 96, params, animated, warps, layer: dimensions(request.project.resolution),
             depth: { masters: segments.map(segment => path.join(masters, `${segment.n}.mkv`)), width: analysis.width, height: analysis.height, near: analysis.near, far: analysis.far, indices: Array.from({ length: frames }, (_, k) => base + k - segments[0].first) } }));
           await gpuJob(() => run(python, [script, job], { signal: request.signal, jsonProgress: 'stderr', onProgress: p => { request.onStage?.(`Baking depth · ${clip.name} · ${Math.floor(p)}%`); report(.3 + p / 100 * .7); } }), request.signal);
         } });
