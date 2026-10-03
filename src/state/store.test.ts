@@ -484,6 +484,18 @@ test('published history is never coalesced and effect instances stay independent
   state().undo();assert.equal(clip().effects.at(-1)!.id,second.id);
 });
 
+test('Depth starts at full Mix, a clip takes one, and a preset-sized change is one undo', () => {
+  const before = clip().effects.length;
+  state().addEffect('c3', 'Depth'); state().addEffect('c3', 'Depth');
+  const depth = clip().effects.filter(e => e.name === 'Depth');
+  assert.equal(depth.length, 1); assert.equal(depth[0].amount, 100); assert.equal(clip().effects.length, before + 1);
+  state().updateEffect('c3', depth[0].id, { amount: 100, parameters: { blur: 55, range: 12, fog: 0 } });
+  assert.equal(clip().effects.find(e => e.id === depth[0].id)!.parameters!.blur, 55);
+  state().undo();
+  assert.equal(clip().effects.find(e => e.id === depth[0].id)!.parameters, undefined);
+  state().updateEffect('c3', depth[0].id, null);
+});
+
 test('a color-wheel gesture undoes together without replacing another parameter',()=>{
   state().selectClip('c3');state().addNode('Wheel',{liftR:0,liftG:0,contrast:1});const id=state().selectedNodeId!;
   state().updateNode(id,{parameters:{liftR:.05,liftG:.02}},'wheel-drag');

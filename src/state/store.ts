@@ -14,7 +14,7 @@ import type { Bin, Clip, CollaborativeLock, Comment, GradeNode, Marker, MediaAss
 import { bins as fixedBins, createDemoProject, defaultProperties, projects, users } from './demo.ts';
 import { authenticationService, collaborationService, colorService, createId, LOCK_TTL, lockConflict, mediaService, projectService, renderService } from '../services/index.ts';
 import type { PersistedState } from '../services/index.ts';
-import { acceptsEffect, effectDefinitions } from '../services/effects.ts';
+import { acceptsEffect, effectDefinitions, initialAmount } from '../services/effects.ts';
 import { transitionPresetId, type TransitionPreset, timelineTransitions, trimLeak, leakRange, bestAlign, defaultTransition, leakAudioTrack, leakMediaId, maximumDuration, neighbourAt, transitionAlign, transitionCurve, transitionDefinitions, transitionDuration, transitionFields, transitionName, transitionParams, transitionProperty, type TransitionAlign, type TransitionParams, type TransitionSide } from '../services/transitions.ts';
 import { advancePlayhead, playheadMotion, type PlayheadMotion } from '../services/presence.ts';
 import { closedShift, commonGaps, companionAudioTrack, markersOf, trackGap, trimRoom, uncoveredParts } from '../services/timeline.ts';
@@ -1352,7 +1352,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if(name==='Smart Mask'){get().addSmartMask(clipId);return;}
       const clip = editableClip(clipId, 'effects');
       if (!clip || !acceptsEffect(clip, get().media.find(m => m.id === clip.mediaId)?.kind, name)) return;
-      commit('EffectAdded', clipId, `added ${name} to ${clip.name}`, [{ collection: 'clips', id: clipId, value: { effects: [...clip.effects, { id: createId('effect'), name, enabled: true, amount: 50 }] } }]);
+      commit('EffectAdded', clipId, `added ${name} to ${clip.name}`, [{ collection: 'clips', id: clipId, value: { effects: [...clip.effects, { id: createId('effect'), name, enabled: true, amount: initialAmount(name) }] } }]);
       set({ selectedClipId: clipId, selectedTextIds: [], textSelection: null, sidePanel: 'inspector', inspectorTab: 'Effects' });
     },
     updateEffect(clipId, effectId, patch, gesture) {

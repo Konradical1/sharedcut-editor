@@ -1,4 +1,5 @@
 import SmartMaskInspector from './SmartMaskInspector';
+import DepthInspector from './DepthInspector';
 import MotionTrackerInspector from './MotionTrackerInspector';
 import { PanelTabPresence, usePanelTabPresence } from './PanelTabPresence';
 import CaptionInspector from './CaptionInspector';
@@ -14,7 +15,7 @@ import { isTitle } from '../services/text';
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode, type PointerEvent } from 'react';
 import { Shapes, Type, SlidersHorizontal, ChevronDown, ChevronLeft, ChevronRight, RotateCcw, Diamond, Plus, Film, Crop, Gauge, WandSparkles, Volume2, Layers, LockKeyhole, Info, X, Trash2, ArrowUp, ArrowDown, Crosshair } from 'lucide-react';
 import { useEditorStore, usePanelPlayhead } from '../state/store';
-import { effectDefinitions, effectValue, effectEnabled, acceptsEffect, loudnessTargets, loudnessTarget } from '../services/effects';
+import { effectDefinitions, effectValue, effectEnabled, acceptsEffect, initialAmount, loudnessTargets, loudnessTarget } from '../services/effects';
 import { IconButton, EmptyState, NumberInput, durationLabel, fpsLabel } from './ui';
 import { api } from '../services/api';
 import { blendModeNames } from '../services/blendModes';
@@ -181,12 +182,12 @@ export default function Inspector() {
           <summary data-cursor-anchor={`effect-${effect.id}`} className="effect-stack-item"><ChevronDown size={12}/><span>{effect.name}</span></summary>
           <div data-cursor-anchor={`effect-controls-${effect.id}`} className="effect-stack-controls"><label><input type="checkbox" aria-label={`Enable ${effect.name}`} checked={effectEnabled(selected,effect)} onChange={e=>s().updateEffect(selected.id,effect.id,{enabled:e.target.checked})}/>Enabled</label><span className="spacer"/>
             <IconButton label={`Move ${effect.name} up`} disabled={index===0} onClick={()=>s().reorderEffect(selected.id,effect.id,-1)}><ArrowUp size={12}/></IconButton><IconButton label={`Move ${effect.name} down`} disabled={index===selected.effects.length-1} onClick={()=>s().reorderEffect(selected.id,effect.id,1)}><ArrowDown size={12}/></IconButton>
-            <IconButton label={`Reset ${effect.name}`} onClick={()=>s().updateEffect(selected.id,effect.id,{amount:50,parameters:Object.fromEntries((effectDefinitions[effect.name]?.parameters??[]).filter(p=>p.key!=='amount').map(p=>[p.key,p.initial]))})}><RotateCcw size={12}/></IconButton>
+            <IconButton label={`Reset ${effect.name}`} onClick={()=>s().updateEffect(selected.id,effect.id,{amount:initialAmount(effect.name),parameters:Object.fromEntries((effectDefinitions[effect.name]?.parameters??[]).filter(p=>p.key!=='amount').map(p=>[p.key,p.initial]))})}><RotateCcw size={12}/></IconButton>
             <IconButton label={`Delete ${effect.name}`} onClick={()=>s().updateEffect(selected.id,effect.id,null)}><Trash2 size={12}/></IconButton>
           </div><p className="inspector-note">{effectDefinitions[effect.name]?.description}</p>
           {effect.name==='Smart Mask'&&<SmartMaskInspector clip={selected} maskId={effect.maskId} targetId={effect.id}/>}
           {effect.name==='Stabilize'&&<StabilizeStatus clipId={selected.id} lock={effect.parameters?.lock??0}/>}
-          {(effectDefinitions[effect.name]?.parameters??[]).map(p=><Property key={p.key} effectId={effect.id} name={p.key} label={p.label} initial={p.initial} min={p.min} max={p.max} step={p.step} suffix={p.suffix}/>)}
+          {effect.name==='Depth'?<DepthInspector clip={selected} effect={effect}/>:(effectDefinitions[effect.name]?.parameters??[]).map(p=><Property key={p.key} effectId={effect.id} name={p.key} label={p.label} initial={p.initial} min={p.min} max={p.max} step={p.step} suffix={p.suffix}/>)}
           {effect.name==='Noise Reduction'&&<p className="inspector-note">Temporal picture smoothing is applied during export. Audio preview uses a noise gate.</p>}
         </details>)}<label className="form-field effect-add"><span>Add an effect</span><select data-cursor-anchor="add-effect" aria-label="Add clip effect" defaultValue="" onChange={e=>{if(e.target.value)s().addEffect(selected.id,e.target.value);e.target.value='';}}><option value="">Choose effect…</option>{Object.keys(effectDefinitions).filter(name=>acceptsEffect(selected,asset?.kind,name)).map(name=><option key={name}>{name}</option>)}</select></label></>}
       {tab==='Info'&&<Section title="Source metadata" icon={<Info size={12}/>}><dl className="metadata-list"><dt>File</dt><dd>{asset?.name}</dd><dt>Media ID</dt><dd className="mono">{selected.mediaId}</dd><dt>Duration</dt><dd>{durationLabel(selected.duration)}</dd><dt>Resolution</dt><dd>{asset?.resolution}</dd><dt>Frame rate</dt><dd>{fpsLabel(asset?.fps)} fps</dd><dt>Camera</dt><dd>{asset?.camera??'Camera original'}</dd><dt>Proxy</dt><dd className="accent-text">{asset?.status==='ready'?'Ready · linked':asset?.status}</dd></dl></Section>}

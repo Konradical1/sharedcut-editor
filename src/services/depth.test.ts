@@ -51,3 +51,21 @@ test('distance maps the run near/far values to 0..100 and back', () => {
   assert.ok(Math.abs(depthDistance(run, depthValue(run, 37)) - 37) < 1e-9);
   assert.ok(depthDistance(run, .6) > depthDistance(run, .7), 'larger values are nearer');
 });
+
+test('presets: six named looks, every value a real Depth parameter inside its range, Focus left to the clip', async () => {
+  const { depthPresets } = await import('./depth.ts'), { effectDefinitions } = await import('./effects.ts');
+  const parameters = new Map(effectDefinitions.Depth.parameters.map(p => [p.key, p]));
+  assert.deepEqual(depthPresets.map(p => p.name), ['Portrait', 'Cinematic haze', 'Morning mist', 'Dreamy glow', 'Subject pop', 'Miniature']);
+  for (const preset of depthPresets) {
+    assert.ok(Object.keys(preset.values).length, preset.name);
+    assert.ok(!('focus' in preset.values) && !('amount' in preset.values), `${preset.name} leaves Focus and Mix alone`);
+    for (const [key, value] of Object.entries(preset.values)) {
+      const p = parameters.get(key);
+      assert.ok(p && Number.isFinite(value) && value >= p.min && value <= p.max, `${preset.name}.${key} = ${value}`);
+    }
+  }
+  const pop = depthPresets.find(p => p.name === 'Subject pop')!.values;
+  assert.ok(pop.bgExposure < 0 && pop.bgWarmth < 0 && pop.blur > 0 && pop.blur <= 25, 'Subject pop: background darker and cooler, slight blur');
+  const mini = depthPresets.find(p => p.name === 'Miniature')!.values;
+  assert.ok(mini.nearBlur === 100 && mini.range <= 10 && mini.blur >= 50, 'Miniature: a thin focus slice, both sides blurred');
+});

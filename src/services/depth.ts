@@ -70,3 +70,14 @@ export function depthDistance(run: Pick<DepthRun, 'near' | 'far'>, value: number
 export function depthValue(run: Pick<DepthRun, 'near' | 'far'>, distance: number) {
   return run.near - Math.max(0, Math.min(100, distance)) / 100 * (run.near - run.far);
 }
+
+/** Ready-made looks. Each is applied over the Depth defaults as one undoable edit; Focus stays the clip's own. */
+export const depthPresets: { name: string; description: string; values: Record<string, number> }[] = [
+  { name: 'Portrait', description: 'Shallow focus with soft bokeh; the background a touch darker.', values: { blur: 55, range: 12, nearBlur: 70, bokeh: 50, light: 35, lightStart: 40, lightSoftness: 30, bgExposure: -.3, bgSaturation: 90, bgContrast: 95 } },
+  { name: 'Cinematic haze', description: 'Warm air in the distance, gentle defocus and a glow on far highlights.', values: { blur: 20, range: 25, nearBlur: 40, fog: 45, fogStart: 30, fogDensity: 35, fogHue: 35, fogSaturation: 18, fogBrightness: 80, fogHorizon: 40, glow: 25, glowThreshold: 75, glowRadius: 40, glowStart: 45 } },
+  { name: 'Morning mist', description: 'Cool, dense mist that swallows the background; nothing defocused.', values: { fog: 75, fogStart: 25, fogDensity: 60, fogHue: 205, fogSaturation: 8, fogBrightness: 92, fogHorizon: 60, light: 30, lightStart: 35, lightSoftness: 40, bgExposure: .2, bgSaturation: 80, bgWarmth: -20, bgContrast: 80 } },
+  { name: 'Dreamy glow', description: 'A soft background bloom with bright bokeh and a faint rose haze.', values: { blur: 25, range: 20, nearBlur: 50, bokeh: 70, glow: 60, glowThreshold: 55, glowRadius: 55, glowStart: 30, fog: 20, fogStart: 40, fogDensity: 30, fogHue: 330, fogSaturation: 10, fogBrightness: 95, fogHorizon: 20 } },
+  { name: 'Subject pop', description: 'Background darker and cooler with a slight blur, so the subject stands out.', values: { blur: 15, range: 15, nearBlur: 50, bokeh: 30, light: 70, lightStart: 30, lightSoftness: 25, bgExposure: -.8, bgSaturation: 75, bgWarmth: -35, bgContrast: 90 } },
+  // Light from distance 0 with the narrowest softness grades the whole picture: the toy-like saturation and contrast.
+  { name: 'Miniature', description: 'Tilt-shift: a thin slice in focus, everything nearer and farther blurred, colours like a toy.', values: { blur: 70, range: 6, nearBlur: 100, bokeh: 20, light: 40, lightStart: 0, lightSoftness: 1, bgExposure: .15, bgSaturation: 140, bgContrast: 120 } },
+];

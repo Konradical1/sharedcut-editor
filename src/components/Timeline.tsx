@@ -26,6 +26,7 @@ import { TimelineMarkers, type RulerMenu } from './TimelineMarkers';
 import { LiveTimecode, onPicture, playheadStrip } from './LiveTimecode';
 import { acceptsEffect } from '../services/effects';
 import { useClipActivity, watchSmartMaskJobs, useActivityVersion } from '../services/clipStatus';
+import { depthClipReady, depthEffect, depthState, depthVersion, subscribeDepth, watchDepthClips } from '../services/depthPreview';
 import { clipFootageStatus } from '../services/footageCache';
 import { FootageRelay, footageRelayed, subscribeFootage } from './footageRelay';
 import { barSegments, type BarState } from '../services/renderBar';
@@ -132,6 +133,14 @@ function TimelinePlayheads(props: PlayheadProps) {
 }
 
 watchSmartMaskJobs(useMaskEditor);
+watchDepthClips(useEditorStore);
+/** How far into the clip depth is analysed: a thin line above the footage-cache line. */
+const DepthReadyLine=memo(function DepthReadyLine({clip}:{clip:Clip}) {
+  useSyncExternalStore(subscribeDepth,depthVersion);
+  const state=depthState(clip.id),reached=state?.run&&(state.status==='ready'?clip.duration:depthClipReady(clip,state.run));
+  if(!reached)return null;
+  return <div className="clip-depth" title={state.status==='ready'?'Depth ready':`Depth analyzed to ${reached.toFixed(1)} s`} style={{'--depth':`${reached/clip.duration*100}%`} as CSSProperties}/>;
+});
 
 // ~400 clip badges follow the footage relay; each re-renders only when its own text changes.
 const footageBadge=(clipId:string)=>{const s=clipFootageStatus(clipId);return `${s.state}|${s.progress}|${s.detail}|${s.playback?.detail??''}`;};
@@ -187,6 +196,7 @@ const TimelineClipView = memo(function TimelineClipView({ near, span, clip, asse
     {kind === 'video' && !isTitle(clip) && !isShape(clip) && !isComposition(clip) && asset?.kind !== 'audio' && <ClipFilmstrip asset={asset} clip={clip} pixels={tilePixels}/>}
     <div className="clip-label">{isTitle(clip) ? <Type size={10}/> : isShape(clip) ? <Shapes size={10}/> : isComposition(clip) ? <Layers size={10}/> : kind === 'audio' ? <AudioLines size={10}/> : <Film size={10}/>}<span>{clip.name}</span>{clip.properties.linkGroup && <Link2 size={10} aria-label="Linked audio/video"/>}{remoteName && <span className="clip-remote-name" style={{ color: remoteColor }}>{remoteName}</span>}{owned && <span className="clip-activity" style={{ background: ownerColor }}/>}</div>
     <ClipActivityBar clipId={clip.id} cacheable={cacheable}/>
+    {depthEffect(clip) && <DepthReadyLine clip={clip}/>}
     {kind === 'audio' && <Waveform samples={asset?.waveform} from={clip.sourceIn / (asset?.duration || 1)} to={(clip.sourceIn + clip.duration * Number(clip.properties.speed || 100) / 100) / (asset?.duration || 1)} reverse={Boolean(clip.properties.reverse)}/>}
     {keyframePixels > 0 && <KeyframeLanes inline clips={[clip]} pixels={keyframePixels} width={clip.duration * keyframePixels} visibleStart={0} visibleEnd={clip.duration * keyframePixels}/>}
     <ClipFades clip={clip} audio={kind === 'audio'} pixels={pixels} fps={fps}/>

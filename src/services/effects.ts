@@ -24,6 +24,8 @@ export function effectValue(clip: Clip, effect: Effect, key: string): number {
   const value = Number(key === 'amount' ? effect.amount : effect.parameters?.[key] ?? clip.properties[`${effect.name}_${key}`] ?? parameter.initial);
   return Number.isFinite(value) ? Math.max(parameter.min, Math.min(parameter.max, value)) : parameter.initial;
 }
+/** The amount a new or reset effect starts at. Depth's Mix is the whole look, so it starts full. */
+export const initialAmount = (name: string) => name === 'Depth' ? 100 : 50;
 export const effectEnabled = (clip: Clip, effect: Effect) => effect.enabled && clip.properties[`${effect.name}_enabled`] !== false;
 /** Normalize loudness targets in LUFS; the first is the default. */
 export const loudnessTargets = [{ lufs: -14, label: 'Web' }, { lufs: -16, label: 'Podcast' }, { lufs: -23, label: 'Broadcast' }];
@@ -31,7 +33,8 @@ export const loudnessTarget = (clip: Clip) => loudnessTargets.find(t => t.lufs =
 export function acceptsEffect(clip: Clip, kind: string | undefined, name: string) {
   if(clip.properties.captionSet)return false;
   if(name==='Smart Mask'||name==='Stabilize')return kind==='video'&&!isTitle(clip)&&!isShape(clip)&&!clip.properties.compositionId;
-  if(name==='Depth')return (kind==='video'||kind==='image')&&!isTitle(clip)&&!isShape(clip)&&!clip.properties.compositionId;
+  // One Depth per clip: its sections already chain light, fog, lens and glow in physical order.
+  if(name==='Depth')return (kind==='video'||kind==='image')&&!isTitle(clip)&&!isShape(clip)&&!clip.properties.compositionId&&!clip.effects.some(e=>e.name==='Depth');
   const definition = effectDefinitions[name];
   if(isTitle(clip)||isShape(clip))kind='image';
   return !!definition && (definition.kind !== 'video' || kind !== 'audio') && (definition.kind !== 'audio' || kind !== 'image');

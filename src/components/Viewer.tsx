@@ -3,6 +3,7 @@ import { FootageRelay, footageRelayed, subscribeFootage } from './footageRelay';
 import SmartMaskEditor from './SmartMaskOverlay';
 import MotionTrackerEditor from './MotionTrackerEditor';
 import MotionTrackerOverlay from './MotionTrackerOverlay';
+import { DepthFocusPicker } from './DepthInspector';
 import TextOverlay from './TextOverlay';
 import ShapeOverlay from './ShapeOverlay';
 import { refreshFonts, useFonts, detectLocalFonts } from '../services/fonts';
@@ -137,6 +138,7 @@ function Viewer({ compact = false, colorAccurate=false }: { compact?: boolean; c
           <TextOverlay/>
           <ShapeOverlay/>
           <MotionTrackerOverlay/>
+          <DepthFocusPicker canvas={canvas}/>
           {safe && <div className="safe-areas"><div/><div/></div>}
           {compare && <div className="viewer-compare"><span>UNGRADED</span></div>}
         </>}
