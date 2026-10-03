@@ -32,3 +32,17 @@ test('the heavy-job limiter runs at most its limit at once and keeps order', asy
   while (gates.length) { gates.shift()!(); await new Promise(resolve => setImmediate(resolve)); }
   await all; assert.deepEqual(events, ['a', 'b', 'c', 'd']);
 });
+
+test('an aborted job leaves the limiter wait and the next job takes the slot', async () => {
+  const run = limiter(1), events: string[] = [];
+  let release!: () => void;
+  const first = run(async () => { events.push('a'); await new Promise<void>(resolve => { release = resolve; }); });
+  const controller = new AbortController();
+  const cancelled = run(async () => { events.push('cancelled'); }, controller.signal);
+  const next = run(async () => { events.push('c'); });
+  controller.abort();
+  await assert.rejects(cancelled, /Cancelled/);
+  await assert.rejects(run(async () => {}, controller.signal), /Cancelled/, 'an already aborted job does not queue');
+  release(); await first; await next;
+  assert.deepEqual(events, ['a', 'c']);
+});

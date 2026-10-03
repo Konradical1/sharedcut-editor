@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -81,6 +81,8 @@ test('segments are served once recorded, by cursor, and only to projects bound t
     assert.equal(job.frames, 128);
     await until(() => service.get('project', job.key).segments.length === 1);
     const running = service.get('project', job.key);
+    assert.deepEqual(Object.keys(running).sort(), ['far', 'first', 'frames', 'height', 'hi', 'key', 'lo', 'mediaId', 'near', 'next', 'progress', 'segments', 'status', 'times', 'width'], 'nothing server-side (projects, base, used, bytes) leaks');
+    assert.equal(service.get('project', job.key, 99).times.length, 128, 'a cursor past the end is from an earlier run of the key and starts over');
     assert.equal(running.status, 'processing'); assert.equal(running.next, 1); assert.equal(running.lo, -1); assert.equal(running.near, 5 / 6);
     assert.equal(readFileSync(service.preview('project', job.key, 0))[0], 1);
     assert.throws(() => service.preview('project', job.key, 1), /not found/, 'an unrecorded segment is not served');
@@ -122,7 +124,8 @@ test('a restart fails interrupted runs and removes partial and orphaned folders'
   mkdirSync(join(f.cache, ready)); writeFileSync(join(f.cache, ready, 'manifest.json'), '{}');
   mkdirSync(join(f.cache, orphan)); writeFileSync(join(f.cache, orphan, 'manifest.json'), '{}');
   const record = (key: string, status: string) => writeFileSync(join(f.cache, `${key}.job.json`), JSON.stringify({ key, base: 'x', status, progress: 40, mediaId: 'media', first: 0, frames: 64, times: [], width: 924, height: 518, lo: 0, hi: 1, near: 1, far: 0, segments: [{ n: 0, first: 0, count: 64 }], projects: ['project'], used: 1 }));
-  record(running, 'processing'); record(ready, 'ready'); record(missing, 'ready');
+  const old = 'f'.repeat(64);
+  record(running, 'processing'); record(ready, 'ready'); record(missing, 'ready'); record(old, 'failed');
   const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory), sourceTimes: async () => times });
   try {
     assert.equal(service.get('project', running).status, 'failed');
@@ -132,6 +135,8 @@ test('a restart fails interrupted runs and removes partial and orphaned folders'
     assert.equal(service.get('project', missing).status, 'failed');
     assert.deepEqual(readdirSync(f.cache).filter(name => !name.endsWith('.job.json')).sort(), [ready]);
     assert.equal(JSON.parse(readFileSync(join(f.cache, `${running}.job.json`), 'utf8')).status, 'failed');
+    assert.throws(() => service.get('project', old), /not found/, 'a failure already shown before this start is dropped');
+    assert.ok(!existsSync(join(f.cache, `${old}.job.json`)));
   } finally { await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
 });
 
@@ -171,6 +176,65 @@ test('a new run is refused when it would take the disk below the free-space floo
     await until(() => service.get('project', job.key).status === 'ready');
     assert.equal(runs(f.directory).length, 1);
   } finally { await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+test('a request refused for low disk keeps the cache when evicting could not make room anyway', async () => {
+  const f = fixture('disk-cache');
+  let free = 10 * 1024 ** 3;
+  const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory), sourceTimes: async () => times, freeBytes: () => free });
+  try {
+    const a = await service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 3, to: 3.5 });
+    await until(() => service.get('project', a.key).status === 'ready');
+    free = 1.5 * 1024 ** 3; // Low for reasons that have nothing to do with depth.
+    await assert.rejects(service.enqueue({ clip: clip('b'), asset, sourcePath: f.source, from: 13, to: 13.5 }), (error: Error & { status?: number }) => error.status === 507);
+    assert.equal(service.get('project', a.key).status, 'ready');
+    assert.ok(existsSync(join(f.cache, a.key, 'manifest.json')));
+  } finally { await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+test('an eviction that cannot delete an old run never fails the run that just finished', async () => {
+  const f = fixture('evict-locked'), previous = process.env.FRAME_LINE_DEPTH_CACHE_GB;
+  process.env.FRAME_LINE_DEPTH_CACHE_GB = String(14 * 1024 ** 2 / 1024 ** 3);
+  const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory, { bytes: 2 * 1024 ** 2 }), sourceTimes: async () => times });
+  const analyse = async (from: number) => { const job = await service.enqueue({ clip: clip(`c${from}`), asset, sourcePath: f.source, from, to: from + .5 }); await until(() => ['ready', 'failed'].includes(service.get('project', job.key).status)); return job.key; };
+  let locked = '';
+  try {
+    const a = await analyse(3);
+    locked = join(f.cache, a, 'preview');
+    chmodSync(locked, 0o500); // Stands in for a Windows handle on a segment being streamed (a no-op on Windows).
+    const b = await analyse(8);
+    const done = service.get('project', b);
+    assert.equal(done.status, 'ready', done.error);
+    assert.ok(done.segments.length > 0, 'its segments survive');
+    assert.throws(() => service.get('project', a), /not found/, 'the old run is out of the records even if its files stay');
+    assert.ok(!existsSync(join(f.cache, `${a}.job.json`)));
+  } finally {
+    if (locked && existsSync(locked)) chmodSync(locked, 0o700);
+    if (previous === undefined) delete process.env.FRAME_LINE_DEPTH_CACHE_GB; else process.env.FRAME_LINE_DEPTH_CACHE_GB = previous;
+    await service.close(); rmSync(f.directory, { recursive: true, force: true });
+  }
+});
+
+test('a cancelled queued run can be asked for again at once; a shared run survives one project leaving', async () => {
+  const f = fixture('requeue'), gate = join(f.directory, 'gate');
+  const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory, { gate }), sourceTimes: async () => times });
+  try {
+    const running = await service.enqueue({ clip: clip('a'), asset, sourcePath: f.source, from: 0, to: 3 });
+    await until(() => service.get('project', running.key).segments.length === 1);
+    const queued = await service.enqueue({ clip: clip('b'), asset, sourcePath: f.source, from: 13, to: 14 });
+    assert.equal(queued.status, 'queued');
+    service.cancel('project', queued.key);
+    const again = await service.enqueue({ clip: clip('b'), asset, sourcePath: f.source, from: 13, to: 14 });
+    assert.equal(again.key, queued.key); assert.equal(again.status, 'queued');
+    // Another project's clip of the same take joins the running run; this project leaving does not stop it.
+    await service.enqueue({ clip: clip('x', 'other'), asset, sourcePath: f.source, from: 1, to: 2 });
+    service.cancel('project', running.key);
+    assert.throws(() => service.get('project', running.key), /not found/);
+    assert.equal(service.get('other', running.key).status, 'processing');
+    writeFileSync(gate, '');
+    await until(() => service.get('other', running.key).status === 'ready' && service.get('project', again.key).status === 'ready');
+    assert.deepEqual(runs(f.directory), ['0:128', '256:128']);
+  } finally { writeFileSync(gate, ''); await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
 });
 
 test('the real worker with the synthetic engine analyses a clip into decodable segments', async t => {

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 VENDOR = Path(__file__).resolve().parent / "vendor"
@@ -42,6 +43,18 @@ KEYFRAMES = [0, 12, 24, 25, 26, 27, 28, 29, 30, 31]
 ALIGN = KEYFRAMES[:OVERLAP - INTERP_LEN]
 HEADROOM = .25
 _out = threading.Lock()
+
+
+def replace(source, target):
+    """os.replace that waits out Defender or the indexer briefly holding a file FFmpeg just closed (Windows
+    PermissionError); one failed rename would otherwise fail a run of up to 25 minutes."""
+    for attempt in range(8):
+        try:
+            return os.replace(source, target)
+        except PermissionError:
+            if attempt == 7:
+                raise
+            time.sleep(.05 * 2 ** attempt)
 
 
 def emit(**message):
@@ -145,7 +158,8 @@ class Decoder:
         self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.frames = queue.Queue(maxsize=48)
         self.errors = b""
-        threading.Thread(target=self._errors, daemon=True).start()
+        self.stderr = threading.Thread(target=self._errors, daemon=True)
+        self.stderr.start()
         threading.Thread(target=self._read, daemon=True).start()
 
     def _errors(self):
@@ -166,6 +180,7 @@ class Decoder:
         if frame is None:
             self.frames.put(None)
             if self.process.wait() != 0:
+                self.stderr.join(5)  # The reason may still be on its way from FFmpeg's stderr.
                 raise ValueError("Could not decode the original: " + self.errors.decode(errors="replace").strip()[-600:])
         return frame
 
@@ -299,7 +314,7 @@ class Writer:
                     if result.returncode:
                         raise ValueError("Could not encode depth: " + result.stderr.decode(errors="replace").strip()[-600:])
                 for source, target in zip(temporary, (preview, master)):
-                    os.replace(source, target)
+                    replace(source, target)
                 emit(segment=n, first=self.job["first"] + n * SEGMENT, count=len(frames))
             except Exception as error:  # Surfaced to the analysis loop on its next frame or at finish.
                 self.failure = error
@@ -394,10 +409,12 @@ def run_vda(job, caps, writer, progress):
                 return infer(x)
             except torch.OutOfMemoryError:
                 if state["retried"]:
-                    raise ValueError("The GPU is busy: not enough video memory for depth analysis. Try again in a moment.")
+                    raise ValueError("The GPU is busy: not enough video memory for depth analysis. Try again in a moment.") from None
                 state.update(micro=1, retried=True)
-                torch.cuda.empty_cache()
-                return infer(x)
+            # Retried outside the except block: its traceback holds the failed attempt's activations, which
+            # empty_cache() cannot free while they are referenced.
+            torch.cuda.empty_cache()
+            return infer(x)
 
         aligner, values, previous, last, read, done = Aligner(total), None, None, None, 0, 0
 
@@ -466,7 +483,7 @@ def main(job):
                     preview=dict(codec="h264", pix_fmt="yuvj420p", rate=RATE), master=dict(MASTER, rate=RATE), **values)
     temporary = output / ".manifest.json.tmp"
     temporary.write_text(json.dumps(manifest, allow_nan=False))
-    os.replace(temporary, output / "manifest.json")
+    replace(temporary, output / "manifest.json")
 
 
 # --- Self test ---
@@ -574,6 +591,26 @@ def selftest():
         stream = json.loads(probe.stdout)["streams"][0]
         assert stream["color_range"] == "pc" and stream["nb_frames"] == "64", stream
         checks.append("segments")
+        # A rename Windows refuses twice (a scanner holding the file) still lands; a failed decode says why.
+        real, refusals = os.replace, [PermissionError(13, "locked")] * 2
+        def flaky(source, target):
+            if refusals:
+                raise refusals.pop()
+            real(source, target)
+        os.replace = flaky
+        try:
+            (directory / "a").write_text("x")
+            replace(directory / "a", directory / "b")
+        finally:
+            os.replace = real
+        assert (directory / "b").read_text() == "x" and not refusals
+        broken = Decoder(dict(job, input=str(directory / "missing.mp4")), "gray")
+        try:
+            broken.next()
+            raise AssertionError("a missing original decoded")
+        except ValueError as error:
+            assert "missing.mp4" in str(error), error
+        checks.append("windows locks and decode errors")
     emit(ok=True, checks=checks, skipped=[] if np is not None else ["alignment (numpy is not installed)"])
 
 

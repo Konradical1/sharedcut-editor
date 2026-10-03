@@ -1681,7 +1681,16 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   // What changed only in memory (render progress, a held-back progress value) is saved on the way out,
   // first thing, in case Windows ends the process before the slower shutdown steps finish.
   const saveBeforeExit = () => { try { flushProgress(); if (store.dirty(state)) persist(); } catch (error) { console.error('Could not save the workspace on shutdown:', error); } };
-  return { server, dataDir, async close() { closed = true; saveBeforeExit(); await masks.close(); await depth.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearInterval(uploadSweep); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
+  return { server, dataDir, async close() {
+    closed = true; saveBeforeExit();
+    // Abort everything before awaiting anything: a job queued for the GPU or a heavy slot behind work that is only
+    // aborted later would otherwise hold the shutdown (and frameline.lock) for the rest of a long depth run.
+    const services = [masks.close(), depth.close(), motionTrackers.close(), colorAssistant.close()];
+    for (const job of flowJobs.values()) job.controller.abort();
+    for (const job of stabilizeJobs.values()) job.controller.abort();
+    for (const controller of aborters.values()) controller.abort();
+    await Promise.all([...services, flowQueue]);
+    clearInterval(housekeeping); clearInterval(uploadSweep); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

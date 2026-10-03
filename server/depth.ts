@@ -62,6 +62,8 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
   let queue = Promise.resolve(), closed = false;
   const save = (job: Job) => { jobs.set(job.key, job); atomicJson(join(directory, `${job.key}.job.json`), job); };
   const manifestPath = (key: string) => join(directory, key, 'manifest.json');
+  /** A cancelled queued run gives its key up at once, so a stale queue entry must not drop a newer run's controller. */
+  const release = (key: string, controller: AbortController) => { if (controllers.get(key) === controller) controllers.delete(key); };
 
   // Nothing runs before the service starts: every partial folder is an interrupted run, and every queued or
   // processing record is one that died with the last server.
@@ -71,6 +73,8 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
     if (!/^[a-f0-9]{64}\.job\.json$/.test(name)) continue;
     try {
       const job = JSON.parse(readFileSync(path, 'utf8')) as Job;
+      // A failure already shown before this start has been seen; its record (with up to 36,000 times) goes.
+      if (['failed', 'cancelled'].includes(job.status)) { rmSync(path, { force: true }); continue; }
       if (['queued', 'processing'].includes(job.status)) Object.assign(job, { status: 'failed', error: 'The server restarted. Analyze depth again.', segments: [] });
       else if (job.status === 'ready' && !regularFile(manifestPath(job.key))) Object.assign(job, { status: 'failed', error: 'This depth analysis is missing. Analyze depth again.', segments: [] });
       if (job.status === 'ready') job.bytes ??= folderBytes(join(directory, job.key));
@@ -79,7 +83,13 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
   }
   for (const name of readdirSync(directory)) if (validKey(name) && jobs.get(name)?.status !== 'ready') { try { remove(join(directory, name)); } catch { /* Retried next start. */ } }
 
-  const evict = (job: Job) => { remove(join(directory, job.key)); rmSync(join(directory, `${job.key}.job.json`), { force: true }); jobs.delete(job.key); };
+  /** Record first, then files: a folder a Windows handle keeps has no ready record, so it is never served and the
+   *  next start removes it. Never throws, so a locked old run cannot fail the request or run that evicts it. */
+  const evict = (job: Job) => {
+    jobs.delete(job.key);
+    try { rmSync(join(directory, `${job.key}.job.json`), { force: true }); rmSync(join(directory, job.key), { recursive: true, force: true, maxRetries: 2, retryDelay: 100 }); }
+    catch (error) { console.error('Depth cache eviction left files behind until the next start:', (error as Error).message); }
+  };
   const evictable = () => [...jobs.values()].filter(job => job.status === 'ready' && !holds.get(job.key)).sort((a, b) => a.used - b.used);
   /** Least recently used runs go first until `need` more bytes fit under the cap; a held run, and the run just
    *  finished (`keep`), are never evicted. */
@@ -89,11 +99,14 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
     for (const job of evictable()) { if (total + need <= cap) break; if (job.key === keep) continue; total -= job.bytes ?? 0; evict(job); }
   };
   const makeRoom = (need: number) => {
-    trim(need);
     const floor = gigabytes('FRAME_LINE_DEPTH_MIN_FREE_GB', 2);
+    const check = (free: number) => { if (free - need < floor) fail(507, `The server is low on disk space: ${(free / 1024 ** 3).toFixed(1)} GB free, and depth analysis keeps ${(floor / 1024 ** 3).toFixed(1)} GB free. Free some space and try again.`); };
+    // The disk can be low for reasons depth cannot fix: then refuse without throwing the cache away for nothing.
+    const reclaimable = evictable().reduce((sum, job) => sum + (job.bytes ?? 0), 0);
+    if (freeBytes() + reclaimable - need < floor) check(freeBytes());
+    trim(need);
     for (const job of evictable()) { if (freeBytes() - need >= floor) break; evict(job); }
-    const free = freeBytes();
-    if (free - need < floor) fail(507, `The server is low on disk space: ${(free / 1024 ** 3).toFixed(1)} GB free, and depth analysis keeps ${(floor / 1024 ** 3).toFixed(1)} GB free. Free some space and try again.`);
+    check(freeBytes());
   };
   const get = (projectId: string, key: string) => {
     const job = validKey(key) ? jobs.get(key) : undefined;
@@ -101,13 +114,15 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
     job!.used = Date.now(); return job!;
   };
   const view = (job: Job, after = 0): DepthRun => {
-    const from = Math.max(0, Math.min(job.segments.length, Math.floor(after) || 0));
+    // ponytail: a cursor past the end is from an earlier run of this key (it failed and was re-asked), so start over;
+    // add a per-run id to DepthRun if the new run can overtake a poller's cursor between two polls.
+    const from = after > job.segments.length ? 0 : Math.max(0, Math.floor(after) || 0);
     const { base, projects, used, bytes, ...run } = job;
     return { ...run, times: from ? [] : job.times, segments: job.segments.slice(from), next: job.segments.length };
   };
 
   async function analyse(job: Job, controller: AbortController, input: { sourcePath: string; sourceFingerprint: string; lut: string; dataLevels: string; yuvMatrix: string; seek: number | null; image: boolean; workerIdentity: unknown }) {
-    if (closed || controller.signal.aborted) { controllers.delete(job.key); return; }
+    if (closed || controller.signal.aborted) { release(job.key, controller); return; }
     const temporary = join(directory, `.partial-${job.key}-${randomUUID()}`);
     try {
       makeRoom(job.frames * BYTES_PER_FRAME); // It may have queued behind other work for a while.
@@ -138,14 +153,14 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       if (existsSync(final)) remove(final); // Leftover of an interrupted commit; never served.
       await commitFolder(temporary, final, 'manifest.json');
       partials.delete(job.key);
-      Object.assign(job, { status: 'ready', progress: 100, bytes: folderBytes(final), used: Date.now() }); save(job);
+      Object.assign(job, { status: 'ready', progress: 100, segments: manifest.segments, bytes: folderBytes(final), used: Date.now() }); delete job.error; save(job);
       trim(0, job.key);
     } catch (error) {
       if (job.status !== 'cancelled') Object.assign(job, { status: controller.signal.aborted || closed ? 'cancelled' : 'failed', error: (error as Error).message });
       job.segments = [];
       try { save(job); } catch { /* Keep the failure visible in memory if the disk is full. */ }
     } finally {
-      partials.delete(job.key); controllers.delete(job.key);
+      partials.delete(job.key); release(job.key, controller);
       try { remove(temporary); } catch { /* A locked leftover is never served and goes at the next start. */ }
     }
   }
@@ -185,16 +200,23 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       const controller = new AbortController(); controllers.set(key, controller);
       const input = { sourcePath, sourceFingerprint, lut: analysis.text, dataLevels: String(clip.properties.dataLevels || 'auto'), yuvMatrix: inputMatrix(clip, asset), seek: range.first > 0 ? (times[range.first - 1] + times[range.first]) / 2 : null, image, workerIdentity: capabilities.workerIdentity };
       // ponytail: one depth process per server, behind any running GPU job; a device-aware pool only for multi-GPU hosts.
-      queue = queue.then(() => heavyJob(() => gpuJob(() => analyse(job, controller, input)))).catch(error => {
-        Object.assign(job, { status: controller.signal.aborted ? 'cancelled' : 'failed', error: (error as Error).message, segments: [] }); controllers.delete(key);
+      queue = queue.then(() => gpuJob(() => heavyJob(() => analyse(job, controller, input), controller.signal), controller.signal)).catch(error => {
+        release(key, controller);
+        if (jobs.get(key) !== job || job.status === 'cancelled') return; // Cancelled while waiting, or asked again since.
+        Object.assign(job, { status: controller.signal.aborted ? 'cancelled' : 'failed', error: (error as Error).message, segments: [] });
         try { save(job); } catch { /* Disk full: the in-memory failure still shows. */ }
       });
       return view(job);
     },
+    /** Another project still waiting on a shared run keeps it; this project just leaves it. */
     cancel(projectId: string, key: string) {
       const job = get(projectId, key);
       if (!['queued', 'processing'].includes(job.status)) return;
-      controllers.get(key)?.abort();
+      if (job.projects.length > 1) { job.projects = job.projects.filter(project => project !== projectId); save(job); return; }
+      const controller = controllers.get(key);
+      controller?.abort();
+      // A queued run has no worker to wait for: free the key now rather than when the queue reaches it.
+      if (controller && job.status === 'queued') release(key, controller);
       Object.assign(job, { status: 'cancelled', error: 'Cancelled by you.', segments: [] }); save(job);
     },
     /** One preview segment, only once the worker has recorded it and only for a project bound to the run. */

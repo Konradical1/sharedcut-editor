@@ -346,7 +346,7 @@ export function smartMaskService(directory: string) {
       const job: Job = { key, signature, projectId: clip.projectId, clipId: clip.id, maskId: mask.id, status: 'queued', progress: 0 };
       save(job);
       // ponytail: one model process per server; add a device-aware pool only for multi-GPU deployment.
-      queue = queue.then(() => heavyJob(() => gpuJob(async () => {
+      queue = queue.then(() => gpuJob(() => heavyJob(async () => {
         if (closed || controller.signal.aborted) { controllers.delete(key); return; }
         const temporary = join(directory, `.partial-${key}-${randomUUID()}`);
         try {
