@@ -1,13 +1,16 @@
-// Depth effects on the editor's GPU: docs/superpowers/specs/2026-10-03-depth-fx-math.md, sections 0-6, exactly.
+// Depth effects on the editor's GPU: docs/superpowers/specs/2026-10-03-depth-fx-math.md, sections 0-7, exactly.
 // scripts/depth-fx.py runs the same math for export; the parity check feeds both the same pixels (depthFxPixels).
 import { effectDefinitions } from './effects.ts';
 
-export type DepthFxParams = Record<'amount' | 'blur' | 'focus' | 'range' | 'nearBlur' | 'bokeh' | 'fog' | 'fogStart' | 'fogDensity' | 'fogHue' | 'fogSaturation' | 'fogBrightness' | 'fogHorizon' | 'glow' | 'glowThreshold' | 'glowRadius' | 'glowStart' | 'light' | 'lightStart' | 'lightSoftness' | 'bgExposure' | 'bgSaturation' | 'bgWarmth' | 'bgContrast', number>;
+export type DepthFxParams = Record<'amount' | 'blur' | 'focus' | 'range' | 'nearBlur' | 'bokeh' | 'fog' | 'fogStart' | 'fogDensity' | 'fogHue' | 'fogSaturation' | 'fogBrightness' | 'fogHorizon' | 'glow' | 'glowThreshold' | 'glowRadius' | 'glowStart' | 'light' | 'lightStart' | 'lightSoftness' | 'bgExposure' | 'bgSaturation' | 'bgWarmth' | 'bgContrast' | 'followSubject', number>;
 export const depthFxKeys = effectDefinitions.Depth.parameters.map(p => p.key) as (keyof DepthFxParams)[];
 export type DepthFxInput = {
   params: DepthFxParams;
   /** Stored depth, 0..255 per sample (R8), `key` changes when the pixels do. */
   depth: { data: Uint8Array; width: number; height: number; key: string };
+  /** The Smart Mask subject over the source box (red channel of a canvas, or R8 bytes): Lens blur keeps it sharp and
+   *  out of the background (section 7). `key` changes when the pixels do. */
+  matte?: { key: string; width: number; height: number } & ({ canvas: TexImageSource } | { data: Uint8Array });
   near: number; far: number;
   /** The original's size: depth sits in its letterboxed box, never the proxy's. */
   sourceWidth: number; sourceHeight: number;
@@ -61,15 +64,16 @@ float sstep(float a,float b,float t){b=max(b,a+1e-4);float x=clamp((t-a)/(b-a),0
 // Every pass but the last renders into a texture whose row 0 is the picture's top row, so gl_FragCoord is the
 // top-left pixel coordinate (pixel centres at i+.5) there; the last pass flips onto the canvas.
 const PREP = `${COMMON}
-uniform sampler2D image,depthMap;uniform vec2 size,depthSize,nearFar;uniform vec4 box,lightA,lightB,fogA,lens;uniform mat3 unwarp,warp;uniform vec3 fogColour;uniform float dither;
+uniform sampler2D image,depthMap,matteMap;uniform vec2 size,depthSize,nearFar;uniform vec4 box,lightA,lightB,fogA,lens;uniform mat3 unwarp,warp;uniform vec3 fogColour;uniform float dither;
 layout(location=0) out vec4 colour;layout(location=1) out vec4 aux;
 float dist(float s){return clamp((nearFar.x-s)/max(nearFar.x-nearFar.y,1e-4),0.,1.);}
 float depthAt(ivec2 t){return texelFetch(depthMap,t,0).r;}
 void main(){
   vec2 p=gl_FragCoord.xy;vec4 src=texture(image,p/size);vec3 I=src.rgb;
   vec2 P=(unwarp*vec3(p,1.)).xy-box.xy;
-  float inside=float(P.x>=0.&&P.y>=0.&&P.x<box.z&&P.y<box.w),D=0.;
+  float inside=float(P.x>=0.&&P.y>=0.&&P.x<box.z&&P.y<box.w),D=0.,alpha=0.;
   if(inside>0.){
+    alpha=texture(matteMap,P/box.zw).r;
     vec2 q=P*depthSize/box.zw-.5,f=floor(q);ivec2 last=ivec2(depthSize)-1;
     float g=lum(I),sw=0.,sd=0.;
     for(int j=-1;j<=2;j++)for(int i=-1;i<=2;i++){
@@ -100,7 +104,7 @@ void main(){
   }
   float delta=D-lens.y;
   colour=vec4(L,src.a);
-  aux=vec4(D,inside*lens.x*clamp((abs(delta)-lens.z)/.35,0.,1.)*(delta<0.?lens.w:1.),inside,0);
+  aux=vec4(D,inside*lens.x*clamp((abs(delta)-lens.z)/.35,0.,1.)*(delta<0.?lens.w:1.)*(1.-alpha),inside,alpha);
 }`;
 /** Area filter onto a smaller grid; `bright` (glow) runs section 5's bright pass on every source pixel first. */
 const area = (glow: boolean) => `${COMMON}
@@ -115,20 +119,20 @@ void main(){
     ${glow ? 'L.rgb*=clamp((lum(enc(L.rgb))-glowA.x)/max(1.-glowA.x,.01),0.,1.)*sstep(glowA.y,glowA.y+.15,A.x)*A.z;' : ''}
     c+=L*w;x+=A*w;total+=w;
   }
-  colour=c/total;${glow ? '' : 'aux=vec4(x.x/total,x.y/total*s,x.z/total,0);'}
+  colour=c/total;${glow ? '' : 'aux=vec4(x.x/total,x.y/total*s,x.z/total,x.w/total);'}
 }`;
 const GATHER = `${COMMON}
 uniform sampler2D colourTex,auxTex;uniform vec2 small;uniform vec4 taps[${MAX_TAPS}];uniform int count;uniform float bokeh;
 out vec4 colour;
 float hw(vec3 c){return 1.+bokeh*8.*max(lum(c)-.7,0.);}
 void main(){
-  vec2 c=gl_FragCoord.xy;vec3 L=texelFetch(colourTex,ivec2(c),0).rgb;vec2 A=texelFetch(auxTex,ivec2(c),0).xy;
+  vec2 c=gl_FragCoord.xy;vec3 L=texelFetch(colourTex,ivec2(c),0).rgb;vec4 A=texelFetch(auxTex,ivec2(c),0);
   float h=hw(L),wsum=h;vec3 acc=L*h;
   for(int i=0;i<${MAX_TAPS};i++){
     if(i>=count)break;
-    vec2 uv=(c+taps[i].xy)/small;vec3 Ls=texture(colourTex,uv).rgb;vec2 As=texture(auxTex,uv).xy;
+    vec2 uv=(c+taps[i].xy)/small;vec3 Ls=texture(colourTex,uv).rgb;vec4 As=texture(auxTex,uv);
     float sc=As.y;if(As.x>A.x)sc=min(sc,2.*A.y);
-    float r=taps[i].z,m=smoothstep(r-.5,r+.5,sc),w=hw(Ls);
+    float r=taps[i].z,m=As.w>.5&&A.w<.5?0.:smoothstep(r-.5,r+.5,sc),w=hw(Ls);
     acc+=mix(acc/wsum*w,Ls*w,m);wsum+=w;
   }
   colour=vec4(acc/wsum,1);
@@ -161,7 +165,7 @@ export function createDepthFx() {
   canvas.width = canvas.height = 1;
   const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false, preserveDrawingBuffer: true });
   type Program = { program: WebGLProgram; at: (name: string) => WebGLUniformLocation | null };
-  type Resources = { programs: Record<'prep' | 'down' | 'glowDown' | 'gather' | 'composite' | 'blur' | 'final', Program>; image: WebGLTexture; depth: WebGLTexture; black: WebGLTexture; framebuffer: WebGLFramebuffer; targets: Map<string, { texture: WebGLTexture; width: number; height: number }>; depthKey?: string };
+  type Resources = { programs: Record<'prep' | 'down' | 'glowDown' | 'gather' | 'composite' | 'blur' | 'final', Program>; image: WebGLTexture; depth: WebGLTexture; matte: WebGLTexture; black: WebGLTexture; framebuffer: WebGLFramebuffer; targets: Map<string, { texture: WebGLTexture; width: number; height: number }>; depthKey?: string; matteKey?: string };
   // `broken`: a program that failed to build is not rebuilt every frame, only after the context comes back.
   let resources: Resources | undefined, lost = false, broken = false;
   const init = (): Resources | undefined => {
@@ -183,7 +187,7 @@ export function createDepthFx() {
       gl.deleteShader(vertex);
       const texture = (filter: number) => { const t = gl.createTexture()!; gl.bindTexture(gl.TEXTURE_2D, t); for (const [key, value] of [[gl.TEXTURE_MIN_FILTER, filter], [gl.TEXTURE_MAG_FILTER, filter], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, key, value); return t; };
       const black = texture(gl.NEAREST); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
-      return { programs, image: texture(gl.LINEAR), depth: texture(gl.NEAREST), black, framebuffer: gl.createFramebuffer()!, targets: new Map() };
+      return { programs, image: texture(gl.LINEAR), depth: texture(gl.NEAREST), matte: texture(gl.LINEAR), black, framebuffer: gl.createFramebuffer()!, targets: new Map() };
     } catch (error) {
       broken = true; warnOnce((error as Error).message);
       for (const shader of made.shaders) gl.deleteShader(shader);
@@ -235,6 +239,13 @@ export function createDepthFx() {
         gl.bindTexture(gl.TEXTURE_2D, r.depth); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, depth.width, depth.height, 0, gl.RED, gl.UNSIGNED_BYTE, depth.data); r.depthKey = depth.key;
       }
+      const { matte } = input;
+      if (matte && r.matteKey !== matte.key) {
+        gl.bindTexture(gl.TEXTURE_2D, r.matte); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        if ('canvas' in matte) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, matte.canvas);
+        else gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, matte.width, matte.height, 0, gl.RED, gl.UNSIGNED_BYTE, matte.data);
+        r.matteKey = matte.key;
+      }
       gl.bindTexture(gl.TEXTURE_2D, null);
       const fit = Math.min(W / input.sourceWidth, H / input.sourceHeight), boxW = input.sourceWidth * fit, boxH = input.sourceHeight * fit;
       const [a, b, c, d, e, f] = input.warp ?? [1, 0, 0, 1, 0, 0], det = a * d - b * c;
@@ -242,7 +253,8 @@ export function createDepthFx() {
       const map = input.view === 'map', R = p.blur / 100 * .025 * W, Wb = Math.min(W, 960), s = Wb / W, Hb = Math.max(1, Math.round(H * s));
       const fog = hsv(((p.fogHue % 360) + 360) % 360, p.fogSaturation / 100, p.fogBrightness / 100).map(v => v ** 2.2);
       const C1 = target('C1', W, H), A1 = target('A1', W, H);
-      pass(r.programs.prep, W, H, [['image', r.image], ['depthMap', r.depth]], [C1, A1], at => {
+      // Without a subject the matte is black: alpha 0 everywhere leaves sections 4 and 7 as section 4 alone.
+      pass(r.programs.prep, W, H, [['image', r.image], ['depthMap', r.depth], ['matteMap', matte && !map ? r.matte : r.black]], [C1, A1], at => {
         gl.uniform2f(at('size'), W, H); gl.uniform2f(at('depthSize'), depth.width, depth.height); gl.uniform2f(at('nearFar'), input.near, input.far);
         gl.uniform4f(at('box'), (W - boxW) / 2, (H - boxH) / 2, boxW, boxH);
         gl.uniformMatrix3fv(at('unwarp'), false, inverse); gl.uniformMatrix3fv(at('warp'), false, forward);
@@ -287,15 +299,15 @@ export function createDepthFx() {
 
 let shared: ReturnType<typeof createDepthFx> | undefined;
 /**
- * Test hook for the parity check: straight RGBA pixels and 8-bit depth in, rendered RGBA out (sections 0-6, no
+ * Test hook for the parity check: straight RGBA pixels and 8-bit depth in, rendered RGBA out (sections 0-7, no
  * dither). Also on `window.frameLineDepthFx` so headless Chrome can call it on the built app.
  */
-export function depthFxPixels(rgba: Uint8ClampedArray | number[], width: number, height: number, depth: Uint8Array | number[], depthWidth: number, depthHeight: number, params: Partial<DepthFxParams>, options: { near?: number; far?: number; taps?: number; sourceWidth?: number; sourceHeight?: number; view?: 'effect' | 'map' } = {}) {
+export function depthFxPixels(rgba: Uint8ClampedArray | number[], width: number, height: number, depth: Uint8Array | number[], depthWidth: number, depthHeight: number, params: Partial<DepthFxParams>, options: { near?: number; far?: number; taps?: number; sourceWidth?: number; sourceHeight?: number; view?: 'effect' | 'map'; matte?: { data: Uint8Array | number[]; width: number; height: number } } = {}) {
   const image = document.createElement('canvas'); image.width = width; image.height = height;
   image.getContext('2d')!.putImageData(new ImageData(Uint8ClampedArray.from(rgba), width, height), 0, 0);
   const full = Object.fromEntries(effectDefinitions.Depth.parameters.map(p => [p.key, params[p.key as keyof DepthFxParams] ?? p.initial])) as DepthFxParams;
   shared ??= createDepthFx();
-  const result = shared.render(image, { params: full, depth: { data: Uint8Array.from(depth), width: depthWidth, height: depthHeight, key: `test:${Math.random()}` }, near: options.near ?? 1, far: options.far ?? 0, sourceWidth: options.sourceWidth ?? width, sourceHeight: options.sourceHeight ?? height, taps: options.taps ?? 48, view: options.view, dither: false });
+  const result = shared.render(image, { params: full, depth: { data: Uint8Array.from(depth), width: depthWidth, height: depthHeight, key: `test:${Math.random()}` }, near: options.near ?? 1, far: options.far ?? 0, sourceWidth: options.sourceWidth ?? width, sourceHeight: options.sourceHeight ?? height, taps: options.taps ?? 48, view: options.view, dither: false, matte: options.matte && { data: Uint8Array.from(options.matte.data), width: options.matte.width, height: options.matte.height, key: `test:${Math.random()}` } });
   if (!result) return undefined;
   const out = document.createElement('canvas'); out.width = width; out.height = height;
   const context = out.getContext('2d', { willReadFrequently: true })!; context.drawImage(result, 0, 0);

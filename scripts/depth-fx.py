@@ -2,10 +2,10 @@
 """SharedCut's depth effects for export: Background light, Fog, Lens blur and Glow driven by a depth run.
 
     depth-fx.py <job.json>                                     bake one clip (written by server/media.ts)
-    depth-fx.py --parity <params.json> <rgb.png> <depth.png> <out.png>
+    depth-fx.py --parity <params.json> <rgb.png> <depth.png> <out.png> [matte.png]
     depth-fx.py --selftest
 
-The math is docs/superpowers/specs/2026-10-03-depth-fx-math.md, sections 0-6, the same formulas the WebGL2
+The math is docs/superpowers/specs/2026-10-03-depth-fx-math.md, sections 0-7, the same formulas the WebGL2
 preview (src/services/depthFx.ts) runs; a parity check feeds both the same picture. A bake reads the clip's
 pre-depth frames (grade, the effects before Depth, Stabilize) from an FFmpeg decoder the server builds, the
 run's depth masters frame by frame, and writes ProRes 4444 at source resolution through an FFmpeg encoder.
@@ -30,7 +30,7 @@ GOLDEN = 2.39996323
 DEFAULTS = dict(amount=100, blur=0, focus=30, range=10, nearBlur=60, bokeh=40, fog=0, fogStart=35, fogDensity=50,
                 fogHue=210, fogSaturation=10, fogBrightness=85, fogHorizon=30, glow=0, glowThreshold=70, glowRadius=30,
                 glowStart=40, light=0, lightStart=40, lightSoftness=30, bgExposure=0, bgSaturation=100, bgWarmth=0,
-                bgContrast=100)
+                bgContrast=100, followSubject=0)
 
 
 def pick_device():
@@ -81,6 +81,26 @@ def sample(image, x, y):
     return F.grid_sample(image[None], grid, mode="bilinear", padding_mode="border", align_corners=False)[0]
 
 
+def unwarp(H, W, warp, device):
+    """Output pixel indices mapped back through the inverse of `warp` (row-major 2x3, source -> output pixels)."""
+    y, x = torch.meshgrid(torch.arange(H, device=device, dtype=torch.float32), torch.arange(W, device=device, dtype=torch.float32), indexing="ij")
+    a, b, c, d, e, f = [float(v) for v in warp]
+    det = a * e - b * d
+    return (e * (x - c) - b * (y - f)) / det, (a * (y - f) - d * (x - c)) / det
+
+
+def matte_at(matte, H, W, warp=None):
+    """Section 7: the subject matte (h x w, 0..1, the source box like the depth) sampled bilinearly at every output pixel,
+    through the Stabilize warp the same way as the depth."""
+    h, w = matte.shape
+    if warp is None:
+        x = (torch.arange(W, device=matte.device, dtype=torch.float32) + .5) * (w / W) - .5
+        y = (torch.arange(H, device=matte.device, dtype=torch.float32) + .5) * (h / H) - .5
+        return sample(matte[None], x[None].expand(H, W), y[:, None].expand(H, W))[0]
+    x, y = unwarp(H, W, warp, matte.device)
+    return sample(matte[None], (x + .5) * (w / W) - .5, (y + .5) * (h / H) - .5)[0]
+
+
 def upsample_depth(I, depth, near, far, warp=None):
     """Section 1: joint-bilateral upsample of the w x h depth onto the H x W picture, as distance, and where the picture
     is (None: everywhere). `warp` is a row-major 2x3 source -> output pixel matrix (Stabilize); output pixels map back
@@ -117,11 +137,8 @@ def upsample_depth(I, depth, near, far, warp=None):
         if weak.any():
             D = torch.where(weak, distance(sample(depth[None], qx[None].expand(H, W), qy[:, None].expand(H, W))[0], near, far), D)
         return D, None
-    y, x = torch.meshgrid(torch.arange(H, device=device, dtype=f32), torch.arange(W, device=device, dtype=f32), indexing="ij")
     a, b, c, d, e, f = [float(v) for v in warp]
-    det = a * e - b * d
-    ia, ib, id_, ie = e / det, -b / det, -d / det, a / det
-    x, y = ia * (x - c) + ib * (y - f), id_ * (x - c) + ie * (y - f)
+    x, y = unwarp(H, W, warp, device)
     inside = (x >= -.5) & (x <= W - .5) & (y >= -.5) & (y <= H - .5)
     qx, qy = (x + .5) * (w / W) - .5, (y + .5) * (h / H) - .5
     ty, tx = torch.meshgrid(torch.arange(-2, h + 2, device=device, dtype=f32), torch.arange(-2, w + 2, device=device, dtype=f32), indexing="ij")
@@ -174,7 +191,7 @@ def bilinear(image, height, width):
     return image if image.shape[-2:] == (height, width) else F.interpolate(image[None], size=(height, width), mode="bilinear", align_corners=False)[0]
 
 
-def lens_blur(L2, D, p, taps, inside=None, layer_width=None, fit=1.0):
+def lens_blur(L2, D, p, taps, inside=None, layer_width=None, fit=1.0, alpha=None):
     """Section 4: circle of confusion, then Gustafsson's single-pass gather at <= 960 px wide. The spec measures both on
     the layer: a source fitted at `fit` into a `layer_width` canvas blurs by .025 of the canvas width, at the scale the
     canvas works at, so a letterboxed source gets the preview's blur."""
@@ -185,12 +202,14 @@ def lens_blur(L2, D, p, taps, inside=None, layer_width=None, fit=1.0):
     coc = R * ((delta.abs() - band) / .35).clamp(0, 1) * torch.where(delta < 0, p["nearBlur"] / 100, 1.0)
     if inside is not None:
         coc = coc * inside  # Off the stabilized frame there is nothing to blur, not a black foreground.
+    if alpha is not None:
+        coc = coc * (1 - alpha)  # Section 7: the subject stays sharp.
     Wb = max(1, js_round(W * min(layer_width, 960) / layer_width * fit))
     s = Wb / W
     Hb = max(1, js_round(H * s))
-    small = area(torch.cat([L2, D[None], coc[None]]), Hb, Wb)
+    small = area(torch.cat([L2, D[None], coc[None]] + ([] if alpha is None else [alpha[None]])), Hb, Wb)
     Ls, Ds, cc, Rb = small[:3], small[3], small[4] * s, R * s
-    B = Ls if Rb < 1 else gather(Ls, Ds, cc, Rb, p["bokeh"] / 100 * 8, taps)
+    B = Ls if Rb < 1 else gather(Ls, Ds, cc, Rb, p["bokeh"] / 100 * 8, taps, None if alpha is None else small[5])
     blend = (coc * s).clamp(0, 1)
     return L2 + (bilinear(B, H, W) - L2) * blend
 
@@ -206,12 +225,12 @@ def gather_taps(Rb, taps):
     return out
 
 
-def gather(Ls, Ds, cc, Rb, bokeh, taps, chunk=24):
-    """Section 4's gather loop. Each step is acc = alpha * acc + beta with alpha = 1 + (1 - m) w / wsum and
+def gather(Ls, Ds, cc, Rb, bokeh, taps, alpha=None, chunk=24):
+    """Section 4's gather loop. Each step is acc = g * acc + beta with g = 1 + (1 - m) w / wsum and
     beta = m w L(sp), so a chunk of steps sampled at once folds into acc_end = P (acc + sum(beta / P_n)), P the running
-    product of alpha: the same sum as one step at a time (see the selftest), in a few dozen GPU passes, not thousands."""
+    product of g: the same sum as one step at a time (see the selftest), in a few dozen GPU passes, not thousands."""
     _, Hb, Wb = Ls.shape
-    stack = torch.cat([Ls, Ds[None], cc[None]])[None]
+    stack = torch.cat([Ls, Ds[None], cc[None]] + ([] if alpha is None else [alpha[None]]))[None]
     xs = torch.arange(Wb, device=Ls.device, dtype=torch.float32)
     ys = torch.arange(Hb, device=Ls.device, dtype=torch.float32)
     weigh = lambda col: 1 + bokeh * (lum(col) - .7).clamp(min=0)
@@ -229,10 +248,12 @@ def gather(Ls, Ds, cc, Rb, bokeh, taps, chunk=24):
         reach = torch.where(Dsp > Ds, torch.minimum(csp, 2 * cc), csp)  # A farther sample can't spill onto a nearer one.
         x = (reach - (r - .5)).clamp(0, 1)  # smoothstep(r - .5, r + .5, reach)
         m = x * x * (3 - 2 * x)
+        if alpha is not None:
+            m = torch.where((at[:, 5] > .5) & (alpha < .5), 0, m)  # Section 7: the subject never smears onto the background.
         weight = weigh(Lsp.transpose(0, 1))
         before = wsum + torch.cumsum(weight, 0) - weight
-        alpha = 1 + (1 - m) * weight / before
-        P = torch.cumprod(alpha, 0)
+        grow = 1 + (1 - m) * weight / before
+        P = torch.cumprod(grow, 0)
         acc = P[-1] * (acc + (Lsp * (m * weight / P)[:, None]).sum(0))
         wsum = wsum + weight.sum(0)
     return acc / wsum
@@ -257,9 +278,10 @@ def glow(L3, D, p, layer_width=None, fit=1.0):
     return L3 + p["glow"] / 100 * 1.5 * bilinear(g, H, W)
 
 
-def depth_fx(I, depth, p, near, far, taps=96, warp=None, layer=None):
+def depth_fx(I, depth, p, near, far, taps=96, warp=None, layer=None, matte=None):
     """The whole effect on one frame: I display RGB 0..1 (3,H,W), depth the stored values 0..1 (h,w). `layer` is the
-    (width, height) canvas the clip is fitted into, centred; the spec's W x H. None: the picture is the layer."""
+    (width, height) canvas the clip is fitted into, centred; the spec's W x H. None: the picture is the layer. `matte`
+    (h,w 0..1) is the Smart Mask subject, which Lens blur keeps sharp and out of the background (section 7)."""
     p = {**DEFAULTS, **p}
     if not any(p[key] > 0 for key in ("light", "fog", "blur", "glow")) or p["amount"] <= 0:
         return I
@@ -286,7 +308,12 @@ def depth_fx(I, depth, p, near, far, taps=96, warp=None, layer=None):
         colour = lin(torch.tensor(hsv(p["fogHue"], p["fogSaturation"] / 100, p["fogBrightness"] / 100), device=I.device).view(3, 1, 1))
         L = L + (colour - L) * f
     if p["blur"] > 0:
-        L = lens_blur(L, D, p, taps, inside, LW, fit)
+        alpha = None
+        if matte is not None:
+            alpha = matte_at(matte, H, W, warp)
+            if inside is not None:
+                alpha = alpha * inside
+        L = lens_blur(L, D, p, taps, inside, LW, fit, alpha)
     if p["glow"] > 0:
         L = glow(L, D, p, LW, fit)
     return (I + (enc(L) - I) * p["amount"] / 100).clamp(0, 1)
@@ -344,6 +371,23 @@ def depth_frames(job, sink, errors, children):
         sink.put(None)
 
 
+def matte_frames(job, sink, errors):
+    """The subject's matte for every bake frame, in order: (path, h x w float32 0..1) read from the mask analysis's native
+    16-bit frames, or (None, None) where the frame is outside the mask's range. A repeated path is not read again."""
+    last = None
+    try:
+        for path in job["matte"]["files"]:
+            if path is not None and path != last:
+                sink.put((path, read_png(path, 1)))
+            else:
+                sink.put((path, None))
+            last = path
+    except Exception as error:
+        errors.append(error)
+    finally:
+        sink.put(None)
+
+
 def render(job):
     ff, W, H, total = job["ffmpeg"], job["width"], job["height"], job["frames"]
     device, children, errors = pick_device(), [], []
@@ -373,6 +417,11 @@ def render(job):
         pictures, depths, written = queue.Queue(maxsize=3), queue.Queue(maxsize=16), queue.Queue(maxsize=3)
         threading.Thread(target=pump, args=(decoder.stdout, W * H * 8, total, pictures, errors), daemon=True).start()
         threading.Thread(target=depth_frames, args=(job, depths, errors, children), daemon=True).start()
+        mattes = queue.Queue(maxsize=8) if job.get("matte") else None
+        if mattes is not None:
+            if len(job["matte"]["files"]) != total:
+                raise ValueError("Invalid subject matte frames.")
+            threading.Thread(target=matte_frames, args=(job, mattes, errors), daemon=True).start()
         encoder_errors = []
         decoder_errors = []
         threading.Thread(target=lambda: decoder_errors.append(decoder.stderr.read()), daemon=True).start()
@@ -399,7 +448,7 @@ def render(job):
         indices, near, far, taps = spec["indices"], float(spec["near"]), float(spec["far"]), int(job.get("taps") or 96)
         if len(indices) != total or any(b < a for a, b in zip(indices, indices[1:])):
             raise ValueError("Invalid depth frame indices.")
-        position, current = -1, None
+        position, current, matte = -1, None, (None, None)
         with torch.inference_mode():
             for k in range(total):
                 data = pictures.get()
@@ -416,8 +465,16 @@ def render(job):
                     position += 1
                 rgba = torch.from_numpy(np.frombuffer(data, np.uint16).reshape(H, W, 4)).to(device).permute(2, 0, 1).float() / 65535
                 depth = torch.from_numpy(np.frombuffer(current, np.uint16).reshape(spec["height"], spec["width"])).to(device).float() / 1023
+                if mattes is not None:
+                    item = mattes.get()
+                    if item is None:
+                        raise errors[0] if errors else ValueError("The subject matte is shorter than the clip.")
+                    if item[0] is None:
+                        matte = (None, None)
+                    elif item[1] is not None:
+                        matte = (item[0], torch.from_numpy(item[1]).to(device))
                 params = {**static, **{key: values[k] for key, values in animated.items()}}
-                rgb = depth_fx(rgba[:3].contiguous(), depth, params, near, far, taps, warps[k] if warps else None, job.get("layer"))
+                rgb = depth_fx(rgba[:3].contiguous(), depth, params, near, far, taps, warps[k] if warps else None, job.get("layer"), matte[1])
                 # Interleave on the GPU: a strided tensor crossed to the CPU element by element (240 ms a 4K frame).
                 out = (torch.cat([rgb, rgba[3:]]) * 65535 + .5).clamp(0, 65535).to(torch.int32).to(torch.uint16).permute(1, 2, 0).contiguous()
                 written.put(out.cpu().numpy().tobytes())
@@ -460,14 +517,15 @@ def read_png(path, channels):
     return image[..., [2, 1, 0]] if image.ndim == 3 else np.repeat(image[..., None], 3, -1)
 
 
-def parity(params_path, rgb_path, depth_path, out_path):
+def parity(params_path, rgb_path, depth_path, out_path, matte_path=None):
     import cv2
     spec = json.loads(Path(params_path).read_text())
     device = pick_device()
     rgb = torch.from_numpy(read_png(rgb_path, 3)[..., :3].copy()).to(device).permute(2, 0, 1)
     depth = torch.from_numpy(read_png(depth_path, 1).copy()).to(device)
+    matte = torch.from_numpy(read_png(matte_path, 1).copy()).to(device) if matte_path else None
     with torch.inference_mode():
-        out = depth_fx(rgb, depth, spec.get("params", {}), float(spec["near"]), float(spec["far"]), int(spec.get("taps", 96)), spec.get("warp"), spec.get("layer"))
+        out = depth_fx(rgb, depth, spec.get("params", {}), float(spec["near"]), float(spec["far"]), int(spec.get("taps", 96)), spec.get("warp"), spec.get("layer"), matte)
     image = (out.permute(1, 2, 0).cpu().numpy()[..., [2, 1, 0]] * 65535 + .5).clip(0, 65535).astype(np.uint16)
     if not cv2.imwrite(str(out_path), image):
         raise ValueError(f"Could not write {out_path}.")
@@ -480,10 +538,10 @@ def detail(image):
     return float((image[..., 1:, :] - image[..., :-1, :]).abs().mean() + (image[..., :, 1:] - image[..., :, :-1]).abs().mean())
 
 
-def gather_reference(Ls, Ds, cc, Rb, bokeh, taps):
+def gather_reference(Ls, Ds, cc, Rb, bokeh, taps, alpha=None):
     """The spec's gather loop exactly as written, one sample at a time: the reference for gather()."""
     _, Hb, Wb = Ls.shape
-    stack = torch.cat([Ls, Ds[None], cc[None]])
+    stack = torch.cat([Ls, Ds[None], cc[None]] + ([] if alpha is None else [alpha[None]]))
     y, x = torch.meshgrid(torch.arange(Hb, device=Ls.device, dtype=torch.float32), torch.arange(Wb, device=Ls.device, dtype=torch.float32), indexing="ij")
     weigh = lambda col: 1 + bokeh * (lum(col) - .7).clamp(min=0)
     wsum = weigh(Ls)
@@ -492,6 +550,8 @@ def gather_reference(Ls, Ds, cc, Rb, bokeh, taps):
         at = sample(stack, x + math.cos(angle) * r, y + math.sin(angle) * r)
         reach = torch.where(at[3] > Ds, torch.minimum(at[4], 2 * cc), at[4])
         m, w = smoothstep(r - .5, r + .5, reach), weigh(at[:3])
+        if alpha is not None:
+            m = torch.where((at[5] > .5) & (alpha < .5), 0, m)
         acc = acc + (acc / wsum * w) * (1 - m) + at[:3] * w * m
         wsum = wsum + w
     return acc / wsum
@@ -501,9 +561,11 @@ def selftest():
     device, checks = pick_device(), []
     generator = torch.Generator(device="cpu").manual_seed(7)
     Ls, Ds, cc = torch.rand(3, 40, 60, generator=generator), torch.rand(40, 60, generator=generator), torch.rand(40, 60, generator=generator) * 9
+    As = torch.rand(40, 60, generator=generator).to(device)
     for taps in (16, 48, 96):
-        batched, reference = gather(Ls.to(device), Ds.to(device), cc.to(device), 9.5, 3.2, taps), gather_reference(Ls.to(device), Ds.to(device), cc.to(device), 9.5, 3.2, taps)
-        assert torch.allclose(batched, reference, atol=2e-5, rtol=1e-4), f"batched gather differs from the loop by {float((batched - reference).abs().max())}"
+        for alpha in (None, As):
+            batched, reference = gather(Ls.to(device), Ds.to(device), cc.to(device), 9.5, 3.2, taps, alpha), gather_reference(Ls.to(device), Ds.to(device), cc.to(device), 9.5, 3.2, taps, alpha)
+            assert torch.allclose(batched, reference, atol=2e-5, rtol=1e-4), f"batched gather differs from the loop by {float((batched - reference).abs().max())}"
     checks.append("gather equals the loop")
     ramp = torch.arange(7.0, device=device).expand(1, 2, 7)
     assert torch.allclose(area(ramp, 1, 3)[0, 0], torch.tensor([5 / 7, 3, 37 / 7], device=device), atol=1e-5), "area weighs pixels by the part covered"
@@ -543,6 +605,19 @@ def selftest():
         edge = depth_fx(border, depth, {"blur": 100, "focus": 100, "range": 10, "nearBlur": 100}, near, far, warp=[1, 0, 20, 0, 1, 0])
         assert float(edge[:, :, :19].max()) < 1e-3 and float(edge[:, :, 21:24].mean()) > .9 * float(edge[:, :, 30:60].mean()), f"the border stays out of the picture ({float(edge[:, :, 21:24].mean())} of {float(edge[:, :, 30:60].mean())})"
         checks.append("lens blur")
+        # Section 7: a bright subject whose depth wrongly reads as far as its dark background. Focused near, everything blurs
+        # and the subject smears a halo over the background; with its matte it stays sharp and the background stays dark.
+        lamp, square = torch.full((3, H, W), .1, device=device), torch.zeros(H, W, device=device)
+        lamp[:, 36:60, 68:92], square[36:60, 68:92] = 1, 1
+        far_depth, lens = torch.full((h, w), .2, device=device), {"blur": 100, "focus": 0, "range": 0, "bokeh": 0}
+        smeared, protected = depth_fx(lamp, far_depth, lens, near, far), depth_fx(lamp, far_depth, lens, near, far, matte=square)
+        assert float(smeared[0, 32, 80]) > .2 and float(smeared[0, 48, 64]) > .2 and float(smeared[0, 48, 68]) < .9, "without a matte the subject blurs into a halo"
+        assert float(protected[:, 36:60, 68:92].min()) > .999, "the subject stays sharp"
+        assert float(protected[0, 32, 80]) < .105 and float(protected[0, 48, 64]) < .105, f"no halo on the background ({float(protected[0, 32, 80])}, {float(protected[0, 48, 64])})"
+        # Within a pixel or two the bilinear samples that straddle the edge (alpha just under one half) still carry some.
+        assert float(protected[0, 48, 66]) < .5 * float(smeared[0, 48, 66]), "and only a faint fringe next to it"
+        assert torch.equal(depth_fx(I, depth, {"fog": 50}, near, far, matte=square), depth_fx(I, depth, {"fog": 50}, near, far)), "the matte only touches Lens blur"
+        checks.append("subject edges")
         fogged = depth_fx(I, depth, {"fog": 100, "fogStart": 30, "fogHorizon": 0}, near, far)
         target = torch.tensor(hsv(210, .1, .85), device=device).view(3, 1)
         assert torch.allclose(fogged[:, :, :70], I[:, :, :70], atol=1e-5), "fog leaves the near half alone"
@@ -583,9 +658,18 @@ def selftest():
         far_detail = [detail(torch.from_numpy(f[:, 100:, :3].copy()).permute(2, 0, 1)) for f in frames]
         assert far_detail[0] < .5 * far_detail[2] and abs(far_detail[2] - detail(torch.from_numpy(original[2, :, 100:, :3].copy()).permute(2, 0, 1))) < .01, f"Mix keyframes apply per frame: {far_detail}"
         assert np.abs(frames[0, :, :60, :3] - original[0, :, :60, :3]).mean() < .01, "the near half survives the round trip"
+        # The subject matte per bake frame: a 16-bit native frame over the far half on frames 0 and 2, none on frame 1.
+        import cv2
+        subject = np.zeros((H, W), np.uint16)
+        subject[:, W // 2:] = 65535
+        cv2.imwrite(str(directory / "subject.png"), subject)
+        render({**job, "output": str(directory / "matted.mov"), "animated": {}, "matte": {"files": [str(directory / "subject.png"), None, str(directory / "subject.png")]}})
+        decoded = subprocess.run([ffmpeg, "-v", "error", "-i", str(directory / "matted.mov"), "-f", "rawvideo", "-pix_fmt", "rgba64le", "-"], capture_output=True, check=True).stdout
+        matted = [detail(torch.from_numpy(f[:, 100:, :3].copy()).permute(2, 0, 1)) for f in np.frombuffer(decoded, np.uint16).reshape(-1, H, W, 4).astype(np.float32) / 65535]
+        sharp = detail(torch.from_numpy(original[0, :, 100:, :3].copy()).permute(2, 0, 1))
+        assert abs(matted[0] - sharp) < .01 and abs(matted[2] - sharp) < .01 and matted[1] < .5 * sharp, f"the matte follows the bake frame by frame: {matted} of {sharp}"
         checks.append("bake")
         # Parity mode reads PNGs and writes a 16-bit PNG.
-        import cv2
         cv2.imwrite(str(directory / "rgb.png"), (I.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
         cv2.imwrite(str(directory / "depth.png"), (depth.cpu().numpy() * 255).round().astype(np.uint8))
         (directory / "params.json").write_text(json.dumps(dict(params=dict(blur=100, focus=0), near=near, far=far, taps=48)))
@@ -602,12 +686,12 @@ if __name__ == "__main__":
     try:
         if sys.argv[1:] == ["--selftest"]:
             selftest()
-        elif sys.argv[1:2] == ["--parity"] and len(sys.argv) == 6:
-            parity(*sys.argv[2:6])
+        elif sys.argv[1:2] == ["--parity"] and len(sys.argv) in (6, 7):
+            parity(*sys.argv[2:])
         elif len(sys.argv) == 2:
             render(json.loads(Path(sys.argv[1]).read_text()))
         else:
-            raise ValueError("Usage: depth-fx.py <job.json> | --parity <params.json> <rgb.png> <depth.png> <out.png> | --selftest")
+            raise ValueError("Usage: depth-fx.py <job.json> | --parity <params.json> <rgb.png> <depth.png> <out.png> [matte.png] | --selftest")
     except Exception as error:
         detail_ = error if isinstance(error, (ValueError, AssertionError, InterruptedError)) else f"{type(error).__name__}: {error}"
         print(f"Depth: {detail_}", file=sys.stderr)

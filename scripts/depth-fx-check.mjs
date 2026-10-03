@@ -18,7 +18,10 @@ const light = { light: 80, lightStart: 30, lightSoftness: 20, bgExposure: -1, bg
 const fog = { fog: 70, fogStart: 30, fogDensity: 60, fogHue: 30, fogSaturation: 30, fogBrightness: 90, fogHorizon: 60 };
 const lens = { blur: 80, focus: 30, range: 10, nearBlur: 60, bokeh: 100 };
 const glow = { glow: 80, glowThreshold: 45, glowRadius: 40, glowStart: 30 };
-const cases = { 'light + fog': { ...light, ...fog }, 'lens blur + bokeh': lens, glow, 'everything, Mix 85': { ...light, ...fog, ...lens, ...glow, amount: 85 } };
+const cases = { 'light + fog': { ...light, ...fog }, 'lens blur + bokeh': lens, glow, 'everything, Mix 85': { ...light, ...fog, ...lens, ...glow, amount: 85 }, 'subject edges': { blur: 80, focus: 75, range: 10, nearBlur: 100, bokeh: 100 } };
+// Section 7: the subject case also gets a matte, at its own size, a little larger than the depth's subject and with a
+// soft edge, so it protects pixels the depth calls background and its edge alpha is fractional.
+const matted = new Set(['subject edges']), mw = 640, mh = 360;
 
 // The scene in normalised coordinates: a sky-to-ground gradient with fine checkers, small lights far away, and a near
 // subject (an ellipse) with its own texture. Depth is drawn from the same shapes so the bilateral upsample has edges.
@@ -36,6 +39,11 @@ for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
   const u = (x + .5) / w, v = (y + .5) / h;
   depth[y * w + x] = Math.round((subject(u, v) ? .85 : .15 + .4 * v) * 255);
 }
+const matte = new Uint8Array(mw * mh);
+for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++) {
+  const r = Math.sqrt(((x + .5) / mw - .3) ** 2 / .18 ** 2 + ((y + .5) / mh - .62) ** 2 / .31 ** 2);
+  matte[y * mw + x] = Math.round(Math.min(1, Math.max(0, (1 - r) / .015 + .5)) * 255);
+}
 
 // Preview side.
 const vite = await createServer({ root, appType: 'custom', logLevel: 'error', server: { port: 0, host: '127.0.0.1' } });
@@ -48,15 +56,15 @@ try {
   const page = await browser.newPage();
   await page.goto(new URL('/__depth-check', vite.resolvedUrls.local[0]).href);
   for (const [name, params] of Object.entries(cases)) {
-    const out = await page.evaluate(async ({ rgb, depth, params, options }) => {
+    const out = await page.evaluate(async ({ rgb, depth, matte, params, options }) => {
       const { depthFxPixels } = await import('/src/services/depthFx.ts');
       const bytes = text => Uint8Array.from(atob(text), c => c.charCodeAt(0));
-      const pixels = depthFxPixels(bytes(rgb), options.W, options.H, bytes(depth), options.w, options.h, params, { near: options.near, far: options.far, taps: options.taps });
+      const pixels = depthFxPixels(bytes(rgb), options.W, options.H, bytes(depth), options.w, options.h, params, { near: options.near, far: options.far, taps: options.taps, matte: matte && { data: bytes(matte), width: options.mw, height: options.mh } });
       if (!pixels) throw new Error('WebGL2 with float render targets is not available in this browser.');
       let text = '';
       for (let i = 0; i < pixels.length; i += 32768) text += String.fromCharCode(...pixels.slice(i, i + 32768));
       return btoa(text);
-    }, { rgb: Buffer.from(rgb).toString('base64'), depth: Buffer.from(depth).toString('base64'), params, options: { W, H, w, h, near, far, taps } });
+    }, { rgb: Buffer.from(rgb).toString('base64'), depth: Buffer.from(depth).toString('base64'), matte: matted.has(name) ? Buffer.from(matte).toString('base64') : undefined, params, options: { W, H, w, h, near, far, taps, mw, mh } });
     preview[name] = Buffer.from(out, 'base64');
   }
   renderer = await page.evaluate(() => { const gl = document.createElement('canvas').getContext('webgl2'), info = gl.getExtension('WEBGL_debug_renderer_info'); return info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER); });
@@ -67,6 +75,7 @@ const work = mkdtempSync(join(tmpdir(), 'depth-parity-'));
 const toPng = (data, format, width, height, path) => execFileSync(ffmpeg, ['-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', format, '-s', `${width}x${height}`, '-i', '-', path], { input: data });
 toPng(rgb, 'rgba', W, H, join(work, 'rgb.png'));
 toPng(depth, 'gray', w, h, join(work, 'depth.png'));
+toPng(matte, 'gray', mw, mh, join(work, 'matte.png'));
 const names = Object.keys(cases);
 names.forEach((name, n) => writeFileSync(join(work, `params${n}.json`), JSON.stringify({ params: cases[name], near, far, taps })));
 const python = process.env.FRAME_LINE_DEPTH_PYTHON || join(root, '.venv-mask', ...(process.platform === 'win32' ? ['Scripts', 'python.exe'] : ['bin', 'python']));
@@ -74,15 +83,15 @@ const script = join(root, 'scripts', 'depth-fx.py');
 let where;
 try { execFileSync(python, ['-c', 'import torch, cv2'], { stdio: 'ignore' }); where = `local ${python}`; } catch { where = undefined; }
 try {
-  if (where) for (let n = 0; n < names.length; n++) execFileSync(python, [script, '--parity', join(work, `params${n}.json`), join(work, 'rgb.png'), join(work, 'depth.png'), join(work, `out${n}.png`)], { stdio: ['ignore', 'ignore', 'inherit'] });
+  if (where) for (let n = 0; n < names.length; n++) execFileSync(python, [script, '--parity', join(work, `params${n}.json`), join(work, 'rgb.png'), join(work, 'depth.png'), join(work, `out${n}.png`), ...matted.has(names[n]) ? [join(work, 'matte.png')] : []], { stdio: ['ignore', 'ignore', 'inherit'] });
   else {
     // ponytail: scp to a fixed scratch folder on the Dell; a configurable remote folder when there is a second host.
     const host = process.env.FRAME_LINE_DEPTH_PARITY_SSH || 'gpu-host', remote = 'C:/Users/jdoe/Desktop/depth-bench/parity';
     const remotePython = 'C:/Users/jdoe/Desktop/SharedCut/.venv-mask/Scripts/python.exe';
     where = `${host} ${remotePython}`;
     execFileSync('ssh', [host, `New-Item -ItemType Directory -Force ${remote} | Out-Null`], { stdio: 'inherit' });
-    execFileSync('scp', ['-q', script, join(work, 'rgb.png'), join(work, 'depth.png'), ...names.map((_, n) => join(work, `params${n}.json`)), `${host}:${remote}/`], { stdio: 'inherit' });
-    execFileSync('ssh', [host, names.map((_, n) => `& ${remotePython} ${remote}/depth-fx.py --parity ${remote}/params${n}.json ${remote}/rgb.png ${remote}/depth.png ${remote}/out${n}.png; if ($LASTEXITCODE) { exit 1 }`).join('; ')], { stdio: ['ignore', 'ignore', 'inherit'] });
+    execFileSync('scp', ['-q', script, join(work, 'rgb.png'), join(work, 'depth.png'), join(work, 'matte.png'), ...names.map((_, n) => join(work, `params${n}.json`)), `${host}:${remote}/`], { stdio: 'inherit' });
+    execFileSync('ssh', [host, names.map((name, n) => `& ${remotePython} ${remote}/depth-fx.py --parity ${remote}/params${n}.json ${remote}/rgb.png ${remote}/depth.png ${remote}/out${n}.png${matted.has(name) ? ` ${remote}/matte.png` : ''}; if ($LASTEXITCODE) { exit 1 }`).join('; ')], { stdio: ['ignore', 'ignore', 'inherit'] });
     execFileSync('scp', ['-q', ...names.map((_, n) => `${host}:${remote}/out${n}.png`), `${work}/`], { stdio: 'inherit' });
   }
   // Compare in 1/255 steps over RGB.
@@ -95,8 +104,18 @@ try {
     for (let p = 0; p < W * H; p++) for (let c = 0; c < 3; c++) { errors[p * 3 + c] = Math.abs(web[p * 4 + c] - exported[p * 3 + c] / 257); change += Math.abs(web[p * 4 + c] - rgb[p * 4 + c]); }
     const sorted = errors.slice().sort(), mean = errors.reduce((sum, e) => sum + e, 0) / errors.length;
     const p99 = sorted[Math.floor(.99 * (sorted.length - 1))], max = sorted[sorted.length - 1], effect = change / errors.length, ok = mean < 1 && p99 < 4 && effect > 2;
+    // With a matte, the subject (where the matte is solid) must come out untouched in both: Focus is far and it is near.
+    let kept = '';
+    if (matted.has(name)) {
+      let sum = 0, count = 0;
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (matte[Math.floor((y + .5) / H * mh) * mw + Math.floor((x + .5) / W * mw)] === 255 && matte[Math.floor((y + .5) / H * mh) * mw + Math.min(mw - 1, Math.floor((x + .5) / W * mw) + 2)] === 255) {
+        const p = y * W + x; for (let c = 0; c < 3; c++) { sum += Math.abs(web[p * 4 + c] - rgb[p * 4 + c]) + Math.abs(exported[p * 3 + c] / 257 - rgb[p * 4 + c]); count += 2; }
+      }
+      kept = `  subject moved ${(sum / count).toFixed(2)}`;
+      if (!(sum / count < .75)) { failed = true; kept += ' FAIL'; }
+    }
     failed ||= !ok;
-    console.log(`${ok ? 'ok  ' : 'FAIL'} ${name.padEnd(20)} mean ${mean.toFixed(3)}  p99 ${p99.toFixed(2)}  max ${max.toFixed(1)}  (/255; the effect moved pixels by ${effect.toFixed(1)})`);
+    console.log(`${ok ? 'ok  ' : 'FAIL'} ${name.padEnd(20)} mean ${mean.toFixed(3)}  p99 ${p99.toFixed(2)}  max ${max.toFixed(1)}  (/255; the effect moved pixels by ${effect.toFixed(1)})${kept}`);
   });
   if (failed) process.exitCode = 1;
 } finally { rmSync(work, { recursive: true, force: true }); }
