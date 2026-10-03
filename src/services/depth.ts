@@ -1,6 +1,6 @@
 // Depth analysis: the contract shared by server/depth.ts, scripts/depth.py and the editor.
 // A run covers a range of source frames of one original; its depth lives in 64-frame segments.
-import { smartMaskFrame } from './smartMask.ts';
+import { smartMaskFrame, type DepthKeyBinding } from './smartMask.ts';
 
 export const DEPTH_SEGMENT = 64;
 /** Frames analysed per run at most: ten minutes at 60 fps, about 1 GB of segments. */
@@ -72,6 +72,20 @@ export function depthDistance(run: Pick<DepthRun, 'near' | 'far'>, value: number
 /** The stored value at a distance; the inverse of depthDistance. */
 export function depthValue(run: Pick<DepthRun, 'near' | 'far'>, distance: number) {
   return run.near - Math.max(0, Math.min(100, distance)) / 100 * (run.near - run.far);
+}
+
+/** Depth key alpha (0..1) at a distance 0 (nearest)..100 (farthest): 1 inside [near, far], easing to 0 over `softness`
+ *  beyond each end, so near 0 and far 100 key everything. */
+export function depthKeyAlpha(key: Pick<DepthKeyBinding, 'near' | 'far' | 'softness'>, distance: number) {
+  const soft = Math.max(key.softness, 1e-4), step = (edge: number) => { const t = Math.max(0, Math.min(1, (distance - edge) / soft)); return t * t * (3 - 2 * t); };
+  return step(key.near - soft) * (1 - step(key.far));
+}
+
+/** The key for every stored depth code 0..levels-1 (v = code / (levels - 1)), distance as in depth-fx-math.md section 0:
+ *  256 levels for the 8-bit preview frames, 1024 for the 10-bit export masters. Preview and export share this table. */
+export function depthKeyTable(run: Pick<DepthRun, 'near' | 'far'>, key: Pick<DepthKeyBinding, 'near' | 'far' | 'softness'>, levels: number) {
+  const span = Math.max(run.near - run.far, 1e-4);
+  return Float32Array.from({ length: levels }, (_, code) => depthKeyAlpha(key, Math.max(0, Math.min(1, (run.near - code / (levels - 1)) / span)) * 100));
 }
 
 /** Ready-made looks. Each is applied over the Depth defaults as one undoable edit; Focus stays the clip's own. */

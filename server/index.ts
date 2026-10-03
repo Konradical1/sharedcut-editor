@@ -32,7 +32,7 @@ import { createGzip } from 'node:zlib';
 import { Readable, Transform } from 'node:stream';
 import { promisify, isDeepStrictEqual } from 'node:util';
 import { LOCK_TTL, MOVEMENT_FIELDS, lockConflict, type PersistedState } from '../src/services/index.ts';
-import type { User, Project, MediaAsset, RenderJob, Clip, Presence, CollaborativeLock } from '../src/state/models.ts';
+import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock } from '../src/state/models.ts';
 import { exportResolveTimeline, importResolve } from './resolve.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
@@ -42,7 +42,7 @@ import { motionTrackerCapabilities, motionTrackerService } from './motionTracker
 import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } from './colorAssistant.ts';
 import { validateMotionTrackers } from '../src/services/motionTracker.ts';
 import { readCameraColor } from './cameraMetadata.ts';
-import { FILMSTRIP_VERSION, FULL_VARIANT, MEDIA_CONCURRENCY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, exportAspect, PROBE_VERSION, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, prepareWaveform, renderTimeline, renderSoundEffect, depthClips, depthRunRange } from './media.ts';
+import { FILMSTRIP_VERSION, FULL_VARIANT, MEDIA_CONCURRENCY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, exportAspect, PROBE_VERSION, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, prepareWaveform, renderTimeline, renderSoundEffect, depthRuns, depthSpan } from './media.ts';
 import { migrateAsset, needsMigration, removeLeftovers, sweepPreparedTemp } from './mediaMigration.ts';
 
 const scrypt = promisify(scryptCallback);
@@ -494,13 +494,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     queue.add(async () => { try { if (!closed && !controller.signal.aborted) await work(controller.signal); }
       finally { if (aborters.get(id) === controller) aborters.delete(id); queued.delete(job); ended(); done?.(); } }, render, prepare && (() => prepare(controller.signal)));
   };
-  /** The run the editor analyses for a Depth clip: its whole span with handles (depthRunRange), from the original. */
-  const depthRequest = (clip: Clip, asset: MediaAsset, records: ReturnType<typeof timelineTransitions>) => ({ clip: structuredClone(clip), asset, sourcePath: originalPath(asset.id), ...depthRunRange(clip, asset, records) });
-  /** An export's Depth clips' analysis, awaited (and held, until `releases` run) before the export joins the render queue:
+  /** An export's depth runs (Depth clips' and depth keys'), awaited (and held, until `releases` run) before the export joins the render queue:
    *  waiting there for minutes would hold every other export and all media preparation. Failures are left to the export. */
   const awaitDepth = async (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>, signal: AbortSignal, releases: (() => void)[]) => {
-    const records = timelineTransitions(snapshot.clips.filter(c => c.projectId === snapshot.project.id), snapshot.timeline.id, snapshot.assets.map(a => a.asset));
-    const requests = depthClips(snapshot).flatMap(clip => { const source = snapshot.assets.find(a => a.asset.id === clip.mediaId); try { return source && ['video', 'image'].includes(source.asset.kind) ? [depthRequest(clip, source.asset, records)] : []; } catch { return []; } });
+    const requests = depthRuns(snapshot);
     if (!requests.length) return;
     const percents = requests.map(() => 0); let shown = -1;
     const show = () => { const value = Math.floor(percents.reduce((a, b) => a + b, 0) / percents.length); if (value !== shown && !closed && !signal.aborted) { shown = value; updateJob(job.id, { remaining: `Waiting for depth analysis · ${value}%` }, false); } };
@@ -1363,11 +1360,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId);
           if (!asset || !['video', 'image'].includes(asset.kind)) fail(400, 'Depth works on video and image clips.');
           if (!existsSync(originalPath(asset!.id))) fail(409, 'Depth reads the original media, which is not on this server.');
-          // The span the clip actually reads, speed ramps, reverse, freeze and transition handles included.
-          const records = timelineTransitions(state.clips.filter(c => c.projectId === clip.projectId), clip.timelineId, state.media);
-          let request!: ReturnType<typeof depthRequest>;
-          try { request = depthRequest(clip, asset!, records); } catch (error) { fail(400, (error as Error).message); }
-          const run = await depth.enqueue({ ...request, joinOnly: !editor });
+          let range = { from: 0, to: 1 };
+          try { range = depthSpan(clip, asset!, state.clips, state.media); } catch (error) { fail(400, (error as Error).message); }
+          const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: originalPath(asset!.id), ...range, joinOnly: !editor });
           send(res, run.status === 'ready' ? 200 : 202, run); return;
         }
         const depthRoute = /^\/api\/depth\/([a-f0-9]{64})(?:\/preview\/(\d+)\.mp4|\/(focus))?$/.exec(path);

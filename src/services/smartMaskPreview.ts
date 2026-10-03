@@ -1,6 +1,6 @@
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 import { effectEnabled } from './effects.ts';
-import { smartMaskFrame, smartMaskSignature, type SmartMaskDocument, type SmartMaskManifest } from './smartMask.ts';
+import { isDepthKey, nodeMaskId, smartMaskFrame, smartMaskSignature, type SmartMaskDocument, type SmartMaskManifest } from './smartMask.ts';
 
 export class SmartMaskPending extends Error {}
 export type SmartMaskPixels = { width:number; height:number; data:Uint8Array; key:string; canvas?:HTMLCanvasElement };
@@ -43,7 +43,7 @@ export function smartMaskPreviewContext(clip:Clip,asset?:Pick<MediaAsset,'inputP
 }
 
 export function activeSmartMasks(clip:Clip,nodes:GradeNode[]):SmartMaskDocument[]{
-  const ids=new Set([...clip.effects.filter(e=>e.name==='Smart Mask'&&effectEnabled(clip,e)&&e.amount>0).map(e=>e.maskId),...nodes.filter(n=>n.clipId===clip.id&&n.enabled&&n.mask?.enabled&&n.mask.amount>0).map(n=>n.mask!.id)]);
+  const ids=new Set([...clip.effects.filter(e=>e.name==='Smart Mask'&&effectEnabled(clip,e)&&e.amount>0).map(e=>e.maskId),...nodes.filter(n=>n.clipId===clip.id&&n.enabled&&n.mask?.enabled&&n.mask.amount>0&&!isDepthKey(n.mask)).map(n=>nodeMaskId(n)!)]);
   return [...ids].map(id=>{const doc=clip.smartMasks?.find(m=>m.id===id);if(!doc)throw Error('Smart Mask references a missing subject.');return doc;});
 }
 

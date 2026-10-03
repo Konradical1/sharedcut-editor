@@ -1,10 +1,12 @@
 // Depth in the editor: one analysis run per clip with a Depth effect (started, polled and invalidated here), and per
 // viewer a small cache of decoded depth frames looked up by the decoded picture's own source timestamp.
-import type { Clip, Effect, MediaAsset } from '../state/models.ts';
+import type { Clip, Effect, GradeNode, MediaAsset } from '../state/models.ts';
 import { api, ApiError, connection } from './api.ts';
 import { setClipActivity } from './clipStatus.ts';
-import { DEPTH_SEGMENT, depthDistance, depthFrameAt, depthSegmentFor, type DepthFocusTrack, type DepthRun } from './depth.ts';
+import { DEPTH_SEGMENT, depthDistance, depthFrameAt, depthKeyTable, depthSegmentFor, type DepthFocusTrack, type DepthRun } from './depth.ts';
 import { effectEnabled } from './effects.ts';
+import { isDepthKey, type DepthKeyBinding } from './smartMask.ts';
+import type { SmartMaskPixels } from './smartMaskPreview.ts';
 import { stabilizeRange } from './stabilize.ts';
 
 /** `clip` and `asset` are the latest seen, so a run can be re-checked (or re-asked) without the store. */
@@ -136,20 +138,22 @@ export function depthClipReady(clip: Clip, run: DepthRun) {
 }
 export const depthEffect = (clip: Pick<Clip, 'effects' | 'properties'>) => clip.effects.find(e => e.name === 'Depth' && effectEnabled(clip as Clip, e));
 
-type EditorLike = { getState: () => { projectId: string; clips: Clip[]; media: MediaAsset[] }; subscribe: (listener: (state: ReturnType<EditorLike['getState']>) => void) => unknown };
+type EditorLike = { getState: () => { projectId: string; clips: Clip[]; media: MediaAsset[]; nodes?: GradeNode[] }; subscribe: (listener: (state: ReturnType<EditorLike['getState']>) => void) => unknown };
 let watching = false;
-/** Called once from the timeline (browser only): every clip in the open project with a Depth effect, on or off, keeps
- *  a run, whether or not it is under the playhead, so its progress shows on the clip and in the inspector. A run is
- *  cancelled only when its effect or clip is gone; another project opening just stops watching it. */
+/** Called once from the timeline (browser only): every clip in the open project with a Depth effect or a grade node
+ *  keyed by depth, on or off, keeps a run, whether or not it is under the playhead, so its progress shows on the clip
+ *  and in the inspector. A run is cancelled only when its effect, key or clip is gone; another project opening just
+ *  stops watching it. */
 export function watchDepthClips(store: EditorLike) {
   if (watching || typeof window === 'undefined') return; watching = true;
-  let clips: Clip[] | undefined, media: MediaAsset[] | undefined, project = '';
+  let clips: Clip[] | undefined, media: MediaAsset[] | undefined, nodes: GradeNode[] | undefined, project = '';
   const sync = (state: ReturnType<EditorLike['getState']>) => {
-    if (state.clips === clips && state.media === media && state.projectId === project) return;
-    clips = state.clips; media = state.media; project = state.projectId;
+    if (state.clips === clips && state.media === media && state.nodes === nodes && state.projectId === project) return;
+    clips = state.clips; media = state.media; nodes = state.nodes; project = state.projectId;
     const assets = new Map(state.media.map(asset => [asset.id, asset])), open = new Set<string>(), kept = new Set<string>();
+    const keyed = new Set((state.nodes ?? []).filter(node => isDepthKey(node.mask)).map(node => node.clipId));
     for (const clip of state.clips) {
-      if (!clip.effects.some(e => e.name === 'Depth')) continue;
+      if (!clip.effects.some(e => e.name === 'Depth') && !keyed.has(clip.id)) continue;
       kept.add(clip.id);
       const asset = assets.get(clip.mediaId);
       if (clip.projectId !== state.projectId || !asset || !['video', 'image'].includes(asset.kind)) continue;
@@ -205,7 +209,7 @@ export function depthFocusTrack(clip: Pick<Clip, 'id' | 'projectId'>, maskKey: s
 }
 
 /** Viewer-only settings: the depth-map view and the one-shot focus picker. Neither is saved nor exported. */
-const ui = { showMap: new Map<string, boolean>(), picking: null as null | { clipId: string; effectId: string } };
+const ui = { showMap: new Map<string, boolean>(), showKey: new Set<string>(), picking: null as null | { clipId: string; effectId: string } };
 export const depthUi = {
   get picking() { return ui.picking; },
   setPicking(value: typeof ui.picking) { ui.picking = value; version++; for (const listener of listeners) listener(); },
@@ -213,7 +217,28 @@ export const depthUi = {
    *  turns it off. Never from the shared effect, so a collaborator's viewer shows the picture. */
   showMap(effect: Pick<Effect, 'id'>) { return ui.showMap.get(effect.id) ?? false; },
   setShowMap(effectId: string, value: boolean) { if (ui.showMap.get(effectId) === value) return; ui.showMap.set(effectId, value); version++; for (const listener of listeners) listener(); },
+  /** A grade node's depth key drawn in the viewer instead of the picture. */
+  showKey(nodeId: string) { return ui.showKey.has(nodeId); },
+  setShowKey(nodeId: string, value: boolean) { if (ui.showKey.has(nodeId) === value) return; if (value) ui.showKey.add(nodeId); else ui.showKey.delete(nodeId); version++; for (const listener of listeners) listener(); },
 };
+
+/** No depth for this frame yet: a key of zero (the node grades nothing, or everything when inverted). */
+export const noDepthKey: SmartMaskPixels = { width: 1, height: 1, data: new Uint8Array([0]), key: 'depth-key:none' };
+const keys = new Map<string, SmartMaskPixels>();
+/** A decoded depth frame through a node's key (depthKeyTable, as the export uses): gray bytes at the depth size on a
+ *  canvas, so fitting it onto the layer is one bilinear GPU draw, as the export upsamples bilinearly. */
+export function depthKeyMatte(pixels: DepthPixels, run: Pick<DepthRun, 'near' | 'far'>, key: Pick<DepthKeyBinding, 'near' | 'far' | 'softness'>): SmartMaskPixels {
+  const name = `depth-key:${pixels.key}:${key.near}:${key.far}:${key.softness}`, cached = keys.get(name);
+  if (cached) return cached;
+  const table = depthKeyTable(run, key, 256), bytes = Uint8Array.from(table, v => Math.round(v * 255)), { width, height } = pixels;
+  const data = new Uint8Array(width * height), canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
+  const context = canvas.getContext('2d')!, image = context.createImageData(width, height);
+  for (let i = 0; i < data.length; i++) { const v = data[i] = bytes[pixels.data[i]]; image.data[i * 4] = image.data[i * 4 + 1] = image.data[i * 4 + 2] = v; image.data[i * 4 + 3] = 255; }
+  context.putImageData(image, 0, 0);
+  const matte = { width, height, data, key: name, canvas };
+  keys.set(name, matte); while (keys.size > 8) keys.delete(keys.keys().next().value!);
+  return matte;
+}
 
 export type DepthPixels = { data: Uint8Array; width: number; height: number; key: string };
 /** The depth each viewer last drew per clip, with a map from canvas pixels to the source box (0..1): the focus picker. */

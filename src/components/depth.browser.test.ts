@@ -1,4 +1,4 @@
-// Browser check for Depth (DepthInspector.tsx, depthPreview.ts, depthFx.ts): the depth map fills in, Lens blur softens
+// Browser check for Depth (DepthInspector.tsx, depthPreview.ts, depthFx.ts) and the depth key on a grade node: the depth map fills in, Lens blur softens
 // only what is far, and the focus picker sets Focus from the picture. Uses the model-free synthetic depth engine
 // (depth = source luma), so it needs python3 and ffmpeg but no torch.
 // Run: node --experimental-strip-types --test src/components/depth.browser.test.ts
@@ -42,7 +42,7 @@ const probe = (page: Page, box: Box) => page.locator('.viewer-frame canvas').eva
   return { mean: mean.map(Math.round), detail: Math.sqrt(Math.max(0, squares / count - (sum / count) ** 2)) };
 }, box);
 
-test('Depth: the map fills in, Lens blur softens only the far region, and the focus picker sets Focus', { timeout: 240000 }, async t => {
+test('Depth: the map fills in, Lens blur softens only the far region, the focus picker sets Focus, and a depth key grades only the far region', { timeout: 240000 }, async t => {
   let python = '';
   try { python = execFileSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).trim(); } catch { t.skip('python3 is not installed'); return; }
   const saved = { engine: process.env.FRAME_LINE_DEPTH_ENGINE, python: process.env.FRAME_LINE_DEPTH_PYTHON, floor: process.env.FRAME_LINE_DEPTH_MIN_FREE_GB };
@@ -173,5 +173,44 @@ test('Depth: the map fills in, Lens blur softens only the far region, and the fo
   assert.ok(followed.detail < sharpFar.detail * .35, `following the near subject blurs the far surround: ${followed.detail.toFixed(2)}`);
   assert.ok((await probe(page, near)).detail > sharpNear.detail * .8, 'and keeps the subject sharp');
   t.diagnostic(`subject: near ${kept.detail.toFixed(1)} with Focus far; followed, far ${followed.detail.toFixed(1)}`);
+
+  // A grade node keyed to the far half of the depth, Depth itself removed. Its influence starts at 0, so the first look
+  // is the same colour pipeline with nothing graded; the Color page then turns it up and shows the key.
+  for (let attempt = 0; ; attempt++) {
+    const { revision, state } = await server(), shot = state.clips.find(c => c.id === 'shot')!;
+    const patched = await context.request.patch(`${url}/api/state`, { data: { revision, delta: { clips: { upsert: [{ ...shot, effects: [] }], remove: [] }, nodes: { upsert: [{ id: 'keyed', projectId: project, clipId: 'shot', kind: 'primary', name: 'Background', enabled: true, order: 1, parameters: { offset: .25 }, mask: { source: 'depth', enabled: true, invert: false, amount: 0, near: 50, far: 100, softness: 5 } }], remove: [] } } } });
+    if (patched.ok()) break;
+    assert.ok(patched.status() === 409 && attempt < 10, `the keyed node is saved: ${await patched.text()}`);
+    await page.waitForTimeout(100);
+  }
+  await page.reload();
+  await page.getByRole('combobox', { name: 'Preview quality' }).selectOption('Full');
+  await page.getByRole('button', { name: 'Color', exact: true }).click();
+  await page.getByRole('button', { name: 'Node 1: Background' }).click();
+  const panel = page.getByRole('button', { name: 'Show effects panel' });
+  if (await panel.count()) await panel.click();
+  await page.locator('.color-effects-panel .inspector-tabs').getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.locator('.depth-key-inspector .depth-status', { hasText: 'Depth ready' }).waitFor({ timeout: 90000 });
+  await page.waitForTimeout(500);
+  const plainNear = (await probe(page, near)).mean, plainFar = (await probe(page, far)).mean;
+  const influence = page.getByRole('textbox', { name: 'Node influence % value', exact: true });
+  await influence.click(); await influence.fill('100'); await influence.press('Enter');
+  let keyedFar = await probe(page, far);
+  for (let i = 0; i < 300 && keyedFar.mean[0] - plainFar[0] < 40; i++) { await page.waitForTimeout(100); keyedFar = await probe(page, far); }
+  const keyedNear = await probe(page, near);
+  t.diagnostic(`depth key: near ${plainNear} → ${keyedNear.mean}, far ${plainFar} → ${keyedFar.mean}`);
+  assert.ok(keyedFar.mean.every((v, c) => v - plainFar[c] > 40), `the far surround is graded: ${plainFar} → ${keyedFar.mean}`);
+  assert.ok(keyedNear.mean.every((v, c) => Math.abs(v - plainNear[c]) <= 2), `the near box is not: ${plainNear} → ${keyedNear.mean}`);
+
+  // Show key draws the key instead of the picture: white where the node grades.
+  await page.getByRole('checkbox', { name: 'Show key' }).check();
+  await page.waitForFunction(() => { const c = document.querySelector('.viewer-frame canvas') as HTMLCanvasElement, [r, g, b] = c.getContext('2d')!.getImageData(Math.round(c.width * .1), c.height >> 1, 1, 1).data; return r > 240 && g > 240 && b > 240; }, undefined, { timeout: 15000 });
+  const keyNear = await probe(page, near), keyFar = await probe(page, far);
+  assert.ok(keyFar.mean.every(v => v > 240) && keyNear.mean.every(v => v < 15), `the key view: far ${keyFar.mean}, near ${keyNear.mean}`);
+  // Inverted, the node grades the near box, and the key view follows.
+  await page.locator('.depth-key-inspector').getByRole('checkbox', { name: 'Invert' }).check();
+  await page.waitForFunction(() => { const c = document.querySelector('.viewer-frame canvas') as HTMLCanvasElement, [r] = c.getContext('2d')!.getImageData(Math.round(c.width * .1), c.height >> 1, 1, 1).data; return r < 15; }, undefined, { timeout: 15000 });
+  const invertedNear = await probe(page, near), invertedFar = await probe(page, far);
+  assert.ok(invertedNear.mean.every(v => v > 240) && invertedFar.mean.every(v => v < 15), `the inverted key view: near ${invertedNear.mean}, far ${invertedFar.mean}`);
   assert.deepEqual(errors, []);
 });

@@ -1,4 +1,5 @@
 import type { SmartMaskPixels } from './smartMaskPreview.ts';
+import { nodeMaskId } from './smartMask.ts';
 import { acesShader, acesTextures } from './aces.generated.ts';
 import { processingStages, sampleCurve, identityCurve, luminanceWeights, interpretation, profiles, hasACES, colorTransform, type Cube } from './color.ts';
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
@@ -188,11 +189,11 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
       if(!Number.isFinite(stops)||Math.abs(stops)>8||!Number.isFinite(warmth)||Math.abs(warmth)>2000)throw new Error('Camera exposure or white balance is out of range.');
       gl.useProgram(program);
       const controls=JSON.stringify([clip.id,clip.properties.colorPipeline,profile,gamut,nodes.map(({enabled,order,parameters,curves,effects,mask})=>({enabled,order,parameters,curves,mask,effects:effects?.map(e=>e.type==='lut'?{...e,cube:cubeId(e.cube)}:e)}))]);
-      const maskIds=[...new Set(nodes.filter(n=>n.enabled&&n.clipId===clip.id&&n.mask?.enabled).map(n=>n.mask!.id))];
+      const maskIds=[...new Set(nodes.filter(n=>n.enabled&&n.clipId===clip.id&&n.mask?.enabled).map(n=>nodeMaskId(n)!))];
       const maskKey=JSON.stringify([source.width,source.height,maskIds.map(id=>maskPixels.get(id)?.key??id)]);
       if(maskKey!==previousMasks){
         const alpha=new Uint8Array(Math.max(1,maskIds.length)*source.width*source.height);
-        maskIds.forEach((id,i)=>{const data=maskPixels.get(id);if(!data){if(nodes.some(n=>n.mask?.id===id&&n.mask.enabled&&n.mask.amount>0))throw new ColorPending('Loading Smart Mask…');return;}alpha.set(data.data,i*source.width*source.height);});
+        maskIds.forEach((id,i)=>{const data=maskPixels.get(id);if(!data){if(nodes.some(n=>nodeMaskId(n)===id&&n.mask!.enabled&&n.mask!.amount>0))throw new ColorPending('Loading Smart Mask…');return;}alpha.set(data.data,i*source.width*source.height);});
         gl.activeTexture(gl.TEXTURE0+maskUnit);gl.bindTexture(gl.TEXTURE_2D_ARRAY,maskTexture);gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);gl.texImage3D(gl.TEXTURE_2D_ARRAY,0,gl.R8,source.width,source.height,Math.max(1,maskIds.length),0,gl.RED,gl.UNSIGNED_BYTE,alpha);previousMasks=maskKey;
       }
       if(controls!==previous){
@@ -201,7 +202,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
         const data=new Float32Array(height*52),curveData=new Float32Array(1024*height*4);
         let lutOffset=0;const lutEffects:Extract<ReturnType<typeof processingStages>[number],{type:'lut'}>[]=[];
         stages.forEach((stage,i)=>{
-          const row=i*52,mask=stage.node.mask;data.set([mask?.enabled?maskIds.indexOf(mask.id):-1,(mask?.amount??100)/100,mask?.invert?1:0,(stage.nodeStart?1:0)+(stage.nodeEnd?2:0)],row+48);
+          const row=i*52,mask=stage.node.mask;data.set([mask?.enabled?maskIds.indexOf(nodeMaskId(stage.node)!):-1,(mask?.amount??100)/100,mask?.invert?1:0,(stage.nodeStart?1:0)+(stage.nodeEnd?2:0)],row+48);
           if(stage.type==='cst'){
             const e=stage.effect;data.set([1,profiles.indexOf(e.inputGamma as typeof profiles[number]),profiles.indexOf(e.outputGamma as typeof profiles[number]),e.toneMapping==='aces2'?2:e.toneMapping==='shoulder'?1:0],row+28);
             stage.matrix.forEach((r,j)=>data.set([...r,j===0&&e.gamutMapping==='compress'?1:0],row+32+j*4));data.set(luminanceWeights(e.outputGamut),row+44);

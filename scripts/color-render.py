@@ -1,5 +1,5 @@
 """Float scene processing; ACES display rendering is native OpenColorIO, not a baked LUT."""
-import bisect, json, os, signal, subprocess, sys
+import bisect, itertools, json, os, signal, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import PyOpenColorIO as ocio
@@ -63,8 +63,9 @@ def grade(rgb,stages,masks=None,managed=True):
         binding=stage.get('node',{}).get('mask')
         if not stage.get('nodeEnd',True) or not binding or not binding['enabled']: return result
         if not binding['amount']: return before
-        if masks is None or binding['id'] not in masks: raise ValueError('Missing spatial node mask')
-        alpha=masks[binding['id']][...,None]
+        key='depth:'+stage['node']['id'] if binding.get('source')=='depth' else binding['id']  # nodeMaskId in smartMask.ts
+        if masks is None or key not in masks: raise ValueError('Missing spatial node mask')
+        alpha=masks[key][...,None]
         return before+(result-before)*(1-alpha if binding['invert'] else alpha)*binding['amount']/100
     before=rgb.copy()
     # Inactive np.where branches may log a negative value; selected results are checked below.
@@ -113,11 +114,41 @@ def frame_read(stream,size):
     if data and len(data)!=size: raise ValueError('Truncated color frame')
     return data
 
+def bilinear(height,width,h,w):
+    """Resize (h,w) to (height,width) bilinearly with half-pixel centres and clamped edges, the browser canvas's upscale."""
+    def axis(n,m):
+        x=np.clip((np.arange(n)+.5)*m/n-.5,0,m-1);lo=np.floor(x).astype(np.intp)
+        return lo,np.minimum(lo+1,m-1),(x-lo).astype(np.float32)
+    y0,y1,fy=axis(height,h);x0,x1,fx=axis(width,w)
+    def resize(a):
+        rows=a[y0]*(1-fy)[:,None]+a[y1]*fy[:,None]
+        return rows[:,x0]*(1-fx)+rows[:,x1]*fx
+    return resize
+
+def depth_key(job,spec):
+    """A depth key per decoded frame: the run's masters decoded in order (10-bit codes, as depth-fx.py reads them), each
+    wanted frame through the key table (depthKeyTable in depth.ts) and up to the source size. A still repeats its frame."""
+    w,h=spec['width'],spec['height'];table=np.asarray(spec['table'],dtype=np.float32);resize=bilinear(job['height'],job['width'],h,w)
+    def codes():
+        for path in spec['masters']:
+            p=subprocess.Popen([job.get('ffmpeg','ffmpeg'),'-v','error','-nostdin','-i',path,'-f','rawvideo','-pix_fmt','gray10le','-'],stdout=subprocess.PIPE)
+            try:
+                while data:=frame_read(p.stdout,w*h*2): yield data
+            except GeneratorExit: p.kill();p.wait();raise
+            if p.wait(): raise RuntimeError('Depth master decode failed')
+    source=codes();position=-1;current=None
+    indices=itertools.chain(spec['indices'],itertools.repeat(spec['indices'][-1])) if spec.get('still') else spec['indices']
+    for index in indices:
+        while position<index:
+            current=next(source,None);position+=1
+            if current is None: raise ValueError('The depth analysis does not cover this clip')
+        yield resize(table[np.minimum(np.frombuffer(current,dtype='<u2').reshape(h,w),1023)])
+
 def threads(job): return max(1,int(job.get('threads') or os.cpu_count() or 1))
 
 def process_frames(source,target,job,mask_targets=None):
     w,h=job['width'],job['height'];count=0;channels=4 if job.get('alpha') else 3
-    masks=job.get('masks',[]);cached={}
+    masks=job.get('masks',[]);cached={};keys={m['document']['id']:depth_key(job,m['depth']) for m in masks if 'depth' in m}
     pool=ThreadPoolExecutor(threads(job))
     while data:=frame_read(source,w*h*channels*4):
         planes=np.frombuffer(data,dtype='<f4').reshape(channels,h,w)
@@ -125,7 +156,12 @@ def process_frames(source,target,job,mask_targets=None):
         times=job.get('frameTimes');time=times[count] if times and count<len(times) else job.get('seek',0)+count/float(job.get('numericFps',24))
         alphas={}
         for mask in masks:
-            doc=mask['document'];index=max(0,bisect.bisect_right(mask['sourceTimes'],time+1e-7)-1)
+            doc=mask['document']
+            if 'depth' in mask:
+                alphas[doc['id']]=next(keys[doc['id']],None)
+                if alphas[doc['id']] is None: raise ValueError('The depth key has fewer frames than the source')
+                continue
+            index=max(0,bisect.bisect_right(mask['sourceTimes'],time+1e-7)-1)
             if time<doc['range']['start']-1e-7 or time>=doc['range']['end']-1e-7: alpha=np.zeros((h,w),dtype=np.float32)
             else:
                 frame=mask['files'].get(str(index))

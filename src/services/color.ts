@@ -1,4 +1,4 @@
-import { validateSmartMaskBinding } from './smartMask.ts';
+import { nodeMaskId, validateNodeMask } from './smartMask.ts';
 import type { Clip, GradeNode, MediaAsset, ColorCurve, ColorEffect, ColorTransformEffect } from '../state/models.ts';
 import { acesMatrices } from './aces.generated.ts';
 import { gradeValues } from './grade.ts';
@@ -220,7 +220,7 @@ export function sampleCurve(v:number,curve:ColorCurve){
 }
 function applyCurves(rgb:number[],node:GradeNode){return rgb.map((v,c)=>{const master=node.curves?.RGB,channel=node.curves?.[['R','G','B'][c] as 'R'];return channel?sampleCurve(master?sampleCurve(v,master):v,channel):master?sampleCurve(v,master):v;});}
 export function validateGradeNode(node:Partial<GradeNode>){
-  if(node.mask){validateSmartMaskBinding(node.mask);if(node.mask.enabled&&node.effects?.some(e=>e.enabled&&e.type==='cst'))throw Error('Keep color-space transforms on an unmasked node.');}
+  if(node.mask){validateNodeMask(node.mask);if(node.mask.enabled&&node.effects?.some(e=>e.enabled&&e.type==='cst'))throw Error('Keep color-space transforms on an unmasked node.');}
   const finite=(v:unknown,min=-1e4,max=1e4)=>typeof v==='number'&&Number.isFinite(v)&&v>=min&&v<=max;
   if(node.position&&(!finite(node.position.x,-1e5,1e5)||!finite(node.position.y,-1e5,1e5)))throw Error('Invalid node position.');
   if(node.order!==undefined&&!finite(node.order,-1e6,1e6))throw Error('Invalid node order.');
@@ -287,7 +287,7 @@ function blendNode(rgb:number[],input:number[],stage:{node:GradeNode;nodeEnd:boo
   const mask=stage.node.mask;if(!stage.nodeEnd||!mask?.enabled)return rgb;
   if(!mask.amount)return input;
   if(!maskAt)throw Error('A spatial node mask requires per-pixel alpha; it cannot be baked into an RGB LUT.');
-  const alpha=maskAt(mask.id);if(!Number.isFinite(alpha))throw Error('Invalid spatial mask alpha.');
+  const alpha=maskAt(nodeMaskId(stage.node)!);if(!Number.isFinite(alpha))throw Error('Invalid spatial mask alpha.');
   const amount=(mask.invert?1-clamp(alpha):clamp(alpha))*mask.amount/100;
   return input.map((v,c)=>v+(rgb[c]-v)*amount);
 }

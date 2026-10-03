@@ -2,7 +2,8 @@ import { venvPython, quotedFilterPath } from './platform.ts';
 import { killProcessTree } from './processTree.ts';
 import { readCameraColor, type CameraColor } from './cameraMetadata.ts';
 import { resolveSmartMaskArtifact } from './smartMask.ts';
-import { smartMaskFrame, type SmartMaskManifest } from '../src/services/smartMask.ts';
+import { activeDepthKeys, nodeMaskId, smartMaskFrame, type SmartMaskManifest } from '../src/services/smartMask.ts';
+import { depthFrameAt, depthKeyTable } from '../src/services/depth.ts';
 import { activeSmartMasks } from '../src/services/smartMaskPreview.ts';
 import { transformMotion, motionArtwork, type MotionPose } from '../src/services/motionBlur.ts';
 import { motionBlurFilters } from './motionBlur.ts';
@@ -671,6 +672,26 @@ export interface RenderRequest {
   /** Internal: hand over the finished FFmpeg command, which writes the lone clip's layer as raw rgba64le on stdout,
    *  instead of running it (the Depth bake reads its pre-depth frames this way). */
   decoder?: (command: string[]) => Promise<void>;
+  /** Internal: the clips as the render started. Depth reads its run from these (depthRun), however a pass, an In/Out
+   *  range, a preview chunk, a bake or a per-frame render cuts a clip by now. */
+  wholeClips?: Clip[];
+}
+
+/** The source span of a clip's one depth run, shared by every reader: the editor (POST /api/depth), an export's wait
+ *  before the render queue, the Depth bake, a depth-keyed grade and a timeline preview. It is everything the clip reads in
+ *  the edit, speed ramps, reverse, freeze and transition handles included. Each run sets its own near/far, so a smaller
+ *  one would put Focus, Fog and keys at other depths than the preview the user tuned. */
+export function depthSpan(clip: Clip, asset: MediaAsset, clips: Clip[], media: MediaAsset[]) {
+  if (asset.kind !== 'video') return { from: 0, to: 1 };
+  const records = timelineTransitions(clips.filter(c => c.projectId === clip.projectId), clip.timelineId, media);
+  const span = clipSpan(clip, records), geometry = extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start));
+  return stabilizeRange(geometry, asset.fps, asset.duration);
+}
+/** A render's depth.ready request for a clip: the run (depthSpan) of the clip as the render started. `source` is the
+ *  media the analysis reads: the original under a Stabilize bake. */
+export function depthRun(request: Pick<RenderRequest, 'clips' | 'wholeClips' | 'assets'>, clip: Clip, source: { asset: MediaAsset; path: string }) {
+  const clips = request.wholeClips ?? request.clips, whole = clips.find(c => c.id === clip.id) ?? clip;
+  return { clip: whole, asset: source.asset, sourcePath: source.path, ...depthSpan(whole, source.asset, clips, request.assets.map(a => a.asset)) };
 }
 
 /**
@@ -741,6 +762,7 @@ export function exportAspect(resolution: string | undefined, projectResolution: 
 
 export async function renderTimeline(request: RenderRequest): Promise<void> {
   exportAspect(request.settings.resolution, request.project.resolution);
+  if (!request.wholeClips) request = { ...request, wholeClips: request.clips };
   if (!request.pass) {
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&isCaption(c)))return renderCaptionTimeline(request);
   rejectDepth(request);
@@ -815,14 +837,14 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   if ((request.only ? clips.filter(clip => request.only!.has(clip.id)) : clips).length > 128) throw new Error('This render range stacks more than 128 clips at once. Export shorter ranges.');
   const colorClips = clips.filter(clip => {
     const track = tracks.find(track => track.id === clip.trackId);
-    return track?.kind === 'video' && !track.hidden && (activeSmartMasks(clip, request.nodes).length > 0 || clip.properties.colorPipeline === 'nodes-v2' && hasACES(request.nodes, clip.id));
+    return track?.kind === 'video' && !track.hidden && (activeSmartMasks(clip, request.nodes).length > 0 || activeDepthKeys(clip, request.nodes).length > 0 || clip.properties.colorPipeline === 'nodes-v2' && hasACES(request.nodes, clip.id));
   });
   // Stage weights estimate work, not time; native frame counts supply progress within each stage.
   // ACES without a matte is a one-second table bake, so only matted clips carry real per-frame colour work.
-  const colorBudget = soundOnly ? 0 : colorClips.some(clip => activeSmartMasks(clip, request.nodes).length) ? 50 : colorClips.length ? 5 : 0;
+  const colorBudget = soundOnly ? 0 : colorClips.some(clip => activeSmartMasks(clip, request.nodes).length || activeDepthKeys(clip, request.nodes).length) ? 50 : colorClips.length ? 5 : 0;
   let colorsDone = 0;
   const overlayInputs = new Map<string, number>();
-  const lutDir = await mkdtemp(path.join(tmpdir(), 'frameline-color-')), tables: string[] = [];
+  const lutDir = await mkdtemp(path.join(tmpdir(), 'frameline-color-')), tables: string[] = [], depthHolds: (() => void)[] = [];
   try {
   // FFmpeg's 10-bit YUV overlay darkens translucent RGB on transparent bases.
   // ponytail: groups composite in 8-bit RGB; use a 16-bit RGB compositor when HDR nesting is supported.
@@ -1018,8 +1040,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         ({ id: lookId, cube: base } = lookCube(await readFile(path.join(request.resolveDir, match[2]), 'utf8')));
       }
       let videoIndex=index,acesCube:string|undefined;
-      const usedMasks=activeSmartMasks(clip,request.nodes),maskStreams=new Map<string,{index:number;timing:string[]}>();
-      const exactColor=usedMasks.length>0||clip.properties.colorPipeline==='nodes-v2'&&hasACES(request.nodes,clip.id);
+      const usedMasks=activeSmartMasks(clip,request.nodes),depthKeys=activeDepthKeys(clip,request.nodes),maskStreams=new Map<string,{index:number;timing:string[]}>();
+      const exactColor=usedMasks.length>0||depthKeys.length>0||clip.properties.colorPipeline==='nodes-v2'&&hasACES(request.nodes,clip.id);
       if(exactColor){
         const metadata=await probeMedia(source.path,request.signal),colorSource=interpretation(clip,source.asset);
         const jobPath=path.join(lutDir,`${index}.json`),output=path.join(lutDir,`${index}.mkv`);
@@ -1037,18 +1059,38 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
           if(shift)document={...document,range:{start:document.range.start-shift,end:document.range.end-shift}};
           return {document,sourceTimes:times,files:Object.fromEntries(manifest.frames.map(f=>[String(f.index),path.join(artifact.directory,f.file)])),...(clip.effects.some(e=>e.maskId===document.id&&effectEnabled(clip,e)&&e.amount>0)?{output:path.join(lutDir,`${index}-${document.id}.mkv`)}:{})};
         });
-        // The Depth bake (decoder) seeks half a frame early and wants the frame at or after it, as the plain -ss path gives.
-        const times=masks[0]?.sourceTimes,renderSeek=(request.decoder?times?.find(t=>t>=seek-1e-7):times?.filter(t=>t<=seek+1e-7).at(-1))??seek;
+        // A depth key reads the editor's run: the whole clip as the render started, not the part this pass decodes.
+        const image=source.asset.kind==='image';let depth:Awaited<ReturnType<NonNullable<RenderRequest['depth']>['ready']>>|undefined;
+        if(depthKeys.length){
+          if(!request.depth)throw Error(`${clip.name}: depth analysis is not available on this server.`);
+          request.onStage?.(`Analyzing depth · ${clip.name}`);
+          depth=await request.depth.ready(depthRun(request,clip,source),request.signal,p=>request.onStage?.(`Analyzing depth · ${clip.name} · ${Math.round(p)}%`));
+          depthHolds.push(depth.release);
+        }
+        // The first frame at or after the seek, as the plain -ss path and the viewer show (and the Depth bake, which
+        // seeks half a frame early, wants): a trim between source frames must not start one frame early here.
+        const times=masks[0]?.sourceTimes??(image?undefined:depth?.run.times),renderSeek=times?.find(t=>t>=seek-1e-7)??seek;
+        if(!masks.length&&times?.some((t,i)=>i>0&&Math.abs(t-times[i-1]-1/(metadata.fps||fps))>Math.max(.000003,.001/(metadata.fps||fps))))throw Error(`${clip.name}: a depth key on export currently needs constant-frame-rate footage. Convert this source to constant frame rate first.`);
         const frameTimes=times?.filter(t=>t>=renderSeek-1e-7&&t<renderSeek+decoded-1e-7);
+        // Each decoded frame's depth from the masters; color-render.py keys it with the same table as the preview and
+        // upsamples bilinearly to the source size (a grading key, unlike Depth's guided upsample in depth-fx-math.md).
+        let depthMasks:{document:{id:string};depth:Record<string,unknown>}[]=[];
+        if(depth){
+          const {run,masters}=depth,wanted=image?[run.first]:(frameTimes??[]).map(t=>depthFrameAt(run,t)),first=wanted[0],last=wanted.at(-1)!;
+          const segments=run.segments.filter(s=>s.first+s.count>first&&s.first<=last).sort((a,b)=>a.n-b.n);
+          if(!wanted.length||wanted.some(i=>i<0)||!segments.length||segments[0].first>first||segments.at(-1)!.first+segments.at(-1)!.count<=last||segments.some((s,i)=>i>0&&s.first!==segments[i-1].first+segments[i-1].count))throw Error(`${clip.name}: the depth analysis does not cover this clip. Analyze depth again.`);
+          const spec={masters:segments.map(s=>path.join(masters,`${s.n}.mkv`)),width:run.width,height:run.height,indices:wanted.map(i=>i-segments[0].first),still:image};
+          depthMasks=depthKeys.map(node=>({document:{id:nodeMaskId(node)!},depth:{...spec,table:Array.from(depthKeyTable(run,node.mask,1024))}}));
+        }
         const hdr=hdrTransform(source.asset.colorTransfer),camera=clip.properties.colorPipeline!=='nodes-v2'?colorTransform(clip,source.asset,[],base):undefined;
         const inputCube=camera||hdr?makeCube(rgb=>{const sdr=hdr?hdr(rgb):rgb;return camera?camera(sdr):sdr;},65):undefined;
-        const job={input:source.path,output,ffmpeg:ffmpeg(),image:source.asset.kind==='image',seek:renderSeek,duration:decoded,width:metadata.width,height:metadata.height,fps:source.asset.kind==='image'?fps:metadata.frameRate||metadata.fps,numericFps:metadata.fps||fps,threads:Number(exportThreads),frames:frameTimes?.length??Math.ceil(decoded*(metadata.fps||fps)),frameTimes,masks,alpha:masks.length>0,managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)};
+        const job={input:source.path,output,ffmpeg:ffmpeg(),image:source.asset.kind==='image',seek:renderSeek,duration:decoded,width:metadata.width,height:metadata.height,fps:source.asset.kind==='image'?fps:metadata.frameRate||metadata.fps,numericFps:metadata.fps||fps,threads:Number(exportThreads),frames:frameTimes?.length??Math.ceil(decoded*(metadata.fps||fps)),frameTimes,masks:[...masks,...depthMasks],alpha:masks.length>0,managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)};
         await writeFile(jobPath,JSON.stringify(job));
         const python=process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color');
         if(!existsSync(python))throw Error('OpenColorIO export is not installed. Run npm run setup:color on the server.');
         const colorStage = `Processing color · ${clip.name} (${colorsDone + 1}/${colorClips.length})`;
         request.onStage?.(colorStage);
-        if(!usedMasks.length){
+        if(!usedMasks.length&&!depthKeys.length){
           // Without a matte every stage is per-pixel, so the exact OCIO grade bakes into a 129³ table. Measured on
           // S-Log3 4K: 0.04 of an 8-bit step mean error, 1.5 worst pixel, versus ~1 s per frame graded in Python.
           // The table is made only of these three fields (write_cube in color-render.py). The bake is not tied to
@@ -1216,7 +1258,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   onProgress?.(colorBudget);
   try { await run(ffmpeg(), args, { signal, duration, onProgress: p => onProgress?.(colorBudget+p*(100-colorBudget)/100) }); onProgress?.(100); }
   catch (error) { await rm(outputPath, { force: true }); throw error; }
-  } finally { releaseLuts(tables); await rm(lutDir, { recursive: true, force: true }); }
+  } finally { releaseLuts(tables); for (const release of depthHolds) release(); await rm(lutDir, { recursive: true, force: true }); }
 }
 
 /**
@@ -1328,6 +1370,8 @@ async function renderStabilizedTimeline(request: RenderRequest) {
   const maskArtifacts=new Map(request.maskArtifacts),stabilized=new Map(request.stabilized);
   for(const [index,clip] of candidates.entries()) {
     if(clip.properties.opticalFlow)throw Error(`${clip.name}: Stabilize and optical flow cannot share a clip yet. Disable optical flow or remove Stabilize.`);
+    // ponytail: the key would need the depth warped like the picture (stabilizeWarpMattes does it for subjects).
+    if(activeDepthKeys(clip,request.nodes).length)throw Error(`${clip.name}: a depth key and Stabilize cannot share a clip in export yet; it needs warped depth. Remove the depth key or Stabilize.`);
     const source=assets.find(a=>a.asset.id===clip.mediaId),track=tracks.find(t=>t.id===clip.trackId);
     if(!source||source.asset.kind!=='video'||!track)throw new Error(`${clip.name}: Stabilize requires a video source.`);
     const span=clipSpan(clip,records),geo=extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
@@ -1384,10 +1428,20 @@ function depthEffect(clip: Clip) {
   });
 }
 const exportRange = (request: Pick<RenderRequest, 'settings' | 'timeline'>) => ({ rangeIn: Number(request.settings.rangeIn) || 0, rangeOut: Number(request.settings.rangeOut ?? request.timeline.duration) || request.timeline.duration });
+type Shown = Pick<RenderRequest, 'clips' | 'tracks' | 'assets' | 'timeline' | 'project' | 'settings'>;
 /** The Depth clips this render shows: on a visible video track, reaching into the range (with their transitions).
  *  One on a hidden track or outside the range is left alone; there Depth draws nothing and has no sound. */
-export function depthClips(request: Pick<RenderRequest, 'clips' | 'tracks' | 'assets' | 'timeline' | 'project' | 'settings'>) {
-  const own = request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && depthEffect(c));
+export const depthClips = (request: Shown) => shownClips(request, clip => !!depthEffect(clip));
+/** Every depth run this render reads, its Depth clips' and its depth-keyed clips', as depth.ready requests: an export waits
+ *  for these before it joins the render queue. A clip whose span cannot be worked out is left for the render to report. */
+export function depthRuns(request: Shown & Pick<RenderRequest, 'nodes' | 'wholeClips'>) {
+  return shownClips(request, clip => !!depthEffect(clip) || activeDepthKeys(clip, request.nodes).length > 0).flatMap(clip => {
+    const source = request.assets.find(a => a.asset.id === clip.mediaId);
+    try { return source && ['video', 'image'].includes(source.asset.kind) ? [depthRun(request, clip, source)] : []; } catch { return []; }
+  });
+}
+function shownClips(request: Shown, wanted: (clip: Clip) => boolean) {
+  const own = request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && wanted(c));
   if (!own.length) return own;
   const records = timelineTransitions(request.clips.filter(c => c.projectId === request.project.id), request.timeline.id, request.assets.map(a => a.asset)), { rangeIn, rangeOut } = exportRange(request);
   return own.filter(clip => {
@@ -1405,13 +1459,6 @@ export function bakesDepth(request: Pick<RenderRequest, 'clips' | 'tracks' | 'as
     const timeline = request.timelines?.find(t => t.id === parent.properties.compositionId && t.projectId === request.project.id);
     return !!timeline && !seen.has(timeline.id) && bakesDepth({ ...request, timeline, settings: { ...request.settings, rangeIn: '0', rangeOut: String(timeline.duration) } }, seen);
   });
-}
-/** The source range a Depth clip's analysis covers: the clip's whole span with its transition handles, as the editor asks
- *  for it (POST /api/depth). An In/Out export reads that same run, so its distances (and Focus) match the preview's. */
-export function depthRunRange(clip: Clip, asset: MediaAsset, records: TransitionRecord[]) {
-  if (asset.kind === 'image') return { from: 0, to: 1 };
-  const span = clipSpan(clip, records);
-  return stabilizeRange(extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start)), asset.fps, asset.duration);
 }
 /** Refused by name before anything is decoded or baked. */
 function rejectDepth(request: RenderRequest) {
@@ -1466,9 +1513,8 @@ async function renderDepthTimeline(request: RenderRequest) {
       const range = image ? { from: 0, to: 1 } : stabilizeRange(geo, sourceFps, source.asset.duration);
       const report = (fraction: number) => request.onProgress?.((index + Math.max(0, Math.min(1, fraction))) / candidates.length * 45);
       request.onStage?.(`Analyzing depth · ${clip.name}`);
-      // The editor's run for the whole clip (the original under a Stabilize bake), even when only part of it is baked.
-      const runClip = original?.clip ?? whole;
-      const { run: analysis, masters, release } = await request.depth.ready({ clip: runClip, asset: originalAsset, sourcePath: original?.source.path ?? source.path, ...depthRunRange(runClip, originalAsset, records) }, request.signal, p => { request.onStage?.(`Analyzing depth · ${clip.name} · ${Math.round(p)}%`); report(p / 100 * .3); });
+      // The editor's run for the whole clip (of the original under a Stabilize bake), even when only part of it is baked.
+      const { run: analysis, masters, release } = await request.depth.ready(depthRun(request, whole, original?.source ?? source), request.signal, p => { request.onStage?.(`Analyzing depth · ${clip.name} · ${Math.round(p)}%`); report(p / 100 * .3); });
       releases.push(release);
       // Bake frame k is the clip's media at `origin + k / fps`, which shows source frame `base + k` of the run.
       const times = analysis.times, step = 1 / (originalAsset.fps || sourceFps);
@@ -1493,7 +1539,7 @@ async function renderDepthTimeline(request: RenderRequest) {
       const output = path.join(directory, `${index}.${image ? 'png' : 'mov'}`), alpha = Boolean(source.asset.hasAlpha) || before.some(e => e.name === 'Smart Mask' && effectEnabled(clip, e) && e.amount > 0);
       // A matte above Depth sends the pre-depth pass through color-render.py first, which keeps a 16-bit RGBA FFV1 copy of the
       // whole bake in the temp folder until the bake ends: 8 bytes a pixel, about half that after FFV1.
-      const matted = activeSmartMasks({ ...clip, effects: before }, nodes).length > 0;
+      const matted = activeSmartMasks({ ...clip, effects: before }, nodes).length > 0 || activeDepthKeys(clip, nodes).length > 0;
       const need = frames * (DEPTH_BAKE_BYTES_4K / (3840 * 2160) + (matted ? 4 : 0)) * width * height + 512 * 1024 ** 2, disk = statfsSync(directory), free = disk.bavail * disk.bsize, floor = depthDiskFloor();
       if (free - need < floor) throw new Error(`${clip.name}: not enough disk space to bake Depth: about ${(need / 1024 ** 3).toFixed(1)} GB needed, ${(free / 1024 ** 3).toFixed(1)} GB free, and ${(floor / 1024 ** 3).toFixed(1)} GB is kept free.`);
       const keys = effectDefinitions.Depth.parameters.map(parameter => parameter.key);
@@ -1611,6 +1657,7 @@ async function renderFlowTimeline(request: RenderRequest) {
     const bakes=await processDirectory('frameline-flow-bakes-'),canvas=dimensions(request.project.resolution);
     for(const [index,clip] of candidates.entries()) {
       if(activeSmartMasks(clip,request.nodes).length)throw Error('Smart Mask and optical-flow retiming need a shared warped matte. Disable optical flow for this clip.');
+      if(activeDepthKeys(clip,request.nodes).length)throw Error(`${clip.name}: a depth key and optical-flow retiming need warped depth. Disable optical flow for this clip.`);
       const source=assets.find(a=>a.asset.id===clip.mediaId),track=tracks.find(t=>t.id===clip.trackId);
       if(!source||source.asset.kind!=='video'||!track)throw new Error(`${clip.name}: optical flow requires a video source.`);
       const span=clipSpan(clip,records),geo=extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));

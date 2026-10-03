@@ -1,9 +1,9 @@
 import { createTimelinePreview } from './timelinePreview.ts';
 import { createSmartMaskPreview, activeSmartMasks, fittedSmartMask, lumaAlphaFilter, SmartMaskPending, unanalyzedSmartMask, type SmartMaskPixels } from './smartMaskPreview.ts';
 import { createMotionPreview } from './motionPreview.ts';
-import { createDepthPreview, depthFocusTrack, depthUi, forgetDepth, rememberDepth, subscribeDepth } from './depthPreview.ts';
+import { createDepthPreview, depthFocusTrack, depthKeyMatte, depthUi, forgetDepth, noDepthKey, rememberDepth, subscribeDepth } from './depthPreview.ts';
 import { depthFocusAt, depthFrameAt } from './depth.ts';
-import { smartMaskSignature } from './smartMask.ts';
+import { activeDepthKeys, nodeMaskId, smartMaskSignature } from './smartMask.ts';
 import { createDepthFx, depthFxKeys, depthTapBudget, type DepthFxInput, type DepthFxParams } from './depthFx.ts';
 import { blendModeOf } from './blendModes.ts';
 import { transformMotion, drawMotionPose, motionArtwork } from './motionBlur.ts';
@@ -854,18 +854,33 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       let masks=new Map<string,SmartMaskPixels>();
       try {
         const nodes = evaluateNodes(nodesOf(state.nodes, clip.id),focusing?.clip??clip,focusing?.time??time).filter(node=>node.enabled);
-        const maskCount=activeSmartMasks(clip,nodes).length;
+        const maskCount=activeSmartMasks(clip,nodes).length,depthKeys=activeDepthKeys(clip,nodes);
         if(maskCount&&clip.properties.opticalFlow)throw Error('Smart Mask and optical-flow retiming need a shared warped matte. Disable optical flow for this clip.');
+        if(depthKeys.length&&clip.properties.opticalFlow)throw Error('A depth key and optical-flow retiming need warped depth. Disable optical flow for this clip.');
+        /** Source-box alpha letterboxed onto the layer, as the source RGB is; one entry per frame, matte and layer size. */
+        const fit=(matte:SmartMaskPixels,sourceWidth:number,sourceHeight:number)=>{
+          const key=`${matte.key}:${width}:${height}:${sourceWidth}:${sourceHeight}`;
+          let fitted=fittedMasks.get(key);if(!fitted){while(fittedMasks.size>=24)fittedMasks.delete(fittedMasks.keys().next().value!);fitted={width,height,key,data:fittedSmartMask(matte,width,height,sourceWidth,sourceHeight)};fittedMasks.set(key,fitted);}
+          return fitted;
+        };
         const loadMasks=(sampleTime:number)=>{
           masks=new Map<string,SmartMaskPixels>();
           for(const [id,mask] of maskPreview.read(clip,nodes,sampleTime,asset)){
             // Only a WebGL node mask needs layer-fitted pixels; the clip effect composites the matte canvas directly.
-            if(!nodes.some(n=>n.mask?.id===id&&n.mask.enabled)){masks.set(id,mask);continue;}
+            if(!nodes.some(n=>nodeMaskId(n)===id&&n.mask!.enabled)){masks.set(id,mask);continue;}
             // A node limited to a subject that is not found yet grades nothing (or everything, inverted), never the whole frame.
             if(mask===unanalyzedSmartMask)warning='Smart Mask · not analyzed here yet · masked grade is off';
             const matte=mask===unanalyzedSmartMask?{...mask,data:new Uint8Array([0])}:mask;
-            const doc=clip.smartMasks!.find(m=>m.id===id)!,key=`${mask.key}:${width}:${height}:${doc.source.width}:${doc.source.height}`;
-            let fitted=fittedMasks.get(key);if(!fitted){while(fittedMasks.size>=24)fittedMasks.delete(fittedMasks.keys().next().value!);fitted={width,height,key,data:fittedSmartMask(matte,width,height,doc.source.width,doc.source.height)};fittedMasks.set(key,fitted);}masks.set(id,fitted);
+            const doc=clip.smartMasks!.find(m=>m.id===id)!;masks.set(id,fit(matte,doc.source.width,doc.source.height));
+          }
+          // A depth key reads the depth of this very frame (one frame old at most); before analysis reaches it the node
+          // grades nothing, like a subject not found yet.
+          for(const node of depthKeys){
+            const depth=depthFrames.frame(clip.id,sampleTime);
+            if(depth.state==='loading')throw new SmartMaskPending('Loading depth…');
+            if(depth.state!=='ready')warning=depth.state==='failed'?`Depth key · ${depth.error} · masked grade is off`:'Depth key · analyzing depth · masked grade is off';
+            const [sourceWidth,sourceHeight]=sourceSize(asset);
+            masks.set(nodeMaskId(node)!,fit(depth.state==='ready'?depthKeyMatte(depth.pixels,depth.run,node.mask):noDepthKey,sourceWidth,sourceHeight));
           }
           return masks;
         };
@@ -876,6 +891,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           if(element)sourceTimestamp=result.dataset.sourceTimestamp ?? '';
           canvas.dataset.colorPrecision=result.dataset.colorPrecision??'8-bit RGB fallback';
           layerContext.clearRect(0,0,width,height); layerContext.drawImage(result,0,0);
+          // Show key (viewer only): where the node grades, white where it grades fully (Invert included).
+          const shown=depthKeys.find(n=>depthUi.showKey(n.id)),key=shown&&masks.get(nodeMaskId(shown)!);
+          if(key){const image=layerContext.createImageData(width,height),flip=shown.mask.invert?255:0;for(let i=0;i<key.data.length;i++){image.data[i*4]=image.data[i*4+1]=image.data[i*4+2]=Math.abs(flip-key.data[i]);image.data[i*4+3]=255;}layerContext.putImageData(image,0,0);}
         }
       } catch (cause) { if(cause instanceof ColorPending||cause instanceof SmartMaskPending){loading=true;footageCache.setDecoderStatus(clip.id,asset.proxyUrl??'',`${asset.name} · ${cause instanceof ColorPending?'Preparing color frame':'Preparing mask'}`);const pending=seeks.findIndex(([media])=>media===element);if(pending>=0)seeks.splice(pending,1);}else {const message=cause instanceof Error?cause.message:'Color preview unavailable.';skipped.set(clip.id,`${clip.name} (${message})`);footageCache.setDecoderStatus(clip.id,asset.proxyUrl??'',`${asset.name}: ${message}`,true);} layerContext.clearRect(0,0,width,height);return; }
       // Stabilize goes first. Grading and node masks read the frame the camera shot; from here on every

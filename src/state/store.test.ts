@@ -8,6 +8,7 @@ import type { Clip, Keyframe } from './models.ts';
 import { neutralBalance, neutralLook, type LookOption } from '../services/colorAssistant.ts';
 import { forwardRoom } from '../services/selection.ts';
 import { depthUi, rememberDepth } from '../services/depthPreview.ts';
+import { nodeMaskId } from '../services/smartMask.ts';
 import { LOCK_TTL, mediaService, projectService, renderService, STORAGE_KEY } from '../services/index.ts';
 
 const baseline = store.getState();
@@ -887,12 +888,12 @@ test('Smart Mask creation, corrections and node sharing are undoable', () => {
   assert.equal(clip().smartMasks![0].prompts.length, 0);
   const node = state().nodes.find(n => n.clipId === 'c3')!;
   state().attachSmartMask('c3', mask.id, node.id);
-  assert.equal(state().nodes.find(n => n.id === node.id)!.mask!.id, mask.id);
+  assert.equal(nodeMaskId(state().nodes.find(n => n.id === node.id)!), mask.id);
   state().updateNode(node.id,{mask:undefined});
   assert.equal(state().nodes.find(n=>n.id===node.id)!.mask,undefined);
   assert.equal(clip().smartMasks![0].id,mask.id);
   state().undo();
-  assert.equal(state().nodes.find(n=>n.id===node.id)!.mask!.id,mask.id);
+  assert.equal(nodeMaskId(state().nodes.find(n=>n.id===node.id)!),mask.id);
 });
 
 test('Smart Mask rejects invalid prompts and obeys clip locks', () => {
@@ -913,6 +914,22 @@ test('copied grade does not carry subject masks onto unrelated footage', () => {
   assert.ok(state().nodes.filter(n=>n.clipId===target.id).every(n=>!n.mask));
 });
 
+test('a depth key on a node is one undoable edit, is validated, and travels with a pasted grade', () => {
+  const node = state().nodes.find(n => n.clipId === 'c3')!, key = { source: 'depth' as const, enabled: true, invert: false, amount: 100, near: 50, far: 100, softness: 10 };
+  state().updateNode(node.id, { mask: key });
+  assert.deepEqual(state().nodes.find(n => n.id === node.id)!.mask, key);
+  state().updateNode(node.id, { mask: { ...key, far: 20 } });
+  assert.deepEqual(state().nodes.find(n => n.id === node.id)!.mask, key, 'far before near is refused');
+  state().updateNode(node.id, { mask: { ...key, near: 60 } });
+  state().undo();
+  assert.deepEqual(state().nodes.find(n => n.id === node.id)!.mask, key);
+  // Unlike a subject, the key reads the target's own depth, so it survives a paste onto other footage.
+  state().copyGrade('c3');
+  const target = state().clips.find(c => c.mediaId !== clip().mediaId && c.timelineId === clip().timelineId)!;
+  state().pasteGrade(target.id);
+  assert.ok(state().nodes.some(n => n.clipId === target.id && n.mask?.source === 'depth' && n.mask.near === 50));
+});
+
 test('duplicated Smart Mask intent is independent and same-source grade paste remaps its binding', () => {
   state().addEffect('c3','Smart Mask');
   const original=clip().smartMasks![0];
@@ -923,9 +940,9 @@ test('duplicated Smart Mask intent is independent and same-source grade paste re
   assert.equal(state().clips.find(c=>c.id===duplicate.id)!.smartMasks![0].name,'Independent');
   state().attachSmartMask('c3',original.id,state().nodes.find(n=>n.clipId==='c3')!.id);
   state().copyGrade('c3');state().pasteGrade(duplicate.id);
-  const copiedMask=state().nodes.find(n=>n.clipId===duplicate.id&&n.mask)?.mask;
-  assert.ok(copiedMask);assert.notEqual(copiedMask.id,original.id);
-  assert.ok(state().clips.find(c=>c.id===duplicate.id)!.smartMasks!.some(m=>m.id===copiedMask.id));
+  const copiedMask=nodeMaskId(state().nodes.find(n=>n.clipId===duplicate.id&&n.mask)!);
+  assert.ok(copiedMask);assert.notEqual(copiedMask,original.id);
+  assert.ok(state().clips.find(c=>c.id===duplicate.id)!.smartMasks!.some(m=>m.id===copiedMask));
 });
 
 test('a trim stops at the neighbour, and the drag preview clamps exactly where the commit does', () => {

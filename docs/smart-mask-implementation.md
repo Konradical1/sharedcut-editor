@@ -44,6 +44,7 @@ Keep publication distinct from certification: `quality:final` requests the final
 * Source-coordinate alpha receives the same fit/crop/rotation/transform as its RGB. Source optical-flow retiming requires the corresponding warped alpha or analysis of the retimed RGB; until implemented, reject this combination explicitly rather than interpolate mattes independently.
 * RGBA synthetic motion blur samples alpha and color together. Existing playback transforms happen after effect application, which is the correct hook for a source cutout.
 * Depth subject (`Effect.maskId` on a Depth effect): Lens blur keeps the subject sharp and out of background gathers, and Follow subject sets Focus from a server-measured focus track (depth math doc, section 7). It uses the same saved revision and source-frame mapping; the preview plays unprotected with a note instead of stalling, the export blocks like a masked one.
+* A node's mask can instead be a depth key (`{source:'depth', enabled, invert, amount, near, far, softness}`) on the clip's depth analysis; it travels the same atlas (preview) and `masks` entry (`color-render.py`) under the id `depth:<node id>`. See section 5 of `superpowers/specs/2026-10-03-depth-map-design.md`.
 * Spatial node masks cannot be collapsed into a global RGB LUT. Use the staged float exporter for masked nodes and extend its complete-node blending; keep the unmasked optimized path.
 
 ## Ordered vertical slices

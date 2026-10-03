@@ -1,7 +1,9 @@
 import { useEffect, useState, useSyncExternalStore, type RefObject } from 'react';
-import { Crosshair, RotateCw } from 'lucide-react';
+import { Crosshair, Layers, RotateCw, Trash2 } from 'lucide-react';
 import { useEditorStore } from '../state/store';
 import type { Clip, Effect } from '../state/models';
+import type { DepthKeyBinding } from '../services/smartMask';
+import { Parameter } from '../workspaces/ColorTools';
 import { api } from '../services/api';
 import { effectDefinitions } from '../services/effects';
 import { depthPresets, type DepthCapabilities } from '../services/depth';
@@ -95,4 +97,24 @@ export function DepthFocusPicker({ canvas }: { canvas: RefObject<HTMLCanvasEleme
     useEditorStore.getState().updateEffect(picking.clipId, picking.effectId, { parameters: { focus: Math.round(focus) } });
     depthUi.setPicking(null);
   }}/>;
+}
+
+/** A grade node's depth key (Color page): analysis status, the key view, and Near / Far / Softness on the clip's
+ *  0 (nearest) to 100 (farthest) distance scale. `change` is the workspace's node patch, so a drag is one undo step. */
+export function DepthKeyInspector({ clip, nodeId, mask, change }: { clip: Clip; nodeId: string; mask: DepthKeyBinding; change: (mask: DepthKeyBinding | undefined) => void }) {
+  useDepthVersion();
+  const asset = useEditorStore(state => state.media.find(m => m.id === clip.mediaId)), state = depthState(clip.id);
+  const patch = (value: Partial<DepthKeyBinding>) => change({ ...mask, ...value });
+  const failed = state?.status === 'failed' || state?.status === 'cancelled';
+  const status = !state ? 'Starting depth analysis…' : failed ? state.error ?? 'Depth analysis failed.' : state.status === 'ready' ? 'Depth ready' : state.error ?? `Analyzing depth · ${Math.round(state.progress)} %`;
+  return <div className="depth-inspector depth-key-inspector" aria-label="Depth key settings">
+    <div className="smart-mask-heading"><Layers size={16}/><strong>Depth Key</strong><button aria-label="Remove depth key" title="Remove the depth key from this node" onClick={() => change(undefined)}><Trash2 size={12}/></button></div>
+    <p className={`depth-status ${state?.status ?? ''}`} role="status">{status}{failed && asset && <button className="depth-retry" onClick={() => retryDepth(clip, asset)}><RotateCw size={11}/>Retry</button>}</p>
+    <div className="smart-mask-inline"><label><input type="checkbox" checked={mask.enabled} onChange={e => patch({ enabled: e.target.checked })}/>Enable</label><label><input type="checkbox" checked={mask.invert} onChange={e => patch({ invert: e.target.checked })}/>Invert</label><label title="Draw the key in the viewer: white is graded. Viewer only."><input type="checkbox" aria-label="Show key" checked={depthUi.showKey(nodeId)} onChange={e => depthUi.setShowKey(nodeId, e.target.checked)}/>Show key</label></div>
+    <Parameter name="Near" value={mask.near} min={0} max={100} step={1} onChange={near => patch({ near, far: Math.max(mask.far, near) })}/>
+    <Parameter name="Far" value={mask.far} min={0} max={100} step={1} onChange={far => patch({ far, near: Math.min(mask.near, far) })}/>
+    <Parameter name="Softness" value={mask.softness} min={0} max={100} step={1} onChange={softness => patch({ softness })}/>
+    <Parameter name="Node influence %" value={mask.amount} min={0} max={100} step={1} onChange={amount => patch({ amount })}/>
+    <small className="depth-hint">Distance 0 is the nearest point of the shot, 100 the farthest.</small>
+  </div>;
 }
