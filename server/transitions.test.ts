@@ -273,6 +273,36 @@ test('transitions render real blended frames through FFmpeg', { timeout: 300000 
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test('an export range that starts or ends inside a transition keeps both sides of it', { timeout: 120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-transition-range-'));
+  try {
+    const red = path.join(dir, 'red.mp4'), blue = path.join(dir, 'blue.mp4'), outputPath = path.join(dir, 'out.mp4');
+    await ff(['-f', 'lavfi', '-i', 'color=c=red:s=320x180:r=24:d=6', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', red]);
+    await ff(['-f', 'lavfi', '-i', 'color=c=blue:s=320x180:r=24:d=6', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', blue]);
+    const track: Track = { id: 'base', timelineId: 'timeline', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
+    // A one-second dissolve centred on the cut at 2 s: window 1.5..2.5.
+    const request = (rangeIn: string, rangeOut: string): RenderRequest => ({
+      project: { id: 'project', resolution: '320 × 180', fps: 24 } as Project, timeline: { id: 'timeline', projectId: 'project', name: 'test', duration: 4 }, tracks: [track],
+      clips: [{ ...clip('a', 0, 2, 1), mediaId: 'red' }, { ...clip('b', 2, 2, 2), mediaId: 'blue', transition: 'Cross dissolve', properties: { ...defaultProperties, transitionDuration: 1, transitionAlign: 'center' } }],
+      nodes: [], outputPath, assets: [{ asset: { ...asset, id: 'red', hasAudio: false }, path: red }, { asset: { ...asset, id: 'blue', hasAudio: false }, path: blue }],
+      settings: { resolution: '320 × 180', fps: '24', codec: 'H.264', rangeIn, rangeOut, audio: 'Disabled' },
+    });
+    const pixel = async (seconds: number) => [...(await ff(['-ss', String(seconds), '-i', outputPath, '-frames:v', '1', '-vf', 'scale=1:1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'])).stdout];
+    await renderTimeline(request('0', '4'));
+    const whole = { late: await pixel(1.8), early: await pixel(2.125) };
+    const near = (a: number[], b: number[]) => a.every((value, i) => Math.abs(value - b[i]) <= 8);
+    // Ends before the cut: the incoming clip starts after the range but its half of the window is inside it. The
+    // dissolve keeps the whole export's timing rather than squeezing the full blend into the part in range.
+    await renderTimeline(request('1', '1.875'));
+    const late = await pixel(.8);
+    assert.ok(late[0] > 100 && late[2] > 25 && near(late, whole.late), `The range's last frames are mid-dissolve as in the whole export (${whole.late}), saw ${late}`);
+    // Starts after the cut: the outgoing clip ended before the range but still fades out inside it.
+    await renderTimeline(request('2.125', '3'));
+    const early = await pixel(0);
+    assert.ok(early[2] > 100 && early[0] > 25 && near(early, whole.early), `The range's first frames are mid-dissolve as in the whole export (${whole.early}), saw ${early}`);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test('the shared overlay pack is named and timed for use', async () => {
   const dir = path.join(process.env.FRAME_LINE_DATA ?? 'data', 'transitions');
   const manifest = await readFile(path.join(dir, 'manifest.json'), 'utf8').then(JSON.parse).catch(() => null);

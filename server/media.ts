@@ -782,14 +782,17 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   if (settings.quality && !['Automatic', 'High · 20 Mb/s', 'Maximum · 50 Mb/s', 'Visually lossless'].includes(settings.quality)) throw new Error('Unsupported export quality.');
   const tracks = request.tracks.filter(track => track.timelineId === timeline.id);
   const solo = tracks.some(track => track.solo && !track.muted);
-  // A clip ending on the range's first frame overlaps it by float noise only (3.6e-15 s, which FFmpeg's duration
-  // parser rejects); split exports cut on exactly those frames, so such a clip is not in the range at all.
-  const clips = request.clips.filter(clip => clip.timelineId === timeline.id && clip.projectId === project.id && !clip.disabled && clip.start < rangeOut - 1e-6 && clip.start + clip.duration > rangeIn + 1e-6)
-    .sort((a, b) => (tracks.find(track => track.id === a.trackId)?.number ?? 0) - (tracks.find(track => track.id === b.trackId)?.number ?? 0) || a.start - b.start);
   // Transitions borrow trim handles rather than moving clips, so they widen a clip's rendered
   // span without changing the edit. Windows outside the export range are dropped entirely.
   const transitions = framedTransitions(timelineTransitions(request.clips.filter(clip => clip.projectId === project.id), timeline.id, request.assets.map(entry => entry.asset)), rangeIn, fps)
     .filter(record => record.start < rangeOut && record.end > rangeIn);
+  // A clip ending on the range's first frame overlaps it by float noise only (3.6e-15 s, which FFmpeg's duration
+  // parser rejects); split exports cut on exactly those frames, so such a clip is not in the range at all.
+  const inRange = (start: number, end: number) => start < rangeOut - 1e-6 && end > rangeIn + 1e-6;
+  // A range ending (or starting) inside a window still holds the other side's half of it, though that clip's own body
+  // is outside: it takes part for its picture only (`audible` checks the body).
+  const clips = request.clips.filter(clip => clip.timelineId === timeline.id && clip.projectId === project.id && !clip.disabled && inRange(...Object.values(clipSpan(clip, transitions)) as [number, number]))
+    .sort((a, b) => (tracks.find(track => track.id === a.trackId)?.number ?? 0) - (tracks.find(track => track.id === b.trackId)?.number ?? 0) || a.start - b.start);
   // A name the registry does not know is reported rather than dropped: a silently missing
   // transition looks exactly like a bug in the edit.
   for (const clip of request.clips.filter(item => item.timelineId === timeline.id && !item.disabled)) {
@@ -804,7 +807,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       .map(clip => { const span = clipSpan(clip, transitions); return { from: Math.max(0, frame(span.start)), to: Math.min(total, frame(span.end)) }; })
       .filter(span => span.to > span.from);
     const passes = renderPasses(spans, transitions.map(record => ({ from: frame(record.start), to: frame(record.end) })), total, PASS_INPUTS, Math.round(PASS_SECONDS * fps));
-    const sounds = audio === 'Disabled' ? [] : clips.filter(clip => { const track = tracks.find(t => t.id === clip.trackId); return track && !track.muted && (!solo || track.solo); });
+    const sounds = audio === 'Disabled' ? [] : clips.filter(clip => { const track = tracks.find(t => t.id === clip.trackId); return track && !track.muted && (!solo || track.solo) && inRange(clip.start, clip.start + clip.duration); });
     if (passes.length > 1 || sounds.length > PASS_SOUNDS) return renderSplit(request, { passes, sounds, fps, total, duration });
   }
   // One pass holds every clip it renders; a split export keeps each pass far below this.
@@ -860,17 +863,21 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   const buildWindow = async (record: TransitionRecord) => {
     const definition = transitionDefinitions[record.name];
     const start = Math.max(0, record.start - rangeIn), end = Math.min(duration, record.end - rangeIn);
-    const span = end - start, frames = frameAt(end) - frameAt(start);
+    const frames = frameAt(end) - frameAt(start);
     if (!definition || frames < 1) return;
+    // A range that cuts into the window still blends over the whole window: the sides are padded with their edge
+    // frames out to it (`pre` and `post` frames), and only the frames in range are kept, so progress never compresses.
+    const whole = record.end - record.start, total = frameAt(record.end - rangeIn) - frameAt(record.start - rangeIn);
+    const pre = frameAt(start) - frameAt(record.start - rangeIn), post = total - frames - pre;
     const shutterAngle = definition.motion ? finite(record.params.shutterAngle ?? 180, `${record.name} shutter angle`, 0, 360) : 0;
     const travel = definition.travel?.({ width, height, params: record.params }) ?? 0;
-    const samples = definition.motion ? motionSamples(shutterAngle, travel, span, fps) : 1;
+    const samples = definition.motion ? motionSamples(shutterAngle, travel, whole, fps) : 1;
     // Whatever spacing is left between sub-frames is closed with a blur of about half that gap, so
     // a fast move reads as one smear instead of a stack of discrete ghosts.
-    const gap = definition.motion ? motionGap(shutterAngle, travel, span, fps) : 0;
+    const gap = definition.motion ? motionGap(shutterAngle, travel, whole, fps) : 0;
     const rate = fps * samples;
     const tag = `x${windowIndex++}`;
-    const plan = { duration: span, width, height, fps, params: record.params, samples, tag };
+    const plan = { duration: whole, width, height, fps, params: record.params, samples, tag };
     const sides = windowSides.get(record) ?? {};
     const pixels = 'yuva444p10le';
     // A missing side is transparent black: a head transition fades up out of nothing, and a tail
@@ -879,10 +886,11 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       // Counted in frames: the window is whole frames, and a float duration can land one frame short or long.
       // One spare frame per side: a blend whose float duration ends a hair past the last input frame never
       // emits that frame. The window is cut back to its exact frame count right after the blend.
-      if (!label) { filters.push(`color=c=black@0:s=${width}x${height}:r=${rate}:d=${(span + 2 / fps).toFixed(5)},trim=end_frame=${(frames + 1) * samples},format=${pixels},setsar=1[${name}]`); return; }
+      if (!label) { filters.push(`color=c=black@0:s=${width}x${height}:r=${rate}:d=${(whole + 2 / fps).toFixed(5)},trim=end_frame=${(total + 1) * samples},format=${pixels},setsar=1[${name}]`); return; }
       const chain = [`trim=start=${Math.max(0, start - .5 / fps).toFixed(6)}:end=${(end - .5 / fps).toFixed(6)}`, 'setpts=PTS-STARTPTS', `fps=${rate}`, 'setsar=1'];
+      if (pre || post) chain.push(`tpad=start_mode=clone:start=${pre * samples}:stop_mode=clone:stop=${post * samples}`);
       chain.push(...(definition.ffmpeg.side?.(role, plan) ?? []));
-      chain.push(`format=${pixels}`, `trim=end_frame=${frames * samples}`, 'setpts=PTS-STARTPTS', `tpad=stop_mode=clone:stop=${samples}`);
+      chain.push(`format=${pixels}`, `trim=end_frame=${total * samples}`, 'setpts=PTS-STARTPTS', `tpad=stop_mode=clone:stop=${samples}`);
       filters.push(`[${label}]${chain.join(',')}[${name}]`);
     };
     prepare(sides.out, 'out', `${tag}a`);
@@ -891,10 +899,10 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     if (!/^[a-z]+$/.test(xfade)) throw new Error(`${record.name}: unsupported transition mode.`);
     if (definition.overlay) {
       // The cut is a whole frame inside the window; switch half a frame early so float time never lands on it.
-      const cutAt = (frameAt(record.cut - rangeIn) - frameAt(start) - .5) / fps;
+      const cutAt = (frameAt(record.cut - rangeIn) - frameAt(record.start - rangeIn) - .5) / fps;
       filters.push(`[${tag}a][${tag}b]blend=all_expr='if(lt(T,${cutAt.toFixed(6)}),A,B)':shortest=1[${tag}x]`);
-    } else filters.push(`[${tag}a][${tag}b]xfade=transition=${xfade}:duration=${span.toFixed(6)}:offset=0[${tag}x]`);
-    filters.push(`[${tag}x]trim=end_frame=${frames * samples}[${tag}t]`);
+    } else filters.push(`[${tag}a][${tag}b]xfade=transition=${xfade}:duration=${whole.toFixed(6)}:offset=0[${tag}x]`);
+    filters.push(`[${tag}x]trim=end_frame=${total * samples}[${tag}t]`);
     let label = `${tag}t`;
 
     // The shutter has to close over the *combined* frame. A push or a slide is positioned by
@@ -912,11 +920,10 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       // Fit the leak to the window rather than cutting it short; these are one-shot bursts.
       const sourceRange = leakRange(record.params, probed.duration);
       const stretch = (record.duration / sourceRange.duration).toFixed(6);
-      const skip = Math.max(0, rangeIn - record.start);
       const opacity = (finite(record.params.leakOpacity ?? 100, `${record.name} opacity`, 0, 100) / 100).toFixed(3);
       const mode = ({ Screen: 'screen', Add: 'addition', Overlay: 'overlay' } as Record<string, string>)[String(record.params.blend ?? 'Screen')] ?? 'screen';
       const zoom = finite(record.params.leakZoom ?? 100, 'Overlay zoom', 100, 300) / 100;
-      filters.push(`[${leakIndex}:v:0]trim=start=${sourceRange.start.toFixed(6)}:end=${sourceRange.end.toFixed(6)},setpts=(PTS-STARTPTS)*${stretch},fps=${fps},scale=${Math.ceil(width * zoom / 2) * 2}:${Math.ceil(height * zoom / 2) * 2}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1,format=gbrapf32le,trim=start=${skip.toFixed(5)}:duration=${span.toFixed(5)},setpts=PTS-STARTPTS[${tag}l]`);
+      filters.push(`[${leakIndex}:v:0]trim=start=${sourceRange.start.toFixed(6)}:end=${sourceRange.end.toFixed(6)},setpts=(PTS-STARTPTS)*${stretch},fps=${fps},scale=${Math.ceil(width * zoom / 2) * 2}:${Math.ceil(height * zoom / 2) * 2}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1,format=gbrapf32le,trim=duration=${whole.toFixed(5)},setpts=PTS-STARTPTS[${tag}l]`);
       // Screen/Add/Overlay are RGB operations; on YUV they tint the chroma planes. Alpha (c3) stays the picture's.
       // Float: FFmpeg 8.1's 16-bit screen and overlay overflow on dark pictures (see bloomFilters).
       const leak = [0, 1, 2].map(c => `c${c}_mode=${mode}:c${c}_opacity=${opacity}`).join(':');
@@ -930,7 +937,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       filters.push(fragment.replaceAll('[IN]', `[${label}]`).replaceAll('[OUT]', `[${tag}f]`));
       if (fragment.includes('[OUT]')) label = `${tag}f`;
     }
-    filters.push(`[${label}]setpts=PTS-STARTPTS+round(${start}/TB),format=${pixels},setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[${tag}s]`);
+    filters.push(`[${label}]${pre || post ? `trim=start_frame=${pre}:end_frame=${pre + frames},` : ''}setpts=PTS-STARTPTS+round(${start}/TB),format=${pixels},setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[${tag}s]`);
     filters.push(`[${currentVideo}][${tag}s]${overlayPlace(0, 0)}:enable='${onScreen(start, end)}'[${tag}v]`);
     currentVideo = `${tag}v`;
   };
@@ -968,7 +975,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     const property = (key: string, fallback: number, min: number, max: number) => finite(p[key] ?? fallback, `${clip.name} ${key}`, min, max);
     const visual = !soundOnly && track.kind === 'video' && source.asset.kind !== 'audio' && !track.hidden;
     const explicitAudio = clips.some(other => other.id !== clip.id && tracks.find(t => t.id === other.trackId)?.kind === 'audio' && other.mediaId === clip.mediaId && other.start === clip.start && other.sourceIn === clip.sourceIn && other.duration === clip.duration);
-    const audible = audio !== 'Disabled' && source.asset.hasAudio && !p.freeze && !track.muted && (!solo || track.solo) && !(track.kind === 'video' && (clip.properties.audioDetached || explicitAudio));
+    const audible = audio !== 'Disabled' && source.asset.hasAudio && !p.freeze && !track.muted && (!solo || track.solo) && !(track.kind === 'video' && (clip.properties.audioDetached || explicitAudio)) && inRange(clip.start, clip.start + clip.duration);
     if (!visual && !audible || request.only && !request.only.has(clip.id)) continue;
     const blend = String(p.blendMode ?? 'Normal');
     if (!blendModeOf(blend)) throw new Error(`${clip.name}: ${blend} blending is not available. Choose another blend mode.`);
