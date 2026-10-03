@@ -100,15 +100,16 @@ def upsample_depth(I, depth, near, far, warp=None):
         taps = sample(guide[None], cx[None].expand(h + 4, w + 4), cy[:, None].expand(h + 4, w + 4))[0]
         bx, by = qx.floor(), qy.floor()
         num, den = torch.zeros_like(guide), torch.zeros_like(guide)
+        # A tap is clamped to the depth texture first; its weight and guide sample use the clamped texel, as the preview does.
         for j in (-1, 0, 1, 2):
-            ty = by + j
+            ty = (by + j).clamp(0, h - 1)
             wy = torch.exp(-(qy - ty) ** 2 / 2)[:, None]
-            guide_rows, dist_rows = taps.index_select(0, (ty + 2).long()), dist.index_select(0, ty.clamp(0, h - 1).long())
+            guide_rows, dist_rows = taps.index_select(0, (ty + 2).long()), dist.index_select(0, ty.long())
             for i in (-1, 0, 1, 2):
-                tx = bx + i
+                tx = (bx + i).clamp(0, w - 1)
                 weight = torch.exp((guide - guide_rows.index_select(1, (tx + 2).long())).square_().mul_(range_weight))
                 weight.mul_(wy).mul_(torch.exp(-(qx - tx) ** 2 / 2)[None])
-                num.addcmul_(weight, dist_rows.index_select(1, tx.clamp(0, w - 1).long()))
+                num.addcmul_(weight, dist_rows.index_select(1, tx.long()))
                 den.add_(weight)
         D = num / den.clamp(min=1e-30)
         weak = den < 1e-6
@@ -129,12 +130,12 @@ def upsample_depth(I, depth, near, far, warp=None):
     bx, by = qx.floor().clamp(-1, w - 1), qy.floor().clamp(-1, h - 1)
     num, den = torch.zeros_like(guide), torch.zeros_like(guide)
     for j in (-1, 0, 1, 2):
-        sy = by + j
+        sy = (by + j).clamp(0, h - 1)
         for i in (-1, 0, 1, 2):
-            sx = bx + i
+            sx = (bx + i).clamp(0, w - 1)
             weight = torch.exp(-((qx - sx) ** 2 + (qy - sy) ** 2) / 2)
             weight = weight * torch.exp((guide - taps[((sy + 2) * (w + 4) + sx + 2).long()]) ** 2 * range_weight)
-            num += weight * dist[(sy.clamp(0, h - 1) * w + sx.clamp(0, w - 1)).long()]
+            num += weight * dist[(sy * w + sx).long()]
             den += weight
     D = num / den.clamp(min=1e-30)
     weak = den < 1e-6
@@ -218,7 +219,7 @@ def glow(L3, D, p):
     Wq = min(W, 480)
     Hq = round(H * Wq / W)
     sigma = p["glowRadius"] / 100 * .04 * W * (Wq / W)
-    radius = max(1, math.ceil(3 * sigma))
+    radius = min(63, math.floor(3 * sigma))  # Taps |k| <= 3 sigma, at most 63 a side: the preview's limit.
     kernel = torch.exp(-torch.arange(-radius, radius + 1, device=L3.device, dtype=torch.float32) ** 2 / (2 * sigma * sigma))
     kernel = (kernel / kernel.sum()).repeat(3, 1, 1)
     g = area(G, Hq, Wq)[None]
