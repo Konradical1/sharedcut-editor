@@ -56,23 +56,23 @@ export function maskAnalysis(clip: Clip, asset: MediaAsset) {
   const text = cubeText(makeCube(logView(input.profile, input.gamut), 33));
   return { text, identity: hash([text, clip.properties.dataLevels || 'auto', clip.properties.yuvMatrix || asset.colorMatrix || 'auto']) };
 }
-function inputMatrix(clip: Clip, asset: MediaAsset) {
+export function inputMatrix(clip: Clip, asset: MediaAsset) {
   const value = String(clip.properties.yuvMatrix || asset.colorMatrix || 'auto');
   return value.startsWith('bt2020') ? 'bt2020' : ['bt470bg', 'smpte170m'].includes(value) ? 'bt601' : ['bt709', 'bt601'].includes(value) ? value : 'auto';
 }
 function json(path: string) { return JSON.parse(readFileSync(path, 'utf8')); }
-function atomicJson(path: string, value: unknown) { const temporary = `${path}.${randomUUID()}.tmp`; writeFileSync(temporary, JSON.stringify(value), { mode: 0o600 }); renameWithRetrySync(temporary, path); }
+export function atomicJson(path: string, value: unknown) { const temporary = `${path}.${randomUUID()}.tmp`; writeFileSync(temporary, JSON.stringify(value), { mode: 0o600 }); renameWithRetrySync(temporary, path); }
 // Node retries EBUSY/EPERM itself here, which Windows raises while a scanner still holds a file open.
 const remove = (path: string) => rmSync(path, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 const DISPLAY_WIDTH = 1920, CHUNK = 24, NATIVE_CHUNK = 8;
 /** Moves a finished analysis into place. A folder watcher (the Vite dev server did this to data/, as can
  *  OneDrive or backup tools) keeps Windows from renaming a directory for as long as it watches, so after a
- *  few seconds copy instead. binding.json goes last: restore only trusts a folder that has it. */
-export async function commitFolder(from: string, to: string) {
+ *  few seconds copy instead. `last` (binding.json for masks) goes last: restore only trusts a folder that has it. */
+export async function commitFolder(from: string, to: string, last = 'binding.json') {
   try { await renameWithRetry(from, to, 6); return; }
   catch (error) { if (!locked(error)) throw error; }
-  cpSync(from, to, { recursive: true, filter: source => basename(source) !== 'binding.json' });
-  copyFileSync(join(from, 'binding.json'), join(to, 'binding.json'));
+  cpSync(from, to, { recursive: true, filter: source => basename(source) !== last });
+  copyFileSync(join(from, last), join(to, last));
 }
 function regularFile(path: string) { try { const file = lstatSync(path); return file.isFile() && file.size > 0; } catch { return false; } }
 function alphaHeader(path: string, width: number, height: number) {

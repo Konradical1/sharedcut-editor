@@ -36,6 +36,7 @@ import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock 
 import { exportResolveTimeline, importResolve } from './resolve.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
+import { depthCapabilities, depthService } from './depth.ts';
 import { validateSmartMask, validateSmartMaskBindings } from '../src/services/smartMask.ts';
 import { motionTrackerCapabilities, motionTrackerService } from './motionTracker.ts';
 import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } from './colorAssistant.ts';
@@ -260,6 +261,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const flowDirectory = join(dataDir, 'optical-flow');
   const masks = smartMaskService(join(dataDir, 'smart-masks'));
   const motionTrackers = motionTrackerService(join(dataDir, 'motion-trackers'));
+  const depth = depthService(join(dataDir, 'depth'), { sourceTimes: masks.sourceTimes });
   const colorAssistant = colorAssistantService(dataDir);
   const flowJobs = new Map<string, FlowPreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
   let flowQueue = Promise.resolve();
@@ -1325,6 +1327,28 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             streamFile(req, res, masks.file(projectId, key, kind as 'manifest' | 'frames' | 'preview' | 'source', frame === undefined ? undefined : Number(frame)), undefined, undefined, !currentClip); return;
           }
         }
+        if (path === '/api/depth/capabilities' && method === 'GET') { const { workerIdentity, ...capabilities } = await depthCapabilities(); send(res, 200, capabilities); return; }
+        if (path === '/api/depth' && method === 'POST') {
+          const body = await jsonBody(req), clip = state.clips.find(item => item.id === textField(body.clipId, 160, true) && (body.projectId === undefined || item.projectId === body.projectId)) ?? fail(404, 'Clip not found.');
+          requireProject(clip.projectId, userId, true);
+          const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId);
+          if (!asset || !['video', 'image'].includes(asset.kind)) fail(400, 'Depth works on video and image clips.');
+          if (!existsSync(originalPath(asset!.id))) fail(409, 'Depth reads the original media, which is not on this server.');
+          // The span the clip actually reads, speed ramps, reverse, freeze and transition handles included.
+          const records = timelineTransitions(state.clips.filter(c => c.projectId === clip.projectId), clip.timelineId, state.media);
+          const span = clipSpan(clip, records), geometry = extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start));
+          let range = { from: 0, to: 1 };
+          if (asset!.kind === 'video') { try { range = stabilizeRange(geometry, asset!.fps, asset!.duration); } catch (error) { fail(400, (error as Error).message); } }
+          const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: originalPath(asset!.id), ...range });
+          send(res, run.status === 'ready' ? 200 : 202, run); return;
+        }
+        const depthRoute = /^\/api\/depth\/([a-f0-9]{64})(?:\/preview\/(\d+)\.mp4)?$/.exec(path);
+        if (depthRoute) {
+          const projectId = textField(url.searchParams.get('projectId'), 160, true); requireProject(projectId, userId, method === 'DELETE');
+          if (!depthRoute[2] && method === 'GET') { send(res, 200, depth.get(projectId, depthRoute[1], Number(url.searchParams.get('after') ?? 0))); return; }
+          if (!depthRoute[2] && method === 'DELETE') { depth.cancel(projectId, depthRoute[1]); send(res, 200, { ok: true }); return; }
+          if (depthRoute[2] && ['GET', 'HEAD'].includes(method)) { streamFile(req, res, depth.preview(projectId, depthRoute[1], Number(depthRoute[2])), 'video/mp4', undefined, true); return; }
+        }
         if (path === '/api/optical-flow/capabilities' && method === 'GET') {
           try { await flowWorker(); send(res,200,{available:true,engine:flowEngineLabel()}); }
           catch(error) { send(res,200,{available:false,error:(error as Error).message}); } return;
@@ -1657,7 +1681,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   // What changed only in memory (render progress, a held-back progress value) is saved on the way out,
   // first thing, in case Windows ends the process before the slower shutdown steps finish.
   const saveBeforeExit = () => { try { flushProgress(); if (store.dirty(state)) persist(); } catch (error) { console.error('Could not save the workspace on shutdown:', error); } };
-  return { server, dataDir, async close() { closed = true; saveBeforeExit(); await masks.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearInterval(uploadSweep); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
+  return { server, dataDir, async close() { closed = true; saveBeforeExit(); await masks.close(); await depth.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearInterval(uploadSweep); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
