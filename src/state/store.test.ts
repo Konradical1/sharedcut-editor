@@ -7,6 +7,7 @@ import { evaluateClip } from '../services/animation.ts';
 import type { Clip, Keyframe } from './models.ts';
 import { neutralBalance, neutralLook, type LookOption } from '../services/colorAssistant.ts';
 import { forwardRoom } from '../services/selection.ts';
+import { depthUi, rememberDepth } from '../services/depthPreview.ts';
 import { LOCK_TTL, mediaService, projectService, renderService, STORAGE_KEY } from '../services/index.ts';
 
 const baseline = store.getState();
@@ -494,6 +495,24 @@ test('Depth starts at full Mix, a clip takes one, and a preset-sized change is o
   state().undo();
   assert.equal(clip().effects.find(e => e.id === depth[0].id)!.parameters, undefined);
   state().updateEffect('c3', depth[0].id, null);
+});
+
+test('Depth: the map shows only where it was added, and first Lens blur takes Focus from the frame centre in the same undo step', () => {
+  state().addEffect('c3', 'Depth');
+  const effect = () => clip().effects.find(e => e.name === 'Depth')!, id = effect().id;
+  assert.equal(depthUi.showMap(effect()), true, 'on in the browser that added it');
+  assert.equal(depthUi.showMap({ id: 'a collaborator added this one' }), false, 'off for an effect added elsewhere');
+  // The frame on screen: near (white) at the centre.
+  rememberDepth('c3', { pixels: { data: new Uint8Array([25, 230, 25, 25, 230, 25]), width: 3, height: 2, key: 'x' }, near: .9, far: .1 });
+  state().updateEffect('c3', id, { parameters: { blur: 40 } });
+  assert.equal(effect().parameters!.focus, 0, 'Focus from the centre depth');
+  state().undo();
+  assert.equal(effect().parameters?.focus, undefined, 'one undo removes both');
+  state().redo();
+  assert.equal(effect().parameters!.focus, 0);
+  state().updateEffect('c3', id, { parameters: { blur: 0 } }); state().updateEffect('c3', id, { parameters: { blur: 60 } });
+  assert.equal(effect().parameters!.focus, 0, 'a Focus already set is kept');
+  state().updateEffect('c3', id, null);
 });
 
 test('a color-wheel gesture undoes together without replacing another parameter',()=>{

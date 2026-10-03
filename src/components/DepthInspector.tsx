@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useSyncExternalStore, type RefObject } from 'react';
+import { useEffect, useState, useSyncExternalStore, type RefObject } from 'react';
 import { Crosshair, RotateCw } from 'lucide-react';
 import { useEditorStore } from '../state/store';
 import type { Clip, Effect } from '../state/models';
@@ -27,14 +27,8 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
   // A failed check (a dropped connection) says nothing about the server: the run's own status shows what happens.
   useEffect(() => { let active = true; void api<DepthCapabilities>('/depth/capabilities').then(value => { if (active) setCapability(value); }).catch(() => {}); return () => { active = false; }; }, []);
   const state = depthState(clip.id), focusPath = `effects.${effect.id}.parameters.focus`, ready = state?.run && depthClipReady(clip, state.run);
-  // Focus nobody chose yet follows the frame centre when Lens blur first turns on (or a preset turns it on).
+  // Focus nobody chose yet follows the frame centre when a preset turns Lens blur on (the store does it for the slider).
   const centreFocus = () => effect.parameters?.focus === undefined && !clip.keyframes?.[focusPath] ? depthAtSource(clip.id, .5, .5) : undefined;
-  const blur = Number(effect.parameters?.blur ?? 0), previousBlur = useRef(blur);
-  useEffect(() => {
-    const was = previousBlur.current; previousBlur.current = blur;
-    const focus = was === 0 && blur > 0 ? centreFocus() : undefined;
-    if (focus !== undefined) s().updateEffect(clip.id, effect.id, { parameters: { focus: Math.round(focus) } });
-  }, [blur]);
   const touched = () => depthUi.setShowMap(effect.id, false);
   const applyPreset = (values: Record<string, number>) => {
     const next: Record<string, number> = Object.fromEntries(effectDefinitions.Depth.parameters.filter(p => p.key !== 'amount' && p.key !== 'focus').map(p => [p.key, p.initial]));

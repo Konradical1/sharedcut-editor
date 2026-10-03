@@ -166,8 +166,9 @@ const ui = { showMap: new Map<string, boolean>(), picking: null as null | { clip
 export const depthUi = {
   get picking() { return ui.picking; },
   setPicking(value: typeof ui.picking) { ui.picking = value; version++; for (const listener of listeners) listener(); },
-  /** On by default while the effect is untouched (you watch the map fill in); off once a preset or section is used. */
-  showMap(effect: Effect) { return ui.showMap.get(effect.id) ?? !Object.keys(effect.parameters ?? {}).length; },
+  /** Off unless this browser turned it on: adding Depth here does (you watch the map fill in), a preset or section
+   *  turns it off. Never from the shared effect, so a collaborator's viewer shows the picture. */
+  showMap(effect: Pick<Effect, 'id'>) { return ui.showMap.get(effect.id) ?? false; },
   setShowMap(effectId: string, value: boolean) { if (ui.showMap.get(effectId) === value) return; ui.showMap.set(effectId, value); version++; for (const listener of listeners) listener(); },
 };
 
@@ -175,6 +176,8 @@ export type DepthPixels = { data: Uint8Array; width: number; height: number; key
 /** The depth each viewer last drew per clip, with a map from canvas pixels to the source box (0..1): the focus picker. */
 const picks = new Map<string, { pixels: DepthPixels; near: number; far: number; toSource?: (x: number, y: number) => [number, number] | undefined }>();
 export function rememberDepth(clipId: string, pick: typeof picks extends Map<string, infer T> ? T : never) { picks.set(clipId, pick); }
+/** Called as a viewer frame starts: only the depth drawn in the frame on screen may be picked. */
+export function forgetDepth() { picks.clear(); }
 /** Distance 0..100 at a point of the source box (u, v in 0..1), from the frame shown last. */
 export function depthAtSource(clipId: string, u: number, v: number) {
   const pick = picks.get(clipId);

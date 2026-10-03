@@ -1,7 +1,7 @@
 import { createTimelinePreview } from './timelinePreview.ts';
 import { createSmartMaskPreview, activeSmartMasks, fittedSmartMask, lumaAlphaFilter, SmartMaskPending, unanalyzedSmartMask, type SmartMaskPixels } from './smartMaskPreview.ts';
 import { createMotionPreview } from './motionPreview.ts';
-import { createDepthPreview, depthUi, rememberDepth, subscribeDepth } from './depthPreview.ts';
+import { createDepthPreview, depthUi, forgetDepth, rememberDepth, subscribeDepth } from './depthPreview.ts';
 import { createDepthFx, depthFxKeys, depthTapBudget, type DepthFxParams } from './depthFx.ts';
 import { blendModeOf } from './blendModes.ts';
 import { transformMotion, drawMotionPose, motionArtwork } from './motionBlur.ts';
@@ -480,7 +480,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     const renderStarted=performance.now();
     const dependencies = [state.timelineId, state.timelines, state.playhead, state.playing, state.clips, state.tracks, state.media, state.leaks, state.nodes, state.settings, project, options.original, options.quality, options.volume, options.compare, options.fontsRevision, state.focus?.clipId, state.focus?.time];
     if (!dirty && !stalled && !retryDue() && dependencies.every((value, i) => value === previous[i])) return;
-    previous = dependencies; dirty = false; renderSlot = slot;
+    previous = dependencies; dirty = false; renderSlot = slot; forgetDepth();
 
     const [projectWidth, projectHeight] = projectSize(project?.resolution ?? '1920 × 1080');
     if (retained !== state.clips) {

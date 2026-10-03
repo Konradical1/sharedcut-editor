@@ -15,6 +15,7 @@ import { bins as fixedBins, createDemoProject, defaultProperties, projects, user
 import { authenticationService, collaborationService, colorService, createId, LOCK_TTL, lockConflict, mediaService, projectService, renderService } from '../services/index.ts';
 import type { PersistedState } from '../services/index.ts';
 import { acceptsEffect, effectDefinitions, initialAmount } from '../services/effects.ts';
+import { depthAtSource, depthUi } from '../services/depthPreview.ts';
 import { transitionPresetId, type TransitionPreset, timelineTransitions, trimLeak, leakRange, bestAlign, defaultTransition, leakAudioTrack, leakMediaId, maximumDuration, neighbourAt, transitionAlign, transitionCurve, transitionDefinitions, transitionDuration, transitionFields, transitionName, transitionParams, transitionProperty, type TransitionAlign, type TransitionParams, type TransitionSide } from '../services/transitions.ts';
 import { advancePlayhead, playheadMotion, type PlayheadMotion } from '../services/presence.ts';
 import { closedShift, commonGaps, companionAudioTrack, markersOf, trackGap, trimRoom, uncoveredParts } from '../services/timeline.ts';
@@ -1352,7 +1353,10 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if(name==='Smart Mask'){get().addSmartMask(clipId);return;}
       const clip = editableClip(clipId, 'effects');
       if (!clip || !acceptsEffect(clip, get().media.find(m => m.id === clip.mediaId)?.kind, name)) return;
-      commit('EffectAdded', clipId, `added ${name} to ${clip.name}`, [{ collection: 'clips', id: clipId, value: { effects: [...clip.effects, { id: createId('effect'), name, enabled: true, amount: initialAmount(name) }] } }]);
+      const effect = { id: createId('effect'), name, enabled: true, amount: initialAmount(name) };
+      commit('EffectAdded', clipId, `added ${name} to ${clip.name}`, [{ collection: 'clips', id: clipId, value: { effects: [...clip.effects, effect] } }]);
+      // Only the browser that adds Depth shows its map while it fills in; collaborators keep the picture.
+      if (name === 'Depth') depthUi.setShowMap(effect.id, true);
       set({ selectedClipId: clipId, selectedTextIds: [], textSelection: null, sidePanel: 'inspector', inspectorTab: 'Effects' });
     },
     updateEffect(clipId, effectId, patch, gesture) {
@@ -1364,6 +1368,12 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         const definition = effectDefinitions[effect.name]?.parameters.find(p => p.key === key && key !== 'amount');
         if (!definition || !Number.isFinite(value)) return;
         parameters[key] = clamp(value, definition.min, definition.max);
+      }
+      // Focus nobody chose yet follows the frame centre when Lens blur first turns on, in the same undo step. Here and
+      // not in a panel, so a collaborator's edit or a redo never commits it a second time.
+      if (effect.name === 'Depth' && parameters.blur > 0 && !(Number(effect.parameters?.blur ?? 0) > 0) && effect.parameters?.focus === undefined && parameters.focus === undefined && !clip.keyframes?.[`effects.${effectId}.parameters.focus`]) {
+        const focus = depthAtSource(clipId, .5, .5);
+        if (focus !== undefined) parameters.focus = Math.round(focus);
       }
       const effects = patch === null ? clip.effects.filter(e => e.id !== effectId) : clip.effects.map(e => e.id === effectId ? { ...e, ...(typeof patch.enabled === 'boolean' ? { enabled: patch.enabled } : {}), ...(patch.amount !== undefined ? { amount: clamp(patch.amount, 0, 100) } : {}), ...(patch.parameters ? { parameters: { ...e.parameters, ...parameters } } : {}) } : e);
       const keyframes={...clip.keyframes};
