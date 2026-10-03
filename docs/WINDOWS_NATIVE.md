@@ -92,6 +92,17 @@ FRAME_LINE_FLOW_PYTHON. FRAME_LINE_CAPTION_DEVICE accepts auto (default), cpu,
 or cuda (GPU required, useful for tests). The default caption model is large-v3;
 FRAME_LINE_WHISPER_MODEL can select another faster-whisper model.
 
+## Depth
+
+`npm run setup:depth` installs the depth model into `.venv-mask` (CUDA torch from `setup:masks`) and verifies its
+weights under `artifacts\depth`. Analysis and export bakes run on the GPU; a CUDA run or bake first frees an idle Smart
+Mask preview worker, and a bake retries once on out-of-memory. Variables: `FRAME_LINE_DEPTH_PYTHON`,
+`FRAME_LINE_DEPTH_WEIGHTS`, `FRAME_LINE_DEPTH_DEVICE`, `FRAME_LINE_DEPTH_PRECISION`, `FRAME_LINE_DEPTH_CACHE_GB` (3),
+`FRAME_LINE_DEPTH_MIN_FREE_GB` (2, never under the 5 GB reserve), `FRAME_LINE_DEPTH_TAPS` and
+`FRAME_LINE_DEPTH_ENGINE=synthetic` for tests. Routes are under `/api/depth` (see the README). Export needs
+constant-frame-rate sources up to 4096 wide and refuses optical flow; a depth key also refuses Stabilize.
+Depth-assisted Smart Mask cleanup (cut SAM leaks at depth jumps, fill holes at the subject's depth) was tried on the soccer and hurdles clips and rejected: at every threshold it cut off hands, feet and arms, while leaks onto players at the same distance stayed and hole filling made them solid.
+
 ## Verification
 
 ```powershell
@@ -103,6 +114,8 @@ npm run test:browser
 npm run test:captions
 npm run test:optical-flow
 npm run test:depth
+npm run test:depth:browser
+npm run test:depth:parity
 npm run test:depth:inference
 npm run test:optical-flow:browser
 npm run test:masks

@@ -458,6 +458,8 @@ Ranked by value:
      that are consistent in depth.
    - Measure on the soccer clip against hand-labelled frames: leak pixels and IoU.
    - Ship it only if it measurably helps.
+   - **Result (2026-10-03): rejected.** On the soccer and hurdles clips it cut off hands, feet and arms at every
+     threshold, while leaks onto players at the same distance stayed and hole filling made them solid.
 
 ## 6. Robustness checklist
 
