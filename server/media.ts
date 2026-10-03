@@ -1029,7 +1029,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
           if(shift)document={...document,range:{start:document.range.start-shift,end:document.range.end-shift}};
           return {document,sourceTimes:times,files:Object.fromEntries(manifest.frames.map(f=>[String(f.index),path.join(artifact.directory,f.file)])),...(clip.effects.some(e=>e.maskId===document.id&&effectEnabled(clip,e)&&e.amount>0)?{output:path.join(lutDir,`${index}-${document.id}.mkv`)}:{})};
         });
-        const times=masks[0]?.sourceTimes,renderSeek=times?.filter(t=>t<=seek+1e-7).at(-1)??seek;
+        // The Depth bake (decoder) seeks half a frame early and wants the frame at or after it, as the plain -ss path gives.
+        const times=masks[0]?.sourceTimes,renderSeek=(request.decoder?times?.find(t=>t>=seek-1e-7):times?.filter(t=>t<=seek+1e-7).at(-1))??seek;
         const frameTimes=times?.filter(t=>t>=renderSeek-1e-7&&t<renderSeek+decoded-1e-7);
         const hdr=hdrTransform(source.asset.colorTransfer),camera=clip.properties.colorPipeline!=='nodes-v2'?colorTransform(clip,source.asset,[],base):undefined;
         const inputCube=camera||hdr?makeCube(rgb=>{const sdr=hdr?hdr(rgb):rgb;return camera?camera(sdr):sdr;},65):undefined;

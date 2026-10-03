@@ -1,17 +1,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { renderTimeline, run, type RenderRequest } from './media.ts';
 import { depthService } from './depth.ts';
-import { smartMaskService } from './smartMask.ts';
+import { maskAnalysis, maskSourceFingerprint, smartMaskService } from './smartMask.ts';
 import { venvPython } from './platform.ts';
 import { stabilizePython } from './stabilize.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
+import { createSmartMask, smartMaskSignature, type SmartMaskManifest } from '../src/services/smartMask.ts';
 
 // The model-free engine: depth is the source's luma, so bright is near and dark is far.
 process.env.FRAME_LINE_DEPTH_ENGINE = 'synthetic';
@@ -99,6 +100,40 @@ test('a keyframed rack focus changes the focus frame by frame', { timeout: 300_0
     const early = await luma(request.outputPath, .2), late = await luma(request.outputPath, 1.8), a = boundary(early), b = boundary(late);
     assert.ok(detail(early, 20, a - 6) > 12 && detail(early, a + 4, Math.min(W, a + 60)) < 4, 'focused near at the start');
     assert.ok(detail(late, 20, b - 6) < 6 && detail(late, b + 4, W) > 12, 'focused far at the end');
+  } finally { await f.close(); }
+});
+
+/** A full-alpha Smart Mask on every source frame, analysed for `clip` (which must carry a Smart Mask effect on `subject`). */
+function fullMatte(f: ReturnType<typeof fixture>, clip: Clip) {
+  const key = 'e'.repeat(64), cache = path.join(f.dir, 'masks', key), n = 75;
+  mkdirSync(path.join(cache, 'frames'), { recursive: true });
+  writeFileSync(path.join(f.dir, 'alpha.raw'), Buffer.alloc(W * H * 2 * n, 0xff));
+  execFileSync(ffmpeg, ['-v', 'error', '-y', '-f', 'rawvideo', '-pixel_format', 'gray16le', '-video_size', `${W}x${H}`, '-framerate', String(FPS), '-i', path.join(f.dir, 'alpha.raw'), '-start_number', '0', path.join(cache, 'frames', '%d.png')]);
+  const mask = createSmartMask(clip, f.asset, 'subject');
+  mask.prompts = [{ id: 'point', time: 1, kind: 'include', points: [{ x: .5, y: .5 }], radius: .01 }]; mask.result = { key, signature: smartMaskSignature(mask) }; clip.smartMasks = [mask];
+  const manifest: SmartMaskManifest = { version: 1, key, signature: mask.result.signature, projectId: 'project', mediaId: 'asset', sourceFingerprint: maskSourceFingerprint(f.source), engine: 'fixture', modelRevision: 'fixture', quality: 'final', width: W, height: H, sourceTimes: Array.from({ length: n }, (_, i) => i / FPS), range: mask.range, alpha: 'gray16',
+    frames: Array.from({ length: n }, (_, i) => ({ index: i, time: i / FPS, file: `frames/${i}.png` })).filter(frame => frame.time >= mask.range.start - 1e-6 && frame.time < mask.range.end - 1e-6) };
+  mkdirSync(path.join(cache, 'source'));
+  for (const frame of manifest.frames) writeFileSync(path.join(cache, 'source', `${frame.index}.jpg`), 'Source image fixture');
+  writeFileSync(path.join(cache, 'manifest.json'), JSON.stringify(manifest));
+  writeFileSync(path.join(cache, 'binding.json'), JSON.stringify({ projectId: 'project', clipId: clip.id, maskId: 'subject', signature: mask.result.signature, sourceFingerprint: maskSourceFingerprint(f.source), analysisIdentity: maskAnalysis(clip, f.asset).identity, workerIdentity: 'fixture' }));
+}
+
+// A matte sends the pre-depth pass down the exact-colour path, which looked up the frame before the half-frame-early
+// seek: the bake ran one source frame early against its depth, and its first frame (before the matte) was black.
+test('a Smart Mask above Depth keeps the picture and its depth on the same frame', { timeout: 300_000, skip: (!torch || !existsSync(process.env.FRAME_LINE_COLOR_PYTHON || venvPython('.venv-color'))) && 'the depth or colour worker is not installed' }, async () => {
+  const f = fixture('mask');
+  try {
+    const clip: Clip = { ...f.clip, sourceIn: .4, duration: 1.2, effects: [{ id: 'cut', name: 'Smart Mask', enabled: true, amount: 100, maskId: 'subject' }, ...f.clip.effects] };
+    fullMatte(f, clip);
+    const request = f.request([clip], 1.2);
+    await renderTimeline(request);
+    for (const time of [0, .2, .6, 1]) {
+      const at = await luma(request.outputPath, time), cut = boundary(at), expected = 60 + 4 * Math.round((.4 + time) * FPS);
+      assert.ok(Math.abs(cut - expected) <= 1, `at ${time} s the picture is source frame ${Math.round((.4 + time) * FPS)} (edge at ${expected}): ${cut}`);
+      const near = detail(at, cut - 12, cut - 2), far = detail(at, cut + 3, cut + 13);
+      assert.ok(near > 12 && far < 4, `at ${time} s the depth edge sits on the picture's (${cut}): near detail ${near}, far detail ${far}`);
+    }
   } finally { await f.close(); }
 });
 
