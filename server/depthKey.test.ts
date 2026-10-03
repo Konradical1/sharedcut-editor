@@ -79,3 +79,19 @@ test('a depth-keyed In/Out export joins the editor\'s depth run, not a smaller s
     assert.deepEqual(used, [editor.run.key], 'the export keys with the run the editor previews');
   } finally { await Promise.all([depth.close(), masks.close()]); rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('a depth key does not move a clip trimmed between source frames', { timeout: 300_000, skip: !existsSync(colorPython) && 'the colour worker (npm run setup:color) is not installed' }, async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'frameline-depth-key-seek-')), source = path.join(dir, 'count.mp4');
+  // 30 fps, luma counts frames 8 levels apart; on a 24 fps timeline, trimmed between source frames 12 and 13.
+  execFileSync(ffmpeg, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=128x72:r=30:d=1', '-vf', "format=yuv444p,geq=lum='N*8':cb=128:cr=128", '-c:v', 'libx264', '-qp', '0', '-pix_fmt', 'yuv444p', '-g', '30', source]);
+  const masks = smartMaskService(path.join(dir, 'masks')), depth = depthService(path.join(dir, 'depth'), { sourceTimes: masks.sourceTimes, python: depthPython });
+  try {
+    const { asset, clip } = fixture(source, 128, 72, 30, 1, { duration: .25, sourceIn: .41 });
+    const plain = exportOf(dir, source, asset, clip, [], 'plain', { fps: '24', rangeIn: '0', rangeOut: '.25' }, depth), keyed = { ...plain, nodes: [keyNode], outputPath: path.join(dir, 'keyed.mov') };
+    await renderTimeline(plain); await renderTimeline(keyed);
+    const luma = async (file: string) => [...await run(ffmpeg, ['-v', 'error', '-i', file, '-vf', 'format=gray', '-f', 'rawvideo', '-'], { binary: true })].filter((_, i) => i % (128 * 72) === 64 * 128 + 64);
+    const a = await luma(plain.outputPath), b = await luma(keyed.outputPath);
+    assert.equal(a.length, 6);
+    assert.ok(a.every((v, i) => Math.abs(v - b[i]) <= 2), `same source frames with and without the key: ${a} vs ${b}`);
+  } finally { await Promise.all([depth.close(), masks.close()]); rmSync(dir, { recursive: true, force: true }); }
+});

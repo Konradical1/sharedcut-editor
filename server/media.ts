@@ -1053,8 +1053,9 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
           depth=await request.depth.ready({clip:whole,asset:source.asset,sourcePath:source.path,...depthSpan(whole,source.asset,request.wholeClips??request.clips,request.assets.map(a=>a.asset))},request.signal,p=>request.onStage?.(`Analyzing depth · ${clip.name} · ${Math.round(p)}%`));
           depthHolds.push(depth.release);
         }
-        // The Depth bake (decoder) seeks half a frame early and wants the frame at or after it, as the plain -ss path gives.
-        const times=masks[0]?.sourceTimes??(image?undefined:depth?.run.times),renderSeek=(request.decoder?times?.find(t=>t>=seek-1e-7):times?.filter(t=>t<=seek+1e-7).at(-1))??seek;
+        // The first frame at or after the seek, as the plain -ss path and the viewer show (and the Depth bake, which
+        // seeks half a frame early, wants): a trim between source frames must not start one frame early here.
+        const times=masks[0]?.sourceTimes??(image?undefined:depth?.run.times),renderSeek=times?.find(t=>t>=seek-1e-7)??seek;
         if(!masks.length&&times?.some((t,i)=>i>0&&Math.abs(t-times[i-1]-1/(metadata.fps||fps))>Math.max(.000003,.001/(metadata.fps||fps))))throw Error(`${clip.name}: a depth key on export currently needs constant-frame-rate footage. Convert this source to constant frame rate first.`);
         const frameTimes=times?.filter(t=>t>=renderSeek-1e-7&&t<renderSeek+decoded-1e-7);
         // Each decoded frame's depth from the masters; color-render.py keys it with the same table as the preview and
