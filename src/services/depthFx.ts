@@ -162,13 +162,16 @@ export function createDepthFx() {
   const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: true, antialias: false, depth: false, stencil: false, preserveDrawingBuffer: true });
   type Program = { program: WebGLProgram; at: (name: string) => WebGLUniformLocation | null };
   type Resources = { programs: Record<'prep' | 'down' | 'glowDown' | 'gather' | 'composite' | 'blur' | 'final', Program>; image: WebGLTexture; depth: WebGLTexture; black: WebGLTexture; framebuffer: WebGLFramebuffer; targets: Map<string, { texture: WebGLTexture; width: number; height: number }>; depthKey?: string };
-  let resources: Resources | undefined, lost = false;
+  // `broken`: a program that failed to build is not rebuilt every frame, only after the context comes back.
+  let resources: Resources | undefined, lost = false, broken = false;
   const init = (): Resources | undefined => {
-    if (!gl || !(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'))) return undefined;
-    const compile = (type: number, source: string) => { const shader = gl.createShader(type)!; gl.shaderSource(shader, source); gl.compileShader(shader); if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS) && !gl.isContextLost()) throw new Error(`Depth shader: ${gl.getShaderInfoLog(shader)}`); return shader; };
+    if (broken || !gl || !(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'))) return undefined;
+    const made: { shaders: WebGLShader[]; programs: WebGLProgram[] } = { shaders: [], programs: [] };
+    const compile = (type: number, source: string) => { const shader = gl.createShader(type)!; made.shaders.push(shader); gl.shaderSource(shader, source); gl.compileShader(shader); if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS) && !gl.isContextLost()) throw new Error(`Depth shader: ${gl.getShaderInfoLog(shader)}`); return shader; };
     let vertex: WebGLShader;
     const link = (source: string): Program => {
-      const program = gl.createProgram()!, fragment = compile(gl.FRAGMENT_SHADER, source);
+      const program = gl.createProgram()!; made.programs.push(program);
+      const fragment = compile(gl.FRAGMENT_SHADER, source);
       gl.attachShader(program, vertex); gl.attachShader(program, fragment); gl.linkProgram(program); gl.deleteShader(fragment);
       if (!gl.getProgramParameter(program, gl.LINK_STATUS) && !gl.isContextLost()) throw new Error(`Depth program: ${gl.getProgramInfoLog(program)}`);
       const locations = new Map<string, WebGLUniformLocation | null>();
@@ -181,11 +184,16 @@ export function createDepthFx() {
       const texture = (filter: number) => { const t = gl.createTexture()!; gl.bindTexture(gl.TEXTURE_2D, t); for (const [key, value] of [[gl.TEXTURE_MIN_FILTER, filter], [gl.TEXTURE_MAG_FILTER, filter], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, key, value); return t; };
       const black = texture(gl.NEAREST); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
       return { programs, image: texture(gl.LINEAR), depth: texture(gl.NEAREST), black, framebuffer: gl.createFramebuffer()!, targets: new Map() };
-    } catch (error) { warnOnce((error as Error).message); return undefined; }
+    } catch (error) {
+      broken = true; warnOnce((error as Error).message);
+      for (const shader of made.shaders) gl.deleteShader(shader);
+      for (const program of made.programs) gl.deleteProgram(program);
+      return undefined;
+    }
   };
   if (gl) {
     canvas.addEventListener('webglcontextlost', event => { event.preventDefault(); lost = true; resources = undefined; });
-    canvas.addEventListener('webglcontextrestored', () => { lost = false; resources = init(); });
+    canvas.addEventListener('webglcontextrestored', () => { lost = false; broken = false; resources = init(); });
     resources = init();
   }
   const target = (name: string, width: number, height: number) => {
