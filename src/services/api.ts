@@ -11,7 +11,8 @@ export class ApiError extends Error {
 
 export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, { credentials: 'same-origin', ...options, headers: { ...(typeof options.body === 'string' ? { 'Content-Type': 'application/json' } : {}), ...options.headers } });
-  const data = response.status === 204 ? null : await response.json();
+  // A failure page that is not JSON (a tunnel's 502) reads as "Server request failed (502)", not a parse error.
+  const data = response.status === 204 ? null : await response.json().catch(error => { if (response.ok) throw error; return null; });
   if (!response.ok) throw new ApiError(response.status, data);
   return data as T;
 }

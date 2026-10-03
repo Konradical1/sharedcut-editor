@@ -24,7 +24,8 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
   useDepthVersion();
   const s = useEditorStore.getState, asset = useEditorStore(state => state.media.find(m => m.id === clip.mediaId));
   const [capability, setCapability] = useState<DepthCapabilities>();
-  useEffect(() => { let active = true; void api<DepthCapabilities>('/depth/capabilities').then(value => { if (active) setCapability(value); }).catch(error => { if (active) setCapability({ available: false, reason: (error as Error).message }); }); return () => { active = false; }; }, []);
+  // A failed check (a dropped connection) says nothing about the server: the run's own status shows what happens.
+  useEffect(() => { let active = true; void api<DepthCapabilities>('/depth/capabilities').then(value => { if (active) setCapability(value); }).catch(() => {}); return () => { active = false; }; }, []);
   const state = depthState(clip.id), focusPath = `effects.${effect.id}.parameters.focus`, ready = state?.run && depthClipReady(clip, state.run);
   // Focus nobody chose yet follows the frame centre when Lens blur first turns on (or a preset turns it on).
   const centreFocus = () => effect.parameters?.focus === undefined && !clip.keyframes?.[focusPath] ? depthAtSource(clip.id, .5, .5) : undefined;
@@ -48,6 +49,7 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
     : !state ? 'Starting depth analysis…'
     : state.status === 'failed' || state.status === 'cancelled' ? state.error ?? 'Depth analysis failed.'
     : state.status === 'ready' ? 'Depth ready'
+    : state.error ? state.error
     : `Analyzing depth · ${Math.round(state.progress)} %${ready ? ` · ready to ${clock(ready)}` : ''}`;
   const failed = state?.status === 'failed' || state?.status === 'cancelled';
   return <div className="depth-inspector">

@@ -2,9 +2,11 @@ import { BufferSource, Input, MP4, VideoSampleSink, type VideoSample } from 'med
 import { DEPTH_SEGMENT_RATE } from './depth.ts';
 
 // Decodes depth preview segments (H.264, depth in full-range Y) into bare Y planes. One request at a time: a newer
-// request stops the older one at its next frame. The last segment's demuxer is kept, so a request inside it seeks
-// (to the GOP before `from`) without parsing the file again.
-let generation = 0, open: { segment: string; sink: Promise<VideoSampleSink> } | undefined;
+// request stops the older one at its next frame. The last few segments' demuxers are kept (two clips on screen take
+// turns), so a request inside one seeks (to the GOP before `from`) without parsing the file again.
+const OPEN = 4;
+let generation = 0;
+const open = new Map<string, { input: Input; sink: Promise<VideoSampleSink> }>();
 
 async function luma(sample: VideoSample) {
   const frame = sample.toVideoFrame();
@@ -27,16 +29,20 @@ async function luma(sample: VideoSample) {
 onmessage = async ({ data }: MessageEvent<{ id: number; segment: string; buffer?: ArrayBuffer; from: number; count: number }>) => {
   const { id, from, count } = data, epoch = ++generation;
   try {
-    if (open?.segment !== data.segment) {
+    let entry = open.get(data.segment);
+    if (entry) open.delete(data.segment);
+    else {
       if (!data.buffer) throw new Error('Depth segment bytes missing.');
       const input = new Input({ formats: [MP4], source: new BufferSource(data.buffer) });
-      open = { segment: data.segment, sink: (async () => {
+      entry = { input, sink: (async () => {
         const track = await input.getPrimaryVideoTrack();
         if (!track || !await track.canDecode()) throw new Error('This browser cannot decode depth previews with WebCodecs.');
         return new VideoSampleSink(track);
       })() };
     }
-    const sink = await open.sink;
+    open.set(data.segment, entry);
+    while (open.size > OPEN) { const [oldest, value] = open.entries().next().value!; open.delete(oldest); value.input.dispose(); }
+    const sink = await entry.sink;
     // Frame i sits at i / rate; a quarter frame in picks frame `from` without rounding doubt.
     for await (const sample of sink.samples((from + .25) / DEPTH_SEGMENT_RATE)) {
       try {
@@ -50,7 +56,8 @@ onmessage = async ({ data }: MessageEvent<{ id: number; segment: string; buffer?
     }
     if (epoch === generation) postMessage({ type: 'done', id });
   } catch (error) {
-    if (open?.segment === data.segment) open = undefined;
+    if (epoch !== generation) return; // A stopped request's error says nothing about the newer one.
+    open.get(data.segment)?.input.dispose(); open.delete(data.segment);
     postMessage({ type: 'error', id, error: error instanceof Error ? error.message : String(error) });
   }
 };

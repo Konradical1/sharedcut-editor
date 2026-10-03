@@ -1,16 +1,21 @@
-// Depth in the editor: one analysis run per clip with an enabled Depth effect (started, polled and invalidated here),
-// and per viewer a small cache of decoded depth frames looked up by the decoded picture's own source timestamp.
+// Depth in the editor: one analysis run per clip with a Depth effect (started, polled and invalidated here), and per
+// viewer a small cache of decoded depth frames looked up by the decoded picture's own source timestamp.
 import type { Clip, Effect, MediaAsset } from '../state/models.ts';
-import { api, connection } from './api.ts';
+import { api, ApiError, connection } from './api.ts';
 import { setClipActivity } from './clipStatus.ts';
 import { DEPTH_SEGMENT, depthDistance, depthFrameAt, depthSegmentFor, type DepthRun } from './depth.ts';
 import { effectEnabled } from './effects.ts';
 import { stabilizeRange } from './stabilize.ts';
 
-export type DepthClipState = { clipId: string; projectId: string; status: 'starting' | DepthRun['status']; progress: number; error?: string; run?: DepthRun; signature: string; context: string; controller: AbortController };
+/** `clip` and `asset` are the latest seen, so a run can be re-checked (or re-asked) without the store. */
+export type DepthClipState = { clipId: string; projectId: string; status: 'starting' | DepthRun['status']; progress: number; error?: string; run?: DepthRun; signature: string; context: string; controller: AbortController; clip: Clip; asset: MediaAsset };
 const runs = new Map<string, DepthClipState>(), listeners = new Set<() => void>();
 let version = 0;
 const POLL_MS = 400;
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+/** Worth asking again: the network or tunnel dropped, the server is restarting or busy, or a key is still stopping
+ *  (409, which is also a viewer waiting for an editor to start the run). */
+const transient = (error: unknown) => !(error instanceof ApiError) || [409, 429, 502, 503, 504].includes(error.status);
 
 function publish(state: DepthClipState) {
   version++;
@@ -32,32 +37,62 @@ function covers(run: DepthRun | undefined, clip: Clip, asset: MediaAsset) {
   try { const range = stabilizeRange(clip, asset.fps, asset.duration); return depthFrameAt(run, range.from) >= 0 && depthFrameAt(run, Math.max(range.from, range.to - 1e-6)) >= 0; }
   catch { return true; }
 }
-/** Fold a poll into what this clip already knows. A full view (it carries `times`) replaces; `?after` views append. */
+/** Fold a server view into what this clip knows. Polls leave `times` out once known (?times=0); a cursor behind ours
+ *  means the server started this key over, so its segments replace ours. */
 function merge(state: DepthClipState, next: DepthRun) {
-  const known = state.run;
-  state.run = !known || next.times.length || next.key !== known.key ? next : { ...next, times: known.times, segments: [...known.segments, ...next.segments.filter(s => !known.segments.some(k => k.n === s.n))] };
+  const known = state.run?.key === next.key ? state.run : undefined;
+  const segments = known && next.next >= known.next ? [...known.segments, ...next.segments.filter(s => !known.segments.some(k => k.n === s.n))] : next.segments;
+  state.run = { ...next, times: next.times.length ? next.times : known?.times ?? [], segments };
   Object.assign(state, { status: next.status, progress: next.status === 'ready' ? 100 : next.progress, error: next.error });
   publish(state);
 }
+/** Frees the GPU queue of a run nothing here reads any more; a split sibling still reading it keeps it, and the server
+ *  keeps it for another project. */
+function cancelRun(projectId: string, key: string) {
+  if ([...runs.values()].some(other => other.run?.key === key)) return;
+  void api(`/depth/${key}?projectId=${encodeURIComponent(projectId)}`, { method: 'DELETE' }).catch(() => {});
+}
+const running = (status: DepthClipState['status']) => status === 'queued' || status === 'processing';
 
 function start(clip: Clip, asset: MediaAsset, signature: string, context: string) {
-  runs.get(clip.id)?.controller.abort();
-  const state: DepthClipState = { clipId: clip.id, projectId: clip.projectId, status: 'starting', progress: 0, signature, context, controller: new AbortController() };
+  const previous = runs.get(clip.id);
+  previous?.controller.abort();
+  const state: DepthClipState = { clipId: clip.id, projectId: clip.projectId, status: 'starting', progress: 0, signature, context, controller: new AbortController(), clip, asset };
   runs.set(clip.id, state); publish(state);
+  // The run this replaces (another colour interpretation, or a range it no longer covers) would hold the GPU queue.
+  if (previous?.run && running(previous.status)) cancelRun(previous.projectId, previous.run.key);
   const { signal } = state.controller;
   void (async () => {
-    try {
-      // The server reads the clip from the saved workspace: an unsaved trim would analyse the old range.
-      await connection.flush();
-      merge(state, await api<DepthRun>('/depth', { method: 'POST', body: JSON.stringify({ projectId: clip.projectId, clipId: clip.id }), signal }));
-      while (!signal.aborted && (state.status === 'queued' || state.status === 'processing')) {
-        await new Promise(resolve => setTimeout(resolve, POLL_MS));
+    let delay = 1000;
+    for (;;) {
+      try {
+        if (state.status === 'starting') {
+          // The server reads the clip from the saved workspace: an unsaved trim would analyse the old range.
+          await connection.flush();
+          // Not abortable: a superseded request still names the run it queued, and that run is cancelled.
+          const run = await api<DepthRun>('/depth', { method: 'POST', body: JSON.stringify({ projectId: clip.projectId, clipId: clip.id }) });
+          if (signal.aborted) { if (signal.reason !== 'keep' && running(run.status)) cancelRun(clip.projectId, run.key); return; }
+          merge(state, run);
+          // A trim made while the request was out is checked now there is a run to check it against.
+          ensureDepthRun(state.clip, state.asset);
+          if (signal.aborted) return;
+        }
+        while (running(state.status)) {
+          await sleep(POLL_MS);
+          if (signal.aborted) return;
+          merge(state, await api<DepthRun>(`/depth/${state.run!.key}?projectId=${encodeURIComponent(clip.projectId)}&after=${state.run!.next}&times=0`, { signal }));
+          delay = 1000;
+        }
+        return;
+      } catch (error) {
+        if (signal.aborted || runs.get(clip.id) !== state) return;
+        const message = (error as Error).message || 'Depth analysis failed.', retry = transient(error);
+        // A dropped poll keeps the run and its progress; only an answer that will not change fails it.
+        Object.assign(state, retry ? { error: message.replace(/\.?$/, ' · retrying') } : { status: 'failed', error: message }); publish(state);
+        if (!retry) return;
+        await sleep(delay); delay = Math.min(delay * 2, 30_000);
         if (signal.aborted) return;
-        merge(state, await api<DepthRun>(`/depth/${state.run!.key}?projectId=${encodeURIComponent(clip.projectId)}&after=${state.run!.next}`, { signal }));
       }
-    } catch (error) {
-      if (signal.aborted || runs.get(clip.id) !== state) return;
-      Object.assign(state, { status: 'failed', error: (error as Error).message || 'Depth analysis failed.' }); publish(state);
     }
   })();
   return state;
@@ -69,24 +104,28 @@ export function ensureDepthRun(clip: Clip, asset: MediaAsset) {
   if (typeof fetch === 'undefined') return undefined;
   const signature = signatureOf(clip), context = contextOf(clip, asset), current = runs.get(clip.id);
   if (current && current.context === context) {
-    if (current.signature === signature) return current;
+    Object.assign(current, { clip, asset });
+    // While the request is out there is no run to check: start() checks the latest clip once it arrives.
+    if (current.signature === signature || current.status === 'starting') return current;
     current.signature = signature;
-    const alive = current.status !== 'failed' && current.status !== 'cancelled';
-    if (alive && (current.status === 'starting' || covers(current.run, clip, asset))) return current;
+    if (current.status !== 'failed' && current.status !== 'cancelled' && covers(current.run, clip, asset)) return current;
   }
   return start(clip, asset, signature, context);
 }
 export function retryDepth(clip: Clip, asset: MediaAsset) { return start(clip, asset, signatureOf(clip), contextOf(clip, asset)); }
-function release(clipId: string) {
+/** Stop watching a clip. `cancel` also frees the server run (the effect or the clip is gone); otherwise the run goes on
+ *  and the next look joins it (another project opened). */
+function release(clipId: string, cancel: boolean) {
   const state = runs.get(clipId);
   if (!state) return;
-  state.controller.abort(); runs.delete(clipId); version++;
+  state.controller.abort(cancel ? undefined : 'keep'); runs.delete(clipId); version++;
   for (const listener of listeners) listener();
   setClipActivity(clipId, 'Depth', undefined);
-  // Nothing else here waits on it: free the GPU. A split sibling still reading the run keeps it going.
-  const key = state.run?.key;
-  if (key && (state.status === 'queued' || state.status === 'processing') && ![...runs.values()].some(other => other.run?.key === key))
-    void api(`/depth/${key}?projectId=${encodeURIComponent(state.projectId)}`, { method: 'DELETE' }).catch(() => {});
+  if (cancel && state.run && running(state.status)) cancelRun(state.projectId, state.run.key);
+}
+/** A ready run whose segments the server no longer has (its cache evicted it, or it went missing in a restart). */
+function rerun(key: string) {
+  for (const state of [...runs.values()]) if (state.status === 'ready' && state.run?.key === key) start(state.clip, state.asset, state.signature, state.context);
 }
 /** Seconds into the clip that analysed depth reaches (forward clips; undefined before the first segment or when reversed). */
 export function depthClipReady(clip: Clip, run: DepthRun) {
@@ -99,21 +138,25 @@ export const depthEffect = (clip: Pick<Clip, 'effects' | 'properties'>) => clip.
 
 type EditorLike = { getState: () => { projectId: string; clips: Clip[]; media: MediaAsset[] }; subscribe: (listener: (state: ReturnType<EditorLike['getState']>) => void) => unknown };
 let watching = false;
-/** Called once from the timeline (browser only): every clip in the open project with an enabled Depth effect keeps
- *  a run, whether or not it is under the playhead, so its progress shows on the clip and in the inspector. */
+/** Called once from the timeline (browser only): every clip in the open project with a Depth effect, on or off, keeps
+ *  a run, whether or not it is under the playhead, so its progress shows on the clip and in the inspector. A run is
+ *  cancelled only when its effect or clip is gone; another project opening just stops watching it. */
 export function watchDepthClips(store: EditorLike) {
   if (watching || typeof window === 'undefined') return; watching = true;
   let clips: Clip[] | undefined, media: MediaAsset[] | undefined, project = '';
   const sync = (state: ReturnType<EditorLike['getState']>) => {
     if (state.clips === clips && state.media === media && state.projectId === project) return;
     clips = state.clips; media = state.media; project = state.projectId;
-    const assets = new Map(state.media.map(asset => [asset.id, asset])), active = new Set<string>();
+    const assets = new Map(state.media.map(asset => [asset.id, asset])), open = new Set<string>(), kept = new Set<string>();
     for (const clip of state.clips) {
+      if (!clip.effects.some(e => e.name === 'Depth')) continue;
+      kept.add(clip.id);
       const asset = assets.get(clip.mediaId);
-      if (clip.projectId !== state.projectId || !depthEffect(clip) || !asset || !['video', 'image'].includes(asset.kind) || asset.status !== 'ready') continue;
-      active.add(clip.id); ensureDepthRun(clip, asset);
+      if (clip.projectId !== state.projectId || !asset || !['video', 'image'].includes(asset.kind)) continue;
+      open.add(clip.id);
+      if (asset.status === 'ready') ensureDepthRun(clip, asset);
     }
-    for (const id of [...runs.keys()]) if (!active.has(id)) release(id);
+    for (const id of [...runs.keys()]) if (!open.has(id)) release(id, !kept.has(id));
   };
   sync(store.getState()); store.subscribe(sync);
 }
@@ -142,63 +185,81 @@ export function depthAtSource(clipId: string, u: number, v: number) {
 export function depthAtCanvas(clipId: string, x: number, y: number) { const point = picks.get(clipId)?.toSource?.(x, y); return point && depthAtSource(clipId, point[0], point[1]); }
 
 export type DepthFrame = { state: 'none' } | { state: 'analyzing' } | { state: 'failed'; error: string } | { state: 'loading' } | { state: 'ready'; pixels: DepthPixels; run: DepthRun };
-const RING = 32, AHEAD = 8, WINDOW = 16, SEGMENT_BYTES = 6;
+const RING = 48, AHEAD = 8, WINDOW = 16, SEGMENT_BYTES = 6, RETRY_MS = 2000;
 
 /** Decoded depth for one viewer: whole segment MP4s fetched (prefetching the next), decoded in a worker into Y planes,
- *  at most RING frames kept. `frame()` never waits: the exact frame, else the one before it, else nothing. */
+ *  at most RING frames kept. `frame()` never waits: the exact frame, else the one shown before it, else nothing.
+ *  Each clip on screen has at most one decode waiting, served in turn, so a dissolve between two Depth clips feeds both. */
 export function createDepthPreview(onReady: () => void) {
-  type Request = { id: number; key: string; projectId: string; n: number; first: number; from: number; count: number };
-  const ring = new Map<string, DepthPixels>(), segments = new Map<string, { bytes?: ArrayBuffer; retryAt?: number; controller: AbortController }>();
-  const requests = new Map<number, Request>(), failed = new Map<string, number>();
-  let worker: Worker | undefined, busy: Request | undefined, workerSegment = '', nextId = 0, wanted = '', disposed = false;
+  type Request = { id: number; owner: string; key: string; projectId: string; n: number; first: number; from: number; count: number };
+  const ring = new Map<string, DepthPixels>(), segments = new Map<string, { bytes?: ArrayBuffer; controller: AbortController }>();
+  const requests = new Map<number, Request>(), queue = new Map<string, Request>(), failed = new Map<string, number>();
+  const wanted = new Map<string, string>(), seen = new Map<string, { index: number; dir: 1 | -1 }>();
+  let worker: Worker | undefined, busy: Request | undefined, nextId = 0, disposed = false;
   const keep = (name: string, pixels: DepthPixels) => { ring.delete(name); ring.set(name, pixels); while (ring.size > RING) ring.delete(ring.keys().next().value!); };
-  const bytesOf = (key: string, projectId: string, n: number) => {
+  /** A failed download or decode waits two seconds, then the frame is drawn again so it is retried even when paused. */
+  const fail = (name: string) => { failed.set(name, Date.now() + RETRY_MS); setTimeout(() => { if (!disposed) onReady(); }, RETRY_MS); };
+  const blocked = (name: string) => (failed.get(name) ?? 0) > Date.now();
+  const bytesOf = (key: string, projectId: string, n: number): ArrayBuffer | 'loading' | 'failed' => {
     const name = `${key}:${n}`;
-    let entry = segments.get(name);
-    if (entry?.retryAt && Date.now() > entry.retryAt) { segments.delete(name); entry = undefined; }
-    if (entry) { segments.delete(name); segments.set(name, entry); return entry.bytes; }
+    if (blocked(name)) return 'failed';
+    const entry = segments.get(name);
+    if (entry) { segments.delete(name); segments.set(name, entry); return entry.bytes ?? 'loading'; }
     while (segments.size >= SEGMENT_BYTES) { const [oldest, value] = segments.entries().next().value!; value.controller.abort(); segments.delete(oldest); }
-    const created: { bytes?: ArrayBuffer; retryAt?: number; controller: AbortController } = { controller: new AbortController() };
+    const created: { bytes?: ArrayBuffer; controller: AbortController } = { controller: new AbortController() };
     segments.set(name, created);
     void fetch(`/api/depth/${key}/preview/${n}.mp4?projectId=${encodeURIComponent(projectId)}`, { credentials: 'same-origin', signal: created.controller.signal })
-      .then(response => { if (!response.ok) throw new Error(`Depth segment download failed (${response.status}).`); return response.arrayBuffer(); })
-      .then(bytes => { created.bytes = bytes; if (busy && `${busy.key}:${busy.n}` === name && busy.id < 0) send(busy); })
-      .catch(() => { created.retryAt = Date.now() + 2000; if (busy && `${busy.key}:${busy.n}` === name) busy = undefined; });
-    return undefined;
+      .then(response => { if (response.status === 404) rerun(key); if (!response.ok) throw new Error(`Depth segment download failed (${response.status}).`); return response.arrayBuffer(); })
+      .then(bytes => { created.bytes = bytes; pump(); })
+      .catch(() => { if (created.controller.signal.aborted || disposed) return; if (segments.get(name) === created) segments.delete(name); fail(name); pump(); });
+    return 'loading';
   };
-  const send = (request: Request) => {
-    busy = request;
-    const bytes = bytesOf(request.key, request.projectId, request.n);
-    if (!bytes) { request.id = -1; return; } // Sent once the download lands.
-    request.id = ++nextId; requests.set(request.id, request);
-    if (requests.size > 4) requests.delete(requests.keys().next().value!);
-    if (!worker) {
-      worker = new Worker(new URL('./depthDecodeWorker.ts', import.meta.url), { type: 'module' });
-      worker.onmessage = ({ data }) => {
-        const owner = requests.get(data.id);
-        if (data.type === 'frame' && owner) {
-          const name = `${owner.key}:${owner.first + owner.n * DEPTH_SEGMENT + data.index}`;
-          keep(name, { data: data.data, width: data.width, height: data.height, key: name });
-          if (name === wanted && !disposed) onReady();
-        } else if (data.type !== 'frame') {
-          if (busy?.id === data.id) busy = undefined;
-          // A segment this browser cannot decode is retried in two seconds, not on every frame.
-          if (data.type === 'error') { workerSegment = ''; if (owner) failed.set(`${owner.key}:${owner.n}`, Date.now() + 2000); console.warn('Depth preview:', data.error); }
-          requests.delete(data.id);
-        }
-      };
+  const receive = ({ data }: MessageEvent) => {
+    const owner = requests.get(data.id);
+    if (data.type === 'frame') {
+      if (!owner) return;
+      const name = `${owner.key}:${owner.first + owner.n * DEPTH_SEGMENT + data.index}`;
+      keep(name, { data: data.data, width: data.width, height: data.height, key: name });
+      if (!disposed && [...wanted.values()].includes(name)) onReady();
+      return;
     }
-    const segment = `${request.key}:${request.n}`;
-    worker.postMessage({ id: request.id, segment, from: request.from, count: request.count, ...(workerSegment !== segment ? { buffer: bytes.slice(0) } : {}) });
-    workerSegment = segment;
+    if (data.type === 'error') { console.warn('Depth preview:', data.error); if (owner) fail(`${owner.key}:${owner.n}`); }
+    requests.delete(data.id);
+    if (busy?.id === data.id) { busy = undefined; pump(); }
   };
-  const inFlight = (key: string, frame: number) => !!busy && busy.key === key && frame >= busy.first + busy.n * DEPTH_SEGMENT + busy.from && frame < busy.first + busy.n * DEPTH_SEGMENT + busy.from + busy.count;
-  /** Keep the next AHEAD frames decoded or decoding; a frame outside the running window replaces it. */
-  const want = (run: DepthRun, projectId: string, frame: number) => {
-    for (let f = frame; f < Math.min(frame + AHEAD, run.first + run.frames); f++) {
-      if (ring.has(`${run.key}:${f}`) || inFlight(run.key, f)) continue;
+  /** The worker decodes one request at a time (a newer one stops the older): the first waiting one whose bytes are here. */
+  const pump = () => {
+    if (busy || disposed) return;
+    for (const [owner, request] of queue) {
+      const bytes = bytesOf(request.key, request.projectId, request.n);
+      if (bytes === 'loading') continue;
+      queue.delete(owner);
+      if (bytes === 'failed') continue;
+      busy = request; request.id = ++nextId; requests.set(request.id, request);
+      if (requests.size > 8) requests.delete(requests.keys().next().value!);
+      if (!worker) { worker = new Worker(new URL('./depthDecodeWorker.ts', import.meta.url), { type: 'module' }); worker.onmessage = receive; }
+      const buffer = bytes.slice(0); // The worker keeps its last few segments open and ignores bytes it already has.
+      worker.postMessage({ id: request.id, segment: `${request.key}:${request.n}`, from: request.from, count: request.count, buffer }, [buffer]);
+      return;
+    }
+  };
+  const holds = (request: Request | undefined, key: string, frame: number) => !!request && request.key === key && frame >= request.first + request.n * DEPTH_SEGMENT + request.from && frame < request.first + request.n * DEPTH_SEGMENT + request.from + request.count;
+  /** Keep the next AHEAD frames in playing order decoded or on their way. A clip's newer request replaces its waiting
+   *  one; its running one stops too when it holds nothing the clip still needs (a jump). */
+  const want = (owner: string, run: DepthRun, projectId: string, frame: number, dir: 1 | -1) => {
+    let useful = false;
+    for (let k = 0; k < AHEAD; k++) {
+      const f = frame + dir * k;
+      if (f < run.first || f >= run.first + run.frames) return;
+      if (ring.has(`${run.key}:${f}`)) continue;
+      if (holds(busy, run.key, f)) { useful = true; continue; }
+      if (holds(queue.get(owner), run.key, f)) return;
       const at = depthSegmentFor(run, f);
-      if (at && !((failed.get(`${run.key}:${at.segment.n}`) ?? 0) > Date.now())) send({ id: 0, key: run.key, projectId, n: at.segment.n, first: run.first, from: at.offset, count: Math.min(WINDOW, at.segment.count - at.offset) });
+      if (!at || blocked(`${run.key}:${at.segment.n}`)) return;
+      const from = dir > 0 ? at.offset : Math.max(0, at.offset - WINDOW + 1);
+      if (busy?.owner === owner && !useful) busy = undefined;
+      queue.set(owner, { id: 0, owner, key: run.key, projectId, n: at.segment.n, first: run.first, from, count: dir > 0 ? Math.min(WINDOW, at.segment.count - at.offset) : at.offset - from + 1 });
+      pump();
       return;
     }
   };
@@ -208,17 +269,20 @@ export function createDepthPreview(onReady: () => void) {
       if (!state) return { state: 'none' };
       if (state.status === 'failed' || state.status === 'cancelled') return { state: 'failed', error: state.error || 'Depth analysis failed.' };
       const run = state.run, index = run ? depthFrameAt(run, time) : -1, at = run && index >= 0 ? depthSegmentFor(run, index) : undefined;
-      if (!run || !at) return { state: 'analyzing' };
-      wanted = `${run.key}:${index}`;
-      want(run, state.projectId, index);
-      // Past three quarters of a segment, the next one downloads.
-      if (at.offset >= DEPTH_SEGMENT * .75 && run.segments.some(s => s.n === at.segment.n + 1)) bytesOf(run.key, state.projectId, at.segment.n + 1);
-      const exact = ring.get(wanted);
-      if (exact) return { state: 'ready', pixels: exact, run };
+      if (!run || !at) return state.error ? { state: 'failed', error: state.error } : { state: 'analyzing' };
+      // Playing order from the last frame asked for: reversed clips and backward scrubs decode backward.
+      const last = seen.get(clipId), dir = last && index !== last.index ? (index < last.index ? -1 : 1) : last?.dir ?? 1, name = `${run.key}:${index}`;
+      seen.set(clipId, { index, dir }); wanted.set(clipId, name);
+      want(clipId, run, state.projectId, index, dir);
+      // Three quarters through a segment in playing order, the next one downloads.
+      const next = at.segment.n + dir;
+      if ((dir > 0 ? at.offset >= DEPTH_SEGMENT * .75 : at.offset < DEPTH_SEGMENT * .25) && run.segments.some(s => s.n === next)) bytesOf(run.key, state.projectId, next);
+      const exact = ring.get(name);
+      if (exact) { keep(name, exact); return { state: 'ready', pixels: exact, run }; }
       // One frame old at most: older depth slides off moving edges.
-      const previous = ring.get(`${run.key}:${index - 1}`);
+      const previous = ring.get(`${run.key}:${index - dir}`);
       return previous ? { state: 'ready', pixels: previous, run } : { state: 'loading' };
     },
-    dispose() { disposed = true; worker?.terminate(); for (const entry of segments.values()) entry.controller.abort(); segments.clear(); ring.clear(); },
+    dispose() { disposed = true; worker?.terminate(); for (const entry of segments.values()) entry.controller.abort(); segments.clear(); ring.clear(); queue.clear(); wanted.clear(); busy = undefined; },
   };
 }
