@@ -25,6 +25,10 @@ test('preview quality selects a smaller stream, audio selects its own stream, an
   assert.equal(playbackUrl({ ...asset, proxyVariants: { '1/4': '/quarter' } } as unknown as MediaAsset, { original: false, quality: 'Stream' }, true), '/quarter');
   assert.equal(playbackUrl({ ...asset, proxyVariants: undefined }, { original: false, quality: 'Stream' }, true), '/full');
   assert.equal(playbackUrl(streamed, { original: false, quality: 'Stream' }, false), '/audio');
+  // Storage v3: Full and Color share full-v3, 1/2 is the Stream file and 1/4 the low stream. Every quality is a field.
+  const v3 = { sourceUrl: '/original', proxyUrl: '/full-v3.mp4?v=1', colorProxyUrl: '/full-v3.mp4?v=1', audioProxyUrl: '/audio-v1.m4a', proxyVariants: { Stream: '/stream-v2.mp4', '1/2': '/stream-v2.mp4', StreamLow: '/stream-low-v2.mp4?v=1', '1/4': '/stream-low-v2.mp4?v=1' } } as unknown as MediaAsset;
+  for (const [quality, url] of [['Full', '/full-v3.mp4?v=1'], ['Color', '/full-v3.mp4?v=1'], ['1/2', '/stream-v2.mp4'], ['Stream', '/stream-v2.mp4'], ['1/4', '/stream-low-v2.mp4?v=1']] as const) assert.equal(playbackUrl(v3, { original: false, quality }, true), url, quality);
+  assert.equal(playbackUrl(v3, { original: false, quality: 'Color' }, false), '/audio-v1.m4a');
 });
 
 test('timeline preview obeys source trims, speed, reverse, freeze, routing, and SDR values', () => {

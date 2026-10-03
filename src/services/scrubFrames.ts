@@ -1,9 +1,10 @@
 /**
- * Paused-scrub pictures from the all-intra quarter proxy. Every frame there is a keyframe, so a seek
- * decodes one small picture where the long-GOP streaming proxy decodes up to two seconds of frames.
- * Pictures are kept, so scrubbing back over a stretch never decodes it twice.
+ * Paused-scrub pictures from the 480 px stream (stream-low-v2, the asset's 1/4). Its GOP is half a second, so a seek
+ * decodes from the keyframe before the target; the worker hands over that whole GOP (a GOP seek), which makes every
+ * later ask inside it free, and carries on into the next one when the scrub moves forward. Pictures are kept, so
+ * scrubbing back over a stretch never decodes it twice. KEEP holds a 60 fps GOP twice over.
  */
-const KEEP = 48, AHEAD = 3, NEAREST = 1;
+const KEEP = 64, AHEAD = 3, NEAREST = 1;
 
 export function createScrubFrames(url: string, fps: number, changed: (frame?: VideoFrame) => void, cacheEnabled = true) {
   const worker = new Worker(new URL('./videoDecodeWorker.ts', import.meta.url), { type: 'module' });
@@ -34,7 +35,7 @@ export function createScrubFrames(url: string, fps: number, changed: (frame?: Vi
       if (exact) return exact;
       const index = Math.floor(time * fps + 1e-6);
       // One request per frame index; the worker abandons whatever a newer seek supersedes.
-      if (index !== wanted) { wanted = index; worker.postMessage({ type: 'seek', generation: ++generation, time, count: AHEAD }); }
+      if (index !== wanted) { wanted = index; worker.postMessage({ type: 'seek', generation: ++generation, time, count: AHEAD, gop: true }); }
       let nearest: VideoFrame | undefined;
       for (const frame of frames) if (Math.abs(start(frame) - time) <= NEAREST && (!nearest || Math.abs(start(frame) - time) < Math.abs(start(nearest) - time))) nearest = frame;
       return nearest;

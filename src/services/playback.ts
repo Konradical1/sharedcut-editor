@@ -76,8 +76,8 @@ export function playbackUrl(asset: MediaAsset, options: Pick<PreviewOptions, 'or
   if(visual&&options.quality==='Full'&&asset.colorProxyUrl)return asset.colorProxyUrl;
   if(options.quality==='Color')return asset.colorProxyUrl||asset.sourceUrl||asset.proxyUrl;
   // An import that predates the upgrade pass has no streaming variant yet. Half resolution is the
-  // closest substitute; falling straight through to the all-intra full proxy would hand a remote
-  // viewer an ~80 Mbit/s stream, which is the one thing this quality exists to avoid.
+  // closest substitute; falling straight through to the 1920 full-v3 file would hand a remote viewer
+  // a 10-bit stream several times Stream's bitrate, which is the one thing this quality exists to avoid.
   for (const quality of options.quality === 'Stream' ? ['Stream', '1/2', '1/4'] : [options.quality]) {
     const url = asset.proxyVariants?.[quality];
     if (url) return url;
@@ -281,7 +281,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   };
   const leaks = new Map<string, { element: HTMLVideoElement; source?: MediaElementAudioSourceNode; gain?: GainNode; lastUsed: number }>();
   const decoders = new Map<string, Decoder>();
-  // Paused only: quarter-proxy stand-ins while a playback decoder seeks. Dropped the moment playback starts.
+  // Paused only: 480 px stand-ins (the 1/4 file) while a playback decoder seeks. Dropped the moment playback starts.
   const scrubs = new Map<string, { frames: ReturnType<typeof createScrubFrames>; media: HTMLVideoElement }>();
   let loadingSince: number | undefined;
   const streamFallbacks = new Map<string, string>();
@@ -506,17 +506,18 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     const skipped = new Map<string, string>();
     const scrubIds = new Set<string>();
     /**
-     * While paused, the all-intra quarter proxy stands in for a playback decoder that is still seeking
-     * (a long-GOP seek decodes up to two seconds of frames first). Opened for every visible clip so a
-     * scrub answers on its first move, but asked for a frame only on a miss: each ask is a decode.
-     * Only for proxies from the same pass; the colour proxy and camera originals are interpreted differently.
+     * While paused, the 480 px stream-low-v2 (the asset's 1/4) stands in for a playback decoder that is still
+     * seeking: full-v3 and Stream decode a GOP of 1920 or 960 frames first. Opened for every visible clip so a
+     * scrub answers on its first move, but asked for a frame only on a miss; each ask decodes one small GOP.
+     * Only for files from the same pass, all BT.709 video range; camera originals are interpreted differently,
+     * and Color keeps its 10-bit picture (and precision label) rather than flash 8-bit stand-ins.
      */
     const scrubFor = (clip: Clip, asset: MediaAsset, decoder: Decoder) => {
       const url = asset.proxyVariants?.['1/4'];
       // The scrub worker demuxes MP4 only; an alpha WebM seeks through its video element instead.
       if (url && !/\.mp4(?:\?|$)/i.test(url)) return undefined;
       // A frame editor loops one clip: each lap starts with a backward seek, which the stand-in covers while playing too.
-      if (state.playing && !focusing || !url || decoder.url === url || (decoder.url !== asset.proxyUrl && !Object.values(asset.proxyVariants ?? {}).includes(decoder.url)) || typeof VideoDecoder === 'undefined' || typeof Worker === 'undefined') return undefined;
+      if (state.playing && !focusing || !url || options.quality === 'Color' || decoder.url === url || (decoder.url !== asset.proxyUrl && !Object.values(asset.proxyVariants ?? {}).includes(decoder.url)) || typeof VideoDecoder === 'undefined' || typeof Worker === 'undefined') return undefined;
       // Keyed by file: pictures are source frames, so every cut from one take shares a decoder.
       // A graded clip reads each picture back through the colour pipeline; start that copy as it lands.
       const scrub = scrubs.get(url) ?? { media: decoder.element as HTMLVideoElement, frames: createScrubFrames(url, asset.fps || 24, frame => { dirty = true; if (frame && color) color.prepare(scrub.media, frame); }, state.settings.footageCache !== false) };
