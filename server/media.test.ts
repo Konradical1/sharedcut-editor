@@ -394,7 +394,7 @@ test('vertical reels: rotated probes, portrait stills, flips, aspect guard and H
   const hdr=await probeMedia(hlg);assert.equal(hdr.colorTransfer,'arib-std-b67');
   const proxied=await prepareMedia({inputPath:hlg,outputDir:path.join(dir,'hlg'),baseUrl:'/f'});
   assert.ok('colorProxyUrl' in proxied&&proxied.colorProxyUrl,'the grading picture is tone-mapped too');
-  assert.equal((await probeMedia(path.join(dir,'hlg','full-v3.mp4'))).colorTransfer,'bt709','full-v3 is SDR and not tagged HLG, or the browser tone-maps it again');
+  assert.equal((await probeMedia(path.join(dir,'hlg','full-v3.mp4'))).colorTransfer,undefined,'full-v3 is untagged like the grading proxy, never HLG, or the browser tone-maps it again');
   assert.equal((await probeMedia(path.join(dir,'hlg','stream-low-v2.mp4'))).colorTransfer,'bt709','previews are SDR');
   const video=(tags:object)=>({id:'v',projectId:'p',name:'HLG',kind:'video',duration:hdr.duration,status:'ready',progress:100,binId:'',thumbnail:'',fps:24,resolution:'128 × 72',size:'',colorMatrix:'bt2020nc',...tags}) as any;
   const wide={...project,resolution:'128 × 72'},shot={...clip,mediaId:'v',properties:{},duration:.25};

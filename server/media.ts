@@ -345,24 +345,28 @@ const knownMatrix = (matrix?: string) => ['bt709', 'bt470bg', 'smpte170m', 'bt20
  * and renames them). `prepared` marks a `video` this module already made (full-v3, or an old color-v1): up to 1920
  * wide, BT.709, video range and tone-mapped. An original gets the matrix, range and HDR handling the grading proxy
  * always had. The smaller files are scaled from the same converted frames, so they are video range too.
+ * `videoStart` / `audioStart`: a separate input's own start time, kept instead of moved to zero. FFmpeg zeroes each input
+ * on its own, so a picture that starts after its sound (an edit list in color-v1) would otherwise slide onto the sound.
  */
-export async function encodePreviews(options: { video: string; prepared: boolean; audio?: string; audioCopy?: boolean; metadata: { fps: number; duration: number; colorMatrix?: string; colorRange?: string; colorTransfer?: string }; outputs: PreviewOutput[]; temp: string; signal?: AbortSignal; onProgress?: (percent: number) => void }) {
+export async function encodePreviews(options: { video: string; prepared: boolean; audio?: string; audioCopy?: boolean; videoStart?: number; audioStart?: number; metadata: { fps: number; duration: number; colorMatrix?: string; colorRange?: string; colorTransfer?: string }; outputs: PreviewOutput[]; temp: string; signal?: AbortSignal; onProgress?: (percent: number) => void }) {
   const { video, metadata, outputs, temp } = options, sizing = 'flags=lanczos+accurate_rnd+full_chroma_int';
   const base = options.prepared ? `scale=w='min(1920,iw)':h=-2:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv:${sizing}`
     : `scale=w='min(1920,iw)':h=-2:in_color_matrix=${knownMatrix(metadata.colorMatrix)}:out_color_matrix=bt709:in_range=${metadata.colorRange === 'pc' ? 'pc' : metadata.colorRange === 'tv' ? 'tv' : 'auto'}:out_range=tv:${sizing}${await toneMap(metadata.colorTransfer, temp)}`;
-  const tags = ['-color_range', 'tv', '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709'];
+  // Tags go on the frames: FFmpeg 8+ takes primaries and transfer from them and ignores -color_primaries / -color_trc.
+  const bt709 = 'setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709';
   const recipes = {
     // Primaries and transfer stay untagged as on the grading proxy: the colour pipeline reads the planes itself.
-    full: { name: FULL_VARIANT, scale: '', codec: ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17', '-g', gop(metadata.fps, .5), '-pix_fmt', 'yuv422p10le', '-color_range', 'tv', '-colorspace', 'bt709', '-color_primaries', 'unknown', '-color_trc', 'unknown'] },
-    stream: { name: STREAM_VARIANT, scale: 960, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '16', '-g', gop(metadata.fps, 2), '-pix_fmt', 'yuv420p', ...tags] },
-    low: { name: STREAM_LOW_VARIANT, scale: 480, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20', '-maxrate', '900k', '-bufsize', '1800k', '-g', gop(metadata.fps, .5), '-pix_fmt', 'yuv420p', ...tags] },
+    full: { name: FULL_VARIANT, scale: '', tag: 'setparams=range=tv:color_primaries=unknown:color_trc=unknown:colorspace=bt709', codec: ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17', '-g', gop(metadata.fps, .5), '-pix_fmt', 'yuv422p10le'] },
+    stream: { name: STREAM_VARIANT, scale: 960, tag: bt709, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '16', '-g', gop(metadata.fps, 2), '-pix_fmt', 'yuv420p'] },
+    low: { name: STREAM_LOW_VARIANT, scale: 480, tag: bt709, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20', '-maxrate', '900k', '-bufsize', '1800k', '-g', gop(metadata.fps, .5), '-pix_fmt', 'yuv420p'] },
   };
   const pictures = outputs.filter((output): output is Exclude<PreviewOutput, 'audio'> => output !== 'audio');
   const audioInput = options.audio === undefined ? undefined : options.audio === video ? 0 : 1;
   const audioCodec = options.audioCopy ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '128k'];
-  const args = [...common, ...options.prepared ? [] : await decodeAccel(), ...safeInput, '-i', video, ...audioInput === 1 ? [...safeInput, '-i', options.audio!] : []];
+  const kept = (start?: number) => start ? ['-itsoffset', String(start)] : [];
+  const args = [...common, ...options.prepared ? [] : await decodeAccel(), ...kept(options.videoStart), ...safeInput, '-i', video, ...audioInput === 1 ? [...kept(options.audioStart), ...safeInput, '-i', options.audio!] : []];
   if (pictures.length) args.push('-filter_complex', [`[0:v]${base},setsar=1,format=yuv422p10le,split=${pictures.length}${pictures.map((_, i) => `[v${i}]`).join('')}`,
-    ...pictures.map((output, i) => `[v${i}]${recipes[output].scale ? `scale=w='min(${recipes[output].scale},iw)':h=-2:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv:${sizing},format=yuv420p,setsar=1` : 'null'}[o${i}]`)].join(';'));
+    ...pictures.map((output, i) => `[v${i}]${recipes[output].scale ? `scale=w='min(${recipes[output].scale},iw)':h=-2:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv:${sizing},format=yuv420p,setsar=1,` : ''}${recipes[output].tag}[o${i}]`)].join(';'));
   pictures.forEach((output, i) => args.push('-map', `[o${i}]`, ...audioInput === undefined ? [] : ['-map', `${audioInput}:a:0?`, ...audioCodec], ...recipes[output].codec, '-movflags', '+faststart', path.join(temp, recipes[output].name)));
   if (outputs.includes('audio') && audioInput !== undefined) args.push('-map', `${audioInput}:a:0`, '-vn', ...audioCodec, '-movflags', '+faststart', path.join(temp, AUDIO_VARIANT));
   if (options.onProgress) args.push('-progress', 'pipe:1', '-nostats');
@@ -483,7 +487,7 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
   // publish() spreads a result over the stored row, so a field this kind of media no longer has is cleared by name.
   const cleared = { proxyVariants: undefined, audioProxyUrl: undefined, colorProxyUrl: undefined, filmstrip: undefined, filmstripFrames: undefined, filmstripVersion: undefined };
   const input = [...metadata.hasAlpha ? [] : await decodeAccel(), ...safeInput, '-i', inputPath];
-  let filmstripFrames = 0, published = false, temp: string | undefined;
+  let filmstripFrames = 0, temp: string | undefined;
   onProgress?.(5);
   try {
     if (metadata.kind !== 'audio') {
@@ -492,24 +496,26 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
       onThumbnail?.(thumbnail);
     }
     onStage?.('Creating playable preview');
+    // Encoded beside it and renamed in, so a failed or killed re-prepare leaves the file the row names untouched (and a
+    // check server's hard-linked copy is replaced, never written through to the live file).
+    temp = await mkdtemp(path.join(outputDir, '.preview-'));
+    const staged = path.join(temp, proxyName);
     if (metadata.hasAlpha) {
-      await run(ffmpeg(), [...common, ...input, '-map', '0:v:0', '-map', '0:a:0?', '-vf', `scale=w='min(1920,iw)':h=-2:flags=lanczos`, ...alphaVideo(metadata.fps), '-c:a', 'libopus', '-b:a', '128k', '-progress', 'pipe:1', '-nostats', proxy], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7) });
+      await run(ffmpeg(), [...common, ...input, '-map', '0:v:0', '-map', '0:a:0?', '-vf', `scale=w='min(1920,iw)':h=-2:flags=lanczos`, ...alphaVideo(metadata.fps), '-c:a', 'libopus', '-b:a', '128k', '-progress', 'pipe:1', '-nostats', staged], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7) });
     } else if (metadata.kind === 'image') {
-      await run(ffmpeg(), [...common, ...input, '-vf', 'scale=w=1920:h=1920:force_original_aspect_ratio=decrease', '-frames:v', '1', proxy], { signal });
+      await run(ffmpeg(), [...common, ...input, '-vf', 'scale=w=1920:h=1920:force_original_aspect_ratio=decrease', '-frames:v', '1', staged], { signal });
     } else if (metadata.kind === 'audio') {
-      await run(ffmpeg(), [...common, ...input, '-vn', '-map', '0:a:0?', '-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '128k', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', proxy], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7) });
+      await run(ffmpeg(), [...common, ...input, '-vn', '-map', '0:a:0?', '-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '128k', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', staged], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7) });
     } else {
-      temp = await mkdtemp(path.join(outputDir, '.preview-'));
       await encodePreviews({ video: inputPath, prepared: false, audio: metadata.hasAudio ? inputPath : undefined, metadata, outputs: ['full'], temp, signal, onProgress: value => onProgress?.(5 + value * .7) });
-      await rename(path.join(temp, FULL_VARIANT), proxy);
     }
+    await rename(staged, proxy);
     onProgress?.(80);
     onStage?.('Preparing audio waveform');
     const peaks = metadata.hasAudio ? await prepareWaveform(inputPath, metadata.duration, signal) : { waveform: [], waveformVersion: 2 };
     // Full and Color both read full-v3, so it is the grading picture from the moment the clip plays.
     const colorProxyUrl = opaque ? url(proxyName) : undefined;
     onPlayable?.({ ...metadata, ...peaks, proxyUrl: url(proxyName), colorProxyUrl, thumbnail });
-    published = Boolean(onPlayable);
     let previews: Pick<MediaAsset, 'proxyVariants' | 'audioProxyUrl'> = {};
     if (metadata.hasAlpha) previews = await prepareAlphaVariants(inputPath, outputDir, baseUrl, metadata, signal, options.refresh);
     else if (opaque) {
@@ -517,7 +523,7 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
       // From full-v3, already converted and tone-mapped; its AAC is copied. A plain re-prepare keeps files on disk.
       const missing = (name: string) => options.refresh || !existsSync(path.join(outputDir, name));
       const outputs = ([['stream', STREAM_VARIANT], ['low', STREAM_LOW_VARIANT], ...metadata.hasAudio ? [['audio', AUDIO_VARIANT]] : []] as [PreviewOutput, string][]).filter(([, name]) => missing(name)).map(([output]) => output);
-      if (outputs.length) for (const name of await encodePreviews({ video: proxy, prepared: true, audio: metadata.hasAudio ? proxy : undefined, audioCopy: true, metadata, outputs, temp: temp!, signal, onProgress: value => onProgress?.(80 + value * .19) })) await rename(path.join(temp!, name), path.join(outputDir, name));
+      if (outputs.length) for (const name of await encodePreviews({ video: proxy, prepared: true, audio: metadata.hasAudio ? proxy : undefined, audioCopy: true, metadata, outputs, temp, signal, onProgress: value => onProgress?.(80 + value * .19) })) await rename(path.join(temp, name), path.join(outputDir, name));
       previews = { proxyVariants: { Stream: url(STREAM_VARIANT), '1/2': url(STREAM_VARIANT), StreamLow: url(STREAM_LOW_VARIANT), '1/4': url(STREAM_LOW_VARIANT) }, audioProxyUrl: metadata.hasAudio ? url(AUDIO_VARIANT) : undefined };
     }
     // After the variants, so the strip is tiled from the 480px stream rather than the 4K original.
@@ -525,8 +531,7 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
     if (metadata.kind === 'video') filmstripFrames = await prepareMediaFilmstrip(inputPath, outputDir, metadata.duration, signal);
     onProgress?.(100);
     return { ...cleared, ...metadata, ...previews, colorProxyUrl, proxyUrl: url(proxyName), thumbnail, ...(filmstripFrames ? { filmstrip: url('filmstrip.jpg'), filmstripFrames, filmstripVersion: FILMSTRIP_VERSION } : {}), ...peaks };
-  } catch (error) { if (!published) await rm(proxy, { force: true }); throw error; }
-  finally { if (temp) await rm(temp, { recursive: true, force: true }); }
+  } finally { if (temp) await rm(temp, { recursive: true, force: true }); }
 }
 
 export function audioFilters(clip: Clip): string[] {

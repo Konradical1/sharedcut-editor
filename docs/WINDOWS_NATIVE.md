@@ -62,7 +62,7 @@ quality, and previews are what fill the disk). Storage v3 keeps three per video:
 build migrates older imports one at a time in the background and deletes the
 files they replace; the log shows `Media storage v3:` lines with the space freed.
 An asset is skipped (and retried at the next start) while free space is under
-its estimated output plus 1 GB. Rolling back to an older build after that makes
+its estimated output plus the 5 GB disk reserve (`FRAME_LINE_MIN_FREE_GB`). Rolling back to an older build after that makes
 migrated clips 404, so roll forward instead.
 
 Optical flow runs on the CPU and uses bounded motion-estimation resolution; it

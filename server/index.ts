@@ -481,11 +481,16 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   };
   const flushProgress = () => { for (const [id, saved] of progressSaves) if (saved.patch) updateAsset(id, {}); };
   const updateJob = (id: string, patch: Partial<RenderJob>, save = true) => { if (!state.renderJobs.some(job => job.id === id)) return; const previous = state.renderJobs; state.renderJobs = state.renderJobs.map(job => job.id === id ? { ...job, ...patch } : job); try { if (save) persist(); else touch(); } catch (error) { state.renderJobs = previous; throw error; } };
+  // Each queued or running job and its id (`camera-<asset>`, `filmstrip-<asset>`… for an asset's side jobs).
+  const queued = new Map<Promise<void>, string>();
+  /** Settles once every job of this asset has ended; the startup migration's chain never holds it up, unlike queue.drain. */
+  const assetJobs = (id: string) => Promise.all([...queued].filter(([, key]) => key === id || key.endsWith(`-${id}`)).map(([job]) => job));
   // `done` runs however the job ends, including cancelled before it started.
   const addWork = (id: string, work: (signal: AbortSignal) => Promise<void>, render = false, done?: () => void) => {
     const controller = new AbortController(); aborters.set(id, controller);
+    let ended!: () => void; const job = new Promise<void>(resolve => { ended = resolve; }); queued.set(job, id);
     queue.add(async () => { try { if (!closed && !controller.signal.aborted) await work(controller.signal); }
-      finally { if (aborters.get(id) === controller) aborters.delete(id); done?.(); } }, render);
+      finally { if (aborters.get(id) === controller) aborters.delete(id); queued.delete(job); ended(); done?.(); } }, render);
   };
   const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)} ));
   const startRender = (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>) => {
@@ -517,9 +522,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       if (signal.aborted) throw new Error('Import cancelled.');
       updateAsset(id, { status: 'processing', progress: 0, error: undefined });
       let previous = -1;
-      // Prepared files are served immutable, so a refresh that rewrites them in place needs new URLs or browsers keep the old pictures.
-      // A replaced original keeps its replacement's version on every URL from then on, the original's included.
-      const replaced = replacedVersion(id), version = refresh ? `?v=${Date.now().toString(36)}` : replaced, bust = (url?: string) => url && version ? url + version : url;
+      // Prepared files are served immutable and footage caches key on the URL, so any re-prepare (a refresh, a Retry: an
+      // encoder upgrade or another host changes the bytes) needs new URLs or browsers mix old pieces with new ones.
+      // A replaced original keeps its replacement's version on its own URL from then on.
+      const replaced = replacedVersion(id), version = refresh || asset.proxyUrl ? `?v=${Date.now().toString(36)}` : replaced, bust = (url?: string) => url && version ? url + version : url;
       const publish = (result: Awaited<ReturnType<typeof probeMedia>> & Partial<Omit<Asset, 'size'>>) => {
         const { size, ...fresh } = result;
         const metadata: typeof fresh = { ...fresh };
@@ -1230,7 +1236,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             if (state.clips.some(clip => clip.mediaId === id) || state.snapshots.some(snapshot => snapshot.state.clips.some(clip => clip.mediaId === id)) || state.renderJobs.some(job => job.projectId === asset.projectId && ['waiting', 'rendering'].includes(job.status)) || captionJobs().some(job=>job.projectId===asset.projectId&&['waiting','running'].includes(job.status))) fail(409, 'This media is used by a timeline, snapshot, or pending export.');
             aborters.get(id)?.abort(); state.media = state.media.filter(item => item.id !== id); persist();
             // Worker cleanup follows cancellation so an encoder cannot recreate deleted files.
-            void queue.drain().then(() => rmSync(mediaDir(id), { recursive: true, force: true })).catch(error => console.error('File cleanup failed:', error)); send(res, 200, { ok: true }); return;
+            void assetJobs(id).then(() => rmSync(mediaDir(id), { recursive: true, force: true })).catch(error => console.error('File cleanup failed:', error)); send(res, 200, { ok: true }); return;
           }
         }
         if(path==='/api/captions'&&method==='GET') {
@@ -1589,30 +1595,33 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       updateAsset(asset.id, { status: 'failed', progress: 0, error: 'This upload stopped for a day and was discarded. Upload the file again.' });
     }
   };
-  const sweepUploads = () => { try { expireUploads(); } catch (error) { console.error('Abandoned upload cleanup failed:', error); } };
+  // An encode killed by a hard restart leaves its temp folder in prepared/. The one the last restart left is under an hour
+  // old at startup, so the hourly pass takes it; a live encode keeps its folder fresh.
+  const sweepPrepared = () => { try { const swept = sweepPreparedTemp(join(dataDir, 'media')); if (swept) console.log(`Removed ${swept} interrupted preview folder(s).`); } catch (error) { console.error('Interrupted preview cleanup failed:', error); } };
+  const sweepUploads = () => { try { expireUploads(); } catch (error) { console.error('Abandoned upload cleanup failed:', error); } sweepPrepared(); };
   sweepUploads(); const uploadSweep = setInterval(sweepUploads, 3600_000); uploadSweep.unref();
-  // An encode killed by a hard restart leaves its temp folder in prepared/; nothing is running yet, so anything stale goes.
-  try { const swept = sweepPreparedTemp(join(dataDir, 'media')); if (swept) console.log(`Removed ${swept} interrupted preview folder(s).`); } catch (error) { console.error('Interrupted preview cleanup failed:', error); }
   // A fresh install gets its legacy row now, so `project-bundle.mjs import` has one to merge into;
   // after a migration or a crash the row is brought up to date before anything reads it.
   if (!store.legacyCurrent()) store.writeLegacy();
   // Media storage v3: older imports move to full-v3 + stream-v2 + stream-low-v2 and their old previews are deleted.
   // One asset at a time on the media queue, each queued only when the last finishes, so exports and new uploads go
   // first and the waiting list never fills. Resumable: a killed run is picked up again at the next start.
-  const migrations: string[] = [], fromOriginal = new Set<string>();
+  const migrations: string[] = [];
   let migrating = false, migrated = 0, freedBytes = 0;
   const migrateNext = () => {
     for (let id = migrations.shift(); id !== undefined && !closed; id = migrations.shift()) {
-      const asset = state.media.find(item => item.id === id), forced = fromOriginal.delete(id);
+      const asset = state.media.find(item => item.id === id);
       // Busy (re-preparing, being replaced or deleted) means it ends up on the v3 set without this pass.
-      if (!asset || aborters.has(id) || !forced && !needsMigration(asset, join(mediaDir(id), 'prepared'))) continue;
+      if (!asset || aborters.has(id) || !needsMigration(asset, join(mediaDir(id), 'prepared'))) continue;
       migrating = true;
       addWork(id, async signal => {
         // The row as it is now: the job may have waited behind uploads and exports.
         const current = state.media.find(item => item.id === id);
-        if (!current || !forced && !needsMigration(current, join(mediaDir(id), 'prepared'))) return;
+        if (!current || !needsMigration(current, join(mediaDir(id), 'prepared'))) return;
         try {
-          const { status, freed } = await migrateAsset(current, { mediaDir: mediaDir(id), baseUrl: `/api/media/${id}/files`, version: replacedVersion(id), freeBytes, fromOriginal: forced, signal, update: patch => updateAsset(id, patch) });
+          // updateAsset skips a row that is gone (its project deleted meanwhile); the old files must then stay for the backup.
+          const update = (patch: Partial<Asset>) => { if (!state.media.some(item => item.id === id)) throw new Error('The asset was deleted.'); updateAsset(id, patch); };
+          const { status, freed } = await migrateAsset(current, { mediaDir: mediaDir(id), baseUrl: `/api/media/${id}/files`, version: replacedVersion(id), freeBytes, reserve: Math.max(2 ** 30, minFreeBytes), signal, update });
           freedBytes += freed; if (status === 'migrated') migrated++;
           if (status === 'low-disk' || status === 'no-source') console.warn(`Media storage v3: ${asset.name} skipped (${status === 'low-disk' ? 'not enough free disk space' : 'no original or grading proxy to encode from'}); it is tried again at the next start.`);
           else console.log(`Media storage v3: ${asset.name} ${status}${freed ? `, ${(freed / 1e9).toFixed(2)} GB freed` : ''} (${migrated} migrated, ${(freedBytes / 1e9).toFixed(1)} GB freed so far, ${migrations.length} left).`);
@@ -1621,20 +1630,25 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       return;
     }
   };
-  const queueMigration = (id: string, rebuild = false) => { if (rebuild) fromOriginal.add(id); if (!migrations.includes(id)) migrations.push(id); if (!migrating) migrateNext(); };
+  const queueMigration = (id: string) => { if (!migrations.includes(id)) migrations.push(id); if (!migrating) migrateNext(); };
   const cameraDue = (asset: Asset) => asset.kind === 'video' && asset.status === 'ready' && asset.cameraMetadataVersion !== 2 && existsSync(originalPath(asset.id));
   // Imports before version 2 read only the file's first 2 MB (Sony can write its profile at the end) and guessed Canon Log 3.
-  // An untagged stream then fell back to a BT.601 matrix, which the grading proxy baked in, so full-v3 is rebuilt from the original.
+  // An untagged stream then fell back to a BT.601 matrix, which the grading proxy baked in. The files that carry it go
+  // before the correction is saved, so the migration rebuilds full-v3 from the original whenever it gets there, even
+  // after restarts; only then is the check marked done.
   for (const asset of state.media) if (cameraDue(asset)) addWork(`camera-${asset.id}`, async signal => {
     try {
       const found = await readCameraColor(originalPath(asset.id), statSync(originalPath(asset.id)).size), current = state.media.find(m => m.id === asset.id);
       if (!current || signal.aborted || closed) return;
-      const matrix = current.colorMatrix === 'auto' ? found?.colorMatrix : undefined;
+      const stale = current.colorMatrix === 'auto' ? found?.colorMatrix : undefined;
+      let matrix = stale;
+      // Windows refuses to delete a file FFmpeg or a player still holds: keep the old matrix and retry on the next start.
+      if (matrix) try { for (const name of ['color-v1.mp4', FULL_VARIANT]) rmSync(join(mediaDir(asset.id), 'prepared', name), { force: true, maxRetries: 3 }); } catch (error) { matrix = undefined; console.error(`${asset.name}: stale grading picture in use, corrected on the next start.`, error); }
       // Positive camera metadata corrects a label. A missing tag never removes one, but says so when import only assumed it.
       const assumed = !found?.inputProfile && current.inputProfile && current.colorEvidence?.startsWith('Canon container (CAEP)') ? `; ${current.inputProfile} was assumed at import, not verified` : '';
-      updateAsset(asset.id, { cameraMetadataVersion: 2, ...(found && { colorEvidence: found.colorEvidence + assumed }), ...(found?.inputProfile && { inputProfile: found.inputProfile, inputGamut: found.inputGamut ?? current.inputGamut }), ...(matrix && { colorMatrix: matrix }) });
-      queueMigration(asset.id, Boolean(matrix));
+      updateAsset(asset.id, { ...(stale === matrix && { cameraMetadataVersion: 2 }), ...(found && { colorEvidence: found.colorEvidence + assumed }), ...(found?.inputProfile && { inputProfile: found.inputProfile, inputGamut: found.inputGamut ?? current.inputGamut }), ...(matrix && { colorMatrix: matrix, colorProxyUrl: undefined }) });
     } catch (error) { if (!signal.aborted) console.error(`Camera metadata check failed for ${asset.name}:`, error); }
+    finally { if (!signal.aborted && !closed) queueMigration(asset.id); }
   });
   // Assets still due a camera check join the migration from that check, after any matrix correction.
   const due = state.media.filter(asset => !cameraDue(asset) && needsMigration(asset, join(mediaDir(asset.id), 'prepared')));
@@ -1648,8 +1662,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         const { resolution, width, height, colorTransfer, colorMatrix, probeVersion, hasAlpha } = await probeMedia(originalPath(asset.id), signal);
         if (signal.aborted || closed) return;
         updateAsset(asset.id, { resolution, width, height, colorTransfer, colorMatrix, probeVersion, hasAlpha } as Partial<Asset>);
-        // Graphics with alpha were proxied to opaque H.264 (a black backdrop); they prepare again as alpha WebM.
-        if (colorTransfer === 'arib-std-b67' || colorTransfer === 'smpte2084' || hasAlpha) processAsset(asset.id, true);
+        // Graphics with alpha were proxied to opaque H.264 (a black backdrop); they prepare again as alpha WebM. The refresh
+        // replaces whatever holds the asset (its storage migration), which would otherwise rename its files over this one's.
+        if (colorTransfer === 'arib-std-b67' || colorTransfer === 'smpte2084' || hasAlpha) { aborters.get(asset.id)?.abort(); processAsset(asset.id, true); }
       } catch (error) { if (!signal.aborted) console.error(`Re-probe failed for ${asset.name}:`, error); }
     });
   }

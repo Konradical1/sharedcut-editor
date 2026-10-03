@@ -65,8 +65,11 @@ test('an old asset moves to full-v3 + stream-v2 + stream-low-v2, its row is upda
     assert.equal(needsMigration(row, old.prepared), false);
     assert.equal((await old.run(row)).status, 'current', 'a second pass has nothing to do');
 
-    // A corrected colour matrix rebuilds from the camera original, under new URLs, and leaves stream-v2 alone.
-    const rebuilt = await old.run(row, { fromOriginal: true });
+    // A corrected colour matrix: the camera check deletes full-v3 (color-v1 is gone already) and clears colorProxyUrl, so
+    // the next pass, at whatever start it comes, rebuilds from the camera original under new URLs and leaves stream-v2 alone.
+    await rm(full); const corrected = { ...row, colorProxyUrl: undefined };
+    assert.equal(needsMigration(corrected, old.prepared), true);
+    const rebuilt = await old.run(corrected);
     assert.equal(rebuilt.status, 'migrated');
     const again = old.row(); assert.notEqual(again.proxyUrl, row.proxyUrl); assert.equal(again.proxyVariants!.Stream, row.proxyVariants!.Stream);
     const [r2, g2] = await colour(full); assert.ok(r2 > 200 && g2 < 60, `rebuilt from the original (red), got ${r2},${g2}`);
@@ -135,6 +138,42 @@ test('graphics lose their opaque proxies, a missing proxy is rebuilt from the or
     const full = await oldAsset(root, 'd'), before = (await readdir(full.prepared)).sort();
     assert.equal((await full.run(full.asset, { freeBytes: () => 2 ** 30 })).status, 'low-disk');
     assert.deepEqual((await readdir(full.prepared)).sort(), before); assert.equal(full.rows.length, 0);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+type Stream = { codec_type: string; start_time?: string; color_primaries?: string; color_transfer?: string };
+const streams = async (file: string) => (JSON.parse((await exec(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,start_time,color_primaries,color_transfer', '-of', 'json', file])).stdout).streams as Stream[]);
+const startOf = (list: Stream[], type: string) => Number(list.find(s => s.codec_type === type)?.start_time);
+
+test('migration keeps a late-starting picture against its sound, reads Matroska lengths, and tags the stream files BT.709', { timeout: 180000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'frameline-migrate-offset-'));
+  try {
+    // A camera file whose picture starts 0.5 s after its PCM sound (which runs 0.5 s longer), tagged BT.2020 primaries.
+    const source = join(root, 'source.mp4'), sound = join(root, 'sound.wav');
+    await ff(['-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=24:d=3', '-vf', 'setparams=color_primaries=bt2020:color_trc=bt709:colorspace=bt709', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', source]);
+    await ff(['-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=3.5', '-c:a', 'pcm_s16le', sound]);
+    const asset = async (id: string, format: 'mov' | 'matroska', old: 'color+audio' | 'color' | 'none') => {
+      const dir = join(root, 'media', id), prepared = join(dir, 'prepared'), base = `/api/media/${id}/files`, original = join(dir, 'original');
+      await mkdir(prepared, { recursive: true });
+      await ff(['-itsoffset', '0.5', '-i', source, '-i', sound, '-map', '0:v', '-map', '1:a', '-c', 'copy', '-f', format, original]);
+      // What older builds made from it: color-v1 without sound, audio-v1 copied out of proxy.mp4.
+      if (old !== 'none') await ff(['-i', original, '-map', '0:v', '-an', '-c:v', 'libx264', '-preset', 'ultrafast', '-g', '1', '-pix_fmt', 'yuv422p10le', join(prepared, 'color-v1.mp4'), '-map', '0:v', '-map', '0:a', '-c:v', 'libx264', '-preset', 'ultrafast', '-g', '1', '-pix_fmt', 'yuv420p', '-c:a', 'aac', join(prepared, 'proxy.mp4')]);
+      if (old === 'color+audio') await ff(['-i', join(prepared, 'proxy.mp4'), '-map', '0:a', '-c:a', 'copy', join(prepared, 'audio-v1.m4a')]);
+      const row = { id, projectId: 'p', name: id, kind: 'video', binId: 'all', duration: 3.5, fps: 24, resolution: '320 × 180', size: '1 MB', status: 'ready', progress: 100, hasAudio: true, cameraMetadataVersion: 2,
+        proxyUrl: `${base}/${old === 'none' ? 'proxy-v2.mp4' : 'proxy.mp4'}`, ...old === 'none' ? {} : { colorProxyUrl: `${base}/color-v1.mp4` }, ...old === 'color+audio' ? { audioProxyUrl: `${base}/audio-v1.m4a` } : {} } as MediaAsset;
+      const result = await migrateAsset(row, { mediaDir: dir, baseUrl: base, freeBytes: roomy, update: () => {} });
+      return { prepared, result };
+    };
+    for (const [id, format, old] of [['cv', 'mov', 'color+audio'], ['cn', 'mov', 'color'], ['mk', 'matroska', 'none']] as const) {
+      const { prepared, result } = await asset(id, format, old);
+      assert.equal(result.status, 'migrated', `${id}: a Matroska picture is measured by its own length, not the longer sound's`);
+      for (const name of ['full-v3.mp4', 'stream-v2.mp4', 'stream-low-v2.mp4']) {
+        const list = await streams(join(prepared, name));
+        assert.ok(Math.abs(startOf(list, 'video') - .5) < .021 && Math.abs(startOf(list, 'audio')) < .021, `${id}/${name}: picture at 0.5 s and sound at 0 as recorded, got ${startOf(list, 'video')} / ${startOf(list, 'audio')}`);
+        const video = list.find(s => s.codec_type === 'video')!, tag = name === 'full-v3.mp4' ? 'unknown' : 'bt709';
+        assert.deepEqual([video.color_primaries ?? 'unknown', video.color_transfer ?? 'unknown'], [tag, tag], `${id}/${name}: primaries and transfer`);
+      }
+    }
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

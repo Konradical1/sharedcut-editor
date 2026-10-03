@@ -349,6 +349,20 @@ async function streamChoice(settings: Record<string, unknown> = {}, stalled = ne
   return { ...fake, state, answer, play: (to: number) => { state.playhead = to; fake.tick(); fake.tick(); } };
 }
 
+test('the automatic low stream follows the row when the storage migration gives StreamLow a new address', async () => {
+  const fake = await streamChoice({ footageCache: false }, new Set(['/stream.mp4']));
+  try {
+    fake.answer.slow = undefined;
+    fake.tick(); fake.tick(1300); fake.tick(50);
+    assert.equal(fake.live('/low.mp4').length, 1);
+    // Migrated: stream-low-v1 is deleted and the row names stream-low-v2.
+    Object.assign(fake.state.media[0], { proxyVariants: { Stream: '/stream.mp4', StreamLow: '/low-v2.mp4?v=1' } });
+    fake.play(4.5); fake.play(8.5);
+    assert.deepEqual([fake.live('/low.mp4').length, fake.live('/stream.mp4').length], [0, 0], 'never the deleted address, and no fall back to full Stream');
+    assert.ok(fake.live('/low-v2.mp4?v=1').length >= 1);
+  } finally { fake.restore(); }
+});
+
 test('a long wait moves a Stream picture to the low stream only on a line too slow for it, or one nothing measures', async () => {
   const fake = await streamChoice({}, new Set(['/stream.mp4']));
   try {

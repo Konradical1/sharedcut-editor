@@ -285,10 +285,12 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   const scrubs = new Map<string, { frames: ReturnType<typeof createScrubFrames>; media: HTMLVideoElement }>();
   let loadingSince: number | undefined;
   const streamFallbacks = new Map<string, string>();
-  const automaticStreams = new Map<string,string>();
+  // Assets the automatic rule moved to their low stream. The address is read from the row each time: the storage migration
+  // gives StreamLow a new one, and the old file is deleted.
+  const automaticStreams = new Set<string>();
   const selectedUrl = (asset: MediaAsset, options: PreviewOptions, visual: boolean) => {
     const url = playbackUrl(asset, options, visual);
-    return url ? streamFallbacks.get(url) ?? (visual&&!options.original&&options.quality==='Stream'?automaticStreams.get(asset.id):undefined) ?? url : url;
+    return url ? streamFallbacks.get(url) ?? (visual&&!options.original&&options.quality==='Stream'&&automaticStreams.has(asset.id)?asset.proxyVariants?.StreamLow:undefined) ?? url : url;
   };
   const groups = new Map<string, { canvas: HTMLCanvasElement; reference: HTMLCanvasElement; audio: AudioRoute }>();
   let color: ReturnType<typeof createColorPreview> | undefined;
@@ -348,7 +350,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // still opens low on a slow line, and the asset is back on Stream at its next decoder once the background fill has
     // saved what that one reads. While nothing measures the line (no answer: cache off, no controlling footage worker, no
     // rate yet) a stall's low stream stands.
-    if (automatic && !open) { const slow = preferLowStream(requestedUrl); if (slow) automaticStreams.set(asset.id, low); else if (slow === false) automaticStreams.delete(asset.id); }
+    if (automatic && !open) { const slow = preferLowStream(requestedUrl); if (slow) automaticStreams.add(asset.id); else if (slow === false) automaticStreams.delete(asset.id); }
     const url = automatic && (open?.url === requestedUrl || open?.url === low && open.automaticLow) ? open!.url : selectedUrl(asset, options, visual), audioOnly = !visual || asset.kind === 'audio';
     const fallback = !url && visual && asset.thumbnail;
     if (!url && !fallback) return;
@@ -744,7 +746,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           // saved). A slow decode, or a cold start on a fast line, would trade quality for nothing: that wait used to drop
           // any not-yet-cached clip to the low stream. While nothing measures the line (no answer: cache off, no controlling
           // footage worker, no rate yet) the wait is the signal.
-          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow&&preferLowStream(decoder.url)!==false){automaticStreams.set(asset.id,asset.proxyVariants.StreamLow);cleanup(decoder);decoders.delete(decoderId);dirty=true;holdLayer();continue;}
+          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow&&preferLowStream(decoder.url)!==false){automaticStreams.add(asset.id);cleanup(decoder);decoders.delete(decoderId);dirty=true;holdLayer();continue;}
           // Failed codecs switch through buffered() immediately. A network timeout remains visible.
           if(performance.now()-decoder.waitingSince>30000){decoder.framesFailed=true;frames.dispose();decoder.frames=undefined;dirty=true;}
           holdLayer();footageCache.setDecoderStatus(clip.id,decoder.url,`${asset.name} · ${frames.ahead?'Decoding requested frame':'Buffering video'}`);continue;
