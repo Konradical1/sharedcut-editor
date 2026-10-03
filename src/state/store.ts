@@ -1307,11 +1307,13 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       commit('PropertyChanged',clipId,`updated ${mask.name}`,[{collection:'clips',id:clipId,value:{smartMasks:clip.smartMasks!.map(m=>m.id===maskId?mask:m)}}],gesture);
     },
     attachSmartMask(clipId,maskId,targetId) {
-      const clip=editableClip(clipId,'smartMasks');if(!clip?.smartMasks?.some(m=>m.id===maskId))return;
+      // An empty maskId clears a Depth effect's subject; every other target always names a mask of this clip.
+      const clip=editableClip(clipId,'smartMasks'),depth=clip?.effects.find(e=>e.id===targetId&&e.name==='Depth');
+      if(!clip||!(maskId?clip.smartMasks?.some(m=>m.id===maskId):depth))return;
       const node=get().nodes.find(n=>n.id===targetId&&n.clipId===clipId);
       if(node?.effects?.some(e=>e.enabled&&e.type==='cst')){get().notify('Use a correction node without color-space transforms for a mask','info');return;}
       if(node){if(!editableClip(clipId,'grade')||!available(node.id,'*'))return;commit('GradeNodeChanged',node.id,'changed node mask',[{collection:'nodes',id:node.id,value:{mask:{id:maskId,enabled:true,invert:false,amount:100}}}]);}
-      else if(clip.effects.some(e=>e.id===targetId&&e.name==='Smart Mask')&&editableClip(clipId,'effects'))commit('PropertyChanged',clipId,'changed clip mask',[{collection:'clips',id:clipId,value:{effects:clip.effects.map(e=>e.id===targetId?{...e,maskId}:e)}}]);
+      else if(clip.effects.some(e=>e.id===targetId&&(e.name==='Smart Mask'||e===depth))&&editableClip(clipId,'effects'))commit('PropertyChanged',clipId,depth?'changed Depth subject':'changed clip mask',[{collection:'clips',id:clipId,value:{effects:clip.effects.map(e=>{if(e.id!==targetId)return e;const{maskId:_,...rest}=e;return maskId?{...rest,maskId}:rest;})}}]);
     },
     addMotionTracker(clipId,at) {
       const state=get(),clip=editableClip(clipId,'motionTrackers'),asset=state.media.find(m=>m.id===clip?.mediaId);

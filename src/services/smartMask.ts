@@ -67,7 +67,8 @@ export function validateSmartMaskBindings(clip:Clip,nodes:GradeNode[]) {
   if(clip.smartMasks!==undefined&&(!Array.isArray(clip.smartMasks)||clip.smartMasks.length>32))throw Error('Too many smart masks on a clip.');
   const ids=new Set<string>();
   for(const mask of clip.smartMasks??[]){validateSmartMask(mask);if(mask.source.mediaId!==clip.mediaId||ids.has(mask.id))throw Error('Smart mask source does not match its clip.');ids.add(mask.id);}
-  for(const effect of clip.effects)if(effect.maskId!==undefined){if(effect.name!=='Smart Mask'||!ids.has(effect.maskId))throw Error('Effect references a missing smart mask.');}
+  // A Smart Mask effect cuts its matte; a Depth effect protects and follows it (its Subject). Both only from their own clip.
+  for(const effect of clip.effects)if(effect.maskId!==undefined){if(!['Smart Mask','Depth'].includes(effect.name)||!ids.has(effect.maskId))throw Error('Effect references a missing smart mask.');}
   for(const node of nodes.filter(n=>n.clipId===clip.id))if(node.mask!==undefined){
     validateSmartMaskBinding(node.mask);
     if(!ids.has(node.mask.id))throw Error('Node references a missing smart mask.');

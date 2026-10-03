@@ -22,6 +22,12 @@ test('smart mask intent persists separately from revisions; source timing, bound
   const masked={...clip,smartMasks:[doc],effects:[{id:'effect',name:'Smart Mask',enabled:true,amount:100,maskId:'mask'}]};
   validateSmartMaskBindings(masked,[]);
   assert.throws(()=>validateSmartMaskBindings({...masked,mediaId:'other'},[]));
+  // A Depth subject binds the same way: a mask of its own clip and media, never another effect kind or a missing one.
+  const subject={...clip,smartMasks:[doc],effects:[{id:'depth',name:'Depth',enabled:true,amount:100,maskId:'mask'}]};
+  validateSmartMaskBindings(subject,[]);
+  assert.throws(()=>validateSmartMaskBindings({...subject,mediaId:'other'},[]));
+  assert.throws(()=>validateSmartMaskBindings({...subject,effects:[{id:'depth',name:'Depth',enabled:true,amount:100,maskId:'missing'}]},[]));
+  assert.throws(()=>validateSmartMaskBindings({...subject,effects:[{id:'blur',name:'Gaussian blur',enabled:true,amount:100,maskId:'mask'}]},[]));
   assert.equal(smartMaskSourceTime(clip,11,asset),3);
   assert.equal(smartMaskSourceTime({...clip,start:20},21,asset),3);
   assert.equal(smartMaskSourceTime({...clip,properties:{speed:50}},11,asset),2.5);

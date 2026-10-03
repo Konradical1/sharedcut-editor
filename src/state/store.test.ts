@@ -515,6 +515,25 @@ test('Depth: the map shows only where it was added, and first Lens blur takes Fo
   state().updateEffect('c3', id, null);
 });
 
+test('Depth subject: picks one of the clip\'s Smart Masks or none, undoably, and only a mask of this clip', () => {
+  state().addEffect('c3', 'Smart Mask'); state().addEffect('c3', 'Depth');
+  const mask = clip().smartMasks![0], depth = () => clip().effects.find(e => e.name === 'Depth')!;
+  state().attachSmartMask('c3', mask.id, depth().id);
+  assert.equal(depth().maskId, mask.id);
+  state().updateEffect('c3', depth().id, { parameters: { followSubject: 1 } });
+  assert.equal(depth().parameters!.followSubject, 1);
+  state().attachSmartMask('c3', 'not-a-mask', depth().id);
+  assert.equal(depth().maskId, mask.id, 'a mask the clip does not have is refused');
+  state().attachSmartMask('c3', '', depth().id);
+  assert.equal('maskId' in depth(), false, 'None clears the subject');
+  state().undo();
+  assert.equal(depth().maskId, mask.id, 'and one undo brings it back');
+  const smart = clip().effects.find(e => e.name === 'Smart Mask')!;
+  state().attachSmartMask('c3', '', smart.id);
+  assert.equal(clip().effects.find(e => e.id === smart.id)!.maskId, mask.id, 'a Smart Mask effect always keeps a mask');
+  for (const e of clip().effects.filter(e => e.name === 'Depth' || e.name === 'Smart Mask')) state().updateEffect('c3', e.id, null);
+});
+
 test('a color-wheel gesture undoes together without replacing another parameter',()=>{
   state().selectClip('c3');state().addNode('Wheel',{liftR:0,liftG:0,contrast:1});const id=state().selectedNodeId!;
   state().updateNode(id,{parameters:{liftR:.05,liftG:.02}},'wheel-drag');
