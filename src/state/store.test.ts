@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict';
 import { beforeEach, test } from 'node:test';
-import { useEditorStore as store } from './store.ts';
+import { projectBins, useEditorStore as store } from './store.ts';
 import { createDemoProject } from './demo.ts';
 import { defaultShape, getShape } from '../services/shapes.ts';
 import { evaluateClip } from '../services/animation.ts';
-import type { Keyframe } from './models.ts';
+import type { Clip, Keyframe } from './models.ts';
 import { neutralBalance, neutralLook, type LookOption } from '../services/colorAssistant.ts';
 import { forwardRoom } from '../services/selection.ts';
 import { LOCK_TTL, mediaService, projectService, renderService, STORAGE_KEY } from '../services/index.ts';
@@ -1423,4 +1423,146 @@ test('splitting and cutting move the comments from the cut on to the right half,
   assert.equal(state().comments.find(m => m.id === early.id)!.clipId, 'c3');
   state().undo();
   assert.deepEqual(state().comments, before);
+});
+
+// ---- Redo, ripple delete, trim tools, insert ----
+const at = (id: string) => [clip(id).start, clip(id).duration, clip(id).sourceIn];
+// Three picture clips end to end on V1 (sourceIn 5, 20, 40 of a 94 s source), each linked to its sound on A1.
+const make = (id: string, start: number, sourceIn: number, trackId = 'v1'): Clip => ({ id, projectId: 'city-after-dark', timelineId: baseline.timelineId, trackId, mediaId: 'm1', name: id, start, duration: 10, sourceIn, color: '#467879', disabled: false, properties: { speed: 100, linkGroup: `link-${id.replace('-audio', '')}` }, effects: [] });
+const editFixture = () => store.setState({ nodes: [], comments: [], selectedClipId: null, selectedClipIds: [],
+  tracks: baseline.tracks.map(t => ({ ...t, locked: false })), settings: { ...baseline.settings, linkSelection: true },
+  clips: [make('A', 0, 5), make('B', 10, 20), make('C', 20, 40), make('A-audio', 0, 5, 'a1'), make('B-audio', 10, 20, 'a1'), make('C-audio', 20, 40, 'a1')] });
+// A repeated toast refreshes in place instead of stacking, so look for it rather than at the end.
+const told = (title: RegExp) => state().notifications.some(n => title.test(n.title));
+
+test('redo re-applies an undone edit as a new edit; a new edit of mine clears it; a collaborator’s newer change blocks it', () => {
+  editFixture();
+  state().moveClip('C', 30);
+  state().undo();
+  assert.equal(clip('C').start, 20);
+  state().redo();
+  assert.equal(clip('C').start, 30);
+  assert.equal(clip('C-audio').start, 30, 'the linked sound comes back with it');
+  assert.equal(state().operations[0].description, 'redid: moved C');
+  state().redo();
+  assert.ok(told(/^Nothing to redo$/));
+  state().undo(); state().undo();
+  assert.equal(clip('C').start, 20, 'undo reverses the redo like any edit');
+  state().redo();
+  assert.equal(clip('C').start, 30);
+  assert.equal(state().operations[0].description, 'redid: moved C', 'a second redo is named for the edit, not the redo');
+  state().undo();
+  state().updateProperty('A', 'x', 12);
+  store.setState({ notifications: [] });
+  state().redo();
+  assert.equal(clip('C').start, 20, 'any new edit of mine clears what can be redone');
+  assert.ok(told(/^Nothing to redo$/));
+
+  state().moveClip('C', 30); state().undo();
+  state().setCurrentUser('ashley'); state().moveClip('C', 40); state().setCurrentUser('kyle');
+  store.setState({ notifications: [] });
+  state().redo();
+  assert.equal(clip('C').start, 40, 'redo never overwrites a collaborator’s newer change');
+  assert.ok(told(/newer change/));
+});
+
+test('ripple delete closes the gap on each track the clips held, keeps sync, respects locks and undoes once', () => {
+  editFixture();
+  state().selectClip('B');
+  state().deleteClip('B', true);
+  assert.equal(state().clips.some(c => c.id === 'B' || c.id === 'B-audio'), false);
+  assert.deepEqual(at('C'), [10, 10, 40]);
+  assert.deepEqual(at('C-audio'), [10, 10, 40]);
+  assert.deepEqual(at('A'), [0, 10, 5]);
+  state().undo();
+  assert.deepEqual([clip('B').start, clip('C').start, clip('C-audio').start], [10, 20, 20]);
+  state().redo();
+  assert.equal(clip('C').start, 10);
+  state().undo();
+  store.setState({ tracks: state().tracks.map(t => t.id === 'a1' ? { ...t, locked: true } : t) });
+  state().selectClip('B');
+  state().deleteClip('B', true);
+  assert.equal(clip('C').start, 20, 'a linked clip on a locked track stops the whole edit');
+  assert.ok(state().clips.some(c => c.id === 'B'));
+});
+
+test('ripple trim moves an edge through the source and pushes or pulls everything after it', () => {
+  editFixture();
+  state().trimEdit('A', 'ripple', 'right', 2);
+  assert.deepEqual(at('A'), [0, 12, 5]);
+  assert.deepEqual([clip('B').start, clip('C').start, clip('B-audio').start, clip('C-audio').start], [12, 22, 12, 22]);
+  state().undo();
+  state().trimEdit('B', 'ripple', 'left', 3);
+  assert.deepEqual(at('B'), [10, 7, 23], 'the in point trims, the clip stays put, the rest closes up');
+  assert.deepEqual([clip('C').start, clip('C-audio').start], [17, 17]);
+  state().undo();
+  assert.deepEqual(state().planTrimEdit('A', 'ripple', 'left', -10)?.delta, -5, 'only 5 s of source before the in point');
+  state().trimEdit('A', 'ripple', 'left', -10);
+  assert.deepEqual(at('A'), [0, 15, 0]);
+  assert.equal(clip('B').start, 15);
+  assert.equal(state().planTrimEdit('A', 'ripple', 'right', -20)?.delta, 1 / 24 - 15, 'a clip keeps at least a frame');
+});
+
+test('roll moves a cut, slip changes only the source, slide moves a clip between its neighbours', () => {
+  editFixture();
+  state().trimEdit('A', 'roll', 'right', 2);
+  assert.deepEqual([at('A'), at('B')], [[0, 12, 5], [12, 8, 22]]);
+  assert.deepEqual([at('A-audio'), at('B-audio'), at('C')], [[0, 12, 5], [12, 8, 22], [20, 10, 40]]);
+  state().undo();
+  state().trimEdit('B', 'slip', 'right', 3);
+  assert.deepEqual([at('B'), at('B-audio')], [[10, 10, 23], [10, 10, 23]]);
+  state().undo();
+  assert.equal(state().planTrimEdit('B', 'slip', 'right', -100)?.delta, -20, 'slip stops at the start of the source');
+  state().trimEdit('B', 'slide', 'right', 2);
+  assert.deepEqual([at('A'), at('B'), at('C')], [[0, 12, 5], [12, 10, 20], [22, 8, 42]]);
+  assert.deepEqual(at('C-audio'), [22, 8, 42]);
+  state().undo();
+  assert.deepEqual([at('A'), at('B'), at('C')], [[0, 10, 5], [10, 10, 20], [20, 10, 40]], 'each tool is one undo step');
+  store.setState({ tracks: state().tracks.map(t => t.id === 'v1' ? { ...t, locked: true } : t) });
+  state().trimEdit('B', 'slide', 'right', 2);
+  assert.equal(clip('B').start, 10, 'locked tracks refuse trim tools');
+});
+
+test('insert pushes later clips right on the tracks it lands on, cutting the clip under the drop point', () => {
+  editFixture();
+  store.setState({ media: [...state().media, { ...state().media.find(m => m.id === 'm1')!, id: 'still', kind: 'image', hasAudio: false }], settings: { ...state().settings, stillDuration: 5 } });
+  state().addMediaToTimeline('still', 15, 'v1', true);
+  const placed = state().clips.find(c => c.mediaId === 'still')!;
+  assert.deepEqual([placed.start, placed.duration], [15, 5]);
+  assert.deepEqual(at('B'), [10, 5, 20]);
+  const right = state().clips.find(c => c.trackId === 'v1' && c.start === 20)!;
+  assert.deepEqual([right.duration, right.sourceIn], [5, 25], 'the right half keeps its source offset');
+  assert.deepEqual([clip('C').start, clip('C-audio').start], [25, 25], 'later clips keep sync with their sound');
+  state().undo();
+  assert.deepEqual([at('B'), at('C')], [[10, 10, 20], [20, 10, 40]]);
+  assert.equal(state().clips.some(c => c.mediaId === 'still'), false);
+  state().addMediaToTimeline('still', 15, 'v1');
+  assert.deepEqual([at('B'), clip('C').start], [[10, 5, 20], 20], 'without insert the drop overwrites');
+});
+
+test('bins: editors create, rename and delete them; a deleted bin’s media go to the upload bins, never away; old projects show the fixed set', () => {
+  const project = () => state().projects.find(p => p.id === 'city-after-dark')!, shown = () => projectBins(project(), state().media), binOf = (id: string) => state().media.find(m => m.id === id)!.binId;
+  assert.equal(project().bins, undefined, 'a project from before custom bins has none of its own');
+  assert.deepEqual(shown().map(b => b.id), ['interviews', 'broll', 'drone', 'audio', 'graphics'], 'only fixed bins holding media are shown');
+  const id = state().createBin('  Selects  ')!;
+  assert.deepEqual(shown().at(-1), { id, name: 'Selects' });
+  assert.equal(project().bins!.length, 6, 'the first change takes over the list the panel showed');
+  state().moveMedia(['m3', 'm7'], id);
+  assert.deepEqual([binOf('m3'), binOf('m7')], [id, id]);
+  state().renameBin(id, 'Best takes');
+  assert.equal(shown().find(b => b.id === id)!.name, 'Best takes');
+  state().deleteBin(id);
+  assert.equal(shown().some(b => b.id === id), false);
+  assert.deepEqual([binOf('m3'), binOf('m7')], ['broll', 'audio'], 'picture goes to B-roll, sound to Audio');
+  assert.equal(state().media.length, baseline.media.length, 'no media deleted');
+  state().deleteBin('broll');
+  assert.ok(shown().some(b => b.id === 'broll'), 'the bin uploads land in stays');
+  const before = { bins: project().bins, media: state().media };
+  store.setState({ locks: [{ id: 'project-lock', userId: 'ashley', projectId: 'city-after-dark', targetId: 'city-after-dark', field: '*', expiresAt: Date.now() + LOCK_TTL }] });
+  state().createBin('Locked out');
+  store.setState({ locks: [] });
+  state().setCurrentUser('maya');
+  state().createBin('Commenter bin'); state().renameBin('drone', 'Air'); state().deleteBin('drone'); state().moveMedia(['m4'], 'broll');
+  state().setCurrentUser('kyle');
+  assert.deepEqual([project().bins, state().media], [before.bins, before.media], 'a locked project and a non-editor change nothing');
 });

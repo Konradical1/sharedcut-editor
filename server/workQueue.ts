@@ -23,3 +23,15 @@ export function workQueue(limit = 1) {
     async drain() { while (running.size || waiting.length) await Promise.all([...running, renders]); await renders; },
   };
 }
+
+// At most `limit` jobs at once; the rest wait in order. A finishing job hands its slot straight to the next.
+export function limiter(limit: number) {
+  let active = 0; const waiting: (() => void)[] = [];
+  return async <T>(work: () => Promise<T>): Promise<T> => {
+    if (active < limit) active++; else await new Promise<void>(resolve => waiting.push(resolve));
+    try { return await work(); } finally { const next = waiting.shift(); if (next) next(); else active--; }
+  };
+}
+// Smart Mask, motion tracking, optical flow and Stabilize each saturate the GPU or every core; across
+// types only this many run at once. Exports and media preparation stay on their own queue, so none waits on the other.
+export const heavyJob = limiter(Math.max(1, Math.floor(Number(process.env.FRAME_LINE_HEAVY_JOBS)) || 2));

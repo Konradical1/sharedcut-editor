@@ -10,8 +10,8 @@ import { animationProperties, boundedAnimationValue, copyAnimatedNodes, evaluate
 import type { Keyframe, KeyframeValue } from './models.ts';
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
-import type { Clip, CollaborativeLock, Comment, GradeNode, Marker, MediaAsset, Notification, Operation, OperationType, Presence, Project, ProjectState, RenderJob, Settings, Snapshot, Timeline, Track, User, Workspace } from './models.ts';
-import { createDemoProject, defaultProperties, projects, users } from './demo.ts';
+import type { Bin, Clip, CollaborativeLock, Comment, GradeNode, Marker, MediaAsset, Notification, Operation, OperationType, Presence, Project, ProjectState, RenderJob, Settings, Snapshot, Timeline, Track, User, Workspace } from './models.ts';
+import { bins as fixedBins, createDemoProject, defaultProperties, projects, users } from './demo.ts';
 import { authenticationService, collaborationService, colorService, createId, LOCK_TTL, lockConflict, mediaService, projectService, renderService } from '../services/index.ts';
 import type { PersistedState } from '../services/index.ts';
 import { acceptsEffect, effectDefinitions } from '../services/effects.ts';
@@ -26,6 +26,9 @@ import { forwardSelection } from '../services/selection.ts';
 type Collection = 'clips' | 'tracks' | 'nodes' | 'comments' | 'timelines';
 type Change = { collection: Collection; id: string; value: Record<string, unknown> | null; replace?: boolean; unset?: string[] };
 type SidePanel = 'inspector' | 'people' | 'history' | 'comments' | null;
+/** Edit tools that move a clip's edges: ripple (trim and shift what follows), roll (move a cut), slip (change source in/out in place), slide (move between neighbours). */
+export type TrimTool = 'ripple' | 'roll' | 'slip' | 'slide';
+export type TrimPlan = { delta: number; clips: Clip[] };
 type LiveMode = 'independent' | 'following' | 'presenting';
 
 export interface EditorStore extends PersistedState {
@@ -77,6 +80,9 @@ export interface EditorStore extends PersistedState {
   keyframeProperty(clipId: string, path: string, value?: KeyframeValue): void;
   unlinkClip(id: string): void; linkClip(id: string): void;
   moveClip(id: string, start: number, trackId?: string): void; trimClip(id: string, start: number, duration: number): void; fitTrim(id: string, start: number, duration: number): {start:number;duration:number}|null;
+  /** Where a trim tool drag of `delta` seconds on `edge` would put every clip it touches (delta clamped to handles, a frame, and the neighbours), or null when there is no room. */
+  planTrimEdit(id: string, tool: TrimTool, edge: 'left' | 'right', delta: number): TrimPlan | null;
+  trimEdit(id: string, tool: TrimTool, edge: 'left' | 'right', delta: number): void;
   /** Markers selected on the current timeline (Delete, ⌘C act on them), and the last markers copied. */
   selectedMarkerIds: string[]; markerClipboard: Marker[] | null;
   /** Replace the current timeline's markers as one undoable edit. */
@@ -86,8 +92,9 @@ export interface EditorStore extends PersistedState {
   deleteMarkers(ids: string[]): void; copyMarkers(ids: string[]): void; pasteMarkers(): void;
   /** Close the gaps between the selected clips (Resolve's Delete Gaps), rippling everything after them as one undo. */
   deleteGaps(ids: string[]): void;
-  deleteGap(trackId:string,start:number,end:number):void; splitClip(id: string): void; deleteClip(id: string): void; duplicateClip(id: string): void; copyClip(id: string): void; pasteClip(): void;
-  addMediaToTimeline(mediaId: string | string[], start?: number, trackId?: string): void; updateTrack(id: string, patch: Partial<Track>, gesture?: string): void; moveTrack(id: string, direction: 'up' | 'down'): void; deleteTrack(id: string): void; createTrack(kind: 'video' | 'audio'): void; setTimeline(id: string): void;
+  /** `ripple` also closes the time the clips held on their tracks; `insert` pushes later clips right instead of overwriting them. */
+  deleteGap(trackId:string,start:number,end:number):void; splitClip(id: string): void; deleteClip(id: string, ripple?: boolean): void; duplicateClip(id: string): void; copyClip(id: string): void; pasteClip(insert?: boolean): void;
+  addMediaToTimeline(mediaId: string | string[], start?: number, trackId?: string, insert?: boolean): void; updateTrack(id: string, patch: Partial<Track>, gesture?: string): void; moveTrack(id: string, direction: 'up' | 'down'): void; deleteTrack(id: string): void; createTrack(kind: 'video' | 'audio'): void; setTimeline(id: string): void;
   addTransition(clipId: string, side: TransitionSide, name: string, patch?: { duration?: number; align?: TransitionAlign; params?: TransitionParams }): void;
   updateTransition(clipId: string, side: TransitionSide, patch: { name?: string; duration?: number; align?: TransitionAlign; curve?: [number, number, number, number]; params?: TransitionParams }, gesture?: string): void;
   removeTransition(clipId: string, side: TransitionSide): void;
@@ -109,11 +116,19 @@ export interface EditorStore extends PersistedState {
   useAcesOutput(clipId:string):void;
   restoreResolveGrade(clipId:string):void; initializeColorGrade(clipId:string):void; arrangeColorNodes(clipId:string):void; moveColorNode(id:string,beforeId:string|null,position?:{x:number;y:number}):void;
   updateNode(id: string, patch: Partial<GradeNode>, gesture?: string): void; applyGrade(nodes: { name: string; parameters: Record<string, number> }[]): void;
-  undo(): void; saveSnapshot(name: string, note: string): void; restoreSnapshot(id: string): void;
+  /** Redo re-applies your most recent undo; any new edit of yours clears what can be redone. */
+  undo(): void; redo(): void; saveSnapshot(name: string, note: string): void; restoreSnapshot(id: string): void;
   addComment(text: string, target?: { clipId?: string; range?: [number, number] }): void;
   replyComment(id: string, text: string): void; resolveComment(id: string): void;
   enqueueRender(name: string, preset: string, settings: Record<string, string>): void; updateRender(id: string, patch: Partial<RenderJob>): void;
   uploadMedia(files: File[]): void; renameMedia(id: string, name: string): void; removeMedia(id: string): void; retryMedia(id: string): void; revealMedia(id: string | null): void;
+  /** Upload `file` as the new original of media `id`: same id, so every clip keeps pointing at it. */
+  replaceMedia(id: string, file: File): void;
+  /** Media picked in the bin: what `,` inserts and `.` overwrites at the playhead. */
+  selectedMediaIds: string[];
+  createBin(name: string): string | undefined; renameBin(id: string, name: string): void;
+  /** Its media go to the bin uploads land in; media are never deleted. */
+  deleteBin(id: string): void; moveMedia(ids: string[], binId: string): void;
   setUserColor(color: string): void; setUserProfile(profile: { name: string; email: string }): void; setCurrentUser(id: string): void;
   setSettings(patch: Partial<Settings>): void; notify(title: string, kind?: Notification['kind'], detail?: string): void; dismissNotification(id: string): void;
   acquireLock(targetId: string, field: string): boolean; renewLock(targetId: string, field: string): boolean; releaseLock(targetId: string, field: string): void; releaseUserLocks(userId: string): void;
@@ -175,6 +190,13 @@ function applyChanges(state: ProjectState, changes: Change[]): ProjectState & {t
   return next;
 }
 const overlap = (a: Change, b: Change) => a.collection === b.collection && a.id === b.id && (a.replace || b.replace || [...Object.keys(a.value ?? {}), ...a.unset ?? []].some(key => [...Object.keys(b.value ?? {}), ...b.unset ?? []].some(other => key === other || key.startsWith(`${other}.`) || other.startsWith(`${key}.`))));
+// Undo and Redo never leave a clip without its track or timeline, a grade node without its clip, or a composition loop.
+const intact = (restored: ProjectState, timelines: Timeline[]) => {
+  if (!restored.clips.every(clip => (restored.timelines ?? timelines).some(t => t.id === clip.timelineId) && restored.tracks.some(track => track.id === clip.trackId && track.timelineId === clip.timelineId)) || !restored.nodes.every(node => restored.clips.some(clip => clip.id === node.clipId))) return false;
+  try { validateCompositions(restored.clips, restored.timelines ?? timelines); return true; } catch { return false; }
+};
+/** Applying `changes` would leave every entity they touch exactly as it is now. */
+const settled = (state: ProjectState, changes: Change[]) => { const next = applyChanges(state, changes); return changes.every(c => JSON.stringify(entity(next, c)) === JSON.stringify(entity(state, c))); };
 const projectState = (state: EditorStore): ProjectState => ({ timelines: state.timelines.filter(t=>t.projectId===state.projectId), clips: state.clips.filter(item => item.projectId === state.projectId), tracks: state.tracks.filter(item => state.timelines.some(t => t.id === item.timelineId && t.projectId === state.projectId)), nodes: state.nodes.filter(item => item.projectId === state.projectId), comments: state.comments.filter(item => item.projectId === state.projectId) });
 const durationOf = (state: EditorStore) => state.timelines.find(t => t.id === state.timelineId)?.duration ?? 180;
 // Where playback stops: the end of the last clip on a server timeline. Remembered per clip list: the clock asks every tick.
@@ -202,6 +224,13 @@ const updatedProjects = (state: EditorStore, clips: Clip[]) => {
   return state.projects.map(project => project.id === state.projectId ? { ...project, duration, modifiedAt: Date.now() } : project);
 };
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+/** Where uploads land, so where a deleted bin's media go. These two cannot be deleted. */
+export const defaultBin = (media: Pick<MediaAsset, 'kind'>) => media.kind === 'audio' ? 'audio' : 'broll';
+/** A project's bins: its own list once an editor changed one, else the fixed set where media sits; plus any bin media name that neither lists (an import makes one per camera). */
+export const projectBins = (project: Project | undefined, media: MediaAsset[]): Bin[] => {
+  const used = new Set(media.filter(m => m.projectId === project?.id && m.binId).map(m => m.binId)), list = project?.bins ?? fixedBins.filter(b => b.id !== 'all' && used.has(b.id));
+  return [...list, ...[...used].filter(id => !list.some(b => b.id === id)).sort().map(id => ({ id, name: fixedBins.find(b => b.id === id)?.name ?? id }))];
+};
 // Below THUMBNAIL_HEIGHT a lane is too short to read a filmstrip or waveform, so they are hidden.
 export const TRACK_MIN_HEIGHT = 24, TRACK_MAX_HEIGHT = 200, TRACK_THUMBNAIL_HEIGHT = 34;
 const sealedHistory = new Set<string>();
@@ -229,6 +258,8 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     if (lock) { state.notify(`${state.users.find(user => user.id === lock.userId)?.name ?? 'Someone'} is editing this control`, 'info'); return false; }
     return true;
   };
+  // The current project's bin list, taken over from what the panel shows on its first change.
+  const setBins = (change: (list: Bin[]) => Bin[]) => { const state = get(); set({ projects: state.projects.map(p => p.id === state.projectId ? { ...p, bins: change(projectBins(p, state.media)), modifiedAt: Date.now() } : p) }); };
   const editableClip = (id: string, field = 'manipulation') => {
     const state = get();
     const clip = state.clips.find(item => item.id === id && item.projectId === state.projectId);
@@ -239,7 +270,9 @@ export const useEditorStore = create<EditorStore>((set, get) => {
   const linkedClips=(clip:Clip)=>get().settings.linkSelection!==false&&clip.properties.linkGroup?get().clips.filter(c=>c.projectId===clip.projectId&&c.timelineId===clip.timelineId&&c.properties.linkGroup===clip.properties.linkGroup):[clip];
   const editableGroup=(clip:Clip,field='manipulation')=>{const group=linkedClips(clip);return group.every(c=>editableClip(c.id,field))?group:null;};
   let lastGesture: { token: string; operationId: string } | undefined;
-  const commit = (type: OperationType, targetId: string, description: string, changes: Change[], gesture?: string) => {
+  // Undo records, newest first: what Redo can re-apply. Any edit you commit clears yours.
+  let redoable: Operation[] = [];
+  const commit =(type: OperationType, targetId: string, description: string, changes: Change[], gesture?: string) => {
     const state = get();
     // Deleting an entity must retain its whole record so undo can recreate it.
     changes=changes.map(change=>change.value===null?{...change,replace:true}:change);
@@ -264,6 +297,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     if (coalesce) { operation.id = previous.id; operation.oldState = previous.oldState; }
     lastGesture = gesture ? { token: gesture, operationId: operation.id } : undefined;
     const next = applyChanges(state, changes);
+    redoable = redoable.filter(op => op.userId !== state.currentUserId);
     set({ ...next, operations: [operation, ...state.operations.slice(coalesce ? 1 : 0)], projects: updatedProjects(state, next.clips), ...(connection.enabled ? { timelines: next.timelines.map(t => ({ ...t, duration: Math.max(t.composition ? t.duration : 180, ...next.clips.filter(c => c.timelineId === t.id).map(c => c.start + c.duration)) })) } : {}) });
   };
   // A placement that lands on a neighbour's edge through float arithmetic can overlap it by 1e-14: not an overlap, so it must not trim.
@@ -298,6 +332,71 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     changes.push(...nodes.map(copy=>({collection:'nodes' as const,id:copy.id,value:record(copy),replace:true})));
     changes.push(...state.comments.filter(m=>m.clipId===c.id&&m.time>=at).map(m=>({collection:'comments' as const,id:m.id,value:{clipId:right.id}})));
     return {right,changes};
+  };
+  // Clips pushed along their tracks by `shifts` seconds, each taking its link partners with it so sync holds;
+  // a partner landing on another clip overwrites it as a drag would. Null when something in the way is locked.
+  const rippleChanges = (shifts:Map<string,number>, excluded:string[]): Change[] | null => {
+    const state=get(),byId=new Map(state.clips.map(c=>[c.id,c])),moves=new Map<string,Clip>();
+    for(const [id,shift] of shifts){const clip=byId.get(id);if(clip)for(const c of linkedClips(clip))if(!excluded.includes(c.id)&&!moves.has(c.id))moves.set(c.id,{...c,start:c.start+(shifts.get(c.id)??shift)});}
+    const placed=[...moves.values()];if(!placed.length)return [];
+    if(placed.some(c=>c.start<-1e-6)){state.notify('Not enough room to move the clips after it','info');return null;}
+    if(!placed.every(c=>editableClip(c.id)))return null;
+    const overwritten=overwriteChanges(placed[0],[...excluded,...moves.keys()],placed);if(!overwritten)return null;
+    return [...overwritten,...placed.map(c=>({collection:'clips' as const,id:c.id,value:{start:c.start}}))];
+  };
+  // Insert: on the tracks `group` lands on, everything from its start on moves right by its length; a clip running across that point is cut first.
+  const insertSpace = (group:Clip[]) => {
+    const state=get(),at=Math.min(...group.map(c=>c.start)),span=Math.max(...group.map(c=>c.start+c.duration))-at,lanes=new Set(group.map(c=>c.trackId));
+    const onLanes=state.clips.filter(c=>lanes.has(c.trackId)&&c.timelineId===state.timelineId),crossing=onLanes.filter(c=>c.start<at-1e-6&&c.start+c.duration>at+1e-6);
+    if(!crossing.every(c=>editableClip(c.id))||state.nodes.some(n=>crossing.some(c=>c.id===n.clipId)&&!available(n.id,'*')))return null;
+    const changes:Change[]=[],links=new Map<string,string>();
+    for(const c of crossing){
+      const old=String(c.properties.linkGroup??'');if(old&&!links.has(old)&&crossing.filter(o=>o.properties.linkGroup===c.properties.linkGroup).length>1)links.set(old,createId('link'));
+      const part=cutClip(c,at,links.get(old));part.right.start+=span;part.changes[1].value=record(part.right);changes.push(...part.changes);
+    }
+    const pushed=rippleChanges(new Map(onLanes.filter(c=>c.start>=at-1e-6).map(c=>[c.id,span])),[...group,...crossing].map(c=>c.id));if(!pushed)return null;
+    return {changes:[...changes,...pushed],moved:[...crossing,...onLanes.filter(c=>c.start>=at-1e-6)].map(c=>c.id)};
+  };
+  // Source beyond a clip's head and tail, in timeline seconds: how far each edge can extend. Stills, titles and freezes never run out.
+  const handles = (c:Clip) => {
+    const state=get(),media=state.media.find(a=>a.id===c.mediaId),rate=Number(c.properties.speed||100)/100;
+    const total=isComposition(c)?state.timelines.find(t=>t.id===c.properties.compositionId)?.duration:media?.kind==='image'?undefined:media?.duration;
+    if(c.properties.freeze||total===undefined)return {head:Infinity,tail:Infinity};
+    const before=c.sourceIn/rate,after=total/rate-before-c.duration;
+    return c.properties.reverse?{head:after,tail:before}:{head:before,tail:after};
+  };
+  // Every trim tool is edge moves times one delta: `head`/`tail` move a clip's in/out point through its source, `shift` moves it whole.
+  // Each touched clip's handles, a frame of length, and its room to clips that stay put bound that delta, so linked audio stays in sync.
+  const planEdit = (clip:Clip,tool:TrimTool,edge:'left'|'right',delta:number): TrimPlan | null => {
+    const state=get(),fps=state.projects.find(p=>p.id===state.projectId)?.fps||24,frame=1/fps;
+    const lane=(c:Clip)=>state.clips.filter(o=>o.id!==c.id&&o.trackId===c.trackId&&o.timelineId===c.timelineId);
+    const next=(c:Clip,side:'left'|'right')=>lane(c).find(o=>Math.abs(side==='left'?o.start+o.duration-c.start:o.start-c.start-c.duration)<frame/2);
+    const moves=new Map<string,{c:Clip;head:number;tail:number;shift:number}>();
+    const add=(c:Clip|undefined,head:number,tail:number,shift:number)=>{if(c&&!moves.has(c.id))moves.set(c.id,{c,head,tail,shift});};
+    for(const c of linkedClips(clip)){
+      if(tool==='slip')add(c,1,1,-1);
+      else if(tool==='slide'){add(c,0,0,1);add(next(c,'left'),0,1,0);add(next(c,'right'),1,0,0);}
+      else if(tool==='roll'){if(edge==='left'){add(c,1,0,0);add(next(c,'left'),0,1,0);}else{add(c,0,1,0);add(next(c,'right'),1,0,0);}}
+      else{add(c,edge==='left'?1:0,edge==='right'?1:0,edge==='left'?-1:0);for(const o of lane(c))if(o.start>=c.start+c.duration-1e-6)add(o,0,0,edge==='left'?-1:1);}
+    }
+    for(const m of [...moves.values()])for(const peer of linkedClips(m.c))add(peer,m.head,m.tail,m.shift);
+    const ids=[...moves.keys()];let lo=-Infinity,hi=Infinity;
+    const atLeast=(k:number,v:number)=>{if(k>0)lo=Math.max(lo,v/k);else if(k<0)hi=Math.min(hi,v/k);else if(v>1e-9)hi=-Infinity;}; // k·delta ≥ v
+    for(const {c,head,tail,shift} of moves.values()){
+      // What a ripple pushes keeps its spacing to the trimmed clip, so only the trimmed clip bounds it.
+      if(tool==='ripple'&&!head&&!tail)continue;
+      const room=handles(c),{floor,ceiling}=trimRoom(c,state.clips,ids);
+      atLeast(tail-head,frame-c.duration);atLeast(head,-room.head);atLeast(-tail,-room.tail);
+      atLeast(head+shift,floor-c.start);atLeast(-(tail+shift),c.start+c.duration-ceiling);
+    }
+    if(lo>hi+1e-9)return null;
+    const d=clamp(Math.round(delta*fps)/fps,lo,hi);
+    return {delta:d,clips:[...moves.values()].map(({c,head,tail,shift})=>{
+      const start=c.start+(head+shift)*d,duration=c.duration+(tail-head)*d,rate=Number(c.properties.speed||100)/100;
+      const sourceIn=c.properties.freeze?c.sourceIn:Math.max(0,c.sourceIn+(c.properties.reverse?-tail:head)*d*rate);
+      // Keyframes ride with the picture when an edge trims it; a slip changes only what plays, so they stay on the clip.
+      return {...c,start,duration,sourceIn,...(tool!=='slip'&&(head||tail)?{...trimAnimation(c,c.start+head*d,duration),start}:{})};
+    })};
   };
   const cloneContents = (clip:Clip, changes:Change[], ancestors=new Set<string>()) => {
     if(!isComposition(clip))return;
@@ -352,7 +451,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     const group=[...new Map(selected.flatMap(linkedClips).map(c=>[c.id,c])).values()];
     return group.every(c=>editableClip(c.id,field))?group:null;
   };
-  const insertClip = (source: Clip, start: number, name = source.name, copied = false, gesture?: string) => {
+  const insertClip = (source: Clip, start: number, name = source.name, copied = false, gesture?: string, insert = false) => {
     const state = get();
     if (!writable()) return;
     const targetTrack = state.tracks.find(track => track.id === source.trackId && track.timelineId === state.timelineId) ?? state.tracks.find(track => track.timelineId === state.timelineId && track.kind === (state.media.find(m => m.id === source.mediaId)?.kind === 'audio' ? 'audio' : 'video') && !track.locked);
@@ -375,19 +474,20 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     if(!source.id&&group.length>1)for(const c of group)c.properties.linkGroup=link;
     else {const links=new Map<string,string>();for(let i=0;i<group.length;i++){const old=sourceGroup[i]?.properties.linkGroup;delete group[i].properties.linkGroup;if(old){if(!links.has(String(old)))links.set(String(old),createId('link'));group[i].properties.linkGroup=links.get(String(old))!;}}}
     const nodes=group.flatMap((c,i)=>copyAnimatedNodes(c,(copied?state.clipboardNodes:state.nodes).filter(n=>n.clipId===sourceGroup[i]?.id),()=>createId('node')));
-    const overwritten=overwriteChanges(group[0],group.map(c=>c.id),group);if(!overwritten)return;changes.push(...overwritten);
+    const space=insert?insertSpace(group):{changes:[],moved:[]};if(!space)return;
+    const overwritten=overwriteChanges(group[0],[...group.map(c=>c.id),...space.moved],group);if(!overwritten)return;changes.push(...space.changes,...overwritten);
     for(const placed of group){cloneContents(placed,changes);changes.push({collection:'clips',id:placed.id,value:record(placed),replace:true});}
-    commit('ClipAdded',clip.id,`added ${name}`, [...changes,...nodes.map(node=>({collection:'nodes' as const,id:node.id,value:record(node),replace:true}))],gesture);
+    commit('ClipAdded',clip.id,`${insert?'inserted':'added'} ${name}`, [...changes,...nodes.map(node=>({collection:'nodes' as const,id:node.id,value:record(node),replace:true}))],gesture);
     set({ selectedClipId: clip.id, selectedClipIds:group.map(c=>c.id), selectedTextIds: isTitle(clip) ? [clip.id] : [], textSelection: null, selectedNodeId: nodes[0]?.id ?? null });
   };
   // One asset, one clip. Shared by the single add and the bin's multi-drop, which only differs in
   // laying the next clip down where the last one ended.
   const assetDuration = (media: MediaAsset) => media.kind === 'image' ? parseFloat(String(get().settings.stillDuration)) || 5 : media.duration;
-  const insertMedia = (media: MediaAsset, start: number, trackId?: string, gesture?: string) => {
+  const insertMedia = (media: MediaAsset, start: number, trackId?: string, gesture?: string, insert = false) => {
     const state = get(), kind = media.kind === 'audio' ? 'audio' : 'video', fps = state.projects.find(p => p.id === state.projectId)?.fps || 24;
     const track = trackId ? state.tracks.find(track => track.id === trackId && track.timelineId === state.timelineId && !track.locked && track.kind === kind) : state.tracks.find(track => track.timelineId === state.timelineId && track.kind === kind && !track.locked && !track.captionSets && track.number === 1) ?? state.tracks.find(track => track.timelineId === state.timelineId && track.kind === kind && !track.locked && !track.captionSets);
     if (!track) { state.notify('Add an unlocked track first', 'info'); return false; }
-    insertClip({ id: '', projectId: state.projectId, timelineId: state.timelineId, trackId: track.id, mediaId: media.id, name: media.name, start: 0, duration: assetDuration(media), sourceIn: 0, color: media.kind === 'audio' ? '#427A68' : '#467879', disabled: false, properties: { ...defaultProperties }, effects: [] }, Math.round(Math.max(0, start) * fps) / fps, media.name, false, gesture);
+    insertClip({ id: '', projectId: state.projectId, timelineId: state.timelineId, trackId: track.id, mediaId: media.id, name: media.name, start: 0, duration: assetDuration(media), sourceIn: 0, color: media.kind === 'audio' ? '#427A68' : '#467879', disabled: false, properties: { ...defaultProperties }, effects: [] }, Math.round(Math.max(0, start) * fps) / fps, media.name, false, gesture, insert);
     return true;
   };
   return {
@@ -398,7 +498,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     notifications: recoveryMessage ? [{ id: 'recovery', title: 'Recovered the demo project', detail: recoveryMessage, kind: 'error', timestamp: Date.now() }] : [],
     dragPreview: null, presence: demo.presence, locks: [{ id: 'demo-speed-lock', projectId: 'city-after-dark', targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }],
     playhead: 42, rangeIn: 0, rangeOut: 180, revealedMediaId: null, playing: false, playbackBuffering: false, workspace: 'edit', sidePanel: 'inspector', modal: null,
-    selectedMarkerIds: [], markerClipboard: null, clipPreview: null, draggingMediaId: null, inspectorTab: 'Video', selectedTransition: null, draggingTransition: null, leaks: [], transitionPresets: [], transitionFavorites: [], saveStatus: 'Saved', liveMode: 'independent', followUserId: null, clipboard: null, clipboardClips: [], clipboardNodes: [], gradeClipboard: null,
+    selectedMarkerIds: [], selectedMediaIds: [], markerClipboard: null, clipPreview: null, draggingMediaId: null, inspectorTab: 'Video', selectedTransition: null, draggingTransition: null, leaks: [], transitionPresets: [], transitionFavorites: [], saveStatus: 'Saved', liveMode: 'independent', followUserId: null, clipboard: null, clipboardClips: [], clipboardNodes: [], gradeClipboard: null,
     addTitle(preset = 0, box = {}, placement, animated = true) {
       const state=get();if(!writable())return;
       const fps=state.projects.find(p=>p.id===state.projectId)?.fps||24;
@@ -609,7 +709,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (!timeline) return;
       const selected = next.clips.find(c => c.projectId === id && c.name === 'Neon crossing') ?? next.clips.find(c => c.timelineId === timeline.id);
       const memberIds = next.projects.find(p => p.id === id)!.members.map(member => member.userId);
-      set({ selectedClipIds:[],compositionTrail:[],shapeTool:null, projectId: id, timelineId: timeline.id, selectedClipId: selected?.id ?? null, selectedNodeId: next.nodes.find(node => node.clipId === selected?.id && node.name === 'Balance')?.id ?? null, workspace: 'edit', selectedTextIds: selected && isTitle(selected) ? [selected.id] : [], textSelection: null, textTool: false, textPreview: [], playhead: selected?.start ?? 0, ...initialRange(next, timeline.id), revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, modal: null, presence: connection.enabled ? [] : createDemoProject(id).presence.filter(p => memberIds.includes(p.userId) && p.userId !== next.currentUserId), locks: !connection.enabled && id === 'city-after-dark' ? [{ id: createId('lock'), projectId: id, targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }] : [] });
+      set({ selectedClipIds:[],selectedMediaIds:[],compositionTrail:[],shapeTool:null, projectId: id, timelineId: timeline.id, selectedClipId: selected?.id ?? null, selectedNodeId: next.nodes.find(node => node.clipId === selected?.id && node.name === 'Balance')?.id ?? null, workspace: 'edit', selectedTextIds: selected && isTitle(selected) ? [selected.id] : [], textSelection: null, textTool: false, textPreview: [], playhead: selected?.start ?? 0, ...initialRange(next, timeline.id), revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, modal: null, presence: connection.enabled ? [] : createDemoProject(id).presence.filter(p => memberIds.includes(p.userId) && p.userId !== next.currentUserId), locks: !connection.enabled && id === 'city-after-dark' ? [{ id: createId('lock'), projectId: id, targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }] : [] });
     },
     createProject(input) {
       const state = get();
@@ -631,6 +731,26 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       }
       set({ playing: false, projects: state.projects.map(project => project.id === state.projectId ? { ...project, resolution: `${width} × ${height}`, fps, modifiedAt: Date.now() } : project) });
       return true;
+    },
+    // Bins live on the project, so they sync and merge per bin like any project field; which bin a file
+    // sits in is the media's own binId, changed through the media endpoint like its name.
+    // ponytail: bin edits and moves are not on the undo stack (media changes never are); add a bins collection to Change if that is missed.
+    createBin(name) {
+      const state = get(), clean = name.trim().slice(0, 80); if (!clean || !writable() || !available(state.projectId, '*')) return;
+      const id = createId('bin'); setBins(list => [...list, { id, name: clean }]); return id;
+    },
+    renameBin(id, name) { const state = get(), clean = name.trim().slice(0, 80); if (clean && writable() && available(state.projectId, '*')) setBins(list => list.map(b => b.id === id ? { ...b, name: clean } : b)); },
+    deleteBin(id) {
+      const state = get(); if (!writable() || !available(state.projectId, '*')) return;
+      if (id === 'broll' || id === 'audio') { state.notify('New uploads land in this bin. Rename it instead', 'info'); return; }
+      const inside = state.media.filter(m => m.projectId === state.projectId && m.binId === id);
+      setBins(list => list.filter(b => b.id !== id));
+      for (const target of ['broll', 'audio']) { const ids = inside.filter(m => defaultBin(m) === target).map(m => m.id); if (ids.length) get().moveMedia(ids, target); }
+    },
+    moveMedia(ids, binId) {
+      const state = get(); if (!ids.length || !writable()) return;
+      if (connection.enabled) { void api('/media/move', { method: 'POST', body: JSON.stringify({ projectId: state.projectId, mediaIds: ids, binId }) }).then(() => connection.refresh()).catch(error => state.notify(error.message, 'error')); return; }
+      set({ media: state.media.map(m => ids.includes(m.id) && m.projectId === state.projectId ? { ...m, binId } : m) });
     },
     setWorkspace(workspace) { set({ workspace, ...(get().settings.pauseOnWorkspace !== false ? { playing: false } : {}) }); },
     selectClips(ids) {
@@ -767,6 +887,19 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       for(const c of group){const s=c.start+target.start-clip.start,d=c.duration+target.duration-clip.duration,value=c.id===id?target:trimmedClip(c,s,d,group);if(!value||Math.abs(value.start-s)>1e-6||Math.abs(value.duration-d)>1e-6){state.notify('Linked media has reached its source boundary','info');return;}const overwritten=overwriteChanges({...c,...value},group.map(c=>c.id));if(!overwritten)return;changes.push(...overwritten,{collection:'clips',id:c.id,value});}
       commit('ClipTrimmed',id,`trimmed ${clip.name}`,changes);
     },
+    planTrimEdit(id, tool, edge, delta) {
+      const state=get(),clip=state.clips.find(c=>c.id===id&&c.projectId===state.projectId);
+      return clip&&Number.isFinite(delta)?planEdit(clip,tool,edge,delta):null;
+    },
+    trimEdit(id, tool, edge, delta) {
+      const clip=editableClip(id);if(!clip||!Number.isFinite(delta))return;
+      const state=get(),plan=planEdit(clip,tool,edge,delta);
+      if(!plan){state.notify('No room for this edit','info','A clip is out of source media or would be shorter than a frame.');return;}
+      if(!plan.delta||!plan.clips.every(c=>editableClip(c.id)))return;
+      const overwritten=overwriteChanges(plan.clips[0],plan.clips.map(c=>c.id),plan.clips);if(!overwritten)return;
+      const before=new Map(state.clips.map(c=>[c.id,c])),fields=['start','duration','sourceIn','keyframes','properties'] as const;
+      commit('ClipTrimmed',id,`${{ripple:'ripple trimmed',roll:'rolled the cut of',slip:'slipped',slide:'slid'}[tool]} ${clip.name}`,[...overwritten,...plan.clips.map(c=>({collection:'clips' as const,id:c.id,value:Object.fromEntries(fields.filter(k=>JSON.stringify(c[k])!==JSON.stringify(before.get(c.id)![k])).map(k=>[k,c[k]]))})).filter(change=>Object.keys(change.value).length)]);
+    },
     splitClip(id) {
       const clip=editableClip(id);if(!clip)return;
       const state=get(),group=editableGroup(clip);if(!group)return;
@@ -868,21 +1001,24 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const overwritten=overwriteChanges(placements[0],following.map(c=>c.id),placements);if(!overwritten)return;
       commit('PropertyChanged',trackId,'closed gap on '+track.name,[...overwritten,...placements.map(c=>({collection:'clips' as const,id:c.id,value:{start:c.start}}))]);
     },
-    deleteClip(id) {
+    deleteClip(id,ripple=false) {
       const clip=editableClip(id,'*');if(!clip)return;
       const state=get(),group=selectedGroup(clip,'*');if(!group)return;const ids=new Set(group.map(c=>c.id));
       const nodes=state.nodes.filter(n=>ids.has(n.clipId));if(nodes.some(n=>!available(n.id,'*')))return;
-      commit('ClipDeleted',id,`deleted ${clip.name}`,[...group.map(c=>({collection:'clips' as const,id:c.id,value:null,replace:true})),...state.comments.filter(c=>c.clipId&&ids.has(c.clipId)).map(c=>({collection:'comments' as const,id:c.id,value:{},unset:['clipId']})),...nodes.map(n=>({collection:'nodes' as const,id:n.id,value:null,replace:true}))]);
+      // Ripple: each track closes exactly the time its deleted clips held.
+      const held=(c:Clip)=>closedShift(group.filter(g=>g.trackId===c.trackId).map(g=>({start:g.start,end:g.start+g.duration})).sort((a,b)=>a.start-b.start),c.start);
+      const closed=ripple?rippleChanges(new Map(state.clips.filter(c=>!ids.has(c.id)&&c.timelineId===clip.timelineId&&held(c)>1e-9).map(c=>[c.id,-held(c)])),[...ids]):[];if(!closed)return;
+      commit('ClipDeleted',id,`${ripple?'ripple ':''}deleted ${clip.name}`,[...closed,...group.map(c=>({collection:'clips' as const,id:c.id,value:null,replace:true})),...state.comments.filter(c=>c.clipId&&ids.has(c.clipId)).map(c=>({collection:'comments' as const,id:c.id,value:{},unset:['clipId']})),...nodes.map(n=>({collection:'nodes' as const,id:n.id,value:null,replace:true}))]);
       if(state.selectedTransition&&ids.has(state.selectedTransition.clipId))set({selectedTransition:null});
       if(state.selectedClipId&&ids.has(state.selectedClipId))set({selectedClipId:null,selectedClipIds:[],selectedTextIds:[],textSelection:null,textPreview:[],selectedNodeId:null});
     },
     duplicateClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) {const group=selectedGroup(clip)??[clip];insertClip(clip,clip.start+Math.max(...group.map(c=>c.start+c.duration))-Math.min(...group.map(c=>c.start)),`${clip.name} copy`);} },
     copyClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) { const group=selectedGroup(clip)??[clip],ids=new Set(group.map(c=>c.id));set({ markerClipboard: null, clipboard: structuredClone(clip),clipboardClips:structuredClone([clip,...group.filter(c=>c.id!==clip.id)]),clipboardNodes:structuredClone(get().nodes.filter(n=>ids.has(n.clipId))) }); get().notify('Clip copied'); } },
-    pasteClip() { const state = get(); if (!state.clipboard) return; if (state.clipboard.projectId !== state.projectId || (!isTitle(state.clipboard) && !isShape(state.clipboard) && !isComposition(state.clipboard) && !state.media.some(media => media.id === state.clipboard!.mediaId && media.projectId === state.projectId))) { state.notify('Copy a clip from this project first', 'info'); return; } // The earliest copied clip lands on the playhead, the rest keep their offsets from it.
-      const first=Math.min(state.clipboard.start,...state.clipboardClips.map(c=>c.start));insertClip(state.clipboard, state.playhead+state.clipboard.start-first,state.clipboard.name,true); },
+    pasteClip(insert = false) { const state = get(); if (!state.clipboard) return; if (state.clipboard.projectId !== state.projectId || (!isTitle(state.clipboard) && !isShape(state.clipboard) && !isComposition(state.clipboard) && !state.media.some(media => media.id === state.clipboard!.mediaId && media.projectId === state.projectId))) { state.notify('Copy a clip from this project first', 'info'); return; } // The earliest copied clip lands on the playhead, the rest keep their offsets from it.
+      const first=Math.min(state.clipboard.start,...state.clipboardClips.map(c=>c.start));insertClip(state.clipboard, state.playhead+state.clipboard.start-first,state.clipboard.name,true,undefined,insert); },
     // A drop can carry the whole bin. Ready clips land end to end from the drop point, sharing one
     // gesture id so the hundred-clip drop is a single undo.
-    addMediaToTimeline(mediaId, start, trackId) {
+    addMediaToTimeline(mediaId, start, trackId, insert = false) {
       const state = get();
       if (start !== undefined && !Number.isFinite(start)) return;
       const ids = Array.isArray(mediaId) ? mediaId : [mediaId];
@@ -895,7 +1031,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         // A single drop on the wrong kind of track still refuses; only a mixed batch sends the odd
         // ones to their own lane rather than failing the whole drop.
         const lane = assets.length === 1 || state.tracks.find(track => track.id === trackId)?.kind === (asset.kind === 'audio' ? 'audio' : 'video') ? trackId : undefined;
-        if (!insertMedia(asset, at, lane, gesture)) return;
+        if (!insertMedia(asset, at, lane, gesture, insert)) return;
         at += assetDuration(asset);
       }
     },
@@ -1409,9 +1545,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
           if(!unchanged){blocked=true;return false;}
           restored=applyChanges(restored,candidate.oldState as Change[]);
         }
-        const intact=restored.clips.every(clip=>(restored.timelines??state.timelines).some(t=>t.id===clip.timelineId)&&restored.tracks.some(track=>track.id===clip.trackId&&track.timelineId===clip.timelineId))&&restored.nodes.every(node=>restored.clips.some(clip=>clip.id===node.clipId));
-        if(!intact){blocked=true;return false;}
-        try{validateCompositions(restored.clips,restored.timelines??state.timelines);}catch{blocked=true;return false;}
+        if(!intact(restored,state.timelines)){blocked=true;return false;}
         group=candidates;changes=candidates.flatMap(o=>o.oldState as Change[]);return true;
       });
       if (!operation) { state.notify(blocked ? 'Cannot undo without overwriting a newer change' : 'No personal actions to undo', 'info'); return; }
@@ -1419,6 +1553,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (changes.some(change => !available(change.id, '*'))) return;
       const undo = collaborationService.createOperation({ ...operation, gestureId: undefined, description: `undid: ${operation.description}`, oldState: [...group].reverse().flatMap(o=>o.newState as Change[]), newState: changes, undone: true });
       const restored = applyChanges(state, changes), ids=new Set(group.map(o=>o.id));
+      redoable = [undo, ...redoable];
       set({ ...restored, selectedClipIds:state.selectedClipIds.filter(id=>restored.clips.some(c=>c.id===id)), textSelection: null, textPreview: [], selectedTextIds: state.selectedTextIds.filter(id => restored.clips.some(c => c.id === id)), projects: updatedProjects(state, restored.clips), operations: [undo, ...state.operations.map(op => ids.has(op.id) ? { ...op, undone: true } : op)], selectedClipId: state.selectedClipId && restored.clips.some(c => c.id === state.selectedClipId) ? state.selectedClipId : null, selectedNodeId: state.selectedNodeId && restored.nodes.some(n => n.id === state.selectedNodeId) ? state.selectedNodeId : null });
       if(!get().timelines.some(t=>t.id===state.timelineId)){
         const parent=[...state.compositionTrail].reverse().find(entry=>get().timelines.some(t=>t.id===entry.timelineId));
@@ -1426,6 +1561,23 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         if(timeline){get().setTimeline(timeline);if(parent)get().setPlayhead(parent.playhead);}
       }
       state.notify(`Undone: ${operation.description}`);
+    },
+    // Redo is a new edit of yours that re-applies what the undo reversed, so it syncs, locks and undoes like any other.
+    // It refuses once anyone has changed what the undo restored, the same rule undo follows.
+    redo() {
+      const state=get();if(!writable(true))return;
+      const undone=redoable.find(op=>op.projectId===state.projectId&&op.userId===state.currentUserId);
+      if(!undone){state.notify('Nothing to redo','info');return;}
+      const forward=structuredClone(undone.oldState as Change[]);
+      if(!settled(state,undone.newState as Change[])||!intact(applyChanges(state,forward),state.timelines)){state.notify('Cannot redo without overwriting a newer change','info');return;}
+      if(forward.some(change=>change.collection!=='comments')&&!writable())return;
+      if(forward.some(change=>!available(change.id,'*')))return;
+      const rest=redoable.filter(op=>op!==undone),description=undone.description.replace(/^undid: (redid: )?/,'');
+      commit(undone.type,undone.targetId,`redid: ${description}`,forward);
+      redoable=rest;
+      const now=get();
+      set({selectedClipIds:now.selectedClipIds.filter(id=>now.clips.some(c=>c.id===id)),selectedTextIds:now.selectedTextIds.filter(id=>now.clips.some(c=>c.id===id)),selectedClipId:now.selectedClipId&&now.clips.some(c=>c.id===now.selectedClipId)?now.selectedClipId:null,selectedNodeId:now.selectedNodeId&&now.nodes.some(n=>n.id===now.selectedNodeId)?now.selectedNodeId:null});
+      state.notify(`Redone: ${description}`);
     },
     saveSnapshot(name, note) {
       const state = get(); if (!writable() || !name.trim()) return;
@@ -1469,6 +1621,11 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       set({ media: state.media.filter(asset => asset.id !== id || asset.projectId !== state.projectId) });
     },
     retryMedia(id) { const state = get(); if (!writable()) return; if (connection.enabled) { void api(`/media/${encodeURIComponent(id)}/retry`, { method: 'POST' }).then(() => connection.refresh()).catch(error => state.notify(error.message, 'error')); return; } set({ media: state.media.map(asset => asset.id === id && asset.projectId === state.projectId ? { ...asset, status: 'proxy', progress: 0 } : asset) }); state.notify('Demo proxy generation queued'); },
+    replaceMedia(id, file) {
+      const state = get(); if (!writable() || !state.media.some(m => m.id === id && m.projectId === state.projectId)) return;
+      if (!connection.enabled) { state.notify('Replacing media needs the server', 'info'); return; }
+      void api(`/media/${encodeURIComponent(id)}/replace`, { method: 'POST', body: JSON.stringify({ name: file.name, size: file.size }) }).then(async () => { await connection.refresh(); enqueueUploads(state.projectId, [file], [], id); }).catch(error => state.notify(error.message, 'error'));
+    },
     revealMedia(id) { if (id === null) set({ revealedMediaId: null }); else if (get().media.some(asset => asset.id === id && asset.projectId === get().projectId)) set({ revealedMediaId: id, workspace: 'edit' }); },
     setUserColor(color) { const state = get(); if (connection.enabled) { if (/^#[0-9a-f]{6}$/i.test(color)) void api('/auth/profile', { method: 'PATCH', body: JSON.stringify({ color }) }).then(() => connection.refresh()).catch(error => state.notify(error.message, 'error')); return; } if (/^#[0-9a-f]{6}$/i.test(color)) set({ users: state.users.map(user => user.id === state.currentUserId ? { ...user, color } : user) }); },
     setUserProfile(profile) { const state = get(); if (connection.enabled) { void api('/auth/profile', { method: 'PATCH', body: JSON.stringify(profile) }).then(() => { state.notify('Profile updated', 'success'); return connection.refresh(); }).catch(error => state.notify(error.message, 'error')); return; } try { const user = state.users.find(user => user.id === state.currentUserId); if (!user) return; const updated = authenticationService.updateProfile(user, profile); set({ users: state.users.map(item => item.id === user.id ? updated : item) }); state.notify('Profile updated', 'success'); } catch (error) { state.notify(error instanceof Error ? error.message : 'Could not update profile', 'error'); } },

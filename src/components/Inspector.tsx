@@ -14,12 +14,13 @@ import { isTitle } from '../services/text';
 import { useEffect, useRef, useState, type CSSProperties, type ReactNode, type PointerEvent } from 'react';
 import { Shapes, Type, SlidersHorizontal, ChevronDown, ChevronLeft, ChevronRight, RotateCcw, Diamond, Plus, Film, Crop, Gauge, WandSparkles, Volume2, Layers, LockKeyhole, Info, X, Trash2, ArrowUp, ArrowDown, Crosshair } from 'lucide-react';
 import { useEditorStore, usePanelPlayhead } from '../state/store';
-import { effectDefinitions, effectValue, effectEnabled, acceptsEffect } from '../services/effects';
+import { effectDefinitions, effectValue, effectEnabled, acceptsEffect, loudnessTargets, loudnessTarget } from '../services/effects';
 import { IconButton, EmptyState, NumberInput, durationLabel, fpsLabel } from './ui';
 import { api } from '../services/api';
 import { blendModeNames } from '../services/blendModes';
 import type { FlowPreview } from '../services/opticalFlow';
 import type { StabilizePreview } from '../services/stabilize';
+import type { Clip } from '../state/models';
 
 function StabilizeStatus({clipId,lock}:{clipId:string;lock:number}) {
   const [capability,setCapability]=useState<{available:boolean;reason?:string}>();
@@ -136,6 +137,12 @@ export function MotionBlurControl() {
     </div>}
   </fieldset>;
 }
+function NormalizeControl({clip,loudness}:{clip:Clip;loudness?:number}) {
+  const on=Boolean(clip.properties.normalize),target=loudnessTarget(clip),s=useEditorStore.getState;
+  return <><label className="inspector-checks"><input type="checkbox" aria-label="Normalize loudness" checked={on} onChange={e=>s().updateProperty(clip.id,'normalize',e.target.checked)}/> Normalize loudness</label>
+    {on&&<label className="inspector-select-row"><span>Target</span><select aria-label="Loudness target" value={target} onChange={e=>s().updateProperty(clip.id,'normalizeTarget',Number(e.target.value))}>{loudnessTargets.map(t=><option key={t.lufs} value={t.lufs}>{t.lufs} LUFS · {t.label}</option>)}</select></label>}
+    {on&&<p className="inspector-note">{loudness===undefined?'Export measures this clip and sets it to the target. Preview plays it unchanged: this file has no loudness measurement (media imported before it existed, or silent).':`Export measures this clip and sets it to ${target} LUFS. Preview applies the whole file's measured ${loudness.toFixed(1)} LUFS → ${(target-loudness).toFixed(1)} dB, an approximation.`}</p>}</>;
+}
 export default function Inspector() {
   // A selected transition is its own subject: it no longer selects the clip it is stored on, so
   // the panel resolves that clip itself rather than lighting it up on the timeline.
@@ -168,7 +175,7 @@ export default function Inspector() {
           {asset?.kind==='video'&&<OpticalFlowControl clipId={selected.id} enabled={Boolean(selected.properties.opticalFlow)}/>}
           <p className="inspector-note">Without keyframes, Speed changes the whole clip and its duration. Add a diamond, move the playhead, then change Speed to create a ramp within the clip.</p><div className="inspector-checks">{[['reverse','Reverse'],['freeze','Freeze frame']].map(([key,label])=><label data-cursor-anchor={key} key={key}><input type="checkbox" checked={Boolean(selected.properties[key])} onChange={e=>s().updateProperty(selected.id,key,e.target.checked)}/>{label}</label>)}</div></Section>
       </>}
-      {tab==='Audio'&&<><Section title="Clip audio" icon={<Volume2 size={12}/>}><Property name="gain" label="Gain" initial={0} min={-60} max={12} step={.5} suffix="dB"/><Property name="pan" label="Pan" initial={0} min={-100} max={100}/><Property name="audioFadeIn" label="Audio fade in" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><Property name="audioFadeOut" label="Audio fade out" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><label className="inspector-checks"><input type="checkbox" disabled title="Loudness normalization is not available" checked={false} onChange={e=>s().updateProperty(selected.id,'normalize',e.target.checked)}/> Normalize loudness</label></Section><div className="inspector-audio-preview"><Volume2 size={28}/><p>Shape your sound in the Audio workspace.</p><button className="button button-secondary" onClick={()=>s().setWorkspace('audio')}>Open mixer</button></div></>}
+      {tab==='Audio'&&<><Section title="Clip audio" icon={<Volume2 size={12}/>}><Property name="gain" label="Gain" initial={0} min={-60} max={12} step={.5} suffix="dB"/><Property name="pan" label="Pan" initial={0} min={-100} max={100}/><Property name="audioFadeIn" label="Audio fade in" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><Property name="audioFadeOut" label="Audio fade out" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><NormalizeControl clip={selected} loudness={(asset as {loudness?:number}|undefined)?.loudness}/></Section><div className="inspector-audio-preview"><Volume2 size={28}/><p>Shape your sound in the Audio workspace.</p><button className="button button-secondary" onClick={()=>s().setWorkspace('audio')}>Open mixer</button></div></>}
       {tab==='Effects'&&<>
         {selected.effects.length===0?<p className="inspector-note">No effects added to this clip yet.</p>:selected.effects.map((effect,index)=><details className={`effect-stack ${effectEnabled(selected,effect)?'':'is-off'}`} key={effect.id} open>
           <summary data-cursor-anchor={`effect-${effect.id}`} className="effect-stack-item"><ChevronDown size={12}/><span>{effect.name}</span></summary>

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { captionDocument, captionSignature, groupCaptionWords, demoCaptionWords, validateWords } from './captions.ts';
+import { captionDocument, captionSignature, groupCaptionWords, demoCaptionWords, subtitleCues, subtitleFile, validateWords } from './captions.ts';
+import type { Clip } from '../state/models.ts';
 import { useEditorStore } from '../state/store.ts';
 import { getText } from './text.ts';
 
@@ -106,4 +107,17 @@ test('reel captions: accent, snap pop with motion blur, thick outline and restyl
   assert.ok(dark>2000,`a thick outline surrounds the letters (${dark} px)`);
   let changed=0;for(let i=0;i<settled.length;i++)if(Math.abs(settled[i]-popping[i])>30)changed++;
   assert.ok(changed>1000,'the spoken word is mid-pop');assert.ok(partial>1500,`temporal samples blur the pop (${partial} soft px)`);
+});
+
+test('subtitle files: SRT and VTT stamps, order, multi-line text, overlaps, the export range and compositions',()=>{
+  const line=(id:string,start:number,duration:number,text:string,timelineId='t'):Clip=>({id,projectId:'p',timelineId,trackId:'captions',mediaId:'frameline-title',name:text,start,duration,sourceIn:0,color:'',disabled:false,properties:{captionSet:'s',textDocument:JSON.stringify({runs:[{text}]})},effects:[]});
+  const clips=[line('b',3725.5,2,'Second\n line two '),line('a',1.2,1.5,'First'),line('late',4000,1,'Late'),line('o',3726,1,'Overlap & <tag>'),{...line('off',10,1,'Off'),disabled:true},line('blank',12,1,'  '),line('other',2,1,'Other timeline','t2')];
+  const cues=subtitleCues(clips,'t',0,3800);
+  assert.deepEqual(cues.map(c=>c.text),['First','Second\n line two','Overlap & <tag>'],'sorted by time; disabled, empty, out-of-range and other timelines left out');
+  assert.equal(subtitleFile(cues,'srt'),'1\n00:00:01,200 --> 00:00:02,700\nFirst\n\n2\n01:02:05,500 --> 01:02:07,500\nSecond\nline two\n\n3\n01:02:06,000 --> 01:02:07,000\nOverlap & <tag>\n');
+  assert.equal(subtitleFile(cues,'vtt'),'WEBVTT\n\n00:00:01.200 --> 00:00:02.700\nFirst\n\n01:02:05.500 --> 01:02:07.500\nSecond\nline two\n\n01:02:06.000 --> 01:02:07.000\nOverlap &amp; &lt;tag&gt;\n');
+  assert.equal(subtitleFile(subtitleCues(clips,'t',2,3726),'srt'),'1\n00:00:00,000 --> 00:00:00,700\nFirst\n\n2\n01:02:03,500 --> 01:02:04,000\nSecond\nline two\n','In/Out cuts lines to the range and times them from its first frame');
+  const composition:Clip={...line('comp',100,4,''),mediaId:'frameline-composition',sourceIn:2,properties:{compositionId:'inner',speed:200}};
+  assert.equal(subtitleFile(subtitleCues([composition,line('i1',3,2,'Inside','inner'),line('i2',20,1,'Past its window','inner')],'t',0,200),'srt'),'1\n00:01:40,500 --> 00:01:41,500\nInside\n','a composition’s lines play at its place and speed');
+  assert.equal(subtitleFile([],'srt'),'');assert.equal(subtitleFile([],'vtt'),'WEBVTT\n\n');
 });

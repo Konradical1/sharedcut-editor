@@ -74,6 +74,29 @@ export function captionSignature(clips: Clip[], tracks: Track[], timelineId: str
   for(let i=0;i<value.length;i++){a=Math.imul(a^value.charCodeAt(i),16777619);b=Math.imul(b,33)^value.charCodeAt(i);}
   return (a>>>0).toString(16)+(b>>>0).toString(16);
 }
+export interface SubtitleCue { start: number; end: number; text: string }
+/**
+ * Caption lines on a timeline, the compositions on it included, cut to [from, to) and timed from `from`
+ * (the export's first frame). A disabled line or composition is left out, as the export leaves it out.
+ */
+export function subtitleCues(clips: Clip[], timelineId: string, from: number, to: number, depth = 0): SubtitleCue[] {
+  if (depth > 16) return [];
+  const cues = clips.filter(c => c.timelineId === timelineId && !c.disabled && c.start < to && c.start + c.duration > from).flatMap((c): SubtitleCue[] => {
+    if (isCaption(c)) { const text = (JSON.parse(String(c.properties.textDocument)) as { runs: { text: string }[] }).runs.map(run => run.text).join('').trim(); return text ? [{ start: c.start, end: c.start + c.duration, text }] : []; }
+    // Inside a composition, time runs from the clip's source in at its speed; a reversed or frozen one has no readable order.
+    if (c.mediaId !== 'frameline-composition' || c.properties.reverse || c.properties.freeze) return [];
+    const rate = Number(c.properties.speed || 100) / 100;
+    return subtitleCues(clips, String(c.properties.compositionId), c.sourceIn, c.sourceIn + c.duration * rate, depth + 1).map(q => ({ ...q, start: c.start + q.start / rate, end: c.start + q.end / rate }));
+  });
+  return cues.map(q => ({ ...q, start: Math.max(q.start, from) - from, end: Math.min(q.end, to) - from })).filter(q => q.end > q.start).sort((a, b) => a.start - b.start || a.end - b.end);
+}
+const stamp = (ms: number, separator: string) => `${String(Math.floor(ms / 3_600_000)).padStart(2, '0')}:${String(Math.floor(ms / 60_000) % 60).padStart(2, '0')}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}${separator}${String(ms % 1000).padStart(3, '0')}`;
+/** SRT (00:00:01,500, numbered) or WebVTT (00:00:01.500). Overlapping cues stay as they are: players show both. */
+export function subtitleFile(cues: SubtitleCue[], format: 'srt' | 'vtt') {
+  const blocks = cues.map(q => ({ start: Math.round(q.start * 1000), end: Math.round(q.end * 1000), text: q.text.replace(/\r\n?/g, '\n').split('\n').map(line => line.trim()).filter(Boolean).join('\n') })).filter(q => q.end > q.start && q.text)
+    .map((q, i) => `${format === 'srt' ? `${i + 1}\n` : ''}${stamp(q.start, format === 'srt' ? ',' : '.')} --> ${stamp(q.end, format === 'srt' ? ',' : '.')}\n${format === 'vtt' ? q.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : q.text}`);
+  return `${format === 'vtt' ? 'WEBVTT\n\n' : ''}${blocks.join('\n\n')}${blocks.length ? '\n' : ''}`;
+}
 /** Speech reads as on-time when the highlight lands just after the word starts; earlier feels rushed. */
 export const captionHighlightLead = .05;
 export const demoCaptionWords:CaptionWord[]='Make every word feel alive'.split(' ').map((text,i)=>({text,start:i*.46,end:i*.46+.4}));

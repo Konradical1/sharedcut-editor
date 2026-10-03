@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { animatedWindows, cachedLut, isAnimated, releaseLuts, retimeSchedule, getMediaCapabilities, prepareMedia, probeMedia, renderPasses, renderTimeline } from './media.ts';
+import { animatedWindows, audioFilters, cachedLut, isAnimated, measureLoudness, releaseLuts, retimeSchedule, getMediaCapabilities, prepareMedia, prepareWaveform, probeMedia, renderPasses, renderTimeline } from './media.ts';
+import { eqBiquads, responseDb } from '../src/services/audioDsp.ts';
+import { blendModeNames } from '../src/services/blendModes.ts';
 import type { RenderRequest } from './media.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
@@ -455,4 +457,73 @@ test('ProRes 4444 graphics keep their alpha in previews and composite over foota
   const at=(x:number)=>[...frame.subarray((32*64+x)*3,(32*64+x)*3+3)];
   assert.ok(at(8)[0]>200&&at(8)[2]<60,`graphic on the left, got ${at(8)}`);assert.ok(at(56)[2]>200&&at(56)[0]<60,`the footage shows through the transparent half, got ${at(56)}`);
  } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+// W3C Compositing over an opaque backdrop, which is what the preview canvas computes: the export must land on it.
+const w3c = (mode: string, cb: number, cs: number, alpha: number) => {
+  const D = (b: number) => b <= .25 ? ((16 * b - 12) * b + 4) * b : Math.sqrt(b);
+  const mixed = ({ Multiply: cb * cs, Screen: cb + cs - cb * cs, Overlay: cb <= .5 ? 2 * cs * cb : 1 - 2 * (1 - cs) * (1 - cb), 'Soft light': cs <= .5 ? cb - (1 - 2 * cs) * cb * (1 - cb) : cb + (2 * cs - 1) * (D(cb) - cb), Lighten: Math.max(cb, cs), Darken: Math.min(cb, cs), Difference: Math.abs(cb - cs),
+    'Hard light': cs <= .5 ? 2 * cs * cb : 1 - 2 * (1 - cs) * (1 - cb), 'Color dodge': cb === 0 ? 0 : cs === 1 ? 1 : Math.min(1, cb / (1 - cs)), 'Color burn': cb === 1 ? 1 : cs === 0 ? 0 : 1 - Math.min(1, (1 - cb) / cs), Exclusion: cb + cs - 2 * cb * cs } as Record<string, number>)[mode];
+  return mode === 'Add' ? Math.min(1, cb + alpha * cs) : (1 - alpha) * cb + alpha * mixed;
+};
+test('blend modes export the W3C result the preview canvas draws, over footage and over nothing', { timeout: 120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-blend-'));
+  try {
+    // Over's full red over black is the corner where W3C colour dodge stays black and FFmpeg's own dodge goes white.
+    // Add goes first: its premultiplied layer once leaked into the next clip's blend.
+    const under = [25, 153, 77], over = [255, 179, 51], modes = ['Add', ...blendModeNames.filter(mode => mode !== 'Normal' && mode !== 'Add')], half = modes.length * .5;
+    const png = async (name: string, rgb: number[]) => { const file = path.join(dir, name); await ff(['-f', 'lavfi', '-i', `color=c=0x${rgb.map(v => v.toString(16).padStart(2, '0')).join('')}:s=64x36,format=rgb24`, '-frames:v', '1', file]); return file; };
+    const asset = (id: string) => ({ id, projectId: 'p', name: id, kind: 'image', duration: 1, status: 'ready', progress: 100, binId: '', thumbnail: '', fps: 0, resolution: '64 × 36', size: '' }) as MediaAsset;
+    const track = (id: string, number: number) => ({ id, timelineId: 'tl', name: id, kind: 'video', number, muted: false, solo: false, locked: false, hidden: false, gain: 0, pan: 0 }) as Track;
+    const clip = (id: string, trackId: string, mediaId: string, start: number, duration: number, properties = {}) => ({ id, projectId: 'p', timelineId: 'tl', trackId, mediaId, name: id, start, duration, sourceIn: 0, color: '#fff', disabled: false, properties: { ...defaultProperties, ...properties }, effects: [] }) as Clip;
+    // Each mode at 60% opacity for half a second, first over the green picture, then over nothing.
+    const clips = [clip('under', 'v1', 'u', 0, half), ...modes.flatMap((mode, i) => [clip(`a${i}`, 'v2', 'o', i * .5, .5, { blendMode: mode, opacity: 60 }), clip(`b${i}`, 'v2', 'o', half + i * .5, .5, { blendMode: mode, opacity: 60 })])];
+    const outputPath = path.join(dir, 'blend.mov');
+    const request: RenderRequest = { project: { id: 'p', resolution: '64 × 36', fps: 24 } as Project, timeline: { id: 'tl', projectId: 'p', name: 'Main', duration: 2 * half }, tracks: [track('v1', 1), track('v2', 2)], clips, nodes: [], assets: [{ asset: asset('u'), path: await png('under.png', under) }, { asset: asset('o'), path: await png('over.png', over) }], settings: { audio: 'Disabled', codec: 'Apple ProRes 4444', resolution: '64 × 36', fps: '24' }, outputPath };
+    await renderTimeline(request);
+    const pixel = async (seconds: number, file = outputPath) => { const frame = (await ff(['-ss', String(seconds), '-i', file, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgba', 'pipe:1'])).stdout; return [...frame.subarray((18 * 64 + 32) * 4, (18 * 64 + 32) * 4 + 4)]; };
+    const near = (got: number[], want: number[], why: string, within = 3) => assert.ok(got.every((v, c) => Math.abs(v - want[c]) <= within), `${why}: ${got} vs ${want}`);
+    for (const [i, mode] of modes.entries()) for (const [backdrop, at] of [[under, i * .5 + .25], [[0, 0, 0], half + i * .5 + .25]] as const)
+      near(await pixel(at), [...backdrop.map((cb, c) => Math.round(255 * w3c(mode, cb / 255, over[c] / 255, .6))), 255], `${mode} over ${backdrop.join(',')}`);
+    // Inside a composition (a transparent render) the same layer over nothing stays itself at its own opacity, as on a
+    // transparent canvas; over the picture it is the opaque result above.
+    const nested = path.join(dir, 'nested.mov');
+    await renderTimeline({ ...request, transparent: true, outputPath: nested });
+    for (const [i, mode] of modes.entries()) {
+      near(await pixel(i * .5 + .25, nested), [...under.map((cb, c) => Math.round(255 * w3c(mode, cb / 255, over[c] / 255, .6))), 255], `${mode} in a composition`);
+      // ProRes 4444 alpha lands a few steps high for a Normal layer too (155 for 153).
+      near(await pixel(half + i * .5 + .25, nested), [...over, 153], `${mode} over nothing in a composition`, 5);
+    }
+    await assert.rejects(renderTimeline({ project: { id: 'p', resolution: '64 × 36', fps: 24 } as Project, timeline: { id: 'tl', projectId: 'p', name: 'Main', duration: 1 }, tracks: [track('v1', 1)], clips: [clip('x', 'v1', 'u', 0, 1, { blendMode: 'Hue' })], nodes: [], assets: [{ asset: asset('u'), path: path.join(dir, 'under.png') }], settings: { audio: 'Disabled', codec: 'H.264', resolution: '64 × 36', fps: '24' }, outputPath: path.join(dir, 'hue.mp4') }), /Hue blending is not available/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('the EQ graph is the export: FFmpeg attenuates each tone by the computed biquad response', async () => {
+  const clip = { id: 'c', name: 'EQ', properties: {}, effects: [{ id: 'e', name: 'EQ', enabled: true, amount: 50, parameters: { 'Low cut': 120, Presence: 7, Air: -5 } }] } as unknown as Clip;
+  const chain = audioFilters(clip), stages = eqBiquads(120, 7, -5, 48000);
+  for (const frequency of [60, 120, 3000, 15000]) {
+    const output = (await ff(['-f', 'lavfi', '-i', `aevalsrc=0.25*sin(2*PI*${frequency}*t):s=48000:d=1`, '-af', `${chain.join(',')},atrim=start=0.5,astats=metadata=1:measure_perchannel=none:measure_overall=RMS_level,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-`, '-f', 'null', '-'])).stdout.toString();
+    const rms = Number([...output.matchAll(/RMS_level=([^\r\n]+)/g)].at(-1)?.[1]), expected = 20 * Math.log10(.25 / Math.SQRT2) + responseDb(stages, frequency, 48000);
+    assert.ok(Math.abs(rms - expected) < .15, `${frequency} Hz: FFmpeg ${rms.toFixed(2)} dB, graph ${expected.toFixed(2)} dB`);
+  }
+});
+
+test('Normalize loudness measures the clip and exports it at the chosen target', { timeout: 60000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-loudness-'));
+  try {
+    // A -20 dBFS 997 Hz tone is −23.01 LUFS in mono; the import measures it as it plays (dual mono at −3 dB each side).
+    const tone = path.join(dir, 'tone.wav');
+    await ff(['-f', 'lavfi', '-i', 'aevalsrc=0.1*sin(2*PI*997*t):s=48000:d=3', tone]);
+    const { loudness } = await prepareWaveform(tone, 3);
+    assert.ok(Math.abs(loudness! + 23.01) < .1, `measured ${loudness}`);
+    const asset = { id: 'a', projectId: 'p', name: 'Tone', kind: 'audio', hasAudio: true, duration: 3, status: 'ready', progress: 100, binId: '', thumbnail: '', fps: 0, resolution: '', size: '' } as MediaAsset;
+    const track = { id: 't', timelineId: 'tl', name: 'A1', kind: 'audio', number: 1, muted: false, solo: false, locked: false, hidden: false, gain: 0, pan: 0 } as Track;
+    for (const [properties, target] of [[{ normalize: true }, -14], [{ normalize: true, normalizeTarget: -23 }, -23], [{ normalize: false }, -23.01]] as const) {
+      const outputPath = path.join(dir, `out${target}.mov`);
+      const clip = { id: 'c', projectId: 'p', timelineId: 'tl', trackId: 't', mediaId: 'a', name: 'Tone', start: 0, duration: 3, sourceIn: 0, color: '#fff', disabled: false, properties: { ...properties }, effects: [] } as unknown as Clip;
+      await renderTimeline({ project: { id: 'p', resolution: '64 × 64', fps: 24 } as Project, timeline: { id: 'tl', projectId: 'p', name: 'Main', duration: 3 }, tracks: [track], clips: [clip], assets: [{ asset, path: tone }], nodes: [], settings: { audio: 'Linear PCM · 24-bit · 48 kHz', codec: 'Apple ProRes 4444', resolution: '64 × 64', fps: '24' }, outputPath });
+      const exported = await measureLoudness(outputPath);
+      assert.ok(Math.abs(exported! - target) < .3, `${JSON.stringify(properties)}: ${exported} LUFS, wanted ${target}`);
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

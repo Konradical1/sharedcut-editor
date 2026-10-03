@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, writeFile, mkdir } from 'node:fs/promises';
+import { existsSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
@@ -157,6 +158,7 @@ test('HTTP accounts, private/shared projects, role enforcement, conflicts and pe
     const timelineEdit = await state(bobCookie); timelineEdit.state.timelines.push({ id: 'unauthorized-timeline', projectId: 'shared-project', name: 'Forbidden', duration: 120 }); assert.equal((await save(timelineEdit, bobCookie)).response.status, 403);
     assert.equal((await request(memberPath, 'PATCH', { role: 'Viewer' })).response.status, 200);
     const viewer = await state(bobCookie); viewer.state.comments.push({ ...comment, id: 'forbidden-review', text: 'Viewer cannot post.' }); assert.equal((await save(viewer, bobCookie)).response.status, 403);
+    assert.equal((await request('/timeline-previews', 'POST', { projectId: 'shared-project', timelineId: 'none', chunk: 0, width: 320, height: 180 }, bobCookie)).response.status, 404, 'a reviewer still gets the playback render cache');
     assert.equal((await request(memberPath, 'PATCH', { role: 'Editor' })).response.status, 200);
     const history = await state(bobCookie); history.state.operations.push({ id: 'bob-operation', projectId: 'shared-project', userId: bob.id, timestamp: Date.now(), targetId: 'comment', type: 'CommentAdded', description: 'Bob added a comment', oldState: [], newState: [] }); assert.equal((await save(history, bobCookie)).response.status, 200);
     const rewritten = await state(); rewritten.state.operations[0].description = 'Rewritten history'; assert.equal((await save(rewritten)).response.status, 403);
@@ -166,6 +168,15 @@ test('HTTP accounts, private/shared projects, role enforcement, conflicts and pe
     assert.equal(settings.response.status, 200); assert.equal(settings.data.project.shared, false); assert.ok((await state(bobCookie)).state.projects.some(project => project.id === 'shared-project'));
     const deleted = await request('/projects/shared-project', 'DELETE'); assert.equal(deleted.response.status, 200); assert.ok(deleted.data.expiresAt > Date.now()); assert.equal((await state(bobCookie)).state.projects.length, 0);
     assert.equal((await request('/projects/shared-project/restore', 'POST', {})).response.status, 200); assert.ok((await state(bobCookie)).state.projects.some(project => project.id === 'shared-project'));
+    assert.ok(deleted.data.expiresAt > Date.now() + 6 * 86400_000, 'a deleted project stays restorable for a week');
+    const dropped = await state(); dropped.state.projects = dropped.state.projects.filter(project => project.id !== 'private-project'); assert.equal((await save(dropped)).response.status, 200);
+    assert.equal((await request('/projects/private-project/restore', 'POST', {})).response.status, 200, 'a project deleted by a save is restorable too');
+    assert.ok((await state()).state.projects.some(project => project.id === 'private-project'));
+    const carol = (await request('/auth/signup', 'POST', { name: 'Carol', email: 'c@example.com', password: 'another long password' }, '')).data.user;
+    const directory = (await state()).state.users;
+    assert.equal(directory.find(user => user.id === carol.id)?.email, '', 'no email for someone who shares no project');
+    assert.equal(directory.find(user => user.id === carol.id)?.name, 'Carol', 'the name stays for the sharing picker');
+    assert.equal(directory.find(user => user.id === bob.id)?.email, 'b@example.com');
     assert.equal((await request('/auth/logout', 'POST', undefined, bobCookie)).response.status, 200); assert.equal((await request('/state', 'GET', undefined, bobCookie)).response.status, 401);
     const bytes = await readFile(join(dataDir, 'frameline.sqlite')); assert.equal(bytes.includes(Buffer.from('correct horse battery')), false);
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
@@ -245,6 +256,8 @@ test('real upload, authenticated range playback, locks, export download and medi
     assert.equal((await request('/media/source/retry', 'POST', undefined, editorCookie)).status, 404); assert.equal((await request('/media/source', 'DELETE', undefined, editorCookie)).status, 404);
     const badUpload = await fetch(`${base}/api/media?projectId=film&id=invalid&name=..%2Fevil.mp4`, { method: 'POST', headers: { cookie }, body: bytes }); assert.equal(badUpload.status, 400);
     const oversized = await fetch(`${base}/api/media?projectId=film&id=oversized&name=large.mp4`, { method: 'POST', headers: { cookie }, body: Buffer.alloc(1024 * 1024 + 1) }); assert.equal(oversized.status, 413);
+    assert.ok(existsSync(join(dataDir, 'renders', `${job.id}.mp4`))); assert.equal((await request(`/renders/${job.id}`, 'DELETE')).status, 200);
+    assert.equal(existsSync(join(dataDir, 'renders', `${job.id}.mp4`)), false, 'deleting an export removes its file');
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
 });
 
@@ -283,6 +296,13 @@ test('behind a trusted proxy, plain-http requests redirect to https and https re
 
     const hostile = await raw('sharedcut.com/evil.example', 'http');
     assert.notEqual(hostile.status, 301);
+
+    // Every request arrives from cloudflared on loopback; attempts count against the address Cloudflare saw.
+    const login = (ip: string, body = JSON.stringify({ email: 'victim@example.com', password: 'wrong password' })) => fetch(`http://127.0.0.1:${port}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip }, body });
+    for (let i = 0; i < 20; i++) assert.equal((await login('203.0.113.7')).status, 401);
+    assert.equal((await login('203.0.113.7')).status, 429);
+    assert.equal((await login('198.51.100.4')).status, 401, 'an attacker locks out only their own address');
+    assert.equal((await login('198.51.100.4', JSON.stringify({ email: 'x@example.com', password: 'x'.repeat(20_000) }))).status, 413);
   } finally {
     await app.close();
     if (previous === undefined) delete process.env.FRAME_LINE_TRUST_PROXY; else process.env.FRAME_LINE_TRUST_PROXY = previous;
@@ -336,6 +356,93 @@ test('placeholder media plus resumable chunked upload survives retries, bad offs
     await app.close();
     await rm(dataDir, { recursive: true, force: true });
   }
+});
+
+test('a disk under its reserve refuses uploads and fails health; an upload idle for a day is discarded', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'frameline-disk-')); const previous = process.env.FRAME_LINE_MIN_FREE_GB;
+  let app = createFrameLineServer({ dataDir });
+  const listen = async () => { await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve)); return `http://127.0.0.1:${(app.server.address() as { port: number }).port}/api`; };
+  try {
+    let base = await listen();
+    const signup = await fetch(`${base}/auth/signup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Owner', email: 'disk@example.com', password: 'correct horse battery' }) });
+    const cookie = signup.headers.get('set-cookie')!.split(';')[0], ownerId = (await signup.json()).user.id;
+    const state = await (await fetch(`${base}/state`, { headers: { cookie } })).json();
+    state.state.projects.push({ id: 'film', name: 'Film', description: '', shared: false, thumbnail: '', modifiedAt: Date.now(), duration: 1, resolution: '320 × 180', fps: 24, status: 'In progress', members: [{ userId: ownerId, role: 'Owner' }] });
+    assert.equal((await fetch(`${base}/state`, { method: 'PUT', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify(state) })).status, 200);
+    assert.equal((await fetch(`${base}/media?projectId=film&id=idle&name=clip.bin&placeholder=1`, { method: 'POST', headers: { cookie } })).status, 201);
+    const healthy = await fetch(`${base}/health`); assert.equal(healthy.status, 200); assert.ok((await healthy.json()).freeBytes > 0);
+    await app.close();
+    const dayOld = new Date(Date.now() - 2 * 86400_000); utimesSync(join(dataDir, 'media', 'idle'), dayOld, dayOld);
+    process.env.FRAME_LINE_MIN_FREE_GB = '1000000000'; app = createFrameLineServer({ dataDir }); base = await listen();
+    const health = await fetch(`${base}/health`); assert.equal(health.status, 503); assert.equal((await health.json()).status, 'low disk space');
+    const media = (await (await fetch(`${base}/state`, { headers: { cookie } })).json()).state.media;
+    assert.equal(media.find((asset: { id: string }) => asset.id === 'idle').status, 'failed', 'an upload idle for a day stops holding a queue slot');
+    const refused = await fetch(`${base}/media/idle/upload`, { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ size: 1000, fingerprint: 'clip.bin:1000:1' }) });
+    assert.equal(refused.status, 507); assert.match((await refused.json()).error, /disk space/);
+  } finally {
+    await app.close(); if (previous === undefined) delete process.env.FRAME_LINE_MIN_FREE_GB; else process.env.FRAME_LINE_MIN_FREE_GB = previous;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('only the uploader deletes an overlay, and never one a clip still uses', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'frameline-overlays-'));
+  const app = createFrameLineServer({ dataDir });
+  try {
+    await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve)); const base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}/api`;
+    const account = async (email: string) => { const response = await fetch(`${base}/auth/signup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: email, email, password: 'correct horse battery' }) }); return { cookie: response.headers.get('set-cookie')!.split(';')[0], id: (await response.json()).user.id as string }; };
+    const owner = await account('uploader@example.com'), other = await account('other@example.com');
+    const folder = join(dataDir, 'transitions'); await mkdir(folder, { recursive: true });
+    const leaks = ['mine', 'legacy', 'used'].map(id => ({ id: `${id}-leak`, name: id, file: `${id}-leak.mp4`, duration: 1, fps: 24, hasAudio: false, ...(id === 'mine' ? { addedBy: owner.id } : {}) }));
+    for (const leak of leaks) await writeFile(join(folder, leak.file), 'x');
+    await writeFile(join(folder, 'manifest.json'), JSON.stringify({ version: 1, leaks }));
+    const state = await (await fetch(`${base}/state`, { headers: { cookie: owner.cookie } })).json();
+    state.state.projects.push({ id: 'film', name: 'Film', description: '', shared: false, thumbnail: '', modifiedAt: Date.now(), duration: 1, resolution: '320 × 180', fps: 24, status: 'In progress', members: [{ userId: owner.id, role: 'Owner' }] });
+    state.state.timelines.push({ id: 'timeline', projectId: 'film', name: 'Main', duration: 10 }); state.state.tracks.push({ id: 'track', timelineId: 'timeline', name: 'V1', kind: 'video', number: 1, muted: false, solo: false, locked: false, hidden: false, gain: 0, pan: 0 });
+    state.state.clips.push({ id: 'burn', projectId: 'film', timelineId: 'timeline', trackId: 'track', mediaId: 'frameline-leak:used-leak', name: 'Burn', start: 0, duration: 1, sourceIn: 0, color: '#fff', disabled: false, properties: {}, effects: [] });
+    assert.equal((await fetch(`${base}/state`, { method: 'PUT', headers: { cookie: owner.cookie, 'content-type': 'application/json' }, body: JSON.stringify(state) })).status, 200);
+    const remove = (id: string, cookie: string) => fetch(`${base}/transitions/${id}.mp4`, { method: 'DELETE', headers: { cookie } }).then(response => response.status);
+    assert.equal(await remove('mine-leak', other.cookie), 403);
+    assert.equal(await remove('used-leak', other.cookie), 409);
+    assert.equal(await remove('mine-leak', owner.cookie), 200);
+    assert.equal(await remove('legacy-leak', other.cookie), 200, 'an unused overlay from the original pack has no uploader to wait for');
+    assert.equal((await fetch(`${base}/projects/film`, { method: 'DELETE', headers: { cookie: owner.cookie } })).status, 200);
+    assert.equal(await remove('used-leak', other.cookie), 409, 'a project in Recently deleted still needs its overlay for a restore');
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test('an abandoned Replace Media upload is discarded after a day; the original and the media stay as they were', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'frameline-replace-'));
+  let app = createFrameLineServer({ dataDir });
+  const listen = async () => { await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve)); return `http://127.0.0.1:${(app.server.address() as { port: number }).port}/api`; };
+  try {
+    let base = await listen();
+    const signup = await fetch(`${base}/auth/signup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Owner', email: 'replace@example.com', password: 'correct horse battery' }) });
+    const cookie = signup.headers.get('set-cookie')!.split(';')[0], ownerId = (await signup.json()).user.id;
+    const call = (path: string, method = 'GET', body?: unknown) => fetch(`${base}${path}`, { method, headers: { cookie, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    const chunk = (part: Uint8Array<ArrayBuffer>, offset: number) => fetch(`${base}/media/take/upload`, { method: 'PUT', headers: { cookie, 'upload-offset': String(offset), 'upload-checksum': createHash('sha256').update(part).digest('hex') }, body: part });
+    const media = async () => (await (await call('/state')).json()).state.media.find((asset: { id: string }) => asset.id === 'take');
+    const state = await (await call('/state')).json();
+    state.state.projects.push({ id: 'film', name: 'Film', description: '', shared: false, thumbnail: '', modifiedAt: Date.now(), duration: 1, resolution: '320 × 180', fps: 24, status: 'In progress', members: [{ userId: ownerId, role: 'Owner' }] });
+    assert.equal((await call('/state', 'PUT', state)).status, 200);
+    assert.equal((await call('/media?projectId=film&id=take&name=take.mov&placeholder=1', 'POST')).status, 201);
+    const bytes = new Uint8Array(1000).fill(7);
+    await call('/media/take/upload', 'POST', { size: bytes.length, fingerprint: 'take.mov:1000:1' });
+    assert.equal((await chunk(bytes, 0)).status, 202);
+    for (let i = 0; i < 100 && ['processing', 'uploading'].includes((await media()).status); i++) await new Promise(r => setTimeout(r, 100));
+    assert.equal((await call('/media/take/replace', 'POST', { name: 'take2.mp4', size: 10 })).status, 200);
+    await call('/media/take/upload', 'POST', { size: 10, fingerprint: 'take2.mp4:10:1' });
+    assert.equal((await chunk(new Uint8Array(4).fill(9), 0)).status, 200);
+    const before = await media();
+    await app.close();
+    const staged = ['replacement.json', 'replacement.upload.json', 'replacement.part'].map(name => join(dataDir, 'media', 'take', name)), dayOld = new Date(Date.now() - 2 * 86400_000);
+    for (const file of staged) utimesSync(file, dayOld, dayOld);
+    app = createFrameLineServer({ dataDir }); base = await listen();
+    assert.deepEqual(staged.filter(existsSync), [], 'the staged replacement is gone');
+    assert.deepEqual([...await readFile(join(dataDir, 'media', 'take', 'original'))], [...bytes], 'the original is untouched');
+    assert.deepEqual([(await media()).name, (await media()).status], [before.name, before.status]);
+    assert.equal((await (await call('/media/take/upload')).json()).complete, true, 'the media id is back to its finished original');
+  } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
 });
 
 test('locks cover every collection and an up-to-date poll skips the workspace copy', async () => {
@@ -392,4 +499,71 @@ test('locks cover every collection and an up-to-date poll skips the workspace co
     assert.ok(short.locks.some((lock: { targetId: string }) => lock.targetId === 'tr1'));
     assert.ok((await read(ada, latest.revision - 1)).state, 'A stale client still receives the full copy.');
   } finally { await app.close(); await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test('bins live on the project for editors, media move in one request, a replaced file keeps its media id, and deleted projects are listed for a week', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'frameline-bins-'));
+  const app = createFrameLineServer({ dataDir });
+  try {
+    await new Promise<void>(resolve => app.server.listen(0, '127.0.0.1', resolve));
+    const base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}/api`;
+    const signup = async (email: string) => { const response = await fetch(`${base}/auth/signup`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: email, email, password: 'correct horse battery' }) }); return { cookie: response.headers.get('set-cookie')!.split(';')[0], id: (await response.json()).user.id as string }; };
+    const owner = await signup('bins@example.com'), viewer = await signup('viewer@example.com');
+    const call = (path: string, method = 'GET', body?: unknown, cookie = owner.cookie) => fetch(`${base}${path}`, { method, headers: { cookie, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) }, body: body === undefined ? undefined : JSON.stringify(body) });
+    const view = async (cookie = owner.cookie) => (await (await call('/state', 'GET', undefined, cookie)).json()) as { revision: number; state: PersistedState };
+    const saveBins = async (bins: unknown, cookie = owner.cookie) => { const current = await view(cookie); current.state.projects = current.state.projects.map(p => p.id === 'film' ? { ...p, bins } as typeof p : p); return (await call('/state', 'PUT', current, cookie)).status; };
+    const current = await view();
+    current.state.projects.push({ id: 'film', name: 'Film', description: '', shared: false, thumbnail: '', modifiedAt: Date.now(), duration: 0, resolution: '320 × 180', fps: 24, status: 'In progress', members: [{ userId: owner.id, role: 'Owner' }] });
+    assert.equal((await call('/state', 'PUT', current)).status, 200);
+    assert.equal((await call('/projects/film', 'PATCH', { access: 'people', members: [{ userId: viewer.id, role: 'Viewer' }] })).status, 200);
+    for (const [id, name] of [['take', 'take.mov'], ['song', 'song.wav']]) assert.equal((await call(`/media?projectId=film&id=${id}&name=${name}&placeholder=1`, 'POST')).status, 201);
+
+    assert.equal((await view()).state.projects.find(p => p.id === 'film')!.bins, undefined, 'a project without its own bins still loads');
+    assert.equal(await saveBins([{ id: 'bin-1', name: 'Selects' }]), 200);
+    assert.equal(await saveBins([{ id: 'bad/id', name: 'Selects' }]), 400);
+    assert.equal(await saveBins([{ id: 'bin-1', name: 'A' }, { id: 'bin-1', name: 'B' }]), 400);
+    assert.equal(await saveBins([{ id: 'bin-1', name: '' }]), 400);
+    assert.equal(await saveBins([], viewer.cookie), 403, 'a viewer cannot edit bins');
+
+    assert.equal((await call('/media/move', 'POST', { projectId: 'film', mediaIds: ['take', 'song'], binId: 'bin-1' })).status, 200);
+    assert.deepEqual((await view()).state.media.filter(m => m.projectId === 'film').map(m => m.binId), ['bin-1', 'bin-1']);
+    assert.equal((await call('/media/move', 'POST', { projectId: 'film', mediaIds: ['take'], binId: 'broll' }, viewer.cookie)).status, 403);
+    assert.equal((await call('/media/move', 'POST', { projectId: 'film', mediaIds: ['nope'], binId: 'broll' })).status, 404);
+    assert.equal((await call('/media/move', 'POST', { projectId: 'film', mediaIds: ['take'], binId: '../x' })).status, 400);
+
+    // Upload an original, let its (failing) processing settle, then relink the media to a new file.
+    const bytes = new Uint8Array(1000).fill(7);
+    await call('/media/take/upload', 'POST', { size: bytes.length, fingerprint: 'take.mov:1000:1' });
+    assert.equal((await fetch(`${base}/media/take/upload`, { method: 'PUT', headers: { cookie: owner.cookie, 'upload-offset': '0', 'upload-checksum': createHash('sha256').update(bytes).digest('hex') }, body: bytes })).status, 202);
+    for (let i = 0; i < 100 && ['processing', 'uploading'].includes((await view()).state.media.find(m => m.id === 'take')!.status); i++) await new Promise(r => setTimeout(r, 100));
+    assert.equal((await call('/media/take/replace', 'POST', { name: 'song.wav' })).status, 400, 'a video is replaced by a video');
+    assert.equal((await call('/media/take/replace', 'POST', { name: 'take2.mp4' }, viewer.cookie)).status, 403);
+    assert.equal((await call('/media/take/replace', 'POST', { name: '../take2.mp4' })).status, 400);
+    assert.equal((await call('/media/take/replace', 'POST', { name: 'take2.mp4', size: 2 ** 52 })).status, 413);
+    assert.equal(existsSync(join(dataDir, 'media', 'take', 'original')), true, 'a replacement the upload would refuse keeps the old original');
+    assert.equal((await call('/media/take/replace', 'POST', { name: 'take2.mp4', size: 10 })).status, 200);
+    const original = join(dataDir, 'media', 'take', 'original'), before = (await view()).state.media.find(m => m.id === 'take')!, next = new Uint8Array(10).fill(9);
+    const chunk = (part: Uint8Array<ArrayBuffer>, offset: number) => fetch(`${base}/media/take/upload`, { method: 'PUT', headers: { cookie: owner.cookie, 'upload-offset': String(offset), 'upload-checksum': createHash('sha256').update(part).digest('hex') }, body: part });
+    assert.equal((await (await call('/media/take/upload', 'POST', { size: 10, fingerprint: 'take2.mp4:10:1' })).json()).offset, 0, 'the same media id takes the new upload');
+    assert.equal((await chunk(next.slice(0, 4), 0)).status, 200);
+    assert.deepEqual([...await readFile(original)], [...bytes], 'until the replacement has fully arrived the original is untouched');
+    assert.deepEqual((await view()).state.media.find(m => m.id === 'take'), before, 'and so is the media');
+    assert.equal((await chunk(next.slice(4), 4)).status, 202);
+    assert.deepEqual([...await readFile(original)], [...next], 'the last byte swaps the replacement in');
+    const replaced = (await view()).state.media.find(m => m.id === 'take')!;
+    assert.deepEqual([replaced.name, replaced.binId, replaced.duration], ['take2.mp4', 'bin-1', 0]);
+    assert.equal(existsSync(join(dataDir, 'media', 'take', 'replacement.json')), false);
+
+    assert.equal((await call('/projects/film', 'DELETE')).status, 200);
+    const listed = (await (await call('/projects/deleted')).json()).projects;
+    assert.deepEqual(listed.map((p: { id: string; name: string }) => [p.id, p.name]), [['film', 'Film']]);
+    assert.ok(listed[0].expiresAt > Date.now() + 6 * 86400_000, 'restorable for a week');
+    assert.deepEqual((await (await call('/projects/deleted', 'GET', undefined, viewer.cookie)).json()).projects, [], 'only the owner sees it');
+    assert.equal((await call('/projects/film/restore', 'POST', {})).status, 200);
+    assert.deepEqual((await (await call('/projects/deleted')).json()).projects, []);
+    assert.equal((await view()).state.projects.find(p => p.id === 'film')!.bins![0].name, 'Selects', 'bins come back with the project');
+  } finally {
+    await app.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
 });

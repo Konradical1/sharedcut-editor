@@ -7,7 +7,8 @@ import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, trimAnima
 import { bloomPass, leakRange, isLeakMedia, leakIdOf, timelineTransitions, transitionDefinitions, transitionProgress, type TransitionRecord } from './transitions.ts';
 import { drawText, getText, isTitle } from './text.ts';
 import { drawShape, getShape, isShape } from './shapes.ts';
-import { effectValue, effectEnabled, detailPixels } from './effects.ts';
+import { effectValue, effectEnabled, detailPixels, loudnessTarget } from './effects.ts';
+import { eqBiquads, kWeighting, loudnessWindow } from './audioDsp.ts';
 import type { Clip, GradeNode, MediaAsset, Project, Settings, Timeline, Track } from '../state/models.ts';
 import { gradeValues } from './grade.ts';
 import { createVideoFrames } from './videoFrames.ts';
@@ -291,7 +292,11 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   };
   const groups = new Map<string, { canvas: HTMLCanvasElement; reference: HTMLCanvasElement; audio: AudioRoute }>();
   let color: ReturnType<typeof createColorPreview> | undefined;
-  let audio: AudioContext | undefined, master: GainNode | undefined, masterAnalyser: AnalyserNode | undefined;
+  // `master` is the programme (the mix and master gain, as exported, which the meters read); `monitor` is what you hear.
+  let audio: AudioContext | undefined, master: GainNode | undefined, monitor: GainNode | undefined, masterAnalyser: AnalyserNode | undefined;
+  // BS.1770 meter: per channel, the K-weighted and the plain master, read as new samples arrive (see the meter block in tick).
+  let loudnessTaps: { weighted: AnalyserNode; plain: AnalyserNode }[] = [], loudness: ReturnType<typeof loudnessWindow> | undefined, meterAudioTime = 0;
+  const meterSamples = new Float32Array(8192);
   let frame = 0, disposed = false, dirty = true, previous: unknown[] = [], statusKey = '', meterTime = 0;
   const flowPreview = createFlowPreview(() => { dirty = true; });
   const maskPreview=createSmartMaskPreview(()=>{dirty=true;}),fittedMasks=new Map<string,SmartMaskPixels>(),maskCuts=new Map<string,HTMLCanvasElement>();
@@ -398,9 +403,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     for (const effect of clip.effects.filter(e => effectEnabled(clip,e))) {
       const number = (key: string, fallback: number) => effectValue(clip,effect,key.slice(effect.name.length+1));
       if (effect.name === 'EQ') {
-        const low = audio.createBiquadFilter(); low.type = 'highpass'; low.frequency.value = number('EQ_Low cut', 80); add(low);
-        const presence = audio.createBiquadFilter(); presence.type = 'peaking'; presence.frequency.value = 3000; presence.Q.value = 1; presence.gain.value = number('EQ_Presence', 2); add(presence);
-        const air = audio.createBiquadFilter(); air.type = 'highshelf'; air.frequency.value = 10000; air.gain.value = number('EQ_Air', 1); add(air);
+        // The export's exact coefficients (audioDsp.eqBiquads), so what plays is what renders and what the graph draws.
+        for (const [b0, b1, b2, a1, a2] of eqBiquads(number('EQ_Low cut', 80), number('EQ_Presence', 2), number('EQ_Air', 1), audio.sampleRate)) add(audio.createIIRFilter([b0, b1, b2], [1, a1, a2]));
       } else if (effect.name === 'Compressor' || effect.name === 'Limiter') {
         const limiter = effect.name === 'Limiter';
         if (limiter) { const makeup = audio.createGain(); makeup.gain.value = 10 ** (-number('Limiter_Threshold', -6) / 20); add(makeup); }
@@ -437,7 +441,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     const p=clip.properties;
     const poses=transformMotion(clip,time,fps,projectWidth,projectHeight);
     target.save();target.globalAlpha=Math.max(0,Math.min(1,Number(p.opacity??100)/100))*fadeLevel(clip,time);
-    target.globalCompositeOperation=blendModeOf(p.blendMode).canvas;
+    // W3C Compositing; the export reproduces each mode in FFmpeg (media.ts blendFilters).
+    target.globalCompositeOperation=blendModeOf(p.blendMode)?.canvas??'source-over';
     if(poses.length===1)drawMotionPose(target,layer,poses[0],clip,width,height,projectWidth,projectHeight);
     else {
       motion??=createMotionPreview();
@@ -521,12 +526,14 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       scrubIds.add(url);
       return scrub.frames;
     };
-    if (master && audio) master.gain.setTargetAtTime((state.settings.masterMuted || state.settings.monitorAudio === false ? 0 : 10 ** (Number(state.settings.masterGain ?? 0) / 20)) * options.volume / 100, audio.currentTime, .015);
+    if (master && monitor && audio) { master.gain.setTargetAtTime(state.settings.masterMuted ? 0 : 10 ** (Number(state.settings.masterGain ?? 0) / 20), audio.currentTime, .015); monitor.gain.setTargetAtTime(state.settings.monitorAudio === false ? 0 : options.volume / 100, audio.currentTime, .015); }
     const updateAudio = (route:AudioRoute,clip:Clip,track:Track,time:number,audible:boolean) => {
       if(!audio||!route.gain||!route.pan||!route.analyser||!route.samples)return;
       route.analyser.getFloatTimeDomainData(route.samples);
       const rms=Math.sqrt(route.samples.reduce((sum,value)=>sum+value*value,0)/route.samples.length);
-      let gain=audible?10**((track.gain+Number(clip.properties.gain??0))/20)*fadeLevel(clip,time,true):0;
+      // Normalize loudness: the source's measured loudness brought to the target. The export measures the clip itself.
+      const loudness=clip.properties.normalize?(byId(state.media).get(clip.mediaId) as MediaAsset&{loudness?:number}|undefined)?.loudness:undefined;
+      let gain=audible?10**((track.gain+Number(clip.properties.gain??0)+(loudness===undefined?0:loudnessTarget(clip)-loudness))/20)*fadeLevel(clip,time,true):0;
       const noises=clip.effects.filter(e=>e.name==='Noise Reduction'&&effectEnabled(clip,e));
       for(const noise of noises){
         // ponytail: realtime noise gate; FFmpeg uses spectral denoising for final exports.
@@ -1031,7 +1038,18 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     if (performance.now() - meterTime > 80) {
       meterTime = performance.now(); let rms = 0;
       if (masterAnalyser && state.playing) { const samples = new Float32Array(masterAnalyser.fftSize); masterAnalyser.getFloatTimeDomainData(samples); rms = Math.sqrt(samples.reduce((sum, value) => sum + value * value, 0) / samples.length); }
-      window.dispatchEvent(new CustomEvent('frameline:meters', { detail: { tracks: trackLevels, master: rms } }));
+      // Only the samples since the last read: the window then covers the sound once, whatever the frame rate.
+      if (audio && loudness && state.playing) {
+        const fresh = Math.min(meterSamples.length, Math.round((audio.currentTime - meterAudioTime) * audio.sampleRate));
+        let energy = 0, peak = 0;
+        for (const tap of loudnessTaps) {
+          tap.weighted.getFloatTimeDomainData(meterSamples); for (let i = meterSamples.length - fresh; i < meterSamples.length; i++) energy += meterSamples[i] * meterSamples[i];
+          tap.plain.getFloatTimeDomainData(meterSamples); for (let i = meterSamples.length - fresh; i < meterSamples.length; i++) peak = Math.max(peak, Math.abs(meterSamples[i]));
+        }
+        if (meterAudioTime) loudness.push(energy, fresh, peak);
+        meterAudioTime = audio.currentTime;
+      } else { loudness?.reset(); meterAudioTime = 0; }
+      window.dispatchEvent(new CustomEvent('frameline:meters', { detail: { tracks: trackLevels, master: rms, ...loudness?.read() } }));
     }
     const blocker = loading ? [...activeIds].map(id => footageCache.clipFootageStatus(id)).map(item => item.playback).find(Boolean) : undefined;
     // Only a picture the automatic rule moved, by the clip's own asset (a decoder keeps its low stream to the end of its
@@ -1061,7 +1079,14 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     },
     resume() {
       if (disposed) return;
-      if (!audio) { audio = new AudioContext(); master = audio.createGain(); masterAnalyser = audio.createAnalyser(); masterAnalyser.fftSize = 256; master.connect(masterAnalyser).connect(audio.destination); }
+      if (!audio) {
+        audio = new AudioContext(); master = audio.createGain(); monitor = audio.createGain(); masterAnalyser = audio.createAnalyser(); masterAnalyser.fftSize = 256; master.connect(masterAnalyser); master.connect(monitor).connect(audio.destination);
+        const weighted = audio.createChannelSplitter(2), plain = audio.createChannelSplitter(2);
+        kWeighting(audio.sampleRate).reduce<AudioNode>((node, [b0, b1, b2, a1, a2]) => node.connect(audio!.createIIRFilter([b0, b1, b2], [1, a1, a2])), master).connect(weighted);
+        master.connect(plain);
+        loudnessTaps = [0, 1].map(channel => { const tap = { weighted: audio!.createAnalyser(), plain: audio!.createAnalyser() }; tap.weighted.fftSize = tap.plain.fftSize = meterSamples.length; weighted.connect(tap.weighted, channel); plain.connect(tap.plain, channel); return tap; });
+        loudness = loudnessWindow(audio.sampleRate);
+      }
       void audio.resume().catch(() => { if (!disposed) status({ title: 'Audio unavailable', detail: 'Allow audio playback in your browser.' }); });
       for (const decoder of decoders.values()) decoder.blocked = false;
       dirty = true;

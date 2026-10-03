@@ -1,7 +1,7 @@
 import { useEffect, type Dispatch, type SetStateAction } from 'react';
 import { useEditorStore } from './state/store';
 import { fieldOwnsKey, typingSurface } from './services/focus';
-export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + X','Cut selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['I / O','Mark In / Out'], ['V / B / A','Selection / blade / select forward tool'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['M','Add marker at playhead'], ['Right-click ruler','Add marker here, paste markers'], ['Delete','Delete selected clip'] ];
+export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + Shift + Z, Ctrl + Y','Redo what I undid'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + X','Cut selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['⌘ / Ctrl + Shift + V','Paste and push later clips right (insert)'], ['⌘ / Ctrl + drop','Insert media instead of overwriting'], [', / .','Insert / overwrite the selected bin media at the playhead'], ['I / O','Mark In / Out'], ['V / B / A','Selection / blade / select forward tool'], ['R / E / Y / U','Ripple trim / roll / slip / slide tool'], ['J / K / L','Play backward / stop / play forward (press again for 2×, 4×, 8×)'], ['K + J / K + L','Step one frame back / forward'], ['F','Match frame: show the clip’s media in the bin'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['M','Add marker at playhead'], ['Right-click ruler','Add marker here, paste markers'], ['Delete','Delete selected clip'], ['Shift + Delete','Ripple delete: delete and close the gap'] ];
 /** A click is an action, not a focus grab. Editing apps keep the keyboard on the app, so Space plays
  *  instead of replaying the last button touched — and nothing sits there wearing a focus ring. */
 export function useFocusRelease() {
@@ -21,9 +21,40 @@ export function useFocusRelease() {
     return()=>{document.removeEventListener('pointerdown',release,true);document.removeEventListener('pointerup',release);};
   },[]);
 }
+// J/K/L shuttle. Forward at 1× is ordinary playback; faster or backwards steps the paused playhead a frame at a time on the
+// display clock (playback only runs forward at 1×). Anything else moving the playhead, a click or Space, takes over.
+let shuttleRate=0,shuttleFrame=0,kHeld=false;
+export function shuttle(rate:number) {
+  cancelAnimationFrame(shuttleFrame);shuttleRate=0;
+  const s=useEditorStore.getState();
+  if(rate===1){s.setPlaying(true);return;}
+  if(s.playing)s.setPlaying(false);
+  if(!rate)return;
+  shuttleRate=rate;
+  let time=s.playhead,last=performance.now(),shown=s.playhead;
+  const step=(now:number)=>{
+    const s=useEditorStore.getState(),fps=s.projects.find(p=>p.id===s.projectId)?.fps||24;
+    if(s.playing||s.playhead!==shown){shuttleRate=0;return;}
+    time+=(now-last)/1000*rate;last=now;
+    const frame=Math.max(0,Math.round(time*fps)/fps);
+    if(frame!==shown){s.setPlayhead(frame);shown=useEditorStore.getState().playhead;}
+    // Stops at either end: time zero, or where setPlayhead clamped it.
+    if(time<=0||shown!==frame){shuttleRate=0;return;}
+    shuttleFrame=requestAnimationFrame(step);
+  };
+  shuttleFrame=requestAnimationFrame(step);
+}
+function shuttleKey(key:string) {
+  const s=useEditorStore.getState(),speed=shuttleRate||(s.playing?1:0);
+  if(key==='k'){kHeld=true;shuttle(0);return;}
+  if(kHeld){shuttle(0);s.setPlayhead(s.playhead+(key==='l'?1:-1)/(s.projects.find(p=>p.id===s.projectId)?.fps||24));return;}
+  shuttle(key==='l'?(speed>0?Math.min(8,speed*2):1):(speed<0?Math.max(-8,speed*2):-1));
+}
 export function useEditorShortcuts(enabled: boolean) {
   useEffect(()=>{
     if(!enabled)return;
+    const keyup=(e:KeyboardEvent)=>{if(e.key.toLowerCase()==='k')kHeld=false;};
+    const blur=()=>{kHeld=false;};
     const keydown=(e:KeyboardEvent)=>{
       const target=e.target as HTMLElement;
       if(e.defaultPrevented)return;
@@ -38,19 +69,26 @@ export function useEditorShortcuts(enabled: boolean) {
       if(s.markerClipboard&&command&&e.key.toLowerCase()==='v'){e.preventDefault();s.pasteMarkers();return;}
       if(s.selectedMarkerIds.length&&e.key==='Escape'){useEditorStore.setState({selectedMarkerIds:[]});return;}
       if(command&&e.key.toLowerCase()==='s'){e.preventDefault();s.setModal('snapshot');}
-      else if(command&&e.key.toLowerCase()==='z'){e.preventDefault();s.undo();}
+      else if(command&&e.key.toLowerCase()==='z'){e.preventDefault();if(e.shiftKey)s.redo();else s.undo();}
+      else if(e.ctrlKey&&!e.metaKey&&e.key.toLowerCase()==='y'){e.preventDefault();s.redo();}
       else if(command&&e.key.toLowerCase()==='b'&&s.selectedClipId){e.preventDefault();s.splitClip(s.selectedClipId);}
       else if(command&&e.key.toLowerCase()==='c'&&s.selectedClipId){e.preventDefault();s.copyClip(s.selectedClipId);}
       else if(command&&e.key.toLowerCase()==='x'&&s.selectedClipId){e.preventDefault();s.copyClip(s.selectedClipId);s.deleteClip(s.selectedClipId);}
-      else if(command&&e.key.toLowerCase()==='v'){e.preventDefault();s.pasteClip();}
+      else if(command&&e.key.toLowerCase()==='v'){e.preventDefault();s.pasteClip(e.shiftKey);}
       else if(command&&e.key.toLowerCase()==='d'&&s.selectedClipId){e.preventDefault();s.duplicateClip(s.selectedClipId);}
       else if(command&&e.key.toLowerCase()==='t'){e.preventDefault();s.applyTransitionAtPlayhead();}
       else if(e.code==='Space'){e.preventDefault();if(s.liveMode!=='following')s.setPlaying(!s.playing);}
+      // From the bin: `,` inserts at the playhead (later clips move right), `.` overwrites, on the first unlocked track with its linked sound.
+      else if(!command&&!e.altKey&&(e.key===','||e.key==='.')&&s.workspace==='edit'&&s.media.some(m=>s.selectedMediaIds.includes(m.id)&&m.projectId===s.projectId)){e.preventDefault();if(!e.repeat)s.addMediaToTimeline(s.selectedMediaIds.filter(id=>s.media.some(m=>m.id===id&&m.projectId===s.projectId)),s.playhead,undefined,e.key===',');}
+      else if(!command&&!e.altKey&&['j','k','l'].includes(e.key.toLowerCase())&&s.liveMode!=='following'){e.preventDefault();if(!e.repeat)shuttleKey(e.key.toLowerCase());}
+      // Match frame: the clip under the playhead (or the selected one) shows its media in the bin.
+      else if(!command&&!e.altKey&&e.key.toLowerCase()==='f'&&s.workspace==='edit'){const clip=s.clips.find(c=>c.id===s.selectedClipId)??s.clips.filter(c=>c.timelineId===s.timelineId&&!c.disabled&&c.start<=s.playhead&&c.start+c.duration>s.playhead&&s.tracks.find(t=>t.id===c.trackId)?.kind==='video').sort((a,b)=>(s.tracks.find(t=>t.id===b.trackId)?.number??0)-(s.tracks.find(t=>t.id===a.trackId)?.number??0))[0];if(clip){e.preventDefault();s.revealMedia(null);s.revealMedia(clip.mediaId);}}
       else if((e.key==='ArrowLeft'||e.key==='ArrowRight')&&s.liveMode!=='following'){e.preventDefault();s.setPlayhead(s.playhead+(e.key==='ArrowRight'?1:-1)/(s.projects.find(p=>p.id===s.projectId)?.fps||24));}
       else if((e.key==='Delete'||e.key==='Backspace')&&s.selectedTransition){e.preventDefault();s.removeTransition(s.selectedTransition.clipId,s.selectedTransition.side);}
-      else if((e.key==='Delete'||e.key==='Backspace')&&s.selectedClipId){e.preventDefault();s.deleteClip(s.selectedClipId);}
+      else if((e.key==='Delete'||e.key==='Backspace')&&s.selectedClipId){e.preventDefault();s.deleteClip(s.selectedClipId,e.shiftKey);}
     };
-    document.addEventListener('keydown',keydown);return()=>document.removeEventListener('keydown',keydown);
+    document.addEventListener('keydown',keydown);document.addEventListener('keyup',keyup);window.addEventListener('blur',blur);
+    return()=>{document.removeEventListener('keydown',keydown);document.removeEventListener('keyup',keyup);window.removeEventListener('blur',blur);};
   },[enabled]);
 }
 
@@ -64,6 +102,8 @@ export function useTimelineShortcuts(setTool: Dispatch<SetStateAction<string>>, 
       if (k === 't') { useEditorStore.setState({textTool:!s.textTool,shapeTool:null,playing:false}); }
       if (k === 'b') {setTool('blade');useEditorStore.setState({textTool:false,shapeTool:null});}
       if (k === 'a') {setTool('forward');useEditorStore.setState({textTool:false,shapeTool:null});}
+      const trim = ({ r: 'ripple', e: 'roll', y: 'slip', u: 'slide' } as Record<string, string>)[k];
+      if (trim) {setTool(trim);useEditorStore.setState({textTool:false,shapeTool:null});}
       if (k === 's' || k === 'p') {setTool('select');useEditorStore.setState({shapeTool:k==='p'?'pen':'rectangle',textTool:false,playing:false});}
       if (k === 'n') setSnapping(value => !value);
       if (k === 'm' && !e.repeat) s.addMarker();

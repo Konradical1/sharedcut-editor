@@ -1,6 +1,6 @@
 import { createPreviewCache } from './previewCache.ts';
 import { validateMotionBlur } from '../src/services/motionBlur.ts';
-import { workQueue } from './workQueue.ts';
+import { workQueue, heavyJob } from './workQueue.ts';
 import { stateDelta, applyStateDelta, stateEqual, shareState } from '../src/services/stateDelta.ts';
 import { COLLECTIONS, holdDataLock, workspaceStore } from './workspaceStore.ts';
 import { parseImportLink, downloadLink, youtubeThumbnail } from './linkImport.ts';
@@ -24,7 +24,7 @@ import { isTitle, getText, validateText } from '../src/services/text.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { linkSync, copyFileSync, mkdirSync, existsSync, createReadStream, createWriteStream, statSync, renameSync, rmSync, chmodSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { linkSync, copyFileSync, mkdirSync, existsSync, createReadStream, createWriteStream, statSync, statfsSync, renameSync, rmSync, chmodSync, readFileSync, writeFileSync, appendFileSync, truncateSync } from 'node:fs';
 import { resolve, join, extname, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
@@ -51,6 +51,8 @@ type Account = { user: User; hash: string; salt: string; settings: PersistedStat
 type Entry = Record<string, any>;
 const emptyState = (): PersistedState => ({ projects: [], media: [], timelines: [], clips: [], tracks: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], users: [], currentUserId: '', settings: { ...DEFAULT_SETTINGS } });
 const idIsValid = (id: unknown): id is string => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id);
+const BIN_ID = /^[A-Za-z0-9 _-]{1,64}$/;
+const mediaKind = (name: string): MediaAsset['kind'] => /\.(wav|mp3|aac|aiff?|flac|m4a|ogg)$/i.test(name) ? 'audio' : /\.(png|jpe?g|webp|gif|tiff?|bmp|heic)$/i.test(name) ? 'image' : 'video';
 const jsonValue = (value: unknown) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 // Structural first: saved entities are shared by reference, so a 10 MB media list compares in
 // microseconds instead of two JSON round trips. The JSON pass keeps the old answer for the rest.
@@ -113,10 +115,10 @@ const profile = (body: Entry) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) fail(400, 'Enter a valid email address.');
   return { name, email, initials: initials(name) };
 };
-async function jsonBody(req: IncomingMessage) {
+async function jsonBody(req: IncomingMessage, max = 20 * 1024 * 1024) {
   if (!req.headers['content-type']?.toLowerCase().startsWith('application/json')) fail(415, 'Use application/json.');
   const chunks: Buffer[] = []; let length = 0;
-  for await (const chunk of req) { length += chunk.length; if (length > 20 * 1024 * 1024) fail(413, 'The document exceeds 20 MB.'); chunks.push(chunk); }
+  for await (const chunk of req) { length += chunk.length; if (length > max) fail(413, max < 1024 ** 2 ? 'The request is too large.' : `The document exceeds ${max / 1024 ** 2} MB.`); chunks.push(chunk); }
   let body: unknown; try { body = JSON.parse(Buffer.concat(chunks).toString()); } catch { fail(400, 'Invalid JSON.'); }
   object(body); safeJson(body); return body;
 }
@@ -126,6 +128,14 @@ async function binaryBody(req: IncomingMessage, max: number, onProgress?: (bytes
   if(!length)fail(400,'Empty upload.');return Buffer.concat(chunks);
 }
 
+// Behind cloudflared every request comes from loopback; the client is then the address Cloudflare saw.
+const clientAddress = (req: IncomingMessage) => {
+  const peer = req.socket.remoteAddress ?? 'local';
+  if (process.env.FRAME_LINE_TRUST_PROXY !== '1' || !/^(?:127\.|::ffff:127\.|::1$)/.test(peer)) return peer;
+  // X-Forwarded-For's last entry is the one the local proxy appended; earlier ones are whatever the client sent.
+  const forwarded = String(req.headers['cf-connecting-ip'] ?? String(req.headers['x-forwarded-for'] ?? '').split(',').at(-1)).trim();
+  return forwarded && forwarded.length <= 64 ? forwarded : peer;
+};
 const acceptsGzip = (req: IncomingMessage) => (req.headers['accept-encoding'] ?? '').split(',').some(item => {
   const [name, ...params] = item.trim().split(';');
   return name === 'gzip' && !params.some(p => /^q=0(?:\.0*)?$/.test(p.trim()));
@@ -263,7 +273,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const next = pickStabilizeJob([...stabilizeJobs.values()].filter(j => j.status === 'preparing' && !j.started && !j.controller.signal.aborted));
     if (!next) return;
     next.started = true; stabilizeBusy = true;
-    void next.run().finally(() => { stabilizeBusy = false; pumpStabilize(); });
+    void heavyJob(next.run).finally(() => { stabilizeBusy = false; pumpStabilize(); });
   };
   // Accounts are read by every request and every view but rarely change. `data_version` moves when
   // another connection commits (a script adding a session or account), which reloads them.
@@ -310,7 +320,12 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       memo!.lists.set(key, { source, dependency, list }); return list as T[];
     };
     const timelines = pick('timelines', state.timelines, item => ids.has(item.projectId)), timelineIds = new Set(timelines.map(item => item.id));
-    return { revision, lockRevision, state: { ...state, projects, timelines, tracks: pick('tracks', state.tracks, item => timelineIds.has(item.timelineId), timelines), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, pick(key, state[key as Collection] as Entry[], item => ids.has(item.projectId))])), users: allUsers, currentUserId: userId, settings: account.settings }, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
+    // Email addresses only for the viewer and people who share a project with them. Everyone else keeps a
+    // name and avatar, which is all the people picker in SharingFields needs to add them.
+    const known = [...new Set([userId, ...projects.flatMap(project => project.members.map(member => member.userId))])].sort().join('\n');
+    let shown = memo!.lists.get('users');
+    if (shown?.source !== allUsers || shown.dependency !== known) { const keep = new Set(known.split('\n')); memo!.lists.set('users', shown = { source: allUsers, dependency: known, list: allUsers.map(user => keep.has(user.id) ? user : { ...user, email: '' }) }); }
+    return { revision, lockRevision, state: { ...state, projects, timelines, tracks: pick('tracks', state.tracks, item => timelineIds.has(item.timelineId), timelines), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, pick(key, state[key as Collection] as Entry[], item => ids.has(item.projectId))])), users: shown.list as User[], currentUserId: userId, settings: account.settings }, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
   };
   // ponytail: sixteen recent views per account, 32 accounts; older clients recover with a full snapshot.
   // The views share their entities with the state, so each costs a few arrays of references.
@@ -418,6 +433,14 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const resolveDir = (id:string) => join(dataDir,'resolve',id);
   const mediaDir = (id: string) => join(dataDir, 'media', id);
   const originalPath = (id: string) => join(mediaDir(id), 'original');
+  const replacedVersion = (id: string) => { try { return readFileSync(join(mediaDir(id), 'replaced'), 'utf8'); } catch { return ''; } };
+  // A deleted project, media included, stays restorable for a week before purgeExpiredProjects removes its files.
+  const PROJECT_RECOVERY_MS = 7 * 86400_000;
+  const minFreeGb = Number(process.env.FRAME_LINE_MIN_FREE_GB ?? 5), minFreeBytes = (Number.isFinite(minFreeGb) && minFreeGb >= 0 ? minFreeGb : 5) * 1024 ** 3;
+  const freeBytes = () => { const disk = statfsSync(dataDir); return disk.bavail * disk.bsize; };
+  const requireSpace = (bytes: number) => { const free = freeBytes(); if (free < bytes + minFreeBytes) fail(507, `The server is almost out of disk space (${(free / 1e9).toFixed(1)} GB free, ${(minFreeBytes / 1e9).toFixed(0)} GB kept in reserve). Free space on the server before uploading.`); };
+  // Which project asked for each Smart Mask frame preview; the file name alone authorizes nothing.
+  const maskPreviews = new Set<string>();
   const projectBundle = (project: Project) => {
     const timelines = state.timelines.filter(item => item.projectId === project.id), timelineIds = new Set(timelines.map(item => item.id));
     return { projects: [project], timelines, tracks: state.tracks.filter(item => timelineIds.has(item.timelineId)), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, (state[key as Collection] as Entry[]).filter(item => item.projectId === project.id)])) } as unknown as Record<Collection, Entry[]>;
@@ -426,16 +449,18 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const timelineIds = new Set(state.timelines.filter(item => item.projectId === projectId).map(item => item.id));
     state = { ...state, projects: state.projects.filter(item => item.id !== projectId), timelines: state.timelines.filter(item => item.projectId !== projectId), tracks: state.tracks.filter(item => !timelineIds.has(item.timelineId)), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, (state[key as Collection] as Entry[]).filter(item => item.projectId !== projectId)])) };
   };
+  const backupProject = (id: string, ownerId: string, expiresAt: number, backup: Record<Collection, Entry[]>) => db.prepare('INSERT INTO deleted_projects(id,ownerId,expiresAt,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET ownerId=excluded.ownerId,expiresAt=excluded.expiresAt,data=excluded.data').run(id, ownerId, expiresAt, JSON.stringify(backup));
   const purgeExpiredProjects = () => {
     const rows = db.prepare('SELECT id,data FROM deleted_projects WHERE expiresAt<=?').all(Date.now()) as { id: string; data: string }[];
-    for (const row of rows) {
+    // A file Windows holds open (antivirus, an indexer) must not crash the housekeeping timer or block startup; the row stays and is retried.
+    for (const row of rows) try {
       const bundle = JSON.parse(row.data) as Record<Collection, Entry[]>;
       for (const asset of bundle.media ?? []) rmSync(mediaDir(asset.id), { recursive: true, force: true });
       for (const job of bundle.renderJobs ?? []) for (const extension of ['.mp4', '.mov']) rmSync(join(dataDir, 'renders', `${job.id}${extension}`), { force: true });
       db.prepare('DELETE FROM caption_jobs WHERE projectId=?').run(row.id);
       try { colorAssistant.purge(row.id); } catch { /* A still being served; its folder outlives the purge. */ }
       db.prepare('DELETE FROM deleted_projects WHERE id=?').run(row.id);
-    }
+    } catch (error) { console.error(`Purging deleted project ${row.id} failed:`, error); }
   };
   // Every revision wakes every client into fetching state, so progress alone saves at most once a second
   // per asset; the latest value lands when the second is up, or sooner with any other change.
@@ -491,7 +516,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       updateAsset(id, { status: 'processing', progress: 0, error: undefined });
       let previous = -1;
       // Prepared files are served immutable, so a refresh that rewrites them in place needs new URLs or browsers keep the old pictures.
-      const version = refresh ? `?v=${Date.now().toString(36)}` : '', bust = (url?: string) => url && version ? url + version : url;
+      // A replaced original keeps its replacement's version on every URL from then on, the original's included.
+      const replaced = replacedVersion(id), version = refresh ? `?v=${Date.now().toString(36)}` : replaced, bust = (url?: string) => url && version ? url + version : url;
       const publish = (result: Awaited<ReturnType<typeof probeMedia>> & Partial<Omit<Asset, 'size'>>) => {
         const { size, ...fresh } = result;
         const metadata: typeof fresh = { ...fresh };
@@ -499,7 +525,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           for (const key of ['proxyUrl', 'thumbnail', 'audioProxyUrl', 'colorProxyUrl', 'filmstrip'] as const) if (metadata[key]) metadata[key] = bust(metadata[key])!;
           if (metadata.proxyVariants) metadata.proxyVariants = Object.fromEntries(Object.entries(metadata.proxyVariants).map(([k, url]) => [k, bust(url)!]));
         }
-        updateAsset(id, { ...metadata, ...(asset.importLink ? { thumbnail: state.media.find(item => item.id === id)?.thumbnail || metadata.thumbnail } : {}), size: size >= 1e9 ? `${(size / 1e9).toFixed(1)} GB` : `${(size / 1e6).toFixed(1)} MB`, sourceUrl: `/api/media/${id}/original`, status: 'ready', progress: 100 });
+        updateAsset(id, { ...metadata, ...(asset.importLink ? { thumbnail: state.media.find(item => item.id === id)?.thumbnail || metadata.thumbnail } : {}), size: size >= 1e9 ? `${(size / 1e9).toFixed(1)} GB` : `${(size / 1e6).toFixed(1)} MB`, sourceUrl: `/api/media/${id}/original${replaced}`, status: 'ready', progress: 100 });
       };
       const result = await prepareMedia({ inputPath: originalPath(id), outputDir: join(mediaDir(id), 'prepared'), baseUrl: `/api/media/${id}/files`, signal, refresh,
         onStage: preparationStage => { if (!signal.aborted) updateAsset(id, { preparationStage }); },
@@ -540,6 +566,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (type === 'number') numberField(item[field], -1e15, 1e15);
       }
       if (key === 'projects' && item.classRole !== undefined && !['Viewer', 'Editor'].includes(item.classRole)) fail(400, 'Invalid class role.');
+      // Bin ids are what media binId holds, so they follow the media endpoint's rule for one.
+      if (key === 'projects' && item.bins !== undefined) { if (!Array.isArray(item.bins) || item.bins.length > 500) fail(400, 'Invalid bins.'); const seen = new Set(); for (const bin of item.bins) { object(bin); if (typeof bin.id !== 'string' || !BIN_ID.test(bin.id) || seen.has(bin.id)) fail(400, 'Invalid bin ID.'); seen.add(bin.id); textField(bin.name, 80, true); } }
       if (item.name !== undefined) textField(item.name, 255, true);
       for (const field of ['duration', 'start', 'sourceIn', 'time']) if (item[field] !== undefined) numberField(item[field], 0, 86400 * 7);
       if (key === 'tracks' && item.captionSets!==undefined) {try{validateCaptionSets(item.captionSets);}catch(error){fail(400,(error as Error).message);}}
@@ -672,13 +700,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const deleted = new Set([...allowed].filter(id => !nextProjectIds.has(id)));
     if (deleted.size) { next.media = state.media.filter(item => !deleted.has(item.projectId)); next.renderJobs = state.renderJobs.filter(item => !deleted.has(item.projectId)); }
     validateRelations(next);
+    // A project deleted by a save is restorable like one deleted through DELETE /api/projects/:id; its files go when the backup expires.
+    const backups = [...deleted].map(id => [id, projectBundle(existing.get(id)!)] as const), expiresAt = Date.now() + PROJECT_RECOVERY_MS;
     const previousState = state; const previousRevision = revision; const previousSettings = account.settings;
     const settings = { ...DEFAULT_SETTINGS, ...incoming.settings };
-    try { transaction(() => { if (!same(settings, account.settings)) { account.settings = settings; saveAccount(account); } state = next; persist(); }); }
+    try { transaction(() => { if (!same(settings, account.settings)) { account.settings = settings; saveAccount(account); } for (const [id, backup] of backups) backupProject(id, userId, expiresAt, backup); state = next; persist(); }); }
     catch (error) { state = previousState; revision = previousRevision; account.settings = previousSettings; throw error; }
-    const removedMedia = previousState.media.filter(asset => deleted.has(asset.projectId)); const removedJobs = previousState.renderJobs.filter(job => deleted.has(job.projectId));
-    for (const item of [...removedMedia, ...removedJobs]) aborters.get(item.id)?.abort();
-    if (deleted.size) void queue.drain().then(() => { for (const asset of removedMedia) rmSync(mediaDir(asset.id), { recursive: true, force: true }); for (const job of removedJobs) for (const extension of ['.mp4', '.mov']) rmSync(join(dataDir, 'renders', `${job.id}${extension}`), { force: true }); }).catch(error => console.error('File cleanup failed:', error));
+    for (const [, backup] of backups) for (const item of [...backup.media, ...backup.renderJobs]) aborters.get(item.id)?.abort();
     return true;
   }
 
@@ -691,12 +719,17 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (req.headers['sec-fetch-site'] === 'cross-site') fail(403, 'Cross-site requests are not allowed.');
         if (req.headers.origin) { let origin: URL; try { origin = new URL(req.headers.origin); } catch { fail(403, 'Invalid request origin.'); } if (origin!.host !== req.headers.host) fail(403, 'Cross-site requests are not allowed.'); }
       }
-      if (path === '/api/health' && method === 'GET') { const capabilities = await getMediaCapabilities(); send(res, 200, { status: 'ok', ffmpeg: capabilities.available, captions: captionAvailable() }); return; }
+      if (path === '/api/health' && method === 'GET') {
+        let database = true, free = -1; try { db.prepare('SELECT 1').get(); } catch { database = false; } try { free = freeBytes(); } catch { /* Unknown disk: report it, do not fail on it. */ }
+        const status = !database ? 'database unavailable' : free >= 0 && free < minFreeBytes ? 'low disk space' : 'ok';
+        const capabilities = await getMediaCapabilities(); send(res, status === 'ok' ? 200 : 503, { status, ffmpeg: capabilities.available, captions: captionAvailable(), freeBytes: free, minFreeBytes }); return;
+      }
       if (path === '/api/uploads/info' && method === 'GET') { requireAccount(req); const address = server.address(); send(res, 200, { localUrl: `http://localhost:${typeof address === 'object' && address ? address.port : 4310}`, maxUploadBytes }); return; }
       if (path === '/api/auth/me' && method === 'GET') { send(res, 200, { user: authenticated(req)?.user ?? null, registrationRequiresCode: Boolean(process.env.FRAME_LINE_SIGNUP_CODE) }); return; }
       if (['/api/auth/signup', '/api/auth/login'].includes(path) && method === 'POST') {
-        const body = await jsonBody(req); const email = textField(body.email, 254, true).trim().toLowerCase(); const password = textField(body.password, 1024, true);
-        const address = req.socket.remoteAddress ?? 'local'; const now = Date.now(); const networkKey = `network:${address}`; let networkAttempts = authAttempts.get(networkKey);
+        const body = await jsonBody(req, 16 * 1024); const email = textField(body.email, 254, true).trim().toLowerCase(); const password = textField(body.password, 1024, true);
+        // Keyed by the real client and the email: a stranger hammering an account only locks themselves out.
+        const address = clientAddress(req); const now = Date.now(); const networkKey = `network:${address}`; let networkAttempts = authAttempts.get(networkKey);
         if (!networkAttempts || networkAttempts.reset < now) { networkAttempts = { count: 0, reset: now + 60_000 }; authAttempts.set(networkKey, networkAttempts); }
         if (++networkAttempts.count > 120) fail(429, 'Too many sign-in requests. Try again in a minute.');
         const attemptKey = `account:${address}:${email}`; let attempts = authAttempts.get(attemptKey);
@@ -823,7 +856,15 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           streamFile(req, res, overlays.path(overlayRoute[1], kind) ?? fail(404, 'Overlay not found.'), kind === 'jpg' ? 'image/jpeg' : 'video/mp4', undefined, true); return;
         }
         if (overlayRoute && method === 'DELETE') {
-          if (!overlays.remove(overlayRoute[1])) fail(404, 'Overlay not found.');
+          const id = overlayRoute[1], leak = overlays.list().find(item => item.id === id) ?? fail(404, 'Overlay not found.');
+          // Only the uploader removes an overlay; the original pack has no uploader. Neither goes while any clip, saved or in a snapshot, uses it.
+          if (leak.addedBy && leak.addedBy !== userId) fail(403, 'Only the person who uploaded this overlay can delete it.');
+          const uses = (clip: Entry) => leakIdOf(String(clip.mediaId)) === id || Object.values(clip.properties ?? {}).some(value => typeof value === 'string' && value.includes(`"leak":${JSON.stringify(id)}`));
+          // Projects in Recently deleted count too: a restore must find its overlays.
+          const restorable = (db.prepare('SELECT data FROM deleted_projects WHERE expiresAt>?').all(Date.now()) as { data: string }[]).map(row => JSON.parse(row.data) as { clips?: Entry[]; snapshots?: Entry[] });
+          const usedBy = (bundle: { clips?: Entry[]; snapshots?: Entry[] }) => (bundle.clips ?? []).some(uses) || (bundle.snapshots ?? []).some(snapshot => snapshot.state.clips.some(uses));
+          if (usedBy(state as unknown as Entry) || restorable.some(usedBy)) fail(409, 'A project still uses this overlay (one in Recently deleted included). Remove it from those clips first.');
+          if (!overlays.remove(id)) fail(404, 'Overlay not found.');
           send(res, 200, { ok: true }); return;
         }
 
@@ -853,12 +894,20 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           send(res, 200, { ...ephemeral, baseRevision: body.revision, delta: stateDelta(incoming!, aligned) }); return;
         }
         if (path === '/api/state' && method === 'PUT') { const saved = putState(await jsonBody(req), account); sendState(res, saved ? 200 : 409, view(account)); return; }
+        // The owner's own deleted projects that can still be restored, newest first.
+        if (path === '/api/projects/deleted' && method === 'GET') {
+          const rows = db.prepare('SELECT id,expiresAt,data FROM deleted_projects WHERE ownerId=? AND expiresAt>? ORDER BY expiresAt DESC').all(userId, Date.now()) as { id: string; expiresAt: number; data: string }[];
+          send(res, 200, { projects: rows.map(row => ({ id: row.id, name: (JSON.parse(row.data) as { projects?: Project[] }).projects?.[0]?.name ?? row.id, expiresAt: row.expiresAt })) }); return;
+        }
         const restoreProjectRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)\/restore$/.exec(path);
         if (restoreProjectRoute && method === 'POST') {
           const row = db.prepare('SELECT ownerId,expiresAt,data FROM deleted_projects WHERE id=?').get(restoreProjectRoute[1]) as { ownerId: string; expiresAt: number; data: string } | undefined;
           if (!row || row.ownerId !== userId || row.expiresAt <= Date.now()) fail(404, 'That project backup has expired.');
           const bundle = JSON.parse(row!.data) as Record<Collection, Entry[]>;
           if (state.projects.some(project => project.id === restoreProjectRoute[1])) fail(409, 'A project with that ID already exists.');
+          // Deleting cancelled whatever was still processing or exporting; it comes back retryable, not stuck.
+          bundle.media = (bundle.media ?? []).map(asset => ['ready', 'failed', 'uploading'].includes(asset.status) ? asset : { ...asset, status: 'failed', error: 'Processing was interrupted. Retry to continue from the saved original.' });
+          bundle.renderJobs = (bundle.renderJobs ?? []).map(job => ['waiting', 'rendering'].includes(job.status) ? { ...job, status: 'failed', remaining: 'Cancelled', error: 'The project was deleted during this export. Submit it again.' } : job);
           const previous = state, previousRevision = revision;
           try {
             transaction(() => {
@@ -896,9 +945,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         }
         if (projectRoute && method === 'DELETE') {
           const project = requireProject(projectRoute[1], userId); if (roleFor(project, userId) !== 'Owner') fail(403, 'Only the project owner can delete this project.');
-          const backup = projectBundle(project), expiresAt = Date.now() + 60_000, previous = state, previousRevision = revision;
+          const backup = projectBundle(project), expiresAt = Date.now() + PROJECT_RECOVERY_MS, previous = state, previousRevision = revision;
           for (const item of [...backup.media, ...backup.renderJobs]) aborters.get(item.id)?.abort();
-          try { transaction(() => { db.prepare('INSERT INTO deleted_projects(id,ownerId,expiresAt,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET ownerId=excluded.ownerId,expiresAt=excluded.expiresAt,data=excluded.data').run(project.id, userId, expiresAt, JSON.stringify(backup)); removeProject(project.id); persist(); }); }
+          try { transaction(() => { backupProject(project.id, userId, expiresAt, backup); removeProject(project.id); persist(); }); }
           catch (error) { state = previous; revision = previousRevision; throw error; }
           send(res, 200, { projectId: project.id, expiresAt }); return;
         }
@@ -1024,6 +1073,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const project = requireProject(textField(body.projectId, 160, true), userId, true);
           let link; try { link = parseImportLink(body.url, body.mode, body.quality); } catch (error) { fail(400, (error as Error).message); }
           if (aborters.size + state.media.filter(asset => asset.status === 'uploading').length >= QUEUE_LIMIT) fail(429, 'The processing queue is full. Wait for current jobs to finish.');
+          requireSpace(0);
           const id = `media-${randomUUID()}`, spotify = link!.url.includes('open.spotify.com');
           const asset: Asset = { id, projectId: project.id, name: spotify ? 'Spotify track · matching audio' : 'YouTube · waiting to download', kind: link!.mode === 'audio' ? 'audio' : 'video', binId: link!.mode === 'audio' ? 'audio' : 'broll', thumbnail: youtubeThumbnail(link!.url), duration: 0, resolution: '', fps: 0, size: '', status: 'downloading', progress: 0, importLink: link! };
           mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media = [asset, ...state.media]; persist();
@@ -1035,8 +1085,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (!idIsValid(id)) fail(400, 'Invalid media ID.'); if (state.media.some(asset => asset.id === id) || existsSync(mediaDir(id))) fail(409, 'That media ID already exists.');
           const name = textField(url.searchParams.get('name'), 255, true); if (/[\x00-\x1f]/.test(name) || basename(name.replaceAll('\\', '/')) !== name) fail(400, 'Invalid filename.');
           const length = Number(req.headers['content-length']); if (length > maxUploadBytes) fail(413, `Files must be smaller than ${Math.floor(maxUploadBytes / 1024 ** 3)} GB.`);
-          const audio = /\.(wav|mp3|aac|aiff?|flac|m4a|ogg)$/i.test(name); const image = /\.(png|jpe?g|webp|gif|tiff?|bmp|heic)$/i.test(name);
-          const asset: Asset = { id, projectId: project.id, name, kind: audio ? 'audio' : image ? 'image' : 'video', binId: audio ? 'audio' : 'broll', thumbnail: '', duration: 0, resolution: '', fps: 0, size: '', status: 'uploading', progress: 0 };
+          requireSpace(length > 0 ? length : 0);
+          const kind = mediaKind(name);
+          const asset: Asset = { id, projectId: project.id, name, kind, binId: kind === 'audio' ? 'audio' : 'broll', thumbnail: '', duration: 0, resolution: '', fps: 0, size: '', status: 'uploading', progress: 0 };
           mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media = [asset, ...state.media]; persist();
           if (url.searchParams.get('placeholder') === '1') { send(res, 201, { asset }); return; }
           const temporary = join(mediaDir(id), 'upload.part'); let bytes = 0, lastProgress = 0;
@@ -1046,6 +1097,16 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             renameSync(temporary, originalPath(id)); updateAsset(id, { size: bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${(bytes / 1e6).toFixed(1)} MB`, status: 'processing' });
             processAsset(id); send(res, 202, { asset: state.media.find(item => item.id === id) }); return;
           } catch (error) { rmSync(temporary, { force: true }); updateAsset(id, { status: 'failed', error: error instanceof Error ? error.message : 'Upload failed.' }); throw error; }
+        }
+        // Moving a selection between bins is one save, not one per file.
+        if (path === '/api/media/move' && method === 'POST') {
+          const body = await jsonBody(req); const project = requireProject(textField(body.projectId, 160, true), userId, true);
+          const binId = textField(body.binId, 64, true); if (!BIN_ID.test(binId)) fail(400, 'Invalid bin ID.');
+          if (!Array.isArray(body.mediaIds) || !body.mediaIds.length || body.mediaIds.length > 10_000) fail(400, 'Choose media to move.');
+          const ids = new Set<string>(body.mediaIds); if (![...ids].every(id => state.media.some(asset => asset.id === id && asset.projectId === project.id))) fail(404, 'Media not found.');
+          const previous = state.media; state.media = state.media.map(asset => ids.has(asset.id) && asset.binId !== binId ? { ...asset, binId } : asset);
+          try { persist(); } catch (error) { state.media = previous; throw error; }
+          send(res, 200, { ok: true }); return;
         }
         const mediaRoute = /^\/api\/media\/([a-zA-Z0-9_-]+)(?:\/(.*))?$/.exec(path);
         if (mediaRoute) {
@@ -1060,38 +1121,59 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
               const metadata = await probeMedia(temporary);
               if (metadata.kind !== 'image' || metadata.width! > 1024 || metadata.height! > 1024) fail(400, 'Preview must be an image up to 1024 × 1024.');
               await prepareMediaThumbnail(temporary, join(mediaDir(id), 'prepared'));
-              updateAsset(id, { thumbnail: `/api/media/${id}/files/thumbnail.jpg` });
+              updateAsset(id, { thumbnail: `/api/media/${id}/files/thumbnail.jpg${replacedVersion(id)}` });
               send(res, 200, { ok: true }); return;
             } finally { rmSync(temporary, { force: true }); }
           }
+          // Replace Media swaps a file in only while nothing reads the old original (Windows cannot replace an open file).
+          const replaceBusy = () => aborters.has(id) || state.renderJobs.some(job => job.projectId === asset.projectId && ['waiting', 'rendering'].includes(job.status)) || captionJobs().some(job => job.projectId === asset.projectId && ['waiting', 'running'].includes(job.status));
           if(suffix==='upload') {
-            const partial=join(mediaDir(id),'upload.part'), metadataPath=join(mediaDir(id),'upload.json');
-            if(method==='GET'){send(res,200,{offset:existsSync(partial)?statSync(partial).size:0,complete:existsSync(originalPath(id)),metadata:existsSync(metadataPath)?JSON.parse(readFileSync(metadataPath,'utf8')):null});return;}
+            // A pending Replace Media uploads beside the original, which stays in use until the last byte is accepted.
+            const replacement=join(mediaDir(id),'replacement.json'), staging=existsSync(replacement);
+            const partial=join(mediaDir(id),staging?'replacement.part':'upload.part'), metadataPath=join(mediaDir(id),staging?'replacement.upload.json':'upload.json');
+            if(method==='GET'){send(res,200,{offset:existsSync(partial)?statSync(partial).size:0,complete:!staging&&existsSync(originalPath(id)),metadata:existsSync(metadataPath)?JSON.parse(readFileSync(metadataPath,'utf8')):null});return;}
             if(method==='POST') {
               const body=await jsonBody(req);numberField(body.size,1,maxUploadBytes);if(!Number.isSafeInteger(body.size))fail(400,'Invalid file size.');textField(body.fingerprint,300,true);
-              if(existsSync(originalPath(id))){send(res,200,{complete:true});return;}
+              if(!staging&&existsSync(originalPath(id))){send(res,200,{complete:true});return;}
+              if(staging&&body.size!==JSON.parse(readFileSync(replacement,'utf8')).size)fail(409,'The selected file differs from the replacement. Choose Replace Media again.');
               if(uploadLocks.has(id))fail(409,'Upload is busy.');
+              requireSpace(body.size-(existsSync(partial)?statSync(partial).size:0));
               const metadata={size:body.size,fingerprint:body.fingerprint};
               if(existsSync(metadataPath)&&!same(JSON.parse(readFileSync(metadataPath,'utf8')),metadata))fail(409,'The selected file differs from the unfinished upload. Choose the original file.');
               mkdirSync(mediaDir(id),{recursive:true,mode:0o700});writeFileSync(metadataPath,JSON.stringify(metadata),{mode:0o600});
-              updateAsset(id,{status:'uploading',error:undefined});send(res,200,{offset:existsSync(partial)?statSync(partial).size:0,complete:false});return;
+              if(!staging)updateAsset(id,{status:'uploading',error:undefined});send(res,200,{offset:existsSync(partial)?statSync(partial).size:0,complete:false});return;
             }
             if(method==='PUT') {
               if(uploadLocks.has(id))fail(409,'Upload is busy.');
-              if(existsSync(originalPath(id)))fail(409,'Original media is immutable.');
+              if(!staging&&existsSync(originalPath(id)))fail(409,'Original media is immutable.');
               if(!existsSync(metadataPath))fail(409,'Initialize this upload first.');
               const metadata=JSON.parse(readFileSync(metadataPath,'utf8')), offset=Number(req.headers['upload-offset']);
               const current=existsSync(partial)?statSync(partial).size:0;
               if(!Number.isSafeInteger(offset)||offset!==current)fail(409,'Upload offset changed. Resume from the server offset.');
+              requireSpace(Number(req.headers['content-length'])||0);
               uploadLocks.add(id);
               try {
                 const chunk=await binaryBody(req,8*1024*1024);
                 const digest=createHash('sha256').update(chunk).digest('hex');if(req.headers['upload-checksum']!==digest)fail(400,'Chunk checksum mismatch.');
                 if(offset+chunk.length>metadata.size)fail(400,'Upload exceeds its declared size.');
+                // Refused before the last chunk lands, so the client resumes it later with nothing half-swapped.
+                if(staging&&offset+chunk.length===metadata.size&&replaceBusy())fail(409,'Wait for this media’s processing and the project’s exports to finish; the replacement then completes.');
                 appendFileSync(partial,chunk,{mode:0o600,flush:true});const complete=offset+chunk.length===metadata.size;
-                if(complete){progressAt.delete(id);renameSync(partial,originalPath(id));updateAsset(id,{status:'processing',progress:0,preparationStage:'Queued for media processing'});if(!DEFER_PREP)processAsset(id);}
+                if(complete&&staging){
+                  // The swap is one rename over the original; a refused rename puts the chunk back so it can be resent.
+                  try{renameSync(partial,originalPath(id));}catch(error){truncateSync(partial,offset);throw error;}
+                  const name=String(JSON.parse(readFileSync(replacement,'utf8')).name);progressAt.delete(id);
+                  writeFileSync(join(mediaDir(id),'replaced'),`?v=${Date.now().toString(36)}`,{mode:0o600});
+                  const previous=state.media;state.media=state.media.map(item=>item.id===id?{id,projectId:item.projectId,name,kind:item.kind,binId:item.binId,thumbnail:'',duration:0,resolution:'',fps:0,size:'',status:'processing',progress:0,preparationStage:'Queued for media processing'}:item);
+                  try{persist();}catch(error){state.media=previous;throw error;}
+                  for(const file of ['replacement.json','replacement.upload.json'])rmSync(join(mediaDir(id),file),{force:true});
+                  // Processing rewrites the previews under new URLs either way; one Windows still holds open is only a log line.
+                  try{rmSync(join(mediaDir(id),'prepared'),{recursive:true,force:true});}catch(error){console.error('Old previews not removed:',error);}
+                  if(!DEFER_PREP)processAsset(id);
+                }
+                else if(complete){progressAt.delete(id);renameSync(partial,originalPath(id));updateAsset(id,{status:'processing',progress:0,preparationStage:'Queued for media processing'});if(!DEFER_PREP)processAsset(id);}
                 // Keep collaborators informed without persisting the workspace for every chunk.
-                else if (Date.now() - (progressAt.get(id) ?? 0) >= 5000) {
+                else if (!staging && Date.now() - (progressAt.get(id) ?? 0) >= 5000) {
                   progressAt.set(id, Date.now());
                   updateAsset(id, { progress: Math.min(99, Math.floor((offset + chunk.length) / metadata.size * 100)) });
                 }
@@ -1113,11 +1195,25 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             if (body.name !== undefined) patch.name = textField(body.name, 255, true).trim();
             // A bin is a folder in the media panel. A bulk import assigns one per camera, so this
             // takes a free-form id rather than a fixed list; the panel shows whatever is in use.
-            if (body.binId !== undefined) { const binId = textField(body.binId, 64, true).trim(); if (!/^[A-Za-z0-9 _-]{1,64}$/.test(binId)) fail(400, 'A bin name uses letters, numbers, spaces, hyphens or underscores.'); patch.binId = binId; }
+            if (body.binId !== undefined) { const binId = textField(body.binId, 64, true).trim(); if (!BIN_ID.test(binId)) fail(400, 'A bin name uses letters, numbers, spaces, hyphens or underscores.'); patch.binId = binId; }
             if (!Object.keys(patch).length) fail(400, 'Nothing to change.');
             updateAsset(id, patch); send(res, 200, { asset: state.media.find(item => item.id === id) }); return;
           }
           if (method === 'POST' && suffix === 'retry') { if (!existsSync(originalPath(id)) && !asset.importLink) fail(409, 'The original upload is missing. Upload the file again.'); if (aborters.has(id)) fail(409, 'This file is already processing.'); updateAsset(id, { status: 'processing', progress: 0, error: undefined }); processAsset(id); send(res, 202, { asset: state.media.find(item => item.id === id) }); return; }
+          // Relink: the asset keeps its id, binId and every clip on it. This only stages the replacement; the upload routes
+          // swap it in once its last byte is accepted. Until then, and if it never arrives, the original stays in use.
+          if (method === 'POST' && suffix === 'replace') {
+            const body = await jsonBody(req); const name = textField(body.name, 255, true); if (/[\x00-\x1f]/.test(name) || basename(name.replaceAll('\\', '/')) !== name) fail(400, 'Invalid filename.');
+            if (mediaKind(name) !== asset.kind) fail(400, `Choose ${asset.kind === 'image' ? 'an image' : `a ${asset.kind}`} file to replace this media.`);
+            if (!Number.isSafeInteger(body.size) || body.size < 1) fail(400, 'Invalid file size.');
+            if (body.size > maxUploadBytes) fail(413, `Files must be smaller than ${Math.floor(maxUploadBytes / 1024 ** 3)} GB.`);
+            requireSpace(body.size);
+            if (uploadLocks.has(id) || replaceBusy()) fail(409, 'Wait for this media’s processing and the project’s exports to finish, then replace it.');
+            // A new replacement starts over; any earlier staged one goes.
+            for (const file of ['replacement.part', 'replacement.upload.json']) rmSync(join(mediaDir(id), file), { force: true });
+            mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); writeFileSync(join(mediaDir(id), 'replacement.json'), JSON.stringify({ name, size: body.size }), { mode: 0o600 });
+            send(res, 200, { asset }); return;
+          }
           if (method === 'POST' && suffix === 'cancel' && asset.importLink) {
             aborters.get(id)?.abort();
             if (!['ready', 'failed'].includes(asset.status)) updateAsset(id, { status: 'failed', error: 'Import cancelled.', progress: 0 });
@@ -1193,11 +1289,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (!candidate.prompts.length || candidate.prompts.length > 64) fail(400, 'Preview one frame of guides at a time.');
           const frame = Number(body.frame); if (!Number.isSafeInteger(frame) || frame < 0) fail(400, 'Invalid source frame.');
           const image = await masks.preview(structuredClone(clip), asset, originalPath(asset.id), candidate, frame, candidate.prompts);
+          maskPreviews.add(`${clip.projectId}:${basename(image, '.png')}`); if (maskPreviews.size > 10_000) maskPreviews.delete(maskPreviews.values().next().value!);
           send(res, 200, { url: `/api/smart-masks/preview/${basename(image, '.png')}.png?projectId=${encodeURIComponent(clip.projectId)}` }); return;
         }
         const previewRoute = /^\/api\/smart-masks\/preview\/([a-f0-9]{64})\.png$/.exec(path);
         if (previewRoute && ['GET', 'HEAD'].includes(method)) {
-          requireProject(textField(url.searchParams.get('projectId'), 160, true), userId);
+          const projectId = textField(url.searchParams.get('projectId'), 160, true); requireProject(projectId, userId);
+          if (!maskPreviews.has(`${projectId}:${previewRoute[1]}`)) fail(404, 'Preview not found.');
           streamFile(req, res, masks.previewFile(previewRoute[1]), 'image/png', undefined, true); return;
         }
         if (path === '/api/smart-masks' && method === 'POST') {
@@ -1233,6 +1331,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         }
         if (path === '/api/optical-flow' && method === 'POST') {
           const body = await jsonBody(req), clip = state.clips.find(c => c.id === textField(body.clipId,160,true)) ?? fail(404,'Clip not found.');
+          // Playback asks for this for every viewer, reviewers included; heavyJob and the queue cap bound the work.
           const project = requireProject(clip.projectId,userId);
           const asset = state.media.find(a => a.id === clip.mediaId && a.projectId === project.id);
           if (!asset || asset.kind !== 'video' || !clip.properties.opticalFlow) fail(400,'Enable optical flow on a video clip first.');
@@ -1262,14 +1361,15 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             if ([...flowJobs.values()].filter(j=>j.status==='preparing'&&!j.controller.signal.aborted).length >= 8) fail(429,'Optical-flow preview queue is full.');
             job = {status:'preparing',key,progress:0,from,duration,fps,projectId:project.id,clipId:clip.id,generation,controller:new AbortController()};
             flowJobs.set(key,job); const current = job, snapshot = structuredClone({clip:geometry,asset:asset!});
-            flowQueue = flowQueue.then(async () => {
+            flowQueue = flowQueue.then(() => heavyJob(async () => {
               if (closed || current.controller.signal.aborted) return;
               try {
                 await renderOpticalFlow({...snapshot,input,directory:flowDirectory,fps,from,duration,preview:true,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
                 current.status='ready'; current.url=`/api/optical-flow/${key}/video?projectId=${project.id}`;
-                await trimFlowCache(flowDirectory,new Set([key]));
-              } catch(error) { current.status='failed';current.error=(error as Error).message; }
-            });
+              } catch(error) { current.status='failed';current.error=(error as Error).message; return; }
+              // The preview is ready either way; a cache that could not be trimmed is only a log line.
+              try { await trimFlowCache(flowDirectory,new Set([key])); } catch(error) { console.error('Optical-flow cache trim failed:',error); }
+            }));
           }
           const {controller,projectId,clipId,generation:jobGeneration,...result}=job;
           send(res,200,result); return;
@@ -1285,6 +1385,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         }
         if(path==='/api/timeline-previews'&&method==='POST') {
           const body=await jsonBody(req);object(body);
+          // A playback cache for every viewer, reviewers included; the preview queue is bounded.
           const project=requireProject(textField(body.projectId,160,true),userId);
           const timeline=state.timelines.find(t=>t.id===body.timelineId&&t.projectId===project.id)??fail(404,'Timeline not found.');
           const chunk=numberField(body.chunk,0,5400);if(!Number.isInteger(chunk))fail(400,'Invalid preview chunk.');
@@ -1365,6 +1466,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (path === '/api/stabilize/capabilities' && method === 'GET') { send(res,200,await stabilizeCapabilities()); return; }
         if (path === '/api/stabilize' && method === 'POST') {
           const body = await jsonBody(req), clip = state.clips.find(c => c.id === textField(body.clipId,160,true)) ?? fail(404,'Clip not found.');
+          // The preview warps with this solve for every viewer; without it a reviewer sees the unstabilized picture.
           const project = requireProject(clip.projectId,userId);
           const asset = state.media.find(a => a.id === clip.mediaId && a.projectId === project.id);
           const effect = stabilizeEffect(clip);
@@ -1377,18 +1479,19 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const original = originalPath(asset!.id);
           if (!existsSync(original)) fail(409,'Original media is missing.');
           // The editor warps the picture it already decodes, so one solve serves every frame, quality and section.
-          const generation = JSON.stringify([clip.mediaId,settings,range]), key = createHash('sha256').update(`${clip.id}:${generation}`).digest('hex');
+          // A replaced original (Replace Media keeps the id) is a new source: its version keeps the old solve from being served.
+          const generation = JSON.stringify([clip.mediaId,settings,range]), key = createHash('sha256').update(`${clip.id}:${generation}${replacedVersion(clip.mediaId)}`).digest('hex');
           let job = stabilizeJobs.get(key);
           if (!job || job.controller.signal.aborted || job.status === 'failed' && Date.now() - job.polled > 10_000) {
             for (const old of stabilizeJobs.values()) if (old.clipId === clip.id && old.key !== key) { old.controller.abort(); stabilizeJobs.delete(old.key); }
-            const pending = [...stabilizeJobs.values()].filter(j=>j.status==='preparing'&&!j.started&&!j.controller.signal.aborted);
-            if (pending.length >= 8) { const stale = pending.sort((a,b)=>a.polled-b.polled)[0]; stale.controller.abort(); stabilizeJobs.delete(stale.key); }
+            // A full queue turns the newcomer away; it never cancels someone else's waiting analysis.
+            if ([...stabilizeJobs.values()].filter(j=>j.status==='preparing'&&!j.started&&!j.controller.signal.aborted).length >= 8) fail(429,'The Stabilize queue is full. Retry shortly.');
             const current: StabilizeJob = {status:'preparing',key,progress:0,projectId:project.id,clipId:clip.id,generation,controller:new AbortController(),created:Date.now(),polled:Date.now(),started:false,run:async()=>{
               try {
                 const solved = await stabilizeSolve({input:original,directory:stabilizeDirectory,range,settings,signal:current.controller.signal,onProgress:p=>{current.progress=Math.round(p);}});
                 current.solve=solved.solve; current.zoom=solved.solve.zoom; current.zoomMin=solved.solve.zoomMin; current.status='ready'; current.progress=100;
-                await trimStabilizeCache(stabilizeDirectory,new Set());
-              } catch(error) { current.status='failed';current.error=(error as Error).message; }
+              } catch(error) { current.status='failed';current.error=(error as Error).message; return; }
+              try { await trimStabilizeCache(stabilizeDirectory,new Set()); } catch(error) { console.error('Stabilize cache trim failed:',error); }
             }};
             stabilizeJobs.set(key,current); job = current; pumpStabilize();
           }
@@ -1421,7 +1524,12 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (renderRoute) {
           const job = state.renderJobs.find(job => job.id === renderRoute[1]) ?? fail(404, 'Export not found.'); requireProject(job.projectId, userId, method === 'DELETE');
           if (['GET', 'HEAD'].includes(method) && renderRoute[2] === 'download') { if (job.status !== 'complete') fail(409, 'The export is not complete.'); const extension = job.settings.codec?.includes('ProRes') ? '.mov' : '.mp4'; streamFile(req, res, join(dataDir, 'renders', `${job.id}${extension}`), contentTypes[extension], job.name.toLowerCase().endsWith(extension) ? job.name : `${job.name}${extension}`, true); return; }
-          if (method === 'DELETE' && !renderRoute[2]) { aborters.get(job.id)?.abort(); updateJob(job.id, { status: 'failed', remaining: 'Cancelled', error: 'Cancelled by user.' }); send(res, 200, { ok: true }); return; }
+          if (method === 'DELETE' && !renderRoute[2]) {
+            aborters.get(job.id)?.abort(); updateJob(job.id, { status: 'failed', remaining: 'Cancelled', error: 'Cancelled by user.' });
+            // A file Windows still holds open (a download in progress) is left for the next delete.
+            for (const extension of ['.mp4', '.mov']) try { rmSync(join(dataDir, 'renders', `${job.id}${extension}`), { force: true }); } catch (error) { console.error('Export file removal failed:', error); }
+            send(res, 200, { ok: true }); return;
+          }
         }
         fail(404, 'API endpoint not found.');
       }
@@ -1460,6 +1568,20 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const media = (state.media as Asset[]).map((asset): Asset => !['ready', 'failed', 'uploading'].includes(asset.status) ? { ...asset, status: 'failed', error: 'Processing was interrupted. Retry to continue from the saved original.' } : asset.status === 'ready' && asset.preparationStage !== undefined ? { ...asset, preparationStage: undefined } : asset);
   if (media.some((asset, i) => asset !== state.media[i])) state.media = media;
   if (store.dirty(state)) persist();
+  // An upload nobody has sent a chunk to for a day is abandoned: it stops holding a queue slot and its partial file goes.
+  const expireUploads = () => {
+    const cutoff = Date.now() - 86400_000, staged = ['replacement.json', 'replacement.upload.json', 'replacement.part'];
+    const lastTouched = (id: string, names: string[]) => Math.max(0, ...names.map(name => { try { return statSync(join(mediaDir(id), name)).mtimeMs; } catch { return 0; } }));
+    for (const asset of state.media) if (!uploadLocks.has(asset.id)) {
+      // An abandoned Replace Media drops only its staged file: the media keeps its original and its state.
+      if (existsSync(join(mediaDir(asset.id), 'replacement.json')) && lastTouched(asset.id, staged) < cutoff) for (const name of staged) rmSync(join(mediaDir(asset.id), name), { force: true });
+      if (asset.status !== 'uploading' || lastTouched(asset.id, ['upload.part', 'upload.json', '']) >= cutoff) continue;
+      rmSync(join(mediaDir(asset.id), 'upload.part'), { force: true }); rmSync(join(mediaDir(asset.id), 'upload.json'), { force: true });
+      updateAsset(asset.id, { status: 'failed', progress: 0, error: 'This upload stopped for a day and was discarded. Upload the file again.' });
+    }
+  };
+  const sweepUploads = () => { try { expireUploads(); } catch (error) { console.error('Abandoned upload cleanup failed:', error); } };
+  sweepUploads(); const uploadSweep = setInterval(sweepUploads, 3600_000); uploadSweep.unref();
   // A fresh install gets its legacy row now, so `project-bundle.mjs import` has one to merge into;
   // after a migration or a crash the row is brought up to date before anything reads it.
   if (!store.legacyCurrent()) store.writeLegacy();
@@ -1535,7 +1657,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   // What changed only in memory (render progress, a held-back progress value) is saved on the way out,
   // first thing, in case Windows ends the process before the slower shutdown steps finish.
   const saveBeforeExit = () => { try { flushProgress(); if (store.dirty(state)) persist(); } catch (error) { console.error('Could not save the workspace on shutdown:', error); } };
-  return { server, dataDir, async close() { closed = true; saveBeforeExit(); await masks.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
+  return { server, dataDir, async close() { closed = true; saveBeforeExit(); await masks.close(); await motionTrackers.close(); await colorAssistant.close(); for(const job of flowJobs.values())job.controller.abort(); await flowQueue; clearInterval(housekeeping); clearInterval(uploadSweep); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const controller of aborters.values()) controller.abort(); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

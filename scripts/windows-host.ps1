@@ -3,7 +3,7 @@
 #   .\scripts\windows-host.ps1 on        this machine serves sharedcut.com
 #   .\scripts\windows-host.ps1 off       stop serving sharedcut.com (server keeps running)
 #   .\scripts\windows-host.ps1 restart   load new code: stop the running server, start the task again
-#   .\scripts\windows-host.ps1 setup     once: normal priority, a no-prompt restart task, current cloudflared
+#   .\scripts\windows-host.ps1 setup     once: normal priority, a no-prompt restart task, a 5-minute tunnel health check, current cloudflared
 # After setup, any shell restarts the server without a UAC prompt:  schtasks /run /tn "SharedCut Restart"
 # (result in logs\restart.log).
 # Only ONE machine may run the tunnel: two connectors split traffic between two databases.
@@ -13,6 +13,12 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $cf = Join-Path $HOME '.cloudflared'
 $logs = Join-Path $repo 'logs'
+
+# The server holds server.log open while it runs, so it is rotated only between a stop and a start. One old copy is kept.
+function Rotate-Log($file) {
+  try { if ((Test-Path $file) -and (Get-Item $file).Length -gt 50MB) { Move-Item -Force $file "$file.1" } }
+  catch { "$file not rotated: $_" }
+}
 
 function Register-HostTask($name, $exe, $arguments) {
   $action = New-ScheduledTaskAction -Execute $exe -Argument $arguments -WorkingDirectory $repo
@@ -55,6 +61,7 @@ ingress:
     Register-HostTask 'SharedCut Tunnel' 'powershell.exe' `
       "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($loop)))"
     Disable-ScheduledTask 'SharedCut Tunnel' | Out-Null
+    Rotate-Log "$logs\server.log"
     Start-ScheduledTask 'SharedCut Server'
     'Installed. Server running; tunnel off until "on".'
   }
@@ -86,6 +93,17 @@ ingress:
       -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
     Register-ScheduledTask -TaskName 'SharedCut Restart' -Action $restartAction -Principal $principal -Settings $settings -Force | Out-Null
     'Restart task registered.'
+    # Every 5 minutes: if https://sharedcut.com/api/health fails three checks, cloudflared is restarted. Does nothing while the tunnel task
+    # is disabled. FRAME_LINE_ALERT_WEBHOOK in .env, if set, receives a message on a restart or an unhealthy answer.
+    $node = (Get-Command node).Source
+    $healthAction = New-ScheduledTaskAction -Execute 'cmd.exe' -WorkingDirectory $repo `
+      -Argument "/c `"`"$node`" --env-file-if-exists=.env scripts/tunnel-health.mjs >> `"$logs\tunnel-health.log`" 2>&1`""
+    $healthSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 4) -MultipleInstances IgnoreNew `
+      -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+    Register-ScheduledTask -TaskName 'SharedCut Tunnel Health' -Action $healthAction -Settings $healthSettings `
+      -Principal (New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType S4U -RunLevel Highest) `
+      -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5)) -Force | Out-Null
+    'Tunnel health task registered.'
     # cloudflared does not update itself on Windows. The tunnel restarts either way to pick up the new priority.
     $tunnel = (Get-ScheduledTask 'SharedCut Tunnel').State -ne 'Disabled'
     Stop-ScheduledTask 'SharedCut Tunnel' -ErrorAction SilentlyContinue
@@ -103,6 +121,7 @@ ingress:
     Stop-ScheduledTask 'SharedCut Server' -ErrorAction SilentlyContinue
     Get-NetTCPConnection -LocalPort 4310 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
     Start-Sleep 2
+    Rotate-Log "$logs\server.log"
     Start-ScheduledTask 'SharedCut Server'
     Start-Sleep 5
     $server = Get-NetTCPConnection -LocalPort 4310 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { workQueue } from './workQueue.ts';
+import { workQueue, limiter } from './workQueue.ts';
 
 test('exports bypass active media, run serially, and block further background work', async () => {
   const queue = workQueue(), events: string[] = [];
@@ -19,4 +19,16 @@ test('exports bypass active media, run serially, and block further background wo
   assert.deepEqual(events, ['media', 'export']);
   releaseRender(); await queue.drain();
   assert.deepEqual(events, ['media', 'export', 'next export', 'background']);
+});
+
+test('the heavy-job limiter runs at most its limit at once and keeps order', async () => {
+  const run = limiter(2), events: string[] = [], gates: (() => void)[] = [];
+  const job = (name: string) => run(async () => { events.push(name); await new Promise<void>(resolve => gates.push(resolve)); });
+  const all = Promise.all(['a', 'b', 'c', 'd'].map(job));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(events, ['a', 'b']);
+  gates.shift()!(); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(events, ['a', 'b', 'c']);
+  while (gates.length) { gates.shift()!(); await new Promise(resolve => setImmediate(resolve)); }
+  await all; assert.deepEqual(events, ['a', 'b', 'c', 'd']);
 });

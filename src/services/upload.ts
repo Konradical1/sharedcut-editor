@@ -117,13 +117,15 @@ const controllers = new Map<string, AbortController>();
 let queueEpoch = 0;
 const patchJob = (key: string, patch: Partial<UploadJob>) => uploadQueue.setState(state => ({ jobs: state.jobs.map(job => job.key === key ? { ...job, ...patch } : job) }));
 
-export function enqueueUploads(projectId: string, files: File[], candidates: MediaAsset[]) {
+/** `assetId` uploads into that existing media (a replacement) instead of creating one. */
+export function enqueueUploads(projectId: string, files: File[], candidates: MediaAsset[], assetId?: string) {
   const jobs = [...uploadQueue.getState().jobs];
   for (const file of files) {
-    const key = `${projectId}:${fingerprintOf(file)}`;
+    const key = `${projectId}:${fingerprintOf(file)}${assetId ? `:${assetId}` : ''}`;
     const existing = jobs.find(job => job.key === key);
-    if (existing) { if (['paused', 'failed'].includes(existing.status)) { existing.status = 'queued'; existing.error = undefined; existing.file = file; } continue; }
-    jobs.push({ key, projectId, name: file.name, file, candidates, status: 'queued', progress: { bytes: 0, total: file.size, speed: 0, elapsed: 0, message: 'Queued' } });
+    if (existing && !(assetId && existing.status === 'uploaded')) { if (['paused', 'failed'].includes(existing.status)) { existing.status = 'queued'; existing.error = undefined; existing.file = file; } continue; }
+    if (existing) jobs.splice(jobs.indexOf(existing), 1);
+    jobs.push({ key, projectId, name: file.name, file, candidates, assetId, status: 'queued', progress: { bytes: 0, total: file.size, speed: 0, elapsed: 0, message: 'Queued' } });
   }
   uploadQueue.setState({ jobs: [...jobs] });
   pumpUploads();

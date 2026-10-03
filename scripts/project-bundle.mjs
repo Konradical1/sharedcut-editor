@@ -69,6 +69,9 @@ function exportProject(needle, outDir) {
 function importProject(inDir) {
   const bundle = JSON.parse(readFileSync(join(inDir, 'project.json'), 'utf8'));
   if (bundle.version !== 1) throw new Error(`Unsupported bundle version ${bundle.version}.`);
+  // Ids become folder names under data/; the server's own id rule keeps a crafted bundle from writing outside them.
+  const idIsValid = id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id);
+  for (const item of [bundle.project, ...BY_PROJECT.flatMap(key => bundle[key] ?? []), ...(bundle.timelines ?? []), ...(bundle.tracks ?? [])]) if (!idIsValid(item?.id)) throw new Error(`The bundle has an invalid id ${JSON.stringify(item?.id)}; refusing to import it.`);
   const { db, revision, state, fromItems } = open();
 
   // The owner's account id is per-install. Without a remap the project imports invisible: every

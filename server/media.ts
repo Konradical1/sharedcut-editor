@@ -14,7 +14,8 @@ import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, sampleKey
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { isTitle, getText, drawText, validateText } from '../src/services/text.ts';
 import { isShape, getShape, drawShape, validateShape } from '../src/services/shapes.ts';
-import { effectValue, effectEnabled } from '../src/services/effects.ts';
+import { effectValue, effectEnabled, loudnessTarget } from '../src/services/effects.ts';
+import { eqBiquads } from '../src/services/audioDsp.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
 import { blendModeOf } from '../src/services/blendModes.ts';
 import { uncoveredParts } from '../src/services/timeline.ts';
@@ -460,7 +461,33 @@ export async function prepareWaveform(inputPath: string, duration: number, signa
     const value = Number(db); return Number.isFinite(value) ? Number(Math.min(1, 10 ** (value / 20)).toPrecision(4)) : 0;
   });
   if (!waveform.length) throw new Error('Could not extract an audio waveform.');
-  return { waveform, waveformVersion: 2 };
+  // Measured with the waveform so the preview can apply Normalize loudness as a gain; the export measures the clip itself.
+  const loudness = await measureLoudness(inputPath, { signal }).catch(error => { if (signal?.aborted) throw error; return undefined; });
+  return { waveform, waveformVersion: 2, ...(loudness === undefined ? {} : { loudness }) };
+}
+
+/** Integrated loudness (LUFS, BS.1770) of the first audio stream or a section of it, as it plays: 48 kHz stereo, after
+ *  `filters`. Undefined for silence. */
+export async function measureLoudness(inputPath: string, options: { seek?: number; duration?: number; filters?: string[]; signal?: AbortSignal } = {}) {
+  const chain = [...options.filters ?? [], 'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo', 'asetnsamples=n=48000:p=0', 'ebur128=metadata=1', 'ametadata=print:key=lavfi.r128.I:file=-'];
+  const output = await run(ffmpeg(), [...common, ...options.seek ? ['-ss', options.seek.toFixed(6)] : [], ...options.duration ? ['-t', options.duration.toFixed(6)] : [], ...safeInput, '-i', inputPath, '-map', '0:a:0', '-vn', '-af', chain.join(','), '-f', 'null', '-'], { signal: options.signal });
+  const value = Number([...output.toString().matchAll(/lavfi\.r128\.I=([^\r\n]+)/g)].at(-1)?.[1]);
+  return Number.isFinite(value) && value > -70 ? Math.round(value * 100) / 100 : undefined;
+}
+// A clip's measurement is the same for every pass of every export until its source, trim or effects change.
+const loudnessCache = new Map<string, Promise<number | undefined>>();
+async function clipLoudness(inputPath: string, seek: number, duration: number, filters: string[]) {
+  // Size and time too: Replace Media puts a new file at the same path.
+  const file = await stat(inputPath), key = JSON.stringify([inputPath, file.size, file.mtimeMs, seek, duration, filters]);
+  let measured = loudnessCache.get(key);
+  if (!measured) {
+    while (loudnessCache.size >= 256) loudnessCache.delete(loudnessCache.keys().next().value!);
+    // No caller's signal: renders share this promise, so one cancelled render must not fail another's measurement.
+    measured = measureLoudness(inputPath, { seek, duration, filters });
+    loudnessCache.set(key, measured);
+    measured.catch(() => loudnessCache.delete(key));
+  }
+  return measured;
 }
 
 export async function prepareMedia(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; refresh?: boolean; onProgress?: (percent: number) => void; onThumbnail?: (url: string) => void; onStage?: (stage: string) => void; onPlayable?: (asset: Awaited<ReturnType<typeof probeMedia>> & {proxyUrl: string; thumbnail: string}) => void }) {
@@ -507,18 +534,18 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
   } catch (error) { if (!published) await rm(proxy, { force: true }); throw error; }
 }
 
-function audioFilters(clip: Clip): string[] {
-  const p = clip.properties;
+export function audioFilters(clip: Clip): string[] {
   const filters: string[] = [];
   for (const effect of clip.effects.filter(effect => effectEnabled(clip,effect))) {
     const value = (key: string, fallback: number, min: number, max: number) => finite(effectValue(clip,effect,key.slice(effect.name.length+1)), key, min, max);
-    if (effect.name === 'EQ') filters.push(`highpass=f=${value('EQ_Low cut', 80, 20, 500)}`, `equalizer=f=3000:t=q:w=1:g=${value('EQ_Presence', 2, -12, 12)}`, `treble=f=10000:g=${value('EQ_Air', 1, -12, 12)}`);
+    // The coefficients the preview plays and the Audio workspace draws. FFmpeg's own shelf widths change meaning
+    // between versions (9.0 reads treble's q 0.5 as 0.707), so the export takes them literally at a known rate.
+    if (effect.name === 'EQ') filters.push('aresample=48000', ...eqBiquads(value('EQ_Low cut', 80, 20, 500), value('EQ_Presence', 2, -12, 12), value('EQ_Air', 1, -12, 12), 48000).map(([b0, b1, b2, a1, a2]) => `biquad=b0=${b0}:b1=${b1}:b2=${b2}:a0=1:a1=${a1}:a2=${a2}`));
     else if (effect.name === 'Compressor') filters.push(`acompressor=threshold=${10 ** (value('Compressor_Threshold', -18, -60, 0) / 20)}:ratio=${value('Compressor_Ratio', 3, 1, 20)}:attack=${value('Compressor_Attack', 15, 1, 100)}:release=${value('Compressor_Release', 120, 10, 1000)}:makeup=1`);
     else if (effect.name === 'Limiter') filters.push(`volume=${-value('Limiter_Threshold', -6, -24, 0)}dB`, `alimiter=limit=${10 ** (value('Limiter_Ceiling', -1, -12, 0) / 20)}:release=${value('Limiter_Release', 80, 10, 500)}:level=0:latency=1`);
     else if (effect.name === 'Noise Reduction') filters.push(`afftdn=nr=${.01 + value('Noise Reduction_Reduction', 35, 0, 100) * .96}:nf=${-20 - value('Noise Reduction_Sensitivity', 50, 0, 100) * .6}:gs=${Math.round(value('Noise Reduction_Smoothing', 25, 0, 100) / 2)}`);
     else if (!['Film grain', 'Vignette', 'Gaussian blur', 'Sharpen', 'Bloom', 'Smart Mask'].includes(effect.name)) throw new Error(`${clip.name}: ${effect.name} is not supported for audio.`);
   }
-  if (p.normalize) filters.push('loudnorm=I=-16:TP=-1.5:LRA=11');
   return filters;
 }
 
@@ -554,6 +581,34 @@ function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset
     else if (!['EQ', 'Compressor', 'Limiter'].includes(effect.name)) throw new Error(`${clip.name}: ${effect.name} is not supported for video. Remove or bypass the effect.`);
   }
   return filters;
+}
+
+/**
+ * Composite `layer` onto `under` with a blend mode the way the preview's canvas does (W3C Compositing). The layer is
+ * placed on a transparent frame and blended against the picture in float RGB; over an opaque picture that gives
+ * (1 − αs)·Cb + αs·B(Cb, Cs), so a layer over nothing blends with black exactly as the canvas does. A `transparent`
+ * render (a composition's own) also weighs the backdrop's alpha in, so over nothing the layer stays itself. Add is
+ * Porter-Duff plus: min(1, Cb + αs·Cs).
+ */
+export function blendFilters(o: { under: string; layer: string; output: string; mode: string; tag: string; width: number; height: number; fps: number; duration: number; x: string; y: string; enable: string; transparent?: boolean }): string[] {
+  const { tag: t, enable } = o, add = o.mode === 'Add', formula = blendModeOf(o.mode)?.ffmpeg;
+  if (!formula) throw new Error(`${o.mode} blending is not available.`);
+  const colors = [0, 1, 2].map(c => formula.includes('(') ? `c${c}_expr='${formula}'` : `c${c}_mode=${formula}`).join(':');
+  // Add over an opaque picture places the layer on opaque black, which premultiplies it (αs·Cs). The premultiply filter
+  // would too, but FFmpeg 9 tags its frames premultiplied and negotiates that onto the next clip's blend, which then
+  // premultiplies that clip's layer a second time.
+  const placed = [`color=c=black${add && !o.transparent ? '' : '@0'}:s=${o.width}x${o.height}:r=${o.fps}:d=${o.duration},format=rgba[${t}c]`, `[${o.layer}]scale=in_color_matrix=bt709:in_range=tv,format=rgba[${t}p]`,
+    `[${t}c][${t}p]overlay=format=rgb:alpha=straight:x=${o.x}:y=${o.y}:eof_action=pass:repeatlast=0:enable='${enable}',format=gbrapf32le${add && o.transparent ? ',premultiply=inplace=1' : ''}${o.transparent && !add ? ',split=3' : ''}[${t}l]${o.transparent && !add ? `[${t}o][${t}a]` : ''}`];
+  if (!o.transparent) return [...placed, `[${o.under}]split[${t}k][${t}u]`, `[${t}u]scale=in_color_matrix=bt709:in_range=tv,format=gbrapf32le[${t}b]`,
+    // The picture under is opaque, so darken keeps the layer's alpha and addition saturates it to opaque.
+    `[${t}l][${t}b]blend=${colors}:c3_mode=${add ? 'addition' : 'darken'}:enable='${enable}',scale=out_color_matrix=bt709:out_range=tv,format=yuva444p10le,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[${t}m]`,
+    `[${t}k][${t}m]overlay=format=yuv444p10:alpha=straight:x=0:y=0:eof_action=pass:repeatlast=0:enable='${enable}'[${o.output}]`];
+  if (add) return [...placed, `[${o.under}]format=gbrapf32le,premultiply=inplace=1[${t}b]`, `[${t}b][${t}l]blend=all_mode=addition:enable='${enable}',unpremultiply=inplace=1,format=rgba[${o.output}]`];
+  // Over a translucent backdrop the layer's colour becomes (1 − αb)·Cs + αb·B(Cb, Cs) before it goes on top.
+  // ponytail: 8-bit like every composition render; a float overlay would lift it when nesting supports HDR.
+  return [...placed, `[${o.under}]split[${t}k][${t}u]`, `[${t}u]format=gbrapf32le[${t}b]`, `[${t}l][${t}b]blend=${colors}:c3_expr=B[${t}m]`,
+    `[${t}o]format=gbrpf32le[${t}s]`, `[${t}s][${t}m]overlay=format=rgb:alpha=straight:x=0:y=0,format=gbrapf32le[${t}x]`,
+    `[${t}x][${t}a]blend=c3_mode=darken,format=rgba[${t}y]`, `[${t}k][${t}y]overlay=format=rgb:alpha=straight:x=0:y=0:eof_action=pass:repeatlast=0:enable='${enable}'[${o.output}]`];
 }
 
 /** A clip whose own span changes over time, and so cannot be composited in a single pass. */
@@ -762,18 +817,6 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   let windowIndex = 0;
   const overlayPlace = (shiftX: number, shiftY: number) => `overlay=format=${request.transparent ? 'rgb' : 'yuv444p10'}:alpha=straight:x=(W-w)/2+${shiftX}:y=(H-h)/2+${shiftY}:eof_action=pass:repeatlast=0`;
 
-  // Blend modes: park the clip on a transparent canvas, blend it with the picture in float RGB (FFmpeg 8.1's 16-bit
-  // blend overflows on dark pictures), then fade the blended result in by the clip's own alpha.
-  // ponytail: the base's own alpha is kept as is; a blend over a transparent export does not add to it.
-  const blendFilters = (base: string, clipLabel: string, out: string, n: number, mode: string, shiftX: number, shiftY: number, visible: string) => [
-    `color=c=black@0:s=${width}x${height}:r=${fps}:d=${duration},format=rgba[bcv${n}]`,
-    `[bcv${n}][${clipLabel}]overlay=format=rgb:alpha=straight:x=(W-w)/2+${shiftX}:y=(H-h)/2+${shiftY}:eof_action=pass:repeatlast=0,format=gbrapf32le,split[btc${n}][btz${n}]`,
-    `[btz${n}]alphaextract[bam${n}]`,
-    `[${base}]format=gbrapf32le,split[bba${n}][bbb${n}]`,
-    `[bba${n}][btc${n}]blend=all_mode=${mode}:c3_opacity=0[bbl${n}]`,
-    `[bbb${n}][bbl${n}][bam${n}]maskedmerge=enable='${visible}',scale=out_color_matrix=bt709:out_range=tv,format=${request.transparent ? 'rgba' : 'yuv444p10le'},setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[${out}]`,
-  ];
-
   // Placement is decided on whole output frames. Comparing float seconds against `t`, and setpts truncating
   // `offset/TB`, each dropped a frame at clip edges seemingly at random (a black flash at most cuts).
   const frameAt = (seconds: number) => Math.round(seconds * fps);
@@ -913,7 +956,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     const explicitAudio = clips.some(other => other.id !== clip.id && tracks.find(t => t.id === other.trackId)?.kind === 'audio' && other.mediaId === clip.mediaId && other.start === clip.start && other.sourceIn === clip.sourceIn && other.duration === clip.duration);
     const audible = audio !== 'Disabled' && source.asset.hasAudio && !p.freeze && !track.muted && (!solo || track.solo) && !(track.kind === 'video' && (clip.properties.audioDetached || explicitAudio));
     if (!visual && !audible || request.only && !request.only.has(clip.id)) continue;
-    const blend = blendModeOf(p.blendMode).ffmpeg;
+    const blend = String(p.blendMode ?? 'Normal');
+    if (!blendModeOf(blend)) throw new Error(`${clip.name}: ${blend} blending is not available. Choose another blend mode.`);
 
     const speed = property('speed', 100, 1, 800) / 100;
     const localStart = Math.max(rangeIn - geo.start, 0), localEnd = Math.min(geo.duration, rangeOut - geo.start), length = localEnd - localStart;
@@ -1061,15 +1105,16 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       if(motion)filters.push(...motionBlurFilters(`motionbase${index}`,`clipv${index}`,poses,width,height,projectWidth,projectHeight,fps,length));
       const touching = transitions.filter(record => record.outgoingId === clip.id || record.incomingId === clip.id);
       const visible = onScreen(offset, offset + length);
-      if (blend && touching.length) throw new Error(`${clip.name}: ${p.blendMode} blending cannot be combined with a transition yet. Choose Normal or remove the transition.`);
-      if (blend) filters.push(...blendFilters(currentVideo, `clipv${index}`, `v${index}`, index, blend, shiftedX, shiftedY, visible));
-      else if (!touching.length) filters.push(`[${currentVideo}][clipv${index}]${overlayPlace(shiftedX, shiftedY)}:enable='${visible}'[v${index}]`);
+      // A transition window composites its two sides normally, as the preview's side canvases do.
+      const place = (layer: string, enable: string) => filters.push(...blend === 'Normal' ? [`[${currentVideo}][${layer}]${overlayPlace(shiftedX, shiftedY)}:enable='${enable}'[v${index}]`]
+        : blendFilters({ under: currentVideo, layer, output: `v${index}`, mode: blend, tag: `bm${index}`, width, height, fps, duration, x: `(W-w)/2+${shiftedX}`, y: `(H-h)/2+${shiftedY}`, enable, transparent: request.transparent }));
+      if (!touching.length) place(`clipv${index}`, visible);
       else {
         // One branch per window plus the body, so the clip outside its transitions is untouched.
         const branches = touching.map((_, n) => `w${index}_${n}`);
         filters.push(`[clipv${index}]split=${branches.length + 1}[body${index}]${branches.map(name => `[${name}]`).join('')}`);
         const outside = touching.map(record => `(1-${onScreen(Math.max(0, record.start - rangeIn), Math.min(duration, record.end - rangeIn))})`).join('*');
-        filters.push(`[${currentVideo}][body${index}]${overlayPlace(shiftedX, shiftedY)}:enable='${visible}*${outside}'[v${index}]`);
+        place(`body${index}`, `${visible}*${outside}`);
         touching.forEach((record, n) => {
           const sides = windowSides.get(record) ?? {};
           if (record.outgoingId === clip.id) sides.out = branches[n];
@@ -1090,7 +1135,14 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       while (tempo > 2) { sound.push('atempo=2'); tempo /= 2; }
       // Unity atempo can shift quiet onsets; nested mixes must preserve the original samples.
       if(Math.abs(tempo-1)>1e-9)sound.push(`atempo=${tempo}`);
-      sound.push(...audioFilters(clip), 'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo');
+      const effects = [...audioFilters(clip), 'aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo'];
+      sound.push(...effects);
+      if (p.normalize) {
+        // Measured on the clip's whole trim after its effects, so every range and pass of an export gets the same constant
+        // gain; the master limiter catches what the gain pushes over. Tempo and reverse leave integrated loudness alone.
+        const target = loudnessTarget(clip), measured = await clipLoudness(source.path, clip.sourceIn, clip.duration * speed, effects);
+        if (measured !== undefined) sound.push(`volume=${(target - measured).toFixed(2)}dB`);
+      }
       const gain = property('gain', 0, -60, 12) + finite(track.gain, `${track.name} gain`, -60, 12);
       const pan = Math.max(-1, Math.min(1, (property('pan', 0, -100, 100) + finite(track.pan, `${track.name} pan`, -100, 100)) / 100));
       // Match the browser StereoPannerNode: move both stereo channels toward the selected side.

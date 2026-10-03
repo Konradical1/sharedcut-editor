@@ -24,6 +24,9 @@ export function effectValue(clip: Clip, effect: Effect, key: string): number {
   return Number.isFinite(value) ? Math.max(parameter.min, Math.min(parameter.max, value)) : parameter.initial;
 }
 export const effectEnabled = (clip: Clip, effect: Effect) => effect.enabled && clip.properties[`${effect.name}_enabled`] !== false;
+/** Normalize loudness targets in LUFS; the first is the default. */
+export const loudnessTargets = [{ lufs: -14, label: 'Web' }, { lufs: -16, label: 'Podcast' }, { lufs: -23, label: 'Broadcast' }];
+export const loudnessTarget = (clip: Clip) => loudnessTargets.find(t => t.lufs === Number(clip.properties.normalizeTarget))?.lufs ?? loudnessTargets[0].lufs;
 export function acceptsEffect(clip: Clip, kind: string | undefined, name: string) {
   if(clip.properties.captionSet)return false;
   if(name==='Smart Mask'||name==='Stabilize')return kind==='video'&&!isTitle(clip)&&!isShape(clip)&&!clip.properties.compositionId;

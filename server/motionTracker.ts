@@ -10,6 +10,7 @@ import {
 import type { Clip, MediaAsset } from '../src/state/models.ts';
 import { renameWithRetry, venvPython } from './platform.ts';
 import { runWorkerProcess } from './processTree.ts';
+import { heavyJob } from './workQueue.ts';
 
 /** Motion tracker worker (scripts/tracker.py): one run of frames per job, samples streamed back as they settle. */
 const worker = fileURLToPath(new URL('../scripts/tracker.py', import.meta.url));
@@ -204,7 +205,7 @@ export function motionTrackerService(directory: string) {
         finish(job, 'done', unchanged(job.bases));
         return view(job, 0);
       }
-      const task = queue.then(() => execute(job, options.sourcePath, { width, height, fps: asset.fps || 24 }));
+      const task = queue.then(() => heavyJob(() => execute(job, options.sourcePath, { width, height, fps: asset.fps || 24 })));
       queue = task.then(() => {}, () => {});
       return view(job, 0);
     },
