@@ -35,6 +35,7 @@ import { stabilizeEffect, stabilizeMatrixAt, stabilizeRange, stabilizeSettings, 
 import { flowFrames, timingPaths } from '../src/services/opticalFlow.ts';
 import { gpuJob } from './workQueue.ts';
 import type { depthService } from './depth.ts';
+import { depthFocusAt } from '../src/services/depth.ts';
 
 type ProcessOptions = { signal?: AbortSignal; onProgress?: (percent: number) => void; duration?: number; binary?: boolean; maxBytes?: number; jsonProgress?: boolean | 'stderr' };
 const ffmpeg = () => process.env.FFMPEG_PATH || 'ffmpeg';
@@ -664,7 +665,7 @@ export interface RenderRequest {
   /** Internal: thread budget when several FFmpeg passes share the export. */
   threads?: number;
   /** Depth analysis: clips with a Depth effect start or join their run and wait for it. */
-  depth?: Pick<ReturnType<typeof depthService>, 'ready'>;
+  depth?: Pick<ReturnType<typeof depthService>, 'ready' | 'focus'>;
   /** Internal: the camera original behind a Stabilize bake, keyed by clip, for a Depth that reads its analysis. */
   stabilized?: Map<string, { clip: Clip; source: { asset: MediaAsset; path: string }; offset: number; solve: StabilizeSolve }>;
   /** Internal: hand over the finished FFmpeg command, which writes the lone clip's layer as raw rgba64le on stdout,
@@ -1493,6 +1494,31 @@ async function renderDepthTimeline(request: RenderRequest) {
           for (const key of animatedKeys) animated[key].push(key === 'amount' && !effectEnabled(evaluated, e) ? 0 : effectValue(evaluated, e, key));
         }
       }
+      // Section 7: the subject (Effect.maskId) keeps Lens blur off itself and, with Follow subject, sets Focus per frame. It
+      // reads the same saved revision a masked export does (stale or unanalysed blocks the export), by source frame.
+      let matte: { files: (string | null)[] } | undefined;
+      const lensOn = effectValue(clip, effect, 'blur') > 0 || keyed.includes(`effects.${effect.id}.parameters.blur`);
+      if (lensOn && effect.maskId) {
+        const doc = clip.smartMasks?.find(mask => mask.id === effect.maskId);
+        if (!doc) throw new Error(`${clip.name}: the Depth subject is missing. Choose another Subject or None.`);
+        if (!request.smartMaskDir) throw new Error(`${clip.name}: Smart Mask storage is unavailable.`);
+        let subject: { directory: string; manifest: SmartMaskManifest };
+        try { subject = resolveSmartMaskArtifact(request.smartMaskDir, original?.clip ?? clip, doc, original?.source.path ?? source.path, originalAsset); }
+        catch (error) { throw new Error(`${clip.name} (Depth subject): ${(error as Error).message}`); }
+        const files = new Map(subject.manifest.frames.map(frame => [frame.index, path.join(subject.directory, frame.file)])), sourceTimes = subject.manifest.sourceTimes ?? [];
+        matte = { files: Array.from({ length: frames }, (_, k) => {
+          const time = sourceTimes[base + k], file = files.get(base + k);
+          if (file || time === undefined || time < doc.range.start - 1e-7 || time >= doc.range.end - 1e-7) return file ?? null; // Outside the mask's range: no subject there.
+          throw new Error(`${clip.name}: the Depth subject “${doc.name}” is not analyzed at ${time.toFixed(2)} s of the source. Analyze the mask over the whole clip, or set Subject to None.`);
+        }) };
+        const following = animated?.followSubject ?? [];
+        if (params.followSubject >= .5 || following.some(value => value >= .5)) {
+          request.onStage?.(`Measuring subject focus · ${clip.name}`);
+          const track = await request.depth.focus(clip.projectId, analysis.key, subject);
+          // A subject never found in its mask leaves Focus as set, as the preview does.
+          if (track.values.length) animated = { ...animated, focus: Array.from({ length: frames }, (_, k) => (following[k] ?? params.followSubject) >= .5 ? depthFocusAt(track, base + k)! : animated?.focus?.[k] ?? params.focus) };
+        }
+      }
       const warps = original && Array.from({ length: frames }, (_, k) => {
         const m = stabilizeMatrixAt(original.solve, offset + origin + k / sourceFps), sx = width / original.solve.width, sy = height / original.solve.height;
         return [m[0], m[1] * sx / sy, m[2] * sx, m[3] * sy / sx, m[4], m[5] * sy];
@@ -1507,7 +1533,7 @@ async function renderDepthTimeline(request: RenderRequest) {
         settings: { ...request.settings, resolution: `${width} × ${height}`, fps: String(sourceFps), rangeIn: '0', rangeOut: String(duration), codec: 'Apple ProRes 4444', audio: 'Disabled' },
         outputPath: output, onProgress: undefined,
         decoder: async command => {
-          await writeFile(job, JSON.stringify({ ffmpeg: ffmpeg(), decoder: command, width, height, frames, fps: image ? String(fps) : metadata.frameRate || String(sourceFps), output, image, alpha, threads: Number(exportThreads), taps: Number(process.env.FRAME_LINE_DEPTH_TAPS) || 96, params, animated, warps, layer: dimensions(request.project.resolution),
+          await writeFile(job, JSON.stringify({ ffmpeg: ffmpeg(), decoder: command, width, height, frames, fps: image ? String(fps) : metadata.frameRate || String(sourceFps), output, image, alpha, threads: Number(exportThreads), taps: Number(process.env.FRAME_LINE_DEPTH_TAPS) || 96, params, animated, warps, matte, layer: dimensions(request.project.resolution),
             depth: { masters: segments.map(segment => path.join(masters, `${segment.n}.mkv`)), width: analysis.width, height: analysis.height, near: analysis.near, far: analysis.far, indices: Array.from({ length: frames }, (_, k) => base + k - segments[0].first) } }));
           await gpuJob(() => run(python, [script, job], { signal: request.signal, jsonProgress: 'stderr', onProgress: p => { request.onStage?.(`Baking depth · ${clip.name} · ${Math.floor(p)}%`); report(.3 + p / 100 * .7); } }), request.signal);
         } });

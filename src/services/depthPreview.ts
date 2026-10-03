@@ -3,7 +3,7 @@
 import type { Clip, Effect, MediaAsset } from '../state/models.ts';
 import { api, ApiError, connection } from './api.ts';
 import { setClipActivity } from './clipStatus.ts';
-import { DEPTH_SEGMENT, depthDistance, depthFrameAt, depthSegmentFor, type DepthRun } from './depth.ts';
+import { DEPTH_SEGMENT, depthDistance, depthFrameAt, depthSegmentFor, type DepthFocusTrack, type DepthRun } from './depth.ts';
 import { effectEnabled } from './effects.ts';
 import { stabilizeRange } from './stabilize.ts';
 
@@ -159,6 +159,48 @@ export function watchDepthClips(store: EditorLike) {
     for (const id of [...runs.keys()]) if (!open.has(id)) release(id, !kept.has(id));
   };
   sync(store.getState()); store.subscribe(sync);
+}
+
+export type DepthFocusState = { state: 'waiting' } | { state: 'ready'; track: DepthFocusTrack } | { state: 'failed'; error: string };
+const focusTracks = new Map<string, { value: DepthFocusState; controller: AbortController }>();
+const changed = () => { version++; for (const listener of listeners) listener(); };
+/**
+ * Focus follows subject: the server's focus track for the clip's ready run and its subject's current analysis
+ * (`maskKey`). Asked once and polled while the server measures; `waiting` until then (or until the run is ready), and
+ * a failure is asked again after ten seconds.
+ */
+export function depthFocusTrack(clip: Pick<Clip, 'id' | 'projectId'>, maskKey: string): DepthFocusState {
+  const state = runs.get(clip.id), run = state?.run;
+  if (!run || state.status !== 'ready' || typeof fetch === 'undefined') return { state: 'waiting' };
+  const id = `${run.key}:${maskKey}:${clip.id}`, known = focusTracks.get(id);
+  if (known) { focusTracks.delete(id); focusTracks.set(id, known); return known.value; }
+  while (focusTracks.size >= 32) { const [oldest, entry] = focusTracks.entries().next().value!; entry.controller.abort(); focusTracks.delete(oldest); }
+  const entry = { value: { state: 'waiting' } as DepthFocusState, controller: new AbortController() }, { signal } = entry.controller;
+  focusTracks.set(id, entry);
+  void (async () => {
+    let delay = 1000;
+    for (;;) {
+      try {
+        // The server reads the subject from the saved workspace: one picked a moment ago may not be there yet.
+        await connection.flush();
+        const value = await api<DepthFocusTrack | { status: 'processing' }>(`/depth/${run.key}/focus?projectId=${encodeURIComponent(clip.projectId)}&clipId=${encodeURIComponent(clip.id)}`, { signal });
+        if (signal.aborted) return;
+        if (value.status === 'ready') { entry.value = { state: 'ready', track: value }; changed(); return; }
+      } catch (error) {
+        if (signal.aborted) return;
+        // Asked only for a ready run and a current subject, so a 409 here is an answer (timing mismatch, stale save), not a wait.
+        if (!transient(error) || (error as ApiError).status === 409) {
+          entry.value = { state: 'failed', error: (error as Error).message || 'Could not measure the subject.' }; changed();
+          setTimeout(() => { if (focusTracks.get(id) === entry) { focusTracks.delete(id); changed(); } }, 10_000);
+          return;
+        }
+        delay = Math.min(delay * 2, 30_000);
+      }
+      await sleep(delay);
+      if (signal.aborted) return;
+    }
+  })();
+  return entry.value;
 }
 
 /** Viewer-only settings: the depth-map view and the one-shot focus picker. Neither is saved nor exported. */

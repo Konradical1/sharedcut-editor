@@ -7,12 +7,15 @@ import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, type Browser, type Page } from 'playwright';
 import { createFrameLineServer } from '../../server/index.ts';
+import { maskAnalysis, maskSourceFingerprint } from '../../server/smartMask.ts';
+import { createSmartMask, smartMaskSignature, type SmartMaskManifest } from '../services/smartMask.ts';
+import type { Clip, MediaAsset } from '../state/models.ts';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 let browser: Browser, dist = process.env.DIST ?? '', built = '';
@@ -45,9 +48,9 @@ test('Depth: the map fills in, Lens blur softens only the far region, and the fo
   const saved = { engine: process.env.FRAME_LINE_DEPTH_ENGINE, python: process.env.FRAME_LINE_DEPTH_PYTHON, floor: process.env.FRAME_LINE_DEPTH_MIN_FREE_GB };
   Object.assign(process.env, { FRAME_LINE_DEPTH_ENGINE: 'synthetic', FRAME_LINE_DEPTH_PYTHON: python, FRAME_LINE_DEPTH_MIN_FREE_GB: '.05' });
   const temp = await mkdtemp(join(tmpdir(), 'frameline-depth-'));
-  const app = createFrameLineServer({ dataDir: join(temp, 'data'), distDir: dist });
+  let app = createFrameLineServer({ dataDir: join(temp, 'data'), distDir: dist });
   await new Promise<void>(r => app.server.listen(0, '127.0.0.1', r));
-  const url = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`;
+  const port = (app.server.address() as { port: number }).port, url = `http://127.0.0.1:${port}`;
   const context = await browser.newContext({ viewport: { width: 1440, height: 900 } }), page = await context.newPage(), errors: string[] = [];
   page.on('pageerror', e => errors.push(e.message));
   t.after(async () => {
@@ -64,7 +67,7 @@ test('Depth: the map fills in, Lens blur softens only the far region, and the fo
   await page.getByRole('textbox', { name: 'Project name' }).fill('Depth');
   await page.getByRole('button', { name: 'Create project', exact: true }).click();
   await page.locator('.timeline-track').first().waitFor();
-  type View = { revision: number; state: { projects: { id: string }[]; timelines: { id: string }[]; media: { id: string; status: string }[]; clips: { id: string; effects: { name: string; parameters?: Record<string, number> }[] }[] } };
+  type View = { revision: number; state: { projects: { id: string }[]; timelines: { id: string }[]; media: (MediaAsset & { status: string })[]; clips: (Clip & { effects: { name: string; parameters?: Record<string, number> }[] })[] } };
   const server = async () => (await (await context.request.get(`${url}/api/state`)).json()) as View;
   const { state: { projects: [{ id: project }], timelines: [{ id: timelineId }] } } = await server();
 
@@ -119,7 +122,7 @@ test('Depth: the map fills in, Lens blur softens only the far region, and the fo
   assert.ok(focus !== undefined && focus < 26, `Focus follows the frame centre when Lens blur first turns on: ${focus}`);
   let blurredFar = await probe(page, far);
   for (let i = 0; i < 100 && blurredFar.detail > sharpFar.detail * .35; i++) { await page.waitForTimeout(100); blurredFar = await probe(page, far); }
-  const blurredNear = await probe(page, near);
+  let blurredNear = await probe(page, near);
   t.diagnostic(`map near ${mapNear.mean} far ${mapFar.mean}; detail near ${sharpNear.detail.toFixed(1)} → ${blurredNear.detail.toFixed(1)}, far ${sharpFar.detail.toFixed(1)} → ${blurredFar.detail.toFixed(1)}; centre focus ${focus}`);
   assert.ok(blurredFar.detail < sharpFar.detail * .35, `far loses its detail: ${sharpFar.detail.toFixed(2)} → ${blurredFar.detail.toFixed(2)}`);
   assert.ok(blurredNear.detail > sharpNear.detail * .8, `near keeps its detail: ${sharpNear.detail.toFixed(2)} → ${blurredNear.detail.toFixed(2)}`);
@@ -131,5 +134,44 @@ test('Depth: the map fills in, Lens blur softens only the far region, and the fo
   for (let i = 0; i < 50 && ((await parameters()).focus ?? 0) < 60; i++) await page.waitForTimeout(100);
   assert.ok(((await parameters()).focus ?? 0) >= 60, `the picker focuses on the far surround: ${(await parameters()).focus}`);
   assert.equal(await page.getByRole('button', { name: 'Set focus here' }).count(), 0, 'one click, then the picker disarms');
+  for (let i = 0; i < 100 && (blurredNear = await probe(page, near)).detail > sharpNear.detail * .35; i++) await page.waitForTimeout(100);
+  assert.ok(blurredNear.detail < sharpNear.detail * .35, `focused far, the near box blurs: ${blurredNear.detail.toFixed(2)}`);
+
+  // Subject: an analysed Smart Mask on the near box. Its analysis is written as the mask worker would (no SAM here), which
+  // the server reads at start, so the clip is saved with the subject, the server restarted on the same data, the page reloaded.
+  const before = await server(), shot = before.state.clips.find(c => c.id === 'shot')!, source = before.state.media[0], key = 'a'.repeat(64), frames = 72;
+  const mask = createSmartMask(shot, source, 'box');
+  mask.prompts = [{ id: 'point', time: 1, kind: 'include', points: [{ x: .5, y: .5 }], radius: .01 }]; mask.result = { key, signature: smartMaskSignature(mask) };
+  const subjectClip = { ...shot, smartMasks: [mask], effects: shot.effects.map(e => e.name === 'Depth' ? { ...e, maskId: mask.id } : e) };
+  assert.ok((await context.request.patch(`${url}/api/state`, { data: { revision: before.revision, delta: { clips: { upsert: [subjectClip], remove: [] } } } })).ok(), 'the subject is saved');
+  await app.close();
+  const maskDir = join(temp, 'data', 'smart-masks', key), original = join(temp, 'data', 'media', 'depthsrc', 'original');
+  await mkdir(join(maskDir, 'source'), { recursive: true }); await mkdir(join(maskDir, 'frames'));
+  const row = (y: number) => Buffer.from(Uint16Array.from({ length: 640 }, (_, x) => x >= 160 && x <= 479 && y >= 90 && y <= 269 ? 65535 : 0).buffer);
+  await writeFile(join(temp, 'alpha.raw'), Buffer.concat(Array.from({ length: frames * 360 }, (_, i) => row(i % 360))));
+  execFileSync(process.env.FFMPEG_PATH ?? 'ffmpeg', ['-v', 'error', '-f', 'rawvideo', '-pixel_format', 'gray16le', '-video_size', '640x360', '-framerate', '24', '-i', join(temp, 'alpha.raw'), '-start_number', '0', join(maskDir, 'frames', '%d.png')]);
+  for (let i = 0; i < frames; i++) await writeFile(join(maskDir, 'source', `${i}.jpg`), 'fixture');
+  const manifest: SmartMaskManifest = { version: 1, key, signature: mask.result.signature, projectId: project, mediaId: 'depthsrc', sourceFingerprint: maskSourceFingerprint(original), engine: 'fixture', modelRevision: 'fixture', quality: 'preview', width: 640, height: 360, sourceTimes: Array.from({ length: frames }, (_, i) => i / 24), range: mask.range, alpha: 'gray16', frames: Array.from({ length: frames }, (_, i) => ({ index: i, time: i / 24, file: `frames/${i}.png` })) };
+  await writeFile(join(maskDir, 'manifest.json'), JSON.stringify(manifest));
+  await writeFile(join(maskDir, 'binding.json'), JSON.stringify({ projectId: project, clipId: 'shot', maskId: mask.id, signature: mask.result.signature, sourceFingerprint: manifest.sourceFingerprint, analysisIdentity: maskAnalysis(subjectClip, source).identity, workerIdentity: 'fixture' }));
+  await writeFile(join(temp, 'data', 'smart-masks', `${key}.job.json`), JSON.stringify({ key, signature: mask.result.signature, projectId: project, clipId: 'shot', maskId: mask.id, status: 'ready', progress: 100 }));
+  app = createFrameLineServer({ dataDir: join(temp, 'data'), distDir: dist });
+  await new Promise<void>(r => app.server.listen(port, '127.0.0.1', r));
+  await page.reload();
+  await page.locator('[data-clip="shot"]').first().click();
+  await page.locator('.inspector-tabs').getByRole('button', { name: 'Effects', exact: true }).click();
+  assert.equal(await page.getByRole('combobox', { name: 'Depth subject' }).inputValue(), mask.id);
+  // Focus still sits far, but the subject keeps its detail and the surround stays blurred.
+  let kept = await probe(page, near);
+  for (let i = 0; i < 300 && kept.detail < sharpNear.detail * .8; i++) { await page.waitForTimeout(100); kept = await probe(page, near); }
+  assert.ok(kept.detail > sharpNear.detail * .8, `the subject stays sharp with Focus far: ${sharpNear.detail.toFixed(2)} → ${kept.detail.toFixed(2)}`);
+  // Follow subject: Focus goes to the subject's own distance (near), so the far surround blurs and the box stays sharp.
+  await page.getByRole('checkbox', { name: 'Follow subject' }).check();
+  await page.locator('.depth-subject-note', { hasText: 'Focus follows the subject' }).waitFor({ timeout: 60000 });
+  let followed = await probe(page, far);
+  for (let i = 0; i < 100 && followed.detail > sharpFar.detail * .35; i++) { await page.waitForTimeout(100); followed = await probe(page, far); }
+  assert.ok(followed.detail < sharpFar.detail * .35, `following the near subject blurs the far surround: ${followed.detail.toFixed(2)}`);
+  assert.ok((await probe(page, near)).detail > sharpNear.detail * .8, 'and keeps the subject sharp');
+  t.diagnostic(`subject: near ${kept.detail.toFixed(1)} with Focus far; followed, far ${followed.detail.toFixed(1)}`);
   assert.deepEqual(errors, []);
 });

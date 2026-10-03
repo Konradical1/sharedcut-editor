@@ -2,12 +2,14 @@ import { runWorkerProcess } from './processTree.ts';
 import { gpuJob, heavyJob } from './workQueue.ts';
 import { venvPython } from './platform.ts';
 import { atomicJson, commitFolder, inputMatrix, maskAnalysis, maskSourceFingerprint } from './smartMask.ts';
+import { run } from './media.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statfsSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import { DEPTH_MAX_FRAMES, DEPTH_SEGMENT, depthAnalysisSize, depthRange, type DepthCapabilities, type DepthRun, type DepthSegment } from '../src/services/depth.ts';
+import { DEPTH_FOCUS_VERSION, DEPTH_MAX_FRAMES, DEPTH_SEGMENT, depthAnalysisSize, depthDistance, depthRange, matteMedian, smoothFocus, type DepthCapabilities, type DepthFocusTrack, type DepthRun, type DepthSegment } from '../src/services/depth.ts';
+import type { SmartMaskManifest } from '../src/services/smartMask.ts';
 import type { Clip, MediaAsset } from '../src/state/models.ts';
 
 const defaultWorker = fileURLToPath(new URL('../scripts/depth.py', import.meta.url));
@@ -44,6 +46,38 @@ async function checkCapabilities(python: string, worker: string): Promise<Capabi
   } catch (error) { return { available: false, reason: (error as Error).message }; }
 }
 
+/** The subject's resolved mask analysis (resolveSmartMaskArtifact): its folder and verified manifest. */
+export type DepthSubject = { directory: string; manifest: SmartMaskManifest };
+/**
+ * Focus follows subject, measured once: per analysed frame the median distance under the matte (alpha over one half),
+ * smoothed (smoothFocus). Depth comes from the masters, the matte from the analysis's playback-size frames (the native
+ * ones when it has none), both scaled onto the depth grid, one 64-frame segment at a time.
+ */
+async function measureFocus(job: Pick<DepthRun, 'key' | 'first' | 'frames' | 'times' | 'width' | 'height' | 'near' | 'far' | 'segments'>, masters: string, subject: DepthSubject): Promise<DepthFocusTrack> {
+  const { manifest } = subject, ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg', size = job.width * job.height;
+  const times = manifest.sourceTimes ?? [];
+  // Both index the same decoded source timestamps; a mismatch means one of them was made from another decode.
+  if (job.times.some((time, i) => i % 16 === 0 && Math.abs((times[job.first + i] ?? Infinity) - time) > 1e-4)) fail(409, 'The subject mask and the depth analysis disagree on frame timing. Analyze the mask again.');
+  const analysed = new Set(manifest.frames.map(frame => frame.index)), pattern = join(subject.directory.replaceAll('%', '%%'), manifest.preview ? 'preview' : 'frames', '%d.png');
+  const raw: (number | null)[] = new Array(job.frames).fill(null);
+  for (const segment of job.segments) {
+    const wanted = Array.from({ length: segment.count }, (_, i) => segment.first + i).filter(index => analysed.has(index));
+    if (!wanted.length) continue;
+    // Mask frames have no gaps (validateMaskManifest), so the wanted ones are one run of indices.
+    const depth = await run(ffmpeg, ['-v', 'error', '-nostdin', '-i', join(masters, `${segment.n}.mkv`), '-f', 'rawvideo', '-pix_fmt', 'gray10le', '-'], { binary: true, maxBytes: segment.count * size * 2 + 1 });
+    const matte = await run(ffmpeg, ['-v', 'error', '-nostdin', '-framerate', '30', '-start_number', String(wanted[0]), '-i', pattern, '-frames:v', String(wanted.length), '-vf', `scale=${job.width}:${job.height}:flags=area`, '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { binary: true, maxBytes: wanted.length * size + 1 });
+    if (depth.length !== segment.count * size * 2 || matte.length !== wanted.length * size) fail(500, 'Could not read the depth or the subject mask to measure focus.');
+    const all = new Uint16Array(depth.buffer.slice(depth.byteOffset, depth.byteOffset + depth.length)); // Aligned for 16-bit reads.
+    wanted.forEach((index, k) => {
+      const median = matteMedian(all.subarray((index - segment.first) * size, (index - segment.first + 1) * size), matte.subarray(k * size, (k + 1) * size));
+      raw[index - job.first] = median === null ? null : depthDistance(job, median);
+    });
+  }
+  const span = job.times.length > 1 ? job.times[job.times.length - 1] - job.times[0] : 0;
+  const values = smoothFocus(raw, span > 0 ? (job.times.length - 1) / span : 30);
+  return { status: 'ready', key: hash([job.key, manifest.key, DEPTH_FOCUS_VERSION]), first: job.first, frames: job.frames, measured: raw.filter(value => value !== null).length, values };
+}
+
 function folderBytes(path: string) {
   let total = 0;
   for (const entry of readdirSync(path, { recursive: true, withFileTypes: true })) if (entry.isFile()) total += statSync(join(entry.parentPath, entry.name)).size;
@@ -60,6 +94,7 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
   const python = options.python ?? defaultPython(), worker = options.worker ?? defaultWorker;
   const freeBytes = options.freeBytes ?? (() => { const disk = statfsSync(directory); return disk.bavail * disk.bsize; });
   const jobs = new Map<string, Job>(), controllers = new Map<string, AbortController>(), partials = new Map<string, string>(), holds = new Map<string, number>();
+  const focusTasks = new Map<string, { promise: Promise<DepthFocusTrack>; retryAt?: number }>();
   let queue = Promise.resolve(), closed = false;
   const save = (job: Job) => { jobs.set(job.key, job); atomicJson(join(directory, `${job.key}.job.json`), job); };
   const manifestPath = (key: string) => join(directory, key, 'manifest.json');
@@ -83,12 +118,17 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
     } catch { /* A corrupt record is ignored; its folder goes below. */ }
   }
   for (const name of readdirSync(directory)) if (validKey(name) && jobs.get(name)?.status !== 'ready') { try { remove(join(directory, name)); } catch { /* Retried next start. */ } }
+  // Focus tracks are named `<run key>-<id>.json` and go with their run.
+  const focusDirectory = join(directory, 'focus');
+  mkdirSync(focusDirectory, { recursive: true, mode: 0o700 });
+  const dropFocus = (keep: (name: string) => boolean) => { for (const name of readdirSync(focusDirectory)) if (!keep(name)) rmSync(join(focusDirectory, name), { force: true }); };
+  dropFocus(name => !name.endsWith('.tmp') && jobs.get(name.slice(0, 64))?.status === 'ready');
 
   /** Record first, then files: a folder a Windows handle keeps has no ready record, so it is never served and the
    *  next start removes it. Never throws, so a locked old run cannot fail the request or run that evicts it. */
   const evict = (job: Job) => {
     jobs.delete(job.key);
-    try { rmSync(join(directory, `${job.key}.job.json`), { force: true }); rmSync(join(directory, job.key), { recursive: true, force: true, maxRetries: 2, retryDelay: 100 }); }
+    try { rmSync(join(directory, `${job.key}.job.json`), { force: true }); dropFocus(name => !name.startsWith(job.key)); rmSync(join(directory, job.key), { recursive: true, force: true, maxRetries: 2, retryDelay: 100 }); }
     catch (error) { console.error('Depth cache eviction left files behind until the next start:', (error as Error).message); }
   };
   const evictable = () => [...jobs.values()].filter(job => job.status === 'ready' && !holds.get(job.key)).sort((a, b) => a.used - b.used);
@@ -250,6 +290,28 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
         onProgress?.(job!.progress);
         await new Promise(resolve => setTimeout(resolve, 250));
       }
+    },
+    /**
+     * The focus track for a ready run and a subject (focus follows subject), measured once and kept beside the run until
+     * it is evicted. Concurrent asks share one measurement; a failed one is answered as such for 30 seconds.
+     */
+    focus(projectId: string, key: string, subject: DepthSubject): Promise<DepthFocusTrack> {
+      const job = get(projectId, key);
+      if (job.status !== 'ready') fail(409, 'Depth analysis is not finished yet.');
+      const id = hash([key, subject.manifest.key, DEPTH_FOCUS_VERSION]).slice(0, 32), file = join(focusDirectory, `${key}-${id}.json`);
+      const known = focusTasks.get(id);
+      if (known && !(known.retryAt && Date.now() > known.retryAt)) return known.promise;
+      const release = service.hold(key);
+      const entry: { promise: Promise<DepthFocusTrack>; retryAt?: number } = { promise: (async () => {
+        try { return JSON.parse(readFileSync(file, 'utf8')) as DepthFocusTrack; } catch { /* Not measured yet. */ }
+        const track = await heavyJob(() => measureFocus(job, join(directory, key, 'master'), subject));
+        if (jobs.get(key) === job && job.status === 'ready') atomicJson(file, track);
+        return track;
+      })().finally(release) };
+      focusTasks.set(id, entry);
+      // Measured: the file answers from now on. Failed: the error stands for a while, then a new ask measures again.
+      entry.promise.then(() => { if (focusTasks.get(id) === entry) focusTasks.delete(id); }, () => { entry.retryAt = Date.now() + 30_000; });
+      return entry.promise;
     },
     /** Keeps a ready run from eviction while an export reads its masters; call the returned function when done. */
     hold(key: string) {

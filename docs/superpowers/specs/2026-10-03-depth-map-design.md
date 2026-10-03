@@ -420,6 +420,10 @@ The structure copies `render()` in `color-render.py`.
 
 ## 5. Smart Mask together with depth
 
+Built (Phase 3 items 1 and 2): the Depth inspector's **Subject** picks one of the clip's Smart Masks and **Follow
+subject** keeps Focus on it; the math is section 7 of the math doc. The export reads the mask's native 16-bit frames by
+source index (`matte.files` in the depth-fx.py job) and the focus track as per-frame `animated.focus`.
+
 Ranked by value:
 
 1. **Focus follows the subject** (`maskId` on the Depth effect).

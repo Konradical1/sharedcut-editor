@@ -5,7 +5,8 @@ import type { Clip, Effect } from '../state/models';
 import { api } from '../services/api';
 import { effectDefinitions } from '../services/effects';
 import { depthPresets, type DepthCapabilities } from '../services/depth';
-import { depthAtCanvas, depthAtSource, depthClipReady, depthState, depthUi, depthVersion, retryDepth, subscribeDepth } from '../services/depthPreview';
+import { depthAtCanvas, depthAtSource, depthClipReady, depthFocusTrack, depthState, depthUi, depthVersion, retryDepth, subscribeDepth } from '../services/depthPreview';
+import { smartMaskSignature } from '../services/smartMask';
 import { Property, Section } from './Inspector';
 import './depth.css';
 
@@ -31,7 +32,8 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
   const centreFocus = () => effect.parameters?.focus === undefined && !clip.keyframes?.[focusPath] ? depthAtSource(clip.id, .5, .5) : undefined;
   const touched = () => depthUi.setShowMap(effect.id, false);
   const applyPreset = (values: Record<string, number>) => {
-    const next: Record<string, number> = Object.fromEntries(effectDefinitions.Depth.parameters.filter(p => p.key !== 'amount' && p.key !== 'focus').map(p => [p.key, p.initial]));
+    // A look leaves the clip's own Focus and subject choice alone.
+    const next: Record<string, number> = Object.fromEntries(effectDefinitions.Depth.parameters.filter(p => !['amount', 'focus', 'followSubject'].includes(p.key)).map(p => [p.key, p.initial]));
     Object.assign(next, values);
     const focus = next.blur > 0 ? centreFocus() : undefined;
     if (focus !== undefined) next.focus = Math.round(focus);
@@ -46,11 +48,28 @@ export default function DepthInspector({ clip, effect }: { clip: Clip; effect: E
     : state.error ? state.error
     : `Analyzing depth · ${Math.round(state.progress)} %${ready ? ` · ready to ${clock(ready)}` : ''}`;
   const failed = state?.status === 'failed' || state?.status === 'cancelled';
+  // Subject (Smart Mask tie-in): Lens blur keeps it sharp and out of the background, and can keep Focus on it.
+  const masks = clip.smartMasks ?? [], subject = masks.find(m => m.id === effect.maskId), following = Number(effect.parameters?.followSubject ?? 0) >= .5;
+  const current = !!subject?.result && subject.result.signature === smartMaskSignature(subject);
+  const follow = subject && current && following ? depthFocusTrack(clip, subject.result!.key) : undefined;
+  const subjectNote = !masks.length ? 'Add a Smart Mask to this clip to pick a subject.'
+    : !subject ? undefined
+    : !subject.result ? 'Analyze the subject mask: until then its edges are not protected.'
+    : !current ? 'The subject mask changed since its analysis. Analyze it again.'
+    : !following ? 'Lens blur keeps the subject sharp and off the background.'
+    : follow?.state === 'failed' ? follow.error
+    : follow?.state === 'ready' ? (follow.track.values.length ? 'Focus follows the subject; Focus keyframes are ignored.' : 'The subject is not found in its mask, so Focus applies.')
+    : 'Measuring the subject once depth analysis is ready…';
   return <div className="depth-inspector">
     <p className={`depth-status ${state?.status ?? ''}`} role="status">{status}{failed && asset && <button className="depth-retry" onClick={() => retryDepth(clip, asset)}><RotateCw size={11}/>Retry</button>}</p>
     <label className="inspector-checks"><input type="checkbox" aria-label="Show depth map" checked={depthUi.showMap(effect)} onChange={e => depthUi.setShowMap(effect.id, e.target.checked)}/>Show depth map <span className="depth-hint">near is white · viewer only</span></label>
     <div className="depth-presets" role="group" aria-label="Depth presets">{depthPresets.map(preset => <button key={preset.name} title={preset.description} onClick={() => applyPreset(preset.values)}>{preset.name}</button>)}</div>
     <Property effectId={effect.id} name="amount" label="Mix" initial={100} min={0} max={100} suffix="%"/>
+    <div className="depth-subject">
+      <label className="inspector-select-row"><span>Subject</span><select aria-label="Depth subject" value={subject?.id ?? ''} disabled={!masks.length} onChange={e => s().attachSmartMask(clip.id, e.target.value, effect.id)}><option value="">None</option>{masks.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}</select></label>
+      {subject && <label className="inspector-checks"><input type="checkbox" aria-label="Follow subject" checked={following} onChange={e => s().updateEffect(clip.id, effect.id, { parameters: { followSubject: e.target.checked ? 1 : 0 } })}/>Follow subject <span className="depth-hint">focus stays on it</span></label>}
+      {subjectNote && <p className="depth-hint depth-subject-note">{subjectNote}</p>}
+    </div>
     <div onPointerDownCapture={touched} onKeyDownCapture={touched}>
       {sections.map(section => <Section key={section.title} title={section.title} open={section.title === 'Lens blur' || Number(effect.parameters?.[section.keys[0]] ?? 0) > 0}>
         {section.keys.map(key => { const p = definition[key]; return <div key={key}>

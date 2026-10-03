@@ -103,11 +103,13 @@ test('a keyframed rack focus changes the focus frame by frame', { timeout: 300_0
   } finally { await f.close(); }
 });
 
-/** A full-alpha Smart Mask on every source frame, analysed for `clip` (which must carry a Smart Mask effect on `subject`). */
-function fullMatte(f: ReturnType<typeof fixture>, clip: Clip) {
+/** A Smart Mask `subject` on every source frame, analysed for `clip`: full alpha, or only on the columns `solid` keeps. */
+function fullMatte(f: ReturnType<typeof fixture>, clip: Clip, solid = (_x: number) => true) {
   const key = 'e'.repeat(64), cache = path.join(f.dir, 'masks', key), n = 75;
   mkdirSync(path.join(cache, 'frames'), { recursive: true });
-  writeFileSync(path.join(f.dir, 'alpha.raw'), Buffer.alloc(W * H * 2 * n, 0xff));
+  const row = Buffer.alloc(W * 2);
+  for (let x = 0; x < W; x++) row.writeUInt16LE(solid(x) ? 65535 : 0, x * 2);
+  writeFileSync(path.join(f.dir, 'alpha.raw'), Buffer.concat(Array.from({ length: H * n }, () => row)));
   execFileSync(ffmpeg, ['-v', 'error', '-y', '-f', 'rawvideo', '-pixel_format', 'gray16le', '-video_size', `${W}x${H}`, '-framerate', String(FPS), '-i', path.join(f.dir, 'alpha.raw'), '-start_number', '0', path.join(cache, 'frames', '%d.png')]);
   const mask = createSmartMask(clip, f.asset, 'subject');
   mask.prompts = [{ id: 'point', time: 1, kind: 'include', points: [{ x: .5, y: .5 }], radius: .01 }]; mask.result = { key, signature: smartMaskSignature(mask) }; clip.smartMasks = [mask];
@@ -137,6 +139,37 @@ test('a Smart Mask above Depth keeps the picture and its depth on the same frame
   } finally { await f.close(); }
 });
 
+// Section 7 of the math: the subject stays sharp where Lens blur would take it, and Follow subject puts Focus on it.
+test('a Depth subject stays sharp, Follow subject focuses on it, and a stale subject blocks the export', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
+  const f = fixture('subject');
+  try {
+    // Focused near (the bright left), so the far right blurs; the subject is the far strip x >= 250.
+    const clip: Clip = { ...f.clip, effects: [{ ...f.clip.effects[0], parameters: { blur: 100, focus: 0, range: 20, nearBlur: 100 }, maskId: 'subject' }] };
+    fullMatte(f, clip, x => x >= 250);
+    const source = await luma(f.source, 1);
+    const request = f.request([clip], 2);
+    await renderTimeline(request);
+    let at = await luma(request.outputPath, 1);
+    const cut = boundary(at);
+    assert.ok(detail(at, 256, 316) > .9 * detail(source, 256, 316), `the subject keeps its detail: ${detail(at, 256, 316)} of ${detail(source, 256, 316)}`);
+    assert.ok(detail(at, cut + 12, 240) < .3 * detail(source, cut + 12, 240), `the far side around it still blurs: ${detail(at, cut + 12, 240)}`);
+    assert.ok(detail(at, 20, cut - 8) > .9 * detail(source, 20, cut - 8), 'the near side stays in focus');
+    // Follow subject: Focus goes to the subject's distance (far), so the near side blurs and the whole far side is sharp.
+    const following: Clip = { ...clip, effects: [{ ...clip.effects[0], parameters: { ...clip.effects[0].parameters, followSubject: 1 } }] };
+    await renderTimeline({ ...request, clips: [following] });
+    at = await luma(request.outputPath, 1);
+    assert.ok(detail(at, 20, cut - 8) < .5 * detail(source, 20, cut - 8), `following the far subject blurs the near side: ${detail(at, 20, cut - 8)}`);
+    assert.ok(detail(at, cut + 12, 240) > .8 * detail(source, cut + 12, 240), `and brings the far side into focus: ${detail(at, cut + 12, 240)} of ${detail(source, cut + 12, 240)}`);
+    const run = readdirSync(path.join(f.dir, 'depth')).find(name => /^[a-f0-9]{64}$/.test(name))!;
+    assert.equal(readdirSync(path.join(f.dir, 'depth', 'focus')).filter(name => name.startsWith(run)).length, 1, 'the focus track is measured once and kept beside its run');
+    // Edited since its analysis: the export refuses rather than protecting the wrong outline.
+    const stale: Clip = { ...following, smartMasks: [{ ...following.smartMasks![0], prompts: [{ ...following.smartMasks![0].prompts[0], points: [{ x: .4, y: .5 }] }] }] };
+    await assert.rejects(renderTimeline({ ...request, clips: [stale] }), /Depth subject.*analyze the current mask/);
+    // Without Lens blur the subject changes nothing, so a stale one does not block.
+    await renderTimeline({ ...request, clips: [{ ...stale, effects: [{ ...stale.effects[0], parameters: { fog: 50 } }] }] });
+  } finally { await f.close(); }
+});
+
 // A timeline preview is a 4 s range of the whole project: it baked every Depth clip whole, hidden ones included.
 test('only the Depth this render shows is analysed and baked, and only over the range', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
   const f = fixture('range');
@@ -146,7 +179,7 @@ test('only the Depth this render shows is analysed and baked, and only over the 
     const early = f.request([{ ...f.clip, duration: 1 }], 2, { depth: undefined });
     await renderTimeline({ ...early, settings: { ...early.settings, rangeIn: '1.2' } });
     // A range inside the clip bakes that range alone, on the right frames.
-    const asked: { from: number; to: number }[] = [], request = f.request([f.clip], 2, { depth: { ready: (job, signal, progress) => { asked.push(job); return f.depth.ready(job, signal, progress); } } });
+    const asked: { from: number; to: number }[] = [], request = f.request([f.clip], 2, { depth: { ready: (job, signal, progress) => { asked.push(job); return f.depth.ready(job, signal, progress); }, focus: f.depth.focus } });
     await renderTimeline({ ...request, settings: { ...request.settings, rangeIn: '1', rangeOut: '1.6' } });
     assert.equal(asked.length, 1);
     assert.ok(asked[0].from >= .95 && asked[0].to <= 1.7, `analysed ${asked[0].from}..${asked[0].to} s for a 1..1.6 s range`);

@@ -1356,9 +1356,23 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: originalPath(asset!.id), ...range, joinOnly: !editor });
           send(res, run.status === 'ready' ? 200 : 202, run); return;
         }
-        const depthRoute = /^\/api\/depth\/([a-f0-9]{64})(?:\/preview\/(\d+)\.mp4)?$/.exec(path);
+        const depthRoute = /^\/api\/depth\/([a-f0-9]{64})(?:\/preview\/(\d+)\.mp4|\/(focus))?$/.exec(path);
         if (depthRoute) {
           const projectId = textField(url.searchParams.get('projectId'), 160, true); requireProject(projectId, userId, method === 'DELETE');
+          if (depthRoute[3] && method === 'GET') {
+            // Focus follows subject for one clip: its Depth's subject mask, as the export resolves it (current analysis only).
+            const clip = state.clips.find(item => item.id === url.searchParams.get('clipId') && item.projectId === projectId) ?? fail(404, 'Clip not found.');
+            const effect = clip.effects.find(item => item.name === 'Depth' && item.maskId);
+            const mask = clip.smartMasks?.find(item => item.id === effect?.maskId) ?? fail(409, 'This Depth effect has no subject.');
+            const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === projectId) ?? fail(404, 'Media not found.');
+            if (!existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
+            const subject = resolveSmartMaskArtifact(join(dataDir, 'smart-masks'), clip, mask, originalPath(asset.id), asset);
+            if (depth.get(projectId, depthRoute[1], 0, false).mediaId !== asset.id) fail(409, 'This depth analysis belongs to other media.');
+            // A long run takes a while to measure: answer 202 and let the editor ask again rather than hold the tunnel.
+            const task = depth.focus(projectId, depthRoute[1], subject); task.catch(() => {});
+            const track = await Promise.race([task, new Promise<undefined>(resolve => setTimeout(resolve, 1000))]);
+            send(res, track ? 200 : 202, track ?? { status: 'processing' }); return;
+          }
           if (!depthRoute[2] && method === 'GET') { send(res, 200, depth.get(projectId, depthRoute[1], Number(url.searchParams.get('after') ?? 0), url.searchParams.get('times') !== '0')); return; }
           if (!depthRoute[2] && method === 'DELETE') { depth.cancel(projectId, depthRoute[1]); send(res, 200, { ok: true }); return; }
           if (depthRoute[2] && ['GET', 'HEAD'].includes(method)) { streamFile(req, res, depth.preview(projectId, depthRoute[1], Number(depthRoute[2])), 'video/mp4', undefined, true); return; }

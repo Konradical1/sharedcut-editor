@@ -6,3 +6,4 @@
 .depth-presets{display:grid;grid-template-columns:repeat(3,1fr);gap:5px}
 .depth-presets button{border:1px solid #3d4448;border-radius:5px;padding:6px 4px;background:#24292d;color:#cfd9dc;font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.depth-presets button:hover{background:#2f363b;border-color:#5a6870}
 .depth-picker{position:absolute;inset:0;z-index:20;cursor:crosshair;outline:1px dashed #8a74d8;outline-offset:-1px}
+.depth-subject{display:flex;flex-direction:column;gap:5px}.depth-subject-note{margin:0}

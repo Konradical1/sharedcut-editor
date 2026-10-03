@@ -1,8 +1,10 @@
 import { createTimelinePreview } from './timelinePreview.ts';
 import { createSmartMaskPreview, activeSmartMasks, fittedSmartMask, lumaAlphaFilter, SmartMaskPending, unanalyzedSmartMask, type SmartMaskPixels } from './smartMaskPreview.ts';
 import { createMotionPreview } from './motionPreview.ts';
-import { createDepthPreview, depthUi, forgetDepth, rememberDepth, subscribeDepth } from './depthPreview.ts';
-import { createDepthFx, depthFxKeys, depthTapBudget, type DepthFxParams } from './depthFx.ts';
+import { createDepthPreview, depthFocusTrack, depthUi, forgetDepth, rememberDepth, subscribeDepth } from './depthPreview.ts';
+import { depthFocusAt, depthFrameAt } from './depth.ts';
+import { smartMaskSignature } from './smartMask.ts';
+import { createDepthFx, depthFxKeys, depthTapBudget, type DepthFxInput, type DepthFxParams } from './depthFx.ts';
 import { blendModeOf } from './blendModes.ts';
 import { transformMotion, drawMotionPose, motionArtwork } from './motionBlur.ts';
 import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, trimAnimation } from './animation.ts';
@@ -925,8 +927,28 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           if(depth.state==='none'||depth.state==='analyzing'){warning='Analyzing depth';continue;}
           if(depth.state==='loading')continue;
           const [sourceWidth,sourceHeight]=sourceSize(asset),matrix=warp?warpTransform(warp):undefined;
+          const params=Object.fromEntries(depthFxKeys.map(key=>[key,effectValue(clip,effect,key)])) as DepthFxParams;
+          // The Smart Mask subject (section 7): Lens blur keeps it sharp and, following it, focuses on it. Only its current
+          // analysis counts, as in the export; without one the picture plays unprotected with a note.
+          const subject=params.blur>0&&effect.maskId?clip.smartMasks?.find(m=>m.id===effect.maskId):undefined;
+          let matte:DepthFxInput['matte'];
+          if(subject){
+            if(!subject.result||subject.result.signature!==smartMaskSignature(subject))warning=subject.result?'Depth · the subject mask was edited · analyze it again for clean edges':'Depth · analyze the subject mask for clean edges';
+            else{
+              try{
+                const pixels=maskPreview.readDoc(clip,subject,Number(sourceTimestamp)||0,asset);
+                if(pixels===unanalyzedSmartMask)warning='Depth · subject not analyzed at this frame · edges unprotected';
+                else if(pixels.key!=='empty')matte={key:pixels.key,width:pixels.width,height:pixels.height,...pixels.canvas?{canvas:pixels.canvas}:{data:pixels.data}};
+              }catch(cause){if(!(cause instanceof SmartMaskPending))warning=`Depth · subject unavailable · ${cause instanceof Error?cause.message:cause}`;}
+              if(params.followSubject>=.5){
+                const follow=depthFocusTrack(clip,subject.result.key),focus=follow.state==='ready'?depthFocusAt(follow.track,depthFrameAt(depth.run,Number(sourceTimestamp)||0)):undefined;
+                if(focus!==undefined)params.focus=focus;
+                else warning=follow.state==='failed'?`Depth · Follow subject · ${follow.error}`:follow.state==='ready'?'Depth · subject not found in its mask · Focus applies':'Depth · measuring the subject to follow it';
+              }
+            }
+          }
           depthFx??=createDepthFx();
-          const result=depthFx.render(layer,{params:Object.fromEntries(depthFxKeys.map(key=>[key,effectValue(clip,effect,key)])) as DepthFxParams,depth:depth.pixels,near:depth.run.near,far:depth.run.far,sourceWidth,sourceHeight,warp:matrix,taps:depthTapBudget(options.quality,options.original,state.playing),view:depthUi.showMap(effect)?'map':'effect'});
+          const result=depthFx.render(layer,{params,depth:depth.pixels,matte,near:depth.run.near,far:depth.run.far,sourceWidth,sourceHeight,warp:matrix,taps:depthTapBudget(options.quality,options.original,state.playing),view:depthUi.showMap(effect)?'map':'effect'});
           if(!result){warning='Depth preview needs WebGL2 · export is not affected';continue;}
           layerContext.save();layerContext.globalCompositeOperation='copy';layerContext.drawImage(result,0,0);layerContext.restore();
           // The focus picker: viewer pixel → layer (undo the transform and flip) → original frame (undo Stabilize) → source box.

@@ -82,3 +82,44 @@ export const depthPresets: { name: string; description: string; values: Record<s
   // over the nearest 15 % instead of drawing a hard edge there.
   { name: 'Miniature', description: 'Tilt-shift: a thin slice in focus, everything nearer and farther blurred, colours like a toy.', values: { blur: 70, range: 6, nearBlur: 100, bokeh: 20, light: 40, lightStart: 0, lightSoftness: 15, bgExposure: .15, bgSaturation: 140, bgContrast: 120 } },
 ];
+
+/** Focus follows subject: one distance (0..100) per analysed frame, measured once on the server from the depth masters
+ *  and the subject's mattes. `values` is empty when the subject was never found; frames before its first or after its
+ *  last measurement hold the nearest one. Bump DEPTH_FOCUS_VERSION whenever the measurement or smoothing changes. */
+export const DEPTH_FOCUS_VERSION = 1;
+/** Seconds the centred moving average spans: long enough that focus does not hunt, short enough to keep a rack. */
+export const DEPTH_FOCUS_SMOOTHING = .3;
+export type DepthFocusTrack = { status: 'ready'; key: string; first: number; frames: number; measured: number; values: number[] };
+
+/** Median stored value (0..1) of the depth samples whose matte is over half (> 127 of 255); null when fewer than 16 are. */
+export function matteMedian(depth: Uint16Array, matte: Uint8Array, scale = 1023) {
+  const histogram = new Uint32Array(scale + 1);
+  let count = 0;
+  for (let i = 0; i < depth.length; i++) if (matte[i] > 127) { histogram[Math.min(scale, depth[i])]++; count++; }
+  if (count < 16) return null;
+  for (let v = 0, seen = 0; v <= scale; v++) if ((seen += histogram[v]) * 2 >= count) return v / scale;
+  return null;
+}
+
+/** Gaps (null) filled by straight lines between measurements and held at the ends, then a centred moving average over
+ *  about DEPTH_FOCUS_SMOOTHING seconds: zero phase, so focus lands on the subject when it gets there, not after. */
+export function smoothFocus(raw: (number | null)[], fps: number) {
+  const known = raw.flatMap((value, i) => value === null ? [] : [i]);
+  if (!known.length) return [];
+  let next = 0;
+  const filled = raw.map((value, i) => {
+    if (value !== null) { next++; return value; }
+    if (next === 0 || next === known.length) return raw[known[Math.min(next, known.length - 1)]]!;
+    const a = known[next - 1], b = known[next];
+    return raw[a]! + (raw[b]! - raw[a]!) * (i - a) / (b - a);
+  });
+  const half = Math.max(0, Math.round(DEPTH_FOCUS_SMOOTHING * (Number.isFinite(fps) && fps > 0 ? fps : 30) / 2));
+  const sums = [0];
+  for (const value of filled) sums.push(sums[sums.length - 1] + value);
+  return filled.map((_, i) => { const from = Math.max(0, i - half), to = Math.min(filled.length, i + half + 1); return Math.round((sums[to] - sums[from]) / (to - from) * 100) / 100; });
+}
+
+/** The track's focus at source frame `frame` (held at the ends); undefined when the subject was never found. */
+export function depthFocusAt(track: Pick<DepthFocusTrack, 'first' | 'values'>, frame: number) {
+  return track.values.length ? track.values[Math.max(0, Math.min(track.values.length - 1, Math.round(frame) - track.first))] : undefined;
+}

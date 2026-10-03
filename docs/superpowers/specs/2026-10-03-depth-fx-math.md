@@ -153,4 +153,11 @@ B(c) = acc / wsum
 - Inside the subject: `coc(p) *= (1 - α(p))`.
 - In the gather, a sample with `α(sp) > .5` and `α(c) < .5` gets `m = 0` (subject pixels never smear
   into the background).
-- Focus follow: `F` = the per-frame value from the server's focus track, when present.
+- Focus follow (`followSubject` on): `F` = the per-frame value from the server's focus track, when present; Focus and its
+  keyframes are ignored meanwhile. The track (`GET /api/depth/<run>/focus?projectId&clipId`, cached beside the run) holds,
+  per analysed frame, the median distance of the depth master under `α > .5` (the matte scaled onto the depth grid), gaps
+  bridged by straight lines and held at the ends, then a centred moving average over 0.3 s (zero phase). A subject never
+  found leaves Focus as set.
+- Only the subject's current analysis counts (its saved revision, frames by source index as the Smart Mask effect).
+  Preview: an unanalysed or edited mask renders without section 7 and says so. Export: it refuses, as a masked export
+  does. Without Lens blur the subject changes nothing, so neither path looks at it.

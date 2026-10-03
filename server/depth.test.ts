@@ -130,6 +130,8 @@ test('a restart fails interrupted runs and removes partial and orphaned folders'
   const record = (key: string, status: string) => writeFileSync(join(f.cache, `${key}.job.json`), JSON.stringify({ key, base: 'x', status, progress: 40, mediaId: 'media', first: 0, frames: 64, times: [], width: 924, height: 518, lo: 0, hi: 1, near: 1, far: 0, segments: [{ n: 0, first: 0, count: 64 }], projects: ['project'], used: 1 }));
   const old = 'f'.repeat(64);
   record(running, 'processing'); record(ready, 'ready'); record(missing, 'ready'); record(old, 'failed');
+  // Focus tracks go with their run: a ready run keeps its own, a failed one's and a half-written one go.
+  mkdirSync(join(f.cache, 'focus')); for (const name of [`${ready}-a.json`, `${running}-a.json`, `${ready}-b.json.1.tmp`]) writeFileSync(join(f.cache, 'focus', name), '{}');
   const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory), sourceTimes: async () => times });
   try {
     assert.equal(service.get('project', running).status, 'failed');
@@ -137,7 +139,8 @@ test('a restart fails interrupted runs and removes partial and orphaned folders'
     assert.deepEqual(service.get('project', running).segments, []);
     assert.equal(service.get('project', ready).status, 'ready');
     assert.equal(service.get('project', missing).status, 'failed');
-    assert.deepEqual(readdirSync(f.cache).filter(name => !name.endsWith('.job.json')).sort(), [ready]);
+    assert.deepEqual(readdirSync(f.cache).filter(name => !name.endsWith('.job.json') && name !== 'focus').sort(), [ready]);
+    assert.deepEqual(readdirSync(join(f.cache, 'focus')), [`${ready}-a.json`]);
     assert.equal(JSON.parse(readFileSync(join(f.cache, `${running}.job.json`), 'utf8')).status, 'failed');
     assert.throws(() => service.get('project', old), /not found/, 'a failure already shown before this start is dropped');
     assert.ok(!existsSync(join(f.cache, `${old}.job.json`)));
@@ -152,9 +155,12 @@ test('the cache stays under its cap by evicting the least recently used run, nev
   const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory, { bytes: 1024 ** 2 }), sourceTimes: async () => times });
   const analyse = async (from: number) => { const job = await service.enqueue({ clip: clip(`c${from}`), asset, sourcePath: f.source, from, to: from + .5 }); await until(() => service.get('project', job.key).status === 'ready'); return job.key; };
   try {
-    const a = await analyse(3), b = await analyse(8), c = await analyse(13);
+    const a = await analyse(3), b = await analyse(8);
+    writeFileSync(join(f.cache, 'focus', `${a}-track.json`), '{}');
+    const c = await analyse(13);
     assert.throws(() => service.get('project', a), /not found/, 'the oldest run went');
     assert.ok(!existsSync(join(f.cache, a)));
+    assert.ok(!existsSync(join(f.cache, 'focus', `${a}-track.json`)), 'with its focus track');
     assert.equal(service.get('project', b).status, 'ready'); // b is now the most recently used
     const release = service.hold(c);
     const d = await analyse(17);

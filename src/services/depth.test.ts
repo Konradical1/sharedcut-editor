@@ -69,3 +69,23 @@ test('presets: six named looks, every value a real Depth parameter inside its ra
   const mini = depthPresets.find(p => p.name === 'Miniature')!.values;
   assert.ok(mini.nearBlur === 100 && mini.range <= 10 && mini.blur >= 50, 'Miniature: a thin focus slice, both sides blurred');
 });
+
+test('focus follows subject: the median under the matte, gaps bridged, smoothed without lag', async () => {
+  const { matteMedian, smoothFocus, depthFocusAt } = await import('./depth.ts');
+  // Half the matte over a near patch (900), a sliver of far (100) inside it: the median ignores the sliver.
+  const depth = Uint16Array.from({ length: 100 }, (_, i) => i < 50 ? (i < 5 ? 100 : 900) : 300), matte = Uint8Array.from({ length: 100 }, (_, i) => i < 50 ? 255 : i < 60 ? 127 : 0);
+  assert.equal(matteMedian(depth, matte), 900 / 1023);
+  assert.equal(matteMedian(depth, new Uint8Array(100)), null, 'no subject, no measurement');
+  assert.equal(matteMedian(depth, Uint8Array.from({ length: 100 }, (_, i) => i < 15 ? 255 : 0)), null, 'fewer than 16 samples is noise');
+  // Holes are bridged by a line, the ends held; a step is smoothed symmetrically (zero phase: the halfway point stays put).
+  assert.deepEqual(smoothFocus([null, 10, null, 30, null], 1), [10, 10, 20, 30, 30]);
+  assert.deepEqual(smoothFocus([null, null], 30), []);
+  const step = smoothFocus(Array.from({ length: 60 }, (_, i) => i < 30 ? 20 : 80), 30);
+  assert.equal(step[0], 20); assert.equal(step[59], 80);
+  assert.ok(step[29] < 50 && step[30] > 50 && Math.abs(step[29] + step[30] - 100) < 1e-9, `the step stays centred: ${step[29]}, ${step[30]}`);
+  assert.ok(step[25] > 20 && step[34] < 80 && step[22] === 20 && step[37] === 80, 'smoothing spans about 0.3 s, nine frames at 30 fps');
+  const jitter = smoothFocus(Array.from({ length: 90 }, (_, i) => 50 + (i % 2 ? 6 : -6)), 30);
+  assert.ok(jitter.slice(5, -5).every(v => Math.abs(v - 50) < 1.5), 'frame-to-frame hunting is flattened');
+  assert.equal(depthFocusAt({ first: 10, values: [1, 2, 3] }, 4), 1); assert.equal(depthFocusAt({ first: 10, values: [1, 2, 3] }, 11), 2);
+  assert.equal(depthFocusAt({ first: 10, values: [1, 2, 3] }, 99), 3); assert.equal(depthFocusAt({ first: 10, values: [] }, 10), undefined);
+});
