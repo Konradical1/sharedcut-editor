@@ -87,6 +87,8 @@ the table.
   `round` rounds them to even).
 - Downsample `L2`, `D` and `coc` to `Wb×Hb` with an exact area filter (fractional pixel overlap weights). The
   letterbox is averaged in as zeros, so at the box edge coc and D drop (about halve) in the straddling pixels.
+  PyTorch's `interpolate(mode='area')` is adaptive pooling (whole pixels, equal weights), which only matches when the
+  sizes divide; the export builds the overlap weights itself otherwise.
 - In working pixels, `cocW = coc × s` and `Rb = R × s`.
 
 **Gather.** This is Gustafsson's single-pass bokeh with highlight weights. For each working pixel c:
@@ -112,7 +114,8 @@ B(c) = acc / wsum
 - `N` is the tap budget:
   - Preview: 16 / 32 / 48 by quality, plus 50 % when paused.
   - Export: 96.
-- With the same `N`, both paths sample identical points. The parity check runs both at `N = 48`.
+- With the same `N`, both paths sample identical points. The parity check (`npm run test:depth:parity`) runs both at
+  `N = 48`.
 - If `Rb < 1`, skip the gather (`B = L2` at working resolution).
 - Gather samples are bilinear with half-pixel centres, and positions outside the working image clamp to the edge
   pixel (`grid_sample` pads with zeros by default: use `padding_mode='border'`, `align_corners=False`).

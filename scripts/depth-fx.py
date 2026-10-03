@@ -145,8 +145,29 @@ def upsample_depth(I, depth, near, far, warp=None):
     return torch.where(inside, D, torch.zeros_like(D)), inside
 
 
+def js_round(x):
+    """JS Math.round, as the preview sizes its working images: halves round up (Python's round goes to even)."""
+    return math.floor(x + .5)
+
+
+def overlap(small, large, device):
+    """(small, large) weights of the exact area filter: each output pixel averages the input pixels it covers, by the
+    fraction of each it covers."""
+    k = large / small
+    start = torch.arange(small, device=device, dtype=torch.float32)[:, None] * k
+    pixel = torch.arange(large, device=device, dtype=torch.float32)[None]
+    return (torch.minimum(start + k, pixel + 1) - torch.maximum(start, pixel)).clamp(min=0) / k
+
+
 def area(image, height, width):
-    return image if image.shape[-2:] == (height, width) else F.interpolate(image[None], size=(height, width), mode="area")[0]
+    """Section 4's area filter. F.interpolate's "area" mode is adaptive pooling: whole input pixels, equally weighted, so
+    it matches only when the sizes divide (and MPS refuses the rest)."""
+    H, W = image.shape[-2:]
+    if (H, W) == (height, width):
+        return image
+    if H % height == 0 and W % width == 0:
+        return F.interpolate(image[None], size=(height, width), mode="area")[0]
+    return overlap(height, H, image.device) @ image @ overlap(width, W, image.device).T
 
 
 def bilinear(image, height, width):
@@ -164,9 +185,9 @@ def lens_blur(L2, D, p, taps, inside=None, layer_width=None, fit=1.0):
     coc = R * ((delta.abs() - band) / .35).clamp(0, 1) * torch.where(delta < 0, p["nearBlur"] / 100, 1.0)
     if inside is not None:
         coc = coc * inside  # Off the stabilized frame there is nothing to blur, not a black foreground.
-    Wb = max(1, round(W * min(layer_width, 960) / layer_width * fit))
+    Wb = max(1, js_round(W * min(layer_width, 960) / layer_width * fit))
     s = Wb / W
-    Hb = max(1, round(H * s))
+    Hb = max(1, js_round(H * s))
     small = area(torch.cat([L2, D[None], coc[None]]), Hb, Wb)
     Ls, Ds, cc, Rb = small[:3], small[3], small[4] * s, R * s
     B = Ls if Rb < 1 else gather(Ls, Ds, cc, Rb, p["bokeh"] / 100 * 8, taps)
@@ -224,8 +245,8 @@ def glow(L3, D, p, layer_width=None, fit=1.0):
     th, start = p["glowThreshold"] / 100, p["glowStart"] / 100
     G = L3 * ((lum(enc(L3)) - th) / max(1 - th, .01)).clamp(0, 1) * smoothstep(start, start + .15, D)
     Wl = min(layer_width, 480)
-    Wq = max(1, round(W * Wl / layer_width * fit))
-    Hq = max(1, round(H * Wq / W))
+    Wq = max(1, js_round(W * Wl / layer_width * fit))
+    Hq = max(1, js_round(H * Wq / W))
     sigma = p["glowRadius"] / 100 * .04 * Wl  # .04 of the layer width, in the layer's working pixels.
     radius = min(63, math.floor(3 * sigma))  # Taps |k| <= 3 sigma, at most 63 a side: the preview's limit.
     kernel = torch.exp(-torch.arange(-radius, radius + 1, device=L3.device, dtype=torch.float32) ** 2 / (2 * sigma * sigma))
@@ -484,6 +505,10 @@ def selftest():
         batched, reference = gather(Ls.to(device), Ds.to(device), cc.to(device), 9.5, 3.2, taps), gather_reference(Ls.to(device), Ds.to(device), cc.to(device), 9.5, 3.2, taps)
         assert torch.allclose(batched, reference, atol=2e-5, rtol=1e-4), f"batched gather differs from the loop by {float((batched - reference).abs().max())}"
     checks.append("gather equals the loop")
+    ramp = torch.arange(7.0, device=device).expand(1, 2, 7)
+    assert torch.allclose(area(ramp, 1, 3)[0, 0], torch.tensor([5 / 7, 3, 37 / 7], device=device), atol=1e-5), "area weighs pixels by the part covered"
+    assert js_round(2.5) == 3 and js_round(3.5) == 4, "sizes round halves up, as Math.round does"
+    checks.append("area filter")
     H, W, h, w = 96, 160, 48, 80
     y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
     checker = ((x // 4 + y // 4) % 2).float()
