@@ -170,19 +170,20 @@ test('a Depth subject stays sharp, Follow subject focuses on it, and a stale sub
   } finally { await f.close(); }
 });
 
-// A timeline preview is a 4 s range of the whole project: it baked every Depth clip whole, hidden ones included.
-test('only the Depth this render shows is analysed and baked, and only over the range', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
+// A timeline preview is a 4 s range of the whole project: it baked every Depth clip whole, hidden ones included. An In/Out
+// export reads the editor's whole-clip run (a smaller run of its own maps distances differently) but bakes only the range.
+test('only the Depth this render shows is baked, over the range, from the editor\'s whole-clip analysis', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
   const f = fixture('range');
   try {
     // Hidden, or outside the range: Depth draws nothing there, so no analysis is needed and nothing fails.
     await renderTimeline(f.request([f.clip], 2, { tracks: [{ ...f.track, hidden: true }], depth: undefined }));
     const early = f.request([{ ...f.clip, duration: 1 }], 2, { depth: undefined });
     await renderTimeline({ ...early, settings: { ...early.settings, rangeIn: '1.2' } });
-    // A range inside the clip bakes that range alone, on the right frames.
+    // A range inside the clip bakes that range alone, on the right frames, from the run the editor asks for (0..2 s).
     const asked: { from: number; to: number }[] = [], request = f.request([f.clip], 2, { depth: { ready: (job, signal, progress) => { asked.push(job); return f.depth.ready(job, signal, progress); }, focus: f.depth.focus } });
     await renderTimeline({ ...request, settings: { ...request.settings, rangeIn: '1', rangeOut: '1.6' } });
     assert.equal(asked.length, 1);
-    assert.ok(asked[0].from >= .95 && asked[0].to <= 1.7, `analysed ${asked[0].from}..${asked[0].to} s for a 1..1.6 s range`);
+    assert.ok(Math.abs(asked[0].from) < 1e-6 && Math.abs(asked[0].to - 2) < 1e-6, `analysed ${asked[0].from}..${asked[0].to} s, the whole clip, for a 1..1.6 s range`);
     for (const time of [0, .3, .56]) {
       const at = await luma(request.outputPath, time), cut = boundary(at), expected = 60 + 4 * Math.round((1 + time) * FPS);
       assert.ok(Math.abs(cut - expected) <= 1, `at ${time} s the picture is source frame ${Math.round((1 + time) * FPS)} (edge at ${expected}): ${cut}`);
@@ -191,7 +192,6 @@ test('only the Depth this render shows is analysed and baked, and only over the 
   } finally { await f.close(); }
 });
 
-test('a Depth switched on by a keyframe is baked', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
 // Measuring the subject's distance takes minutes on a long run, behind other heavy jobs: a cancel must not wait for it.
 test('cancelling an export stops waiting for the subject focus measurement', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
   const f = fixture('focus-cancel');
@@ -210,6 +210,7 @@ test('cancelling an export stops waiting for the subject focus measurement', { t
   } finally { await f.close(); }
 });
 
+test('a Depth switched on by a keyframe is baked', { timeout: 300_000, skip: !torch && 'the depth worker (torch) is not installed' }, async () => {
   const f = fixture('keyed-on');
   try {
     const clip = { ...f.clip, effects: [{ ...f.clip.effects[0], enabled: false }], keyframes: { 'effects.depth.enabled': [{ id: 'on', time: 0, value: true, interpolation: 'hold' as const }] } };

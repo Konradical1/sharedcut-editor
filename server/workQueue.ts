@@ -15,13 +15,17 @@ export function workQueue(limit = 1) {
       running.add(job);
     }
   };
-  return {
-    add(work: () => Promise<void>, render = false) {
+  const queue = {
+    /** `prepare` runs first, outside the queue (an export waiting minutes for depth analysis): until it settles nothing
+     *  waits behind this job. It never fails the job; the work reports its own errors. */
+    add(work: () => Promise<void>, render = false, prepare?: () => Promise<void>) {
+      if (prepare) { void prepare().catch(() => {}).then(() => queue.add(work, render)); return; }
       if (render) renders = renders.then(work).catch(error => console.error('Render worker:', error));
       else { waiting.push(work); pump(); }
     },
     async drain() { while (running.size || waiting.length) await Promise.all([...running, renders]); await renders; },
   };
+  return queue;
 }
 
 // At most `limit` jobs at once; the rest wait in order. A finishing job hands its slot straight to the next.

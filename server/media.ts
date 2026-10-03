@@ -1406,6 +1406,13 @@ export function bakesDepth(request: Pick<RenderRequest, 'clips' | 'tracks' | 'as
     return !!timeline && !seen.has(timeline.id) && bakesDepth({ ...request, timeline, settings: { ...request.settings, rangeIn: '0', rangeOut: String(timeline.duration) } }, seen);
   });
 }
+/** The source range a Depth clip's analysis covers: the clip's whole span with its transition handles, as the editor asks
+ *  for it (POST /api/depth). An In/Out export reads that same run, so its distances (and Focus) match the preview's. */
+export function depthRunRange(clip: Clip, asset: MediaAsset, records: TransitionRecord[]) {
+  if (asset.kind === 'image') return { from: 0, to: 1 };
+  const span = clipSpan(clip, records);
+  return stabilizeRange(extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start)), asset.fps, asset.duration);
+}
 /** Refused by name before anything is decoded or baked. */
 function rejectDepth(request: RenderRequest) {
   for (const clip of depthClips(request)) {
@@ -1459,7 +1466,9 @@ async function renderDepthTimeline(request: RenderRequest) {
       const range = image ? { from: 0, to: 1 } : stabilizeRange(geo, sourceFps, source.asset.duration);
       const report = (fraction: number) => request.onProgress?.((index + Math.max(0, Math.min(1, fraction))) / candidates.length * 45);
       request.onStage?.(`Analyzing depth · ${clip.name}`);
-      const { run: analysis, masters, release } = await request.depth.ready({ clip: original?.clip ?? clip, asset: originalAsset, sourcePath: original?.source.path ?? source.path, from: range.from + offset, to: range.to + offset }, request.signal, p => { request.onStage?.(`Analyzing depth · ${clip.name} · ${Math.round(p)}%`); report(p / 100 * .3); });
+      // The editor's run for the whole clip (the original under a Stabilize bake), even when only part of it is baked.
+      const runClip = original?.clip ?? whole;
+      const { run: analysis, masters, release } = await request.depth.ready({ clip: runClip, asset: originalAsset, sourcePath: original?.source.path ?? source.path, ...depthRunRange(runClip, originalAsset, records) }, request.signal, p => { request.onStage?.(`Analyzing depth · ${clip.name} · ${Math.round(p)}%`); report(p / 100 * .3); });
       releases.push(release);
       // Bake frame k is the clip's media at `origin + k / fps`, which shows source frame `base + k` of the run.
       const times = analysis.times, step = 1 / (originalAsset.fps || sourceFps);

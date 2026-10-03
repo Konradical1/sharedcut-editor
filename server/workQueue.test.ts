@@ -21,6 +21,22 @@ test('exports bypass active media, run serially, and block further background wo
   assert.deepEqual(events, ['media', 'export', 'next export', 'background']);
 });
 
+test('an export still preparing (waiting for depth analysis) holds neither later exports nor media work', async () => {
+  const queue = workQueue(), events: string[] = [];
+  let ready!: () => void;
+  queue.add(async () => { events.push('depth export'); }, true, () => new Promise<void>(resolve => { ready = resolve; }));
+  queue.add(async () => { events.push('export'); }, true);
+  queue.add(async () => { events.push('media'); });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(events, ['export', 'media']);
+  ready(); await new Promise(resolve => setImmediate(resolve)); await queue.drain();
+  assert.deepEqual(events, ['export', 'media', 'depth export']);
+  // A failed preparation still queues the work, which reports the failure itself.
+  queue.add(async () => { events.push('after failure'); }, true, async () => { throw new Error('analysis failed'); });
+  await new Promise(resolve => setImmediate(resolve)); await queue.drain();
+  assert.equal(events.at(-1), 'after failure');
+});
+
 test('the heavy-job limiter runs at most its limit at once and keeps order', async () => {
   const run = limiter(2), events: string[] = [], gates: (() => void)[] = [];
   const job = (name: string) => run(async () => { events.push(name); await new Promise<void>(resolve => gates.push(resolve)); });
