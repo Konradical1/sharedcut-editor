@@ -102,5 +102,8 @@ Only one server may open a data folder: a second `npm start` beside the live one
 - Rolling back to a build older than the item tables (61b8d6b or earlier): stop the server, run
   `node scripts/sync-legacy-row.mjs`, then start the old build. Restarts are hard kills, so skipping
   this can start the old build from a copy missing the last edits.
+- Media storage v3 (`server/mediaMigration.ts`) deletes `proxy.mp4`, `color-v1.mp4`, the all-intra
+  half/quarter files and `stream-low-v1.mp4` once an asset is migrated. Any build older than storage v3
+  then 404s on those clips: do not roll back past it, fix forward.
 - `node scripts/remote-playback-check.mjs` plays a timeline on sharedcut.com as a signed-in user and
   reports pictures/s, freezes and loading time; run it before and after any playback change.

@@ -1,5 +1,7 @@
 # Newspaper playback measurements
 
+> **Storage v3 (October 2026):** these measurements predate it. The all-intra Full, 1/2 and 1/4 proxies below were replaced by `full-v3.mp4` (1920, 10-bit 4:2:2, half-second GOP), `stream-v2.mp4` (960) and `stream-low-v2.mp4` (480, half-second GOP). Paused scrubbing now decodes stream-low-v2 a whole GOP per seek (`createScrubFrames`), which carries on into the next GOP while the scrub moves forward. Re-run `scripts/playback-browser-check.mjs` and `scripts/remote-playback-check.mjs` on the migrated library before quoting these numbers.
+
 September 11, 2026 · Chrome 152 · Apple M5 Pro / ANGLE Metal · 1512 × 982 viewport.
 
 The original C0961 recording is 3840 × 2160, 10-bit H.264 4:2:2, 24000/1001 fps, approximately 96.7 Mb/s. Its existing 1920-pixel proxy is approximately 47.9 Mb/s; the new 480 × 270 proxy is approximately 2.4 Mb/s. Originals and original-media exports are retained.
