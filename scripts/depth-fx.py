@@ -86,40 +86,61 @@ def upsample_depth(I, depth, near, far, warp=None):
     row-major 2x3 source -> output pixel matrix (Stabilize); output pixels map back through its inverse."""
     _, H, W = I.shape
     h, w = depth.shape
-    device = I.device
-    y, x = torch.meshgrid(torch.arange(H, device=device, dtype=torch.float32), torch.arange(W, device=device, dtype=torch.float32), indexing="ij")
-    inside = None
-    if warp is not None:
-        a, b, c, d, e, f = [float(v) for v in warp]
-        det = a * e - b * d
-        ia, ib, id_, ie = e / det, -b / det, -d / det, a / det
-        sx, sy = ia * (x - c) + ib * (y - f), id_ * (x - c) + ie * (y - f)
-        inside = (sx >= -.5) & (sx <= W - .5) & (sy >= -.5) & (sy <= H - .5)
-        x, y = sx, sy
+    device, f32 = I.device, torch.float32
+    guide, dist = lum(I), distance(depth, near, far)
+    range_weight = -1 / (2 * .1 ** 2)
+    if warp is None:
+        # Unwarped, a tap's position and spatial weight depend on the column or the row alone: index whole rows and
+        # columns of the tap tables instead of gathering every pixel (a quarter of the GPU passes at 4K).
+        qx = (torch.arange(W, device=device, dtype=f32) + .5) * (w / W) - .5
+        qy = (torch.arange(H, device=device, dtype=f32) + .5) * (h / H) - .5
+        cx = (torch.arange(-2, w + 2, device=device, dtype=f32) + .5) * (W / w) - .5
+        cy = (torch.arange(-2, h + 2, device=device, dtype=f32) + .5) * (H / h) - .5
+        # Guide luminance at every tap centre once, on the depth grid widened by two texels each side.
+        taps = sample(guide[None], cx[None].expand(h + 4, w + 4), cy[:, None].expand(h + 4, w + 4))[0]
+        bx, by = qx.floor(), qy.floor()
+        num, den = torch.zeros_like(guide), torch.zeros_like(guide)
+        for j in (-1, 0, 1, 2):
+            ty = by + j
+            wy = torch.exp(-(qy - ty) ** 2 / 2)[:, None]
+            guide_rows, dist_rows = taps.index_select(0, (ty + 2).long()), dist.index_select(0, ty.clamp(0, h - 1).long())
+            for i in (-1, 0, 1, 2):
+                tx = bx + i
+                weight = torch.exp((guide - guide_rows.index_select(1, (tx + 2).long())).square_().mul_(range_weight))
+                weight.mul_(wy).mul_(torch.exp(-(qx - tx) ** 2 / 2)[None])
+                num.addcmul_(weight, dist_rows.index_select(1, tx.clamp(0, w - 1).long()))
+                den.add_(weight)
+        D = num / den.clamp(min=1e-30)
+        weak = den < 1e-6
+        if weak.any():
+            D = torch.where(weak, distance(sample(depth[None], qx[None].expand(H, W), qy[:, None].expand(H, W))[0], near, far), D)
+        return D
+    y, x = torch.meshgrid(torch.arange(H, device=device, dtype=f32), torch.arange(W, device=device, dtype=f32), indexing="ij")
+    a, b, c, d, e, f = [float(v) for v in warp]
+    det = a * e - b * d
+    ia, ib, id_, ie = e / det, -b / det, -d / det, a / det
+    x, y = ia * (x - c) + ib * (y - f), id_ * (x - c) + ie * (y - f)
+    inside = (x >= -.5) & (x <= W - .5) & (y >= -.5) & (y <= H - .5)
     qx, qy = (x + .5) * (w / W) - .5, (y + .5) * (h / H) - .5
-    guide = lum(I)
-    # Guide luminance at every tap centre once, on the depth grid widened by two texels each side.
-    ty, tx = torch.meshgrid(torch.arange(-2, h + 2, device=device, dtype=torch.float32), torch.arange(-2, w + 2, device=device, dtype=torch.float32), indexing="ij")
+    ty, tx = torch.meshgrid(torch.arange(-2, h + 2, device=device, dtype=f32), torch.arange(-2, w + 2, device=device, dtype=f32), indexing="ij")
     cx, cy = (tx + .5) * (W / w) - .5, (ty + .5) * (H / h) - .5
-    if warp is not None:
-        cx, cy = a * cx + b * cy + c, d * cx + e * cy + f
-    taps = sample(guide[None], cx, cy)[0].flatten()
-    dist = distance(depth, near, far).flatten()
+    taps = sample(guide[None], a * cx + b * cy + c, d * cx + e * cy + f)[0].flatten()  # Tap centres moved with the picture.
+    dist = dist.flatten()
     bx, by = qx.floor().clamp(-1, w - 1), qy.floor().clamp(-1, h - 1)
     num, den = torch.zeros_like(guide), torch.zeros_like(guide)
     for j in (-1, 0, 1, 2):
-        sy_ = by + j
+        sy = by + j
         for i in (-1, 0, 1, 2):
-            sx_ = bx + i
-            weight = torch.exp(-((qx - sx_) ** 2 + (qy - sy_) ** 2) / 2)
-            weight = weight * torch.exp(-(guide - taps[((sy_ + 2) * (w + 4) + sx_ + 2).long()]) ** 2 / (2 * .1 ** 2))
-            num += weight * dist[(sy_.clamp(0, h - 1) * w + sx_.clamp(0, w - 1)).long()]
+            sx = bx + i
+            weight = torch.exp(-((qx - sx) ** 2 + (qy - sy) ** 2) / 2)
+            weight = weight * torch.exp((guide - taps[((sy + 2) * (w + 4) + sx + 2).long()]) ** 2 * range_weight)
+            num += weight * dist[(sy.clamp(0, h - 1) * w + sx.clamp(0, w - 1)).long()]
             den += weight
     D = num / den.clamp(min=1e-30)
     weak = den < 1e-6
     if weak.any():
         D = torch.where(weak, distance(sample(depth[None], qx, qy)[0], near, far), D)
-    return D if inside is None else torch.where(inside, D, torch.zeros_like(D))
+    return torch.where(inside, D, torch.zeros_like(D))
 
 
 def area(image, height, width):
@@ -141,37 +162,52 @@ def lens_blur(L2, D, p, taps):
     Hb = round(H * s)
     small = area(torch.cat([L2, D[None], coc[None]]), Hb, Wb)
     Ls, Ds, cc, Rb = small[:3], small[3], small[4] * s, R * s
-    if Rb < 1:
-        B = Ls
-    else:
-        bokeh = p["bokeh"] / 100 * 8
-        weigh = lambda col: 1 + bokeh * (lum(col) - .7).clamp(min=0)
-        RS = max(.5, Rb * Rb / (2 * taps))
-        pad = math.ceil(Rb) + 2
-        padded = F.pad(torch.cat([Ls, Ds[None], cc[None]])[None], (pad, pad, pad, pad), mode="replicate")[0]
-        wsum = weigh(Ls)
-        acc = Ls * wsum
-        r, angle = RS, 0.0
-        while r < Rb:
-            # Every pixel samples at the same offset, so one shifted bilinear read of the padded stack serves all.
-            dx, dy = math.cos(angle) * r, math.sin(angle) * r
-            ix, iy = math.floor(dx), math.floor(dy)
-            fx, fy = dx - ix, dy - iy
-            x0, y0 = pad + ix, pad + iy
-            top = padded[:, y0:y0 + Hb, x0:x0 + Wb] * (1 - fx) + padded[:, y0:y0 + Hb, x0 + 1:x0 + 1 + Wb] * fx
-            bottom = padded[:, y0 + 1:y0 + 1 + Hb, x0:x0 + Wb] * (1 - fx) + padded[:, y0 + 1:y0 + 1 + Hb, x0 + 1:x0 + 1 + Wb] * fx
-            at = top * (1 - fy) + bottom * fy
-            Lsp, Dsp, csp = at[:3], at[3], at[4]
-            reach = torch.where(Dsp > Ds, torch.minimum(csp, 2 * cc), csp)  # A farther sample can't spill onto a nearer one.
-            m = smoothstep(r - .5, r + .5, reach)
-            weight = weigh(Lsp)
-            acc = acc + (acc / wsum * weight) * (1 - m) + Lsp * weight * m
-            wsum = wsum + weight
-            angle += GOLDEN
-            r += RS / r
-        B = acc / wsum
+    B = Ls if Rb < 1 else gather(Ls, Ds, cc, Rb, p["bokeh"] / 100 * 8, taps)
     blend = (coc * s).clamp(0, 1)
     return L2 + (bilinear(B, H, W) - L2) * blend
+
+
+def gather_taps(Rb, taps):
+    """Radius and angle of every gather sample, in order: golden-angle steps with r += RS / r."""
+    RS, angle, out = max(.5, Rb * Rb / (2 * taps)), 0.0, []
+    r = RS
+    while r < Rb:
+        out.append((r, angle))
+        angle += GOLDEN
+        r += RS / r
+    return out
+
+
+def gather(Ls, Ds, cc, Rb, bokeh, taps, chunk=24):
+    """Section 4's gather loop. Each step is acc = alpha * acc + beta with alpha = 1 + (1 - m) w / wsum and
+    beta = m w L(sp), so a chunk of steps sampled at once folds into acc_end = P (acc + sum(beta / P_n)), P the running
+    product of alpha: the same sum as one step at a time (see the selftest), in a few dozen GPU passes, not thousands."""
+    _, Hb, Wb = Ls.shape
+    stack = torch.cat([Ls, Ds[None], cc[None]])[None]
+    xs = torch.arange(Wb, device=Ls.device, dtype=torch.float32)
+    ys = torch.arange(Hb, device=Ls.device, dtype=torch.float32)
+    weigh = lambda col: 1 + bokeh * (lum(col) - .7).clamp(min=0)
+    wsum = weigh(Ls)
+    acc = Ls * wsum
+    steps = gather_taps(Rb, taps)
+    for start in range(0, len(steps), chunk):
+        part = steps[start:start + chunk]
+        n = len(part)
+        r, dx, dy = (torch.tensor(values, device=Ls.device, dtype=torch.float32)[:, None, None] for values in zip(*[(r, r * math.cos(a), r * math.sin(a)) for r, a in part]))
+        # Every pixel samples at the same offset per step: one bilinear, edge-clamped read per step, all steps at once.
+        grid = torch.stack(torch.broadcast_tensors((xs[None, None, :] + dx + .5) / Wb * 2 - 1, (ys[None, :, None] + dy + .5) / Hb * 2 - 1), -1)
+        at = F.grid_sample(stack.expand(n, -1, -1, -1), grid, mode="bilinear", padding_mode="border", align_corners=False)
+        Lsp, Dsp, csp = at[:, :3], at[:, 3], at[:, 4]
+        reach = torch.where(Dsp > Ds, torch.minimum(csp, 2 * cc), csp)  # A farther sample can't spill onto a nearer one.
+        x = (reach - (r - .5)).clamp(0, 1)  # smoothstep(r - .5, r + .5, reach)
+        m = x * x * (3 - 2 * x)
+        weight = weigh(Lsp.transpose(0, 1))
+        before = wsum + torch.cumsum(weight, 0) - weight
+        alpha = 1 + (1 - m) * weight / before
+        P = torch.cumprod(alpha, 0)
+        acc = P[-1] * (acc + (Lsp * (m * weight / P)[:, None]).sum(0))
+        wsum = wsum + weight.sum(0)
+    return acc / wsum
 
 
 def glow(L3, D, p):
@@ -225,11 +261,14 @@ def depth_fx(I, depth, p, near, far, taps=96, warp=None):
 
 # --- Bake ---
 
+PIPE_CHUNK = 1 << 20  # Windows pipes move a 66 MB 4K frame five times faster in 1 MB reads and writes than in one.
+
+
 def read_exact(stream, size):
     data = bytearray(size)
     view, got = memoryview(data), 0
     while got < size:
-        n = stream.readinto(view[got:])
+        n = stream.readinto(view[got:got + PIPE_CHUNK])
         if not n:
             break
         got += n
@@ -288,14 +327,15 @@ def render(job):
     if job.get("image"):
         codec = ["-frames:v", "1", "-c:v", "png", "-pix_fmt", "rgba64be" if alpha else "rgb48be"]
     else:
-        codec = ["-c:v", "prores_ks", "-profile:v", "4", "-vendor", "apl0", "-pix_fmt", "yuva444p10le" if alpha else "yuv444p10le", "-threads", threads,
+        # Fixed quantiser: prores_ks's rate control ran 4K 4444 at 6 fps on the Dell; qscale 4 runs 43 fps at the same size.
+        codec = ["-c:v", "prores_ks", "-profile:v", "4", "-qscale:v", "4", "-vendor", "apl0", "-pix_fmt", "yuva444p10le" if alpha else "yuv444p10le", "-threads", threads,
                  "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
     out_range = "pc" if job.get("image") else "tv"
     try:
-        decoder = subprocess.Popen(job["decoder"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        decoder = subprocess.Popen(job["decoder"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         children.append(decoder)
         encoder = subprocess.Popen([ff, "-v", "error", "-nostdin", "-y", "-f", "rawvideo", "-pix_fmt", "rgba64le", "-s", f"{W}x{H}", "-r", str(job["fps"]), "-i", "-",
-                                    "-vf", f"scale=out_color_matrix=bt709:out_range={out_range}", *codec, job["output"]], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                                    "-vf", f"scale=out_color_matrix=bt709:out_range={out_range}", *codec, job["output"]], stdin=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
         children.append(encoder)
         pictures, depths, written = queue.Queue(maxsize=3), queue.Queue(maxsize=16), queue.Queue(maxsize=3)
         threading.Thread(target=pump, args=(decoder.stdout, W * H * 8, total, pictures, errors), daemon=True).start()
@@ -308,7 +348,9 @@ def render(job):
         def write():
             try:
                 while (data := written.get()) is not None:
-                    encoder.stdin.write(data)
+                    view = memoryview(data)
+                    for at in range(0, len(view), PIPE_CHUNK):
+                        encoder.stdin.write(view[at:at + PIPE_CHUNK])
             except Exception as error:
                 errors.append(error)
             finally:
@@ -343,8 +385,9 @@ def render(job):
                 depth = torch.from_numpy(np.frombuffer(current, np.uint16).reshape(spec["height"], spec["width"])).to(device).float() / 1023
                 params = {**static, **{key: values[k] for key, values in animated.items()}}
                 rgb = depth_fx(rgba[:3].contiguous(), depth, params, near, far, taps, warps[k] if warps else None)
-                out = torch.cat([rgb, rgba[3:]]).permute(1, 2, 0)
-                written.put((out * 65535 + .5).clamp(0, 65535).to(torch.int32).to(torch.uint16).cpu().numpy().tobytes())
+                # Interleave on the GPU: a strided tensor crossed to the CPU element by element (240 ms a 4K frame).
+                out = (torch.cat([rgb, rgba[3:]]) * 65535 + .5).clamp(0, 65535).to(torch.int32).to(torch.uint16).permute(1, 2, 0).contiguous()
+                written.put(out.cpu().numpy().tobytes())
                 if k % 4 == 3 or k == total - 1:
                     print(json.dumps({"progress": round((k + 1) / total * 100, 1)}), file=sys.stderr, flush=True)
         written.put(None)
@@ -404,8 +447,31 @@ def detail(image):
     return float((image[..., 1:, :] - image[..., :-1, :]).abs().mean() + (image[..., :, 1:] - image[..., :, :-1]).abs().mean())
 
 
+def gather_reference(Ls, Ds, cc, Rb, bokeh, taps):
+    """The spec's gather loop exactly as written, one sample at a time: the reference for gather()."""
+    _, Hb, Wb = Ls.shape
+    stack = torch.cat([Ls, Ds[None], cc[None]])
+    y, x = torch.meshgrid(torch.arange(Hb, device=Ls.device, dtype=torch.float32), torch.arange(Wb, device=Ls.device, dtype=torch.float32), indexing="ij")
+    weigh = lambda col: 1 + bokeh * (lum(col) - .7).clamp(min=0)
+    wsum = weigh(Ls)
+    acc = Ls * wsum
+    for r, angle in gather_taps(Rb, taps):
+        at = sample(stack, x + math.cos(angle) * r, y + math.sin(angle) * r)
+        reach = torch.where(at[3] > Ds, torch.minimum(at[4], 2 * cc), at[4])
+        m, w = smoothstep(r - .5, r + .5, reach), weigh(at[:3])
+        acc = acc + (acc / wsum * w) * (1 - m) + at[:3] * w * m
+        wsum = wsum + w
+    return acc / wsum
+
+
 def selftest():
     device, checks = pick_device(), []
+    generator = torch.Generator(device="cpu").manual_seed(7)
+    Ls, Ds, cc = torch.rand(3, 40, 60, generator=generator), torch.rand(40, 60, generator=generator), torch.rand(40, 60, generator=generator) * 9
+    for taps in (16, 48, 96):
+        batched, reference = gather(Ls.to(device), Ds.to(device), cc.to(device), 9.5, 3.2, taps), gather_reference(Ls.to(device), Ds.to(device), cc.to(device), 9.5, 3.2, taps)
+        assert torch.allclose(batched, reference, atol=2e-5, rtol=1e-4), f"batched gather differs from the loop by {float((batched - reference).abs().max())}"
+    checks.append("gather equals the loop")
     H, W, h, w = 96, 160, 48, 80
     y, x = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing="ij")
     checker = ((x // 4 + y // 4) % 2).float()

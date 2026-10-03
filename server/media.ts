@@ -1377,8 +1377,8 @@ function rejectDepth(request: RenderRequest) {
     if (clip.effects.filter(e => e.name === 'Depth' && effectEnabled(clip, e)).length > 1) throw new Error(`${clip.name}: a clip takes one Depth effect. Remove the extra one.`);
   }
 }
-/** ProRes 4444 at 4K measured about 4 MB a frame on busy footage; the estimate leans high. */
-const DEPTH_BAKE_BYTES_4K = 4.5e6;
+/** The bake (ProRes 4444, qscale 4) measured 0.4 MB a 4K frame on Sony footage and 1.1 MB on a test pattern on the Dell; the estimate leans high. */
+const DEPTH_BAKE_BYTES_4K = 2.5e6;
 
 /**
  * Bake each clip's Depth into source-time replacement media, then composite normally, the way Stabilize does. The bake
