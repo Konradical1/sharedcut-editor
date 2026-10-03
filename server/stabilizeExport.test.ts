@@ -2,11 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm, readdir } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, readdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { probeMedia, renderTimeline, type RenderRequest } from './media.ts';
+import { probeMedia, renderTimeline, run, type RenderRequest } from './media.ts';
+import { venvPython } from './platform.ts';
+import { maskAnalysis, maskSourceFingerprint } from './smartMask.ts';
+import { createSmartMask, smartMaskSignature, type SmartMaskManifest } from '../src/services/smartMask.ts';
 import { stabilizePython } from './stabilize.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
@@ -38,5 +41,39 @@ test('Stabilize export bakes a shaky clip and rejects conflicting effects', { ti
     // Speed edits reuse the same analysis and keep working on the baked media.
     await renderTimeline({ ...request, clips: [{ ...clip, duration: 1, properties: { ...clip.properties, speed: 200 } }], settings: { ...request.settings, rangeOut: '1' }, outputPath: path.join(dir, 'fast.mp4') });
     assert.ok(Math.abs((await probeMedia(path.join(dir, 'fast.mp4'))).duration - 1) < .1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// The bake starts at the clip's own source range, so a trimmed clip's reused matte has to move with it. Before the
+// fix every matte was looked up range.from seconds early: here the subject appears at source 1.25 s, the clip starts
+// reading at 1 s, and the whole export came out black.
+test('Stabilize keeps a Smart Mask on its source frames on a trimmed clip', { timeout: 600000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-stabilize-mask-'));
+  try {
+    if (!existsSync(stabilizePython())) { console.log('Stabilize worker not installed; skipping.'); return; }
+    if (!existsSync(process.env.FRAME_LINE_COLOR_PYTHON || venvPython('.venv-color'))) { console.log('Colour worker not installed; skipping.'); return; }
+    const source = path.join(dir, 'shaky.mp4'), key = 'e'.repeat(64), cache = path.join(dir, 'masks', key);
+    await exec(ffmpeg, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=200x120:r=24:d=3', '-vf', "crop=w=160:h=96:x='20+10*sin(n)':y='12+6*cos(n*1.3)'", '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-g', '1', source]);
+    await mkdir(path.join(cache, 'frames'), { recursive: true });
+    // Alpha 1 from source frame 30 (1.25 s) on, 0 before.
+    const raw = Buffer.alloc(160 * 96 * 2 * 72);
+    for (let f = 30; f < 72; f++) raw.fill(0xff, f * 160 * 96 * 2, (f + 1) * 160 * 96 * 2);
+    await writeFile(path.join(dir, 'alpha.raw'), raw);
+    await exec(ffmpeg, ['-v', 'error', '-y', '-f', 'rawvideo', '-pixel_format', 'gray16le', '-video_size', '160x96', '-framerate', '24', '-i', path.join(dir, 'alpha.raw'), '-start_number', '0', path.join(cache, 'frames', '%d.png')]);
+    const asset: MediaAsset = { id: 'asset', projectId: 'project', name: 'shaky.mp4', kind: 'video', binId: 'all', duration: 3, fps: 24, resolution: '160 × 96', size: '10 KB', status: 'ready', progress: 100, thumbnail: '', hasAudio: false, inputProfile: 'Rec.709', inputGamut: 'Rec.709' };
+    const clip: Clip = { id: 'clip', projectId: 'project', timelineId: 'timeline', mediaId: 'asset', name: 'Shaky', trackId: 'v1', start: 0, duration: 1, sourceIn: 1, color: 'red', disabled: false, properties: { ...defaultProperties }, effects: [{ id: 'fx', name: 'Stabilize', enabled: true, amount: 100, parameters: { crop: 6 } }, { id: 'cut', name: 'Smart Mask', enabled: true, amount: 100, maskId: 'subject' }] };
+    const mask = createSmartMask(clip, asset, 'subject');
+    mask.prompts = [{ id: 'point', time: 1, kind: 'include', points: [{ x: .5, y: .5 }], radius: .01 }]; mask.result = { key, signature: smartMaskSignature(mask) }; clip.smartMasks = [mask];
+    const manifest: SmartMaskManifest = { version: 1, key, signature: mask.result.signature, projectId: 'project', mediaId: 'asset', sourceFingerprint: maskSourceFingerprint(source), engine: 'authored alpha fixture', modelRevision: 'fixture', quality: 'final', width: 160, height: 96, sourceTimes: Array.from({ length: 72 }, (_, i) => i / 24), range: mask.range, alpha: 'gray16', frames: Array.from({ length: 72 }, (_, i) => ({ index: i, time: i / 24, file: `frames/${i}.png` })).filter(f => f.time >= mask.range.start - 1e-6 && f.time < mask.range.end - 1e-6) };
+    await mkdir(path.join(cache, 'source'));
+    for (const f of manifest.frames) await writeFile(path.join(cache, 'source', `${f.index}.jpg`), 'Source image fixture');
+    await writeFile(path.join(cache, 'manifest.json'), JSON.stringify(manifest));
+    await writeFile(path.join(cache, 'binding.json'), JSON.stringify({ projectId: 'project', clipId: 'clip', maskId: 'subject', signature: mask.result.signature, sourceFingerprint: maskSourceFingerprint(source), analysisIdentity: maskAnalysis(clip, asset).identity, workerIdentity: 'fixture' }));
+    const track: Track = { id: 'v1', timelineId: 'timeline', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
+    const outputPath = path.join(dir, 'out.mov');
+    await renderTimeline({ project: { id: 'project', resolution: '160 × 96', fps: 24 } as Project, timeline: { id: 'timeline', projectId: 'project', name: 'test', duration: 1 }, tracks: [track], clips: [clip], nodes: [], assets: [{ asset, path: source }], settings: { resolution: '160 × 96', fps: '24', codec: 'Apple ProRes 422 HQ', rangeIn: '0', rangeOut: '1', audio: 'Disabled' }, outputPath, smartMaskDir: path.join(dir, 'masks'), stabilizeDir: path.join(dir, 'cache') });
+    const brightness = async (time: number) => { const data = await run(ffmpeg, ['-v', 'error', '-ss', String(time), '-i', outputPath, '-frames:v', '1', '-vf', 'crop=80:48:40:24', '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { binary: true }); return data.reduce((sum, value) => sum + value, 0) / data.length; };
+    assert.ok(await brightness(.1) < 8, 'before the subject appears the cutout is empty');
+    assert.ok(await brightness(.6) > 40, `from source 1.25 s the subject shows: ${await brightness(.6)}`);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

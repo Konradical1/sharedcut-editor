@@ -648,8 +648,9 @@ export interface RenderRequest {
   /** Resolves a light-leak id from the shared overlay pack to a file on disk. */
   overlayPath?: (id: string) => string | null;
   /** Mattes already re-rendered to match a baked picture, keyed `clipId:maskId`. Stabilize fills this so a
-   *  Smart Mask lands on the stabilized frame; without it the matte would sit on the original framing. */
-  maskArtifacts?: Map<string, { directory: string; manifest: SmartMaskManifest }>;
+   *  Smart Mask lands on the stabilized frame; without it the matte would sit on the original framing. `offset` is
+   *  the original source second at which the baked media starts: its times are the manifest's minus that. */
+  maskArtifacts?: Map<string, { directory: string; manifest: SmartMaskManifest; offset?: number }>;
   /** Internal, one pass of a split export: `video` renders picture for its own range, `audio` mixes sound for the whole range. */
   pass?: 'video' | 'audio';
   /** Internal, audio pass: mix only these clips. Every clip still decides whose embedded sound would play twice. */
@@ -1005,12 +1006,14 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         const masks=usedMasks.map(document=>{
           if(!request.smartMaskDir)throw Error(`${clip.name}: Smart Mask storage is unavailable.`);
           // A baked picture (Stabilize) hands over its own re-warped matte; everything else resolves the stored one.
-          const artifact=request.maskArtifacts?.get(`${clip.id}:${document.id}`)??resolveSmartMaskArtifact(request.smartMaskDir,clip,document,source.path,source.asset),manifest=artifact.manifest;
+          const artifact:{directory:string;manifest:SmartMaskManifest;offset?:number}=request.maskArtifacts?.get(`${clip.id}:${document.id}`)??resolveSmartMaskArtifact(request.smartMaskDir,clip,document,source.path,source.asset),manifest=artifact.manifest;
           // A reviewed tracked selection is exportable. Its "preview" identity is
           // retained: exporting it does not turn segmentation into hair matting.
           if(manifest.width!==metadata.width||manifest.height!==metadata.height)throw Error(`${clip.name}: Smart Mask dimensions differ from the source.`);
-          const times=manifest.sourceTimes!,step=1/(metadata.fps||fps);
+          // A baked source (Stabilize, Depth) starts at `offset` of the original: move the matte's clock with it.
+          const shift=artifact.offset??0,times=manifest.sourceTimes!.map(t=>t-shift),step=1/(metadata.fps||fps);
           if(times.some((t,i)=>i>0&&Math.abs(t-times[i-1]-step)>Math.max(.000003,step*.001)))throw Error(`${clip.name}: Smart Mask export currently requires constant-frame-rate source footage. Convert this source to constant frame rate and reanalyze.`);
+          if(shift)document={...document,range:{start:document.range.start-shift,end:document.range.end-shift}};
           return {document,sourceTimes:times,files:Object.fromEntries(manifest.frames.map(f=>[String(f.index),path.join(artifact.directory,f.file)])),...(clip.effects.some(e=>e.maskId===document.id&&effectEnabled(clip,e)&&e.amount>0)?{output:path.join(lutDir,`${index}-${document.id}.mkv`)}:{})};
         });
         const times=masks[0]?.sourceTimes,renderSeek=times?.filter(t=>t<=seek+1e-7).at(-1)??seek;
@@ -1319,7 +1322,7 @@ async function renderStabilizedTimeline(request: RenderRequest) {
       await stabilizeWarpMattes({input:source.path,directory:request.stabilizeDir??directory,range,settings,signal:request.signal,
         onProgress:p=>report(mattes*(order+p/100)/documents.length),
         frames:artifact.manifest.frames.map(f=>({input:path.join(artifact.directory,f.file),output:path.join(warped,f.file),time:f.time}))});
-      maskArtifacts.set(`${clip.id}:${document.id}`,{directory:warped,manifest:artifact.manifest});
+      maskArtifacts.set(`${clip.id}:${document.id}`,{directory:warped,manifest:artifact.manifest,offset:range.from});
     }
     request.onStage?.(`Stabilizing · ${clip.name}`);
     const baked=await renderStabilized({input:source.path,directory,analysisDirectory:request.stabilizeDir,range,from:range.from,to:range.to,settings,preview:false,signal:request.signal,onProgress:p=>report(mattes+(1-mattes)*p/100)});
