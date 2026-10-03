@@ -267,10 +267,11 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
       });
       return view(job);
     },
-    /** Another project still waiting on a shared run keeps it; this project just leaves it. */
+    /** Another project still waiting on a shared run keeps it; this project just leaves it. An export waiting for the run
+     *  (a hold) keeps it too: an editor trimming the clip meanwhile must not fail that export. */
     cancel(projectId: string, key: string) {
       const job = get(projectId, key);
-      if (!['queued', 'processing'].includes(job.status)) return;
+      if (!['queued', 'processing'].includes(job.status) || holds.get(key)) return;
       if (job.projects.length > 1) { job.projects = job.projects.filter(project => project !== projectId); save(job); return; }
       const controller = controllers.get(key);
       controller?.abort();
@@ -293,18 +294,22 @@ export function depthService(directory: string, options: { sourceTimes: (clip: C
      */
     async ready(request: DepthRequest, signal?: AbortSignal, onProgress?: (percent: number) => void) {
       const { key } = await service.enqueue(request);
-      for (;;) {
-        if (signal?.aborted) throw new Error('Canceled by you');
-        const job = jobs.get(key);
-        if (!job) fail(410, 'The depth analysis was removed. Export again.');
-        if (job!.status === 'ready') {
-          job!.used = Date.now();
-          return { run: view(job!), masters: join(directory, key, 'master'), release: service.hold(key) };
+      // Held from the start, not once ready: an editor's cancel (a trim, the effect removed) and eviction both leave it alone.
+      const release = service.hold(key);
+      try {
+        for (;;) {
+          if (signal?.aborted) throw new Error('Canceled by you');
+          const job = jobs.get(key);
+          if (!job) fail(410, 'The depth analysis was removed. Export again.');
+          if (job!.status === 'ready') {
+            job!.used = Date.now();
+            return { run: view(job!), masters: join(directory, key, 'master'), release };
+          }
+          if (job!.status === 'failed' || job!.status === 'cancelled') fail(409, `Depth analysis ${job!.status === 'failed' ? 'failed' : 'was cancelled'}: ${job!.error ?? 'analyze depth again.'}`);
+          onProgress?.(job!.progress);
+          await new Promise(resolve => setTimeout(resolve, 250));
         }
-        if (job!.status === 'failed' || job!.status === 'cancelled') fail(409, `Depth analysis ${job!.status === 'failed' ? 'failed' : 'was cancelled'}: ${job!.error ?? 'analyze depth again.'}`);
-        onProgress?.(job!.progress);
-        await new Promise(resolve => setTimeout(resolve, 250));
-      }
+      } catch (error) { release(); throw error; }
     },
     /**
      * The focus track for a ready run and a subject (focus follows subject), measured once and kept beside the run until

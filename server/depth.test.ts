@@ -188,6 +188,28 @@ test('a new run is refused when it would take the disk below the free-space floo
   } finally { await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
 });
 
+test('an export waiting for a run keeps it: an editor cancelling it meanwhile (a trim, the effect removed) fails nothing', async () => {
+  const f = fixture('export-wait'), gate = join(f.directory, 'gate');
+  const service = depthService(f.cache, { python: process.execPath, worker: fakeWorker(f.directory, { gate }), sourceTimes: async () => times });
+  try {
+    const request = { clip: clip('a'), asset, sourcePath: f.source, from: 0, to: 3 };
+    const waiting = service.ready(request);
+    const { key } = await service.enqueue(request);
+    await until(() => service.get('project', key).segments.length === 1);
+    service.cancel('project', key);
+    assert.equal(service.get('project', key).status, 'processing', 'the editor\'s cancel leaves a run an export waits for');
+    writeFileSync(gate, '');
+    const { run, release } = await waiting;
+    assert.equal(run.status, 'ready');
+    release();
+    // Nothing waits any more: a cancel stops the next run as before.
+    const next = await service.enqueue({ clip: clip('b'), asset, sourcePath: f.source, from: 13, to: 14 });
+    service.cancel('project', next.key);
+    assert.equal(service.get('project', next.key).status, 'cancelled');
+  } finally { writeFileSync(gate, ''); await service.close(); rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+
 test('a request refused for low disk keeps the cache when evicting could not make room anyway', async () => {
   const f = fixture('disk-cache');
   let free = 10 * 1024 ** 3;
