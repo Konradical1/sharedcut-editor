@@ -435,6 +435,16 @@ Ranked by value:
    - In Color this means "grade only the background", and it can be combined with a Smart Mask.
    - Preview goes through the colour shader's mask path.
    - Export goes through `color-render.py`, where depth is one more per-pixel alpha plane.
+   - **Built for grade nodes (2026-10-03):** `mask: {source: 'depth', enabled, invert, amount, near, far, softness}`.
+     One mask per node, so a node takes a Smart Mask or a depth key, not both; clip alpha is not built.
+     - Key: `smoothstep(near - s, near, d) × (1 - smoothstep(far, far + s, d))` with `s = max(softness, 1e-4)` and `d`
+       the 0..100 distance of section 0 of the effect maths (`depthKeyAlpha` / `depthKeyTable` in `src/services/depth.ts`).
+       Near 0 and far 100 key everything.
+     - The key is computed per depth texel and upsampled **bilinearly** to the picture, in preview (canvas fit into the
+       R8 mask atlas, like a Smart Mask) and export (`color-render.py` reads the 10-bit masters). No guided upsample:
+       a grading key's edges are as soft as the depth's. Preview keys the 8-bit preview segments, export the masters.
+     - A node using one starts the clip's depth analysis. Before a frame is analyzed the node grades nothing.
+     - Export refuses a depth key with Stabilize or optical flow (it would need warped depth), and on VFR sources.
 4. **Depth helping SAM.** This is an experiment.
    - Cut SAM leaks across depth jumps, such as a teammate standing behind the player, and fill holes
      that are consistent in depth.
