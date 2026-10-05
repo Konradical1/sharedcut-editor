@@ -593,20 +593,28 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   };
   const stills=createStillCache(join(dataDir,'frames'),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)}),{log:line=>console.warn(line),admit:admitPreview});
   const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)} ),{log:line=>console.warn(line),admit:admitPreview});
+  /** Seconds an export spends in each stage ("Stabilizing", "Optical flow", "Rendering video"...), logged when it ends,
+   *  so a slow export says where its time went. The 78-minute Girls Soccer export could only be explained afterwards. */
+  const stageClock = (started: number) => {
+    const spent = new Map<string, number>(); let current = 'Preparing export', since = started;
+    const close = () => { const key = current.split(' · ')[0]; spent.set(key, (spent.get(key) ?? 0) + Date.now() - since); since = Date.now(); };
+    return { enter: (next: string) => { close(); current = next; }, summary: () => { close(); return [...spent].map(([key, ms]) => `${key} ${Math.round(ms / 1000)} s`).join(', '); } };
+  };
   const startRender = (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>) => {
     db.prepare('INSERT OR REPLACE INTO render_snapshots(id,data) VALUES(?,?)').run(job.id, JSON.stringify(snapshot));
     const releases: (() => void)[] = [];
     addWork(job.id, async signal => {
             updateJob(job.id, { status: 'rendering', progress: 0, remaining: 'Preparing export · 0s elapsed' }); const extension = job.settings.codec?.includes('ProRes') ? '.mov' : '.mp4'; const outputPath = join(dataDir, 'renders', `${job.id}${extension}`);
-            const started = Date.now(); let progressValue = 0, stage = 'Preparing export', advancedAt = started, reportedAt = 0;
+            const started = Date.now(), clock = stageClock(started); let progressValue = 0, stage = 'Preparing export', advancedAt = started, reportedAt = 0;
+            const logTimes = (outcome: string) => console.log(`Export ${job.id} (${job.name}) ${outcome} after ${Math.round((Date.now() - started) / 1000)} s: ${clock.summary()}`);
             // At most one progress revision a second: each one sends every client to fetch state.
             const report = () => { if (closed || signal.aborted || Date.now() - reportedAt < 1000) return; const elapsed = Math.floor((Date.now() - started) / 1000);
               reportedAt = Date.now();
               const quiet = Math.floor((Date.now() - advancedAt) / 1000);
               updateJob(job.id, { progress: progressValue, remaining: `${stage} · ${elapsed}s elapsed${quiet >= 30 ? ` · No new frames for ${quiet}s` : ''}` }, false); };
             const heartbeat = setInterval(report, 250);
-            try { let previous = -1; await renderTimeline({ ...snapshot, depth, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { stage = next; advancedAt = Date.now(); report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); }
-            catch (error) { rmSync(outputPath, { force: true }); if (!closed) updateJob(job.id, { status: 'failed', remaining: signal.aborted ? 'Cancelled' : 'Export failed', error: signal.aborted ? 'Cancelled by user.' : error instanceof Error ? error.message : 'Export failed.' }); }
+            try { let previous = -1; await renderTimeline({ ...snapshot, depth, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { clock.enter(next); stage = next; advancedAt = Date.now(); report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); logTimes('finished'); }
+            catch (error) { logTimes(signal.aborted ? 'cancelled' : 'failed'); rmSync(outputPath, { force: true }); if (!closed) updateJob(job.id, { status: 'failed', remaining: signal.aborted ? 'Cancelled' : 'Export failed', error: signal.aborted ? 'Cancelled by user.' : error instanceof Error ? error.message : 'Export failed.' }); }
             finally { clearInterval(heartbeat); if (!closed) db.prepare('DELETE FROM render_snapshots WHERE id=?').run(job.id); }
     }, true, () => { for (const release of releases) release(); }, signal => awaitDepth(job, snapshot, signal, releases));
   };

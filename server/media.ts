@@ -27,7 +27,7 @@ import { clipPart, uncoveredParts } from '../src/services/timeline.ts';
 import { isLeakMedia, leakRange, leakIdOf, motionGap, motionSamples, timelineTransitions, transitionDefinitions, type TransitionRecord } from '../src/services/transitions.ts';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, rm, stat, readFile, writeFile, mkdtemp, rename } from 'node:fs/promises';
+import { mkdir, rm, stat, readFile, writeFile, mkdtemp, rename, utimes } from 'node:fs/promises';
 import { existsSync, rmSync, statfsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -35,7 +35,7 @@ import type { Clip, Effect, GradeNode, MediaAsset, Project, Timeline, Track } fr
 import { colorTransform, cubeText, makeCube, parseCube, hasACES, interpretation, processingStages, hdrToSdr, isHdrTransfer, type Cube } from '../src/services/color.ts';
 import { tmpdir, cpus, setPriority, totalmem } from 'node:os';
 import { renderOpticalFlow, trimFlowCache } from './opticalFlow.ts';
-import { renderStabilized, stabilizeSolve, stabilizeWarpMattes } from './stabilize.ts';
+import { renderStabilized, stabilizeSolve, stabilizeWarpMattes, trimStabilizeCache } from './stabilize.ts';
 import { stabilizeEffect, stabilizeMatrixAt, stabilizeRange, stabilizeSettings, type StabilizeSolve } from '../src/services/stabilize.ts';
 import { flowFrames, timingPaths } from '../src/services/opticalFlow.ts';
 import { gpuJob } from './workQueue.ts';
@@ -1459,11 +1459,17 @@ async function renderFlattenedTransitions(request: RenderRequest) {
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
+// Stabilize export bakes an export is reading, and how much of them to keep (about 25 s of 4K ProRes 422 HQ per GB).
+const stabilizeBakesInUse=new Map<string,number>(), STABILIZE_BAKES_BYTES=16*1024**3;
 /** Bake stabilized picture as source-time replacement media, then composite normally. Timing edits stay on the clip. */
 async function renderStabilizedTimeline(request: RenderRequest) {
-  const directory=await mkdtemp(path.join(tmpdir(),'frameline-stabilize-export-'));
+  const directory=await mkdtemp(path.join(tmpdir(),'frameline-stabilize-export-')),claimed:string[]=[];
   try {
   const clips=[...request.clips],assets=[...request.assets],tracks=[...request.tracks];
+  // Bakes are named by everything that shapes them (stabilizeIdentity), so a re-export reuses them, and so does the
+  // optical-flow bake keyed on this file. They used to live in this export's temporary folder: every export baked
+  // every Stabilize clip again and could never hit the flow cache for one.
+  const bakes=request.stabilizeDir?path.join(request.stabilizeDir,'exports'):directory;
   const records=timelineTransitions(clips.filter(c=>c.projectId===request.project.id),request.timeline.id,assets.map(a=>a.asset));
   const stabilizing=clips.filter(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c));
   // A clip outside the range is never drawn: it only loses the effect, so the render after the bakes does not come back here.
@@ -1503,7 +1509,10 @@ async function renderStabilizedTimeline(request: RenderRequest) {
       maskArtifacts.set(`${clip.id}:${document.id}`,{directory:warped,manifest:artifact.manifest,offset:matteOffset(artifact.manifest.sourceTimes)});
     }
     request.onStage?.(`Stabilizing · ${clip.name}`);
-    const baked=await renderStabilized({input:source.path,directory,analysisDirectory:request.stabilizeDir,range,from:range.from,to:range.to,settings,preview:false,signal:request.signal,onProgress:p=>report(mattes+(1-mattes)*p/100)});
+    const baked=await renderStabilized({input:source.path,directory:bakes,analysisDirectory:request.stabilizeDir,range,from:range.from,to:range.to,settings,preview:false,signal:request.signal,onProgress:p=>report(mattes+(1-mattes)*p/100)});
+    claimed.push(baked.key);stabilizeBakesInUse.set(baked.key,(stabilizeBakesInUse.get(baked.key)??0)+1);
+    // Read again: the cache keeps what was used last.
+    const now=new Date();await utimes(baked.output,now,now).catch(()=>{});
     // A Depth on this clip reads analysis of the original and warps it with the picture's own matrices.
     if(depthEffect(clip))stabilized.set(clip.id,{clip,source,offset:range.from,solve:(await stabilizeSolve({input:source.path,directory:request.stabilizeDir??directory,range,settings,signal:request.signal})).solve});
     const mediaId=`stabilize-${clip.id}`,metadata=await probeMedia(baked.output,request.signal);
@@ -1518,8 +1527,13 @@ async function renderStabilizedTimeline(request: RenderRequest) {
       clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,opticalFlow:false,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name))});
     }
   }
+  // The oldest bakes beyond the budget go, and the leftovers of a render the server died in.
+  if(bakes!==directory)await Promise.all([trimFlowCache(bakes,new Set(stabilizeBakesInUse.keys()),STABILIZE_BAKES_BYTES,'mov'),trimStabilizeCache(bakes,new Set(),Infinity)]);
   await renderTimeline({...request,clips,assets,tracks,maskArtifacts,stabilized,onProgress:p=>request.onProgress?.(45+p*.55)});
-  } finally {await rm(directory,{recursive:true,force:true});}
+  } finally {
+    for(const key of claimed){const left=(stabilizeBakesInUse.get(key)??1)-1;if(left>0)stabilizeBakesInUse.set(key,left);else stabilizeBakesInUse.delete(key);}
+    await rm(directory,{recursive:true,force:true});
+  }
 }
 const DEPTH_SECTIONS = ['blur', 'fog', 'glow', 'light'];
 const depthKeyed = (clip: Clip, effect: Effect) => Object.keys(clip.keyframes ?? {}).filter(key => key.startsWith(`effects.${effect.id}.`) && clip.keyframes![key].length);
