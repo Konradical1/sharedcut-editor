@@ -298,6 +298,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   };
   const groups = new Map<string, { canvas: HTMLCanvasElement; reference: HTMLCanvasElement; audio: AudioRoute }>();
   let color: ReturnType<typeof createColorPreview> | undefined;
+  // Read by the playback checks (never by the editor): raw-plane copy timings since the last reset.
+  Object.assign(canvas, { colorProbe: (reset?: boolean) => color?.probe(reset) });
   // `master` is the programme (the mix and master gain, as exported, which the meters read); `monitor` is what you hear.
   let audio: AudioContext | undefined, master: GainNode | undefined, monitor: GainNode | undefined, masterAnalyser: AnalyserNode | undefined;
   // BS.1770 meter: per channel, the K-weighted and the plain master, read as new samples arrive (see the meter block in tick).

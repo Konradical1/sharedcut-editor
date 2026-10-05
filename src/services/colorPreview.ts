@@ -1,6 +1,7 @@
 import type { SmartMaskPixels } from './smartMaskPreview.ts';
 import { nodeMaskId } from './smartMask.ts';
 import { acesShader, acesTextures } from './aces.generated.ts';
+import { createCopyProbe } from './copyProbe.ts';
 import { processingStages, sampleCurve, identityCurve, luminanceWeights, interpretation, profiles, hasACES, colorTransform, type Cube } from './color.ts';
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 
@@ -149,11 +150,13 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     } else {const look=looks.get(key)!;looks.delete(key);looks.set(key,look);}
     return key;
   };
-  type Decoded={timestamp:number;data?:Uint8Array;layout?:PlaneLayout[];width:number;height:number;displayWidth:number;displayHeight:number;format:string;space:VideoColorSpaceInit;error?:Error};
+  type Decoded={timestamp:number;data?:Uint8Array;layout?:PlaneLayout[];width:number;height:number;displayWidth:number;displayHeight:number;format:string;space:VideoColorSpaceInit;error?:Error;requestedAt?:number;demand?:boolean};
   const nativeFrames=new WeakSet<HTMLVideoElement>();
   const snapshots=new WeakMap<VideoFrame,{pending?:Decoded;ready?:Decoded}>();
   const decoded=new WeakMap<HTMLVideoElement,{pending?:Decoded;ready?:Decoded}>();let lastFrame:Decoded|undefined;
-  const frameFor=(video:HTMLVideoElement,snapshot?:VideoFrame)=>{
+  // Measurement only: how long each raw-plane copy took, and how often a draw had to ask for one itself (no earlier prepare) or wait.
+  const probe=createCopyProbe();
+  const frameFor=(video:HTMLVideoElement,snapshot?:VideoFrame,demand=false)=>{
     if(nativeFrames.has(video))return undefined;
     let frame:VideoFrame;
     try { frame=snapshot?snapshot.clone():new VideoFrame(video); } catch { nativeFrames.add(video);return undefined; }
@@ -166,8 +169,9 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     let buffer:Uint8Array<ArrayBuffer>;
     try { buffer=new Uint8Array(frame.allocationSize()); } catch { frame.close();nativeFrames.add(video);return undefined; }
     state.pending=current;
+    current.requestedAt=performance.now();current.demand=demand;
     // Keep presenting the completed snapshot while the next GPU readback is in flight.
-    Promise.resolve().then(()=>frame.copyTo(buffer)).then(layout=>{current.layout=layout;current.data=buffer;}).catch(()=>{nativeFrames.add(video);}).finally(()=>{state.ready=current;state.pending=undefined;frame.close();onReady();});
+    Promise.resolve().then(()=>frame.copyTo(buffer)).then(layout=>{current.layout=layout;current.data=buffer;}).catch(()=>{nativeFrames.add(video);}).finally(()=>{probe.copied(performance.now()-current.requestedAt!,!!current.demand);state.ready=current;state.pending=undefined;frame.close();onReady();});
     return state.ready??current;
   };
   let previousMasks='',previous='',previousLuts='';
@@ -176,14 +180,15 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
 
   return {
     preload,
+    probe:probe.read,
     prepare(video: HTMLVideoElement, snapshot?: VideoFrame) {
       if (typeof VideoFrame !== 'undefined' && (snapshot || video.readyState >= 2 && !video.seeking)) frameFor(video,snapshot);
     },
     draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame) {
       const key=preload(clip,asset),look=key?looks.get(key):neutral;
       if(look instanceof Error)throw look;if(!look)throw new ColorPending('Preparing color…');
-      const frame=video&&typeof VideoFrame!=='undefined'?frameFor(video,snapshot):undefined;
-      if(frame?.error)throw frame.error;if(frame&&!frame.data)throw new ColorPending('Decoding color…');
+      const frame=video&&typeof VideoFrame!=='undefined'?frameFor(video,snapshot,true):undefined;
+      if(frame?.error)throw frame.error;if(frame&&!frame.data){probe.waited(!!frame.demand);throw new ColorPending('Decoding color…');}
       const maskPixels=typeof masks==='function'?masks(snapshot?snapshot.timestamp/1e6:frame?frame.timestamp/1e6:video?.currentTime??0):masks;
       const {profile,gamut}=interpretation(clip,asset),stops=Number(clip.properties.inputExposure??0),warmth=Number(clip.properties.inputTemperature??0);
       if(!Number.isFinite(stops)||Math.abs(stops)>8||!Number.isFinite(warmth)||Math.abs(warmth)>2000)throw new Error('Camera exposure or white balance is out of range.');
@@ -290,7 +295,7 @@ function createSoftwareColorPreview(onReady:()=>void) {
     return key;
   };
   return {
-    preload,prepare(_video:HTMLVideoElement,_snapshot?:VideoFrame){},
+    preload,probe:createCopyProbe().read,prepare(_video:HTMLVideoElement,_snapshot?:VideoFrame){},
     draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame){
       const key=preload(clip,asset),look=key?looks.get(key):undefined;
       if(look instanceof Error)throw look;if(key&&!look)throw new ColorPending('Preparing color…');

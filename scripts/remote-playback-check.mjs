@@ -102,7 +102,7 @@ await context.addInitScript(({ hw, mem }) => {
   // HW_THREADS / HW_MEMORY: report a Chromebook-class machine (2-4 cores, 4 GB) so Efficient playback Auto switches on as it does there.
   if (hw) Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: () => hw });
   if (mem) Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: () => mem });
-  window.qaReset = () => { window.qa = { frames: [], health: [] }; };
+  window.qaReset = () => { window.qa = { frames: [], health: [] }; document.querySelector('.viewer canvas')?.colorProbe?.(true); };
   window.qaReset();
   // pictureStamp names every footage layer's picture; sourceTimestamp is only the layer drawn last, which a logo on top pins
   // (the live OLD client has no pictureStamp, so it falls back to the old stamp).
@@ -186,6 +186,8 @@ for (let pass = 0; pass < PASSES; pass++) {
     if (run) runs.push(run);
     const span = h.length > 1 ? h.at(-1)[0] - h[0][0] : 1;
     return { renderedPerSec: +(f.length / (span / 1000)).toFixed(1), picturesPerSec: +(distinct / (span / 1000)).toFixed(1), worstFreezesMs: gaps.slice(0, 5).map(([ms]) => Math.round(ms)), freezesAt,
+      loadingRuns: runs.length, meanLoadingRunMs: runs.length ? Math.round(runs.reduce((a, b) => a + b, 0) / runs.length) : 0,
+      colorProbe: document.querySelector('.viewer canvas')?.colorProbe?.() ?? null,
       loadingPct: +(100 * loadingMs / span).toFixed(1), lowStreamPct: +(100 * lowMs / span).toFixed(1), longestLoadingMs: Math.round(Math.max(0, ...runs)), engines: [...new Set(h.map((x) => x[2]).filter(Boolean))], errors: [...errors].slice(0, 5),
       loadingReasonsMs: Object.fromEntries(Object.entries(reasons).sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => [k, Math.round(v)])), ...window.qaNetSummary(since) };
   }, pageStart);
@@ -202,6 +204,7 @@ for (let pass = 0; pass < PASSES; pass++) {
   report.passes.push(p);
   console.log(JSON.stringify(p));
   console.log(`HEADLINE ${headline(p)}`);
+  if (p.colorProbe) console.log(`PROBE runs ${p.loadingRuns} (mean ${p.meanLoadingRunMs} ms) | color copies ${p.colorProbe.copies} (${p.colorProbe.demandCopies} asked by a draw) | draws that waited ${p.colorProbe.waits} (${p.colorProbe.demandWaits} on a draw-asked copy) | copy ms p50 ${p.colorProbe.copyMsP50} p95 ${p.colorProbe.copyMsP95} max ${p.colorProbe.copyMsMax}`);
   if (pass < PASSES - 1) await page.waitForTimeout(Number(process.env.CACHE_WAIT ?? 30000));
 }
 // With DIST, Chrome's worker update check bypasses routing: confirm which footage worker actually served the run.
