@@ -133,6 +133,25 @@ result and mix its sound. When a timeline also uses keyframe animation, each win
 to ProRes 4444 and spliced back with `uncoveredParts` before the per-frame bake runs; a transition
 whose own clips are keyframed is refused by name rather than exported as a hard cut.
 
+### Export speed (2026-10-05)
+
+A 115 s 4K-sourced Girls Soccer export at 1080p took 78 minutes; the stage log (`Export … finished after N s: …` in
+the server log) now says where any export spends its time. What changed, and why:
+
+- **Optical flow** (`scripts/optical-flow.py`) seeks to the source window a clip reads instead of decoding the whole
+  file twice, has FFmpeg write the kept frames as raw RGB (a Windows pipe moved 4K 16-bit frames at ~150 MB/s), runs
+  the inverse-warp iteration at motion resolution and warps frames in parallel: 610 s to 12 s for a 1.7 s clip.
+  Export bakes fit the output frame times the clip's largest zoom (`pictureBox`), not the project canvas.
+- **Work outside the range is skipped**: Stabilize, optical flow and compositions ignore clips whose span misses the
+  In/Out range (`outsideRange`). A composition renders only the stretch its parent reads, at the size it covers.
+- **Clips are graded on the canvas they end up on**: fit, grade, crop and pad happen at the clip's output size
+  (never above the project canvas), so a 4K project exported at 1080p no longer grades 4K frames to shrink them.
+- **Keyframed position, zoom, rotation and anchor stream** (`server/streamedTransform.ts`): one `perspective` filter
+  with per-frame corner expressions in the normal pass, instead of a whole-timeline render per frame. It is 8-bit
+  RGB, so only H.264/H.265 exports stream; ProRes and any other keyed property keep the per-frame path.
+- **Stabilize export bakes are kept** in `FRAME_LINE_DATA/stabilize/exports` by content identity (16 GB, oldest out),
+  so a re-export reuses them and the optical-flow cache keyed on them.
+
 `server/transitions.ts` holds the shared overlay pack in `FRAME_LINE_DATA/transitions/`, listed and
 served through authenticated `/api/transitions` endpoints modelled on shared fonts. Ids are pattern
 checked and resolved against the manifest, so no caller-supplied text reaches a filesystem join.
