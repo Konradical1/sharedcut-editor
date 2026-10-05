@@ -1666,3 +1666,11 @@ test('bins: editors create, rename and delete them; a deleted bin’s media go t
   state().setCurrentUser('kyle');
   assert.deepEqual([project().bins, state().media], [before.bins, before.media], 'a locked project and a non-editor change nothing');
 });
+
+test('opening a project lands on its edit even when a composition timeline loads first', () => {
+  const main = state().timelines.find(t => t.projectId === 'city-after-dark')!;
+  store.setState({ timelines: [{ id: 'title-comp', projectId: 'city-after-dark', name: 'Title', duration: 5, composition: true }, ...state().timelines] });
+  state().openProject('the-long-way-home');
+  state().openProject('city-after-dark');
+  assert.equal(state().timelineId, main.id);
+});

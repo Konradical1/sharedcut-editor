@@ -230,8 +230,10 @@ const initialRange = (state: Pick<EditorStore, 'timelines' | 'clips'>, timelineI
   } catch { /* Storage can be missing or blocked; the edit's own length is the fallback. */ }
   return { rangeIn: 0, rangeOut: content > 0 ? Math.min(content, duration) : duration };
 };
+/** A project's own edit, never a composition's inner timeline, whatever order the timelines load in. */
+const masterTimeline = (timelines: Timeline[], projectId: string) => timelines.find(t => t.projectId === projectId && !t.composition) ?? timelines.find(t => t.projectId === projectId);
 const updatedProjects = (state: EditorStore, clips: Clip[]) => {
-  const primaryTimelineId = state.timelines.find(timeline => timeline.projectId === state.projectId)?.id;
+  const primaryTimelineId = masterTimeline(state.timelines, state.projectId)?.id;
   const duration = Math.max(0, ...clips.filter(clip => clip.timelineId === primaryTimelineId).map(clip => clip.start + clip.duration));
   return state.projects.map(project => project.id === state.projectId ? { ...project, duration, modifiedAt: Date.now() } : project);
 };
@@ -717,7 +719,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         set({ media: [...state.media, ...added.media], timelines: [...state.timelines, ...added.timelines], clips: [...state.clips, ...added.clips], tracks: [...state.tracks, ...added.tracks], nodes: [...state.nodes, ...added.nodes], comments: [...state.comments, ...added.comments], operations: [...added.operations, ...state.operations], snapshots: [...added.snapshots, ...state.snapshots] });
       }
       const next = get();
-      const timeline = next.timelines.find(t => t.projectId === id);
+      const timeline = masterTimeline(next.timelines, id);
       if (!timeline) return;
       const selected = next.clips.find(c => c.projectId === id && c.name === 'Neon crossing') ?? next.clips.find(c => c.timelineId === timeline.id);
       const memberIds = next.projects.find(p => p.id === id)!.members.map(member => member.userId);
