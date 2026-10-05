@@ -159,6 +159,11 @@ the server log) now says where any export spends its time. What changed, and why
   code value, with p99 below half a value; this is a numerical approximation, not pixel identity. Maximum, Visually
   lossless, ProRes and internal frame/alpha bakes retain 129³ trilinear sampling. Encoder quality settings are unchanged.
 
+Validation on the same 82.3–103 s section with two parallel passes: 62.5 s before, 41.7 s after; the slowest
+picture pass fell from 32.7 s to 25.2 s. The live 0–115 s export using the server's usual three passes finished
+in 551 s: composition 47 s, reused stabilization 1 s, optical flow 68 s, animation 60 s, final rendering 368 s,
+join 8 s. Compare the matched two-pass section for the code's gain; the full-run total also benefits from reuse.
+
 `server/transitions.ts` holds the shared overlay pack in `FRAME_LINE_DATA/transitions/`, listed and
 served through authenticated `/api/transitions` endpoints modelled on shared fonts. Ids are pattern
 checked and resolved against the manifest, so no caller-supplied text reaches a filesystem join.
