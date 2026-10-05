@@ -602,11 +602,11 @@ export function audioFilters(clip: Clip): string[] {
  * `decode`: the chain reads the original YUV source (not the colour render's RGB), so the clip's matrix and
  * range apply even when its table is an identity and skipped. `fit`: scale to the canvas in that same pass.
  */
-function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset, masks:Map<string,{index:number;timing:string[]}>=new Map(), decode=Boolean(lutPath), fit?: string): string[] {
+function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset, masks:Map<string,{index:number;timing:string[]}>=new Map(), decode=Boolean(lutPath), fit?: string, interpolation = 'trilinear'): string[] {
   const matrix=String(clip.properties.yuvMatrix||asset.colorMatrix||(asset.inputProfile?.startsWith('S-Log')?'bt709':'auto')).replace('bt2020-ncl','bt2020nc');
   const range=clip.properties.dataLevels==='Full'?'pc':clip.properties.dataLevels==='Video'?'tv':'auto';
   const convert = `scale=${fit ? `${fit}:` : ''}in_color_matrix=${["bt709","bt470bg","smpte170m","bt2020nc"].includes(matrix)?matrix:"auto"}:in_range=${range}`;
-  const filters = decode ? [convert, ...(lutPath || !fit ? ['format=gbrapf32le'] : []), ...(lutPath ? [`lut3d=file=${quotedFilterPath(lutPath)}:interp=trilinear`] : [])] : fit ? [`scale=${fit}`] : [];
+  const filters = decode ? [convert, ...(lutPath || !fit ? ['format=gbrapf32le'] : []), ...(lutPath ? [`lut3d=file=${quotedFilterPath(lutPath)}:interp=${interpolation}`] : [])] : fit ? [`scale=${fit}`] : [];
   for (const effect of clip.effects.filter(effect => effectEnabled(clip,effect))) {
     const amount = finite(effect.amount, `${effect.name} amount`, 0, 100);
     if (!amount) continue;
@@ -633,6 +633,14 @@ function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset
   return filters;
 }
 
+/** The pixels a stationary, unrotated layer can cover. Leave a two-pixel conversion border and use even edges. */
+export function blendRegion(width: number, height: number, layerWidth: number, layerHeight: number, shiftX: number, shiftY: number) {
+  const left = Math.trunc((width - layerWidth) / 2 + shiftX), top = Math.trunc((height - layerHeight) / 2 + shiftY);
+  const x = Math.max(0, Math.floor(left / 2) * 2 - 2), y = Math.max(0, Math.floor(top / 2) * 2 - 2);
+  const right = Math.min(width, Math.ceil((left + layerWidth) / 2) * 2 + 2), bottom = Math.min(height, Math.ceil((top + layerHeight) / 2) * 2 + 2);
+  return right > x && bottom > y && (right - x) * (bottom - y) < width * height / 2 ? { x, y, width: right - x, height: bottom - y } : undefined;
+}
+
 /**
  * Composite `layer` onto `under` with a blend mode the way the preview's canvas does (W3C Compositing). The layer is
  * placed on a transparent frame and blended against the picture in float RGB; over an opaque picture that gives
@@ -640,19 +648,24 @@ function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset
  * render (a composition's own) also weighs the backdrop's alpha in, so over nothing the layer stays itself. Add is
  * Porter-Duff plus: min(1, Cb + αs·Cs).
  */
-export function blendFilters(o: { under: string; layer: string; output: string; mode: string; tag: string; width: number; height: number; fps: number; duration: number; x: string; y: string; enable: string; transparent?: boolean }): string[] {
+export function blendFilters(o: { under: string; layer: string; output: string; mode: string; tag: string; width: number; height: number; fps: number; duration: number; x: string; y: string; enable: string; transparent?: boolean; region?: ReturnType<typeof blendRegion> }): string[] {
   const { tag: t, enable } = o, add = o.mode === 'Add', formula = blendModeOf(o.mode)?.ffmpeg;
   if (!formula) throw new Error(`${o.mode} blending is not available.`);
   const colors = [0, 1, 2].map(c => formula.includes('(') ? `c${c}_expr='${formula}'` : `c${c}_mode=${formula}`).join(':');
+  // Small logos once converted and blended the entire output in float RGB on every frame. Keep placement
+  // unchanged, then crop both blend inputs to the same covered pixels before conversion. Transparent
+  // compositions and Add retain their full-frame alpha math; moving and rotated layers supply no region.
+  const region = !o.transparent && !add ? o.region : undefined;
+  const crop = region ? `crop=${region.width}:${region.height}:${region.x}:${region.y},` : '';
   // Add over an opaque picture places the layer on opaque black, which premultiplies it (αs·Cs). The premultiply filter
   // would too, but FFmpeg 9 tags its frames premultiplied and negotiates that onto the next clip's blend, which then
   // premultiplies that clip's layer a second time.
   const placed = [`color=c=black${add && !o.transparent ? '' : '@0'}:s=${o.width}x${o.height}:r=${o.fps}:d=${o.duration},format=rgba[${t}c]`, `[${o.layer}]scale=in_color_matrix=bt709:in_range=tv,format=rgba[${t}p]`,
-    `[${t}c][${t}p]overlay=format=rgb:alpha=straight:x=${o.x}:y=${o.y}:eof_action=pass:repeatlast=0:enable='${enable}',format=gbrapf32le${add && o.transparent ? ',premultiply=inplace=1' : ''}${o.transparent && !add ? ',split=3' : ''}[${t}l]${o.transparent && !add ? `[${t}o][${t}a]` : ''}`];
-  if (!o.transparent) return [...placed, `[${o.under}]split[${t}k][${t}u]`, `[${t}u]scale=in_color_matrix=bt709:in_range=tv,format=gbrapf32le[${t}b]`,
+    `[${t}c][${t}p]overlay=format=rgb:alpha=straight:x=${o.x}:y=${o.y}:eof_action=pass:repeatlast=0:enable='${enable}',${crop}format=gbrapf32le${add && o.transparent ? ',premultiply=inplace=1' : ''}${o.transparent && !add ? ',split=3' : ''}[${t}l]${o.transparent && !add ? `[${t}o][${t}a]` : ''}`];
+  if (!o.transparent) return [...placed, `[${o.under}]split[${t}k][${t}u]`, `[${t}u]${crop}scale=in_color_matrix=bt709:in_range=tv,format=gbrapf32le[${t}b]`,
     // The picture under is opaque, so darken keeps the layer's alpha and addition saturates it to opaque.
     `[${t}l][${t}b]blend=${colors}:c3_mode=${add ? 'addition' : 'darken'}:enable='${enable}',scale=out_color_matrix=bt709:out_range=tv,format=yuva444p10le,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[${t}m]`,
-    `[${t}k][${t}m]overlay=format=yuv444p10:alpha=straight:x=0:y=0:eof_action=pass:repeatlast=0:enable='${enable}'[${o.output}]`];
+    `[${t}k][${t}m]overlay=format=yuv444p10:alpha=straight:x=${region?.x ?? 0}:y=${region?.y ?? 0}:eof_action=pass:repeatlast=0:enable='${enable}'[${o.output}]`];
   if (add) return [...placed, `[${o.under}]format=gbrapf32le,premultiply=inplace=1[${t}b]`, `[${t}b][${t}l]blend=all_mode=addition:enable='${enable}',unpremultiply=inplace=1,format=rgba[${o.output}]`];
   // Over a translucent backdrop the layer's colour becomes (1 − αb)·Cs + αb·B(Cb, Cs) before it goes on top.
   // ponytail: 8-bit like every composition render; a float overlay would lift it when nesting supports HDR.
@@ -1115,7 +1128,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         if (!match || match[1] !== project.id || !request.resolveDir) throw new Error(`${clip.name}: Resolve look is unavailable.`);
         ({ id: lookId, cube: base } = lookCube(await readFile(path.join(request.resolveDir, match[2]), 'utf8')));
       }
-      let videoIndex=index,acesCube:string|undefined;
+      let videoIndex=index,acesCube:string|undefined,acesInterpolation='trilinear';
       const usedMasks=activeSmartMasks(clip,request.nodes),depthKeys=activeDepthKeys(clip,request.nodes),maskStreams=new Map<string,{index:number;timing:string[]}>();
       const exactColor=usedMasks.length>0||depthKeys.length>0||clip.properties.colorPipeline==='nodes-v2'&&hasACES(request.nodes,clip.id);
       if(exactColor&&adjust&&(usedMasks.length||depthKeys.length))throw Error(`${clip.name}: Smart Masks and depth keys need source footage. Grade masked looks on the clips themselves, not on an adjustment clip.`);
@@ -1169,11 +1182,16 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         const colorStage = `Processing color · ${clip.name} (${colorsDone + 1}/${colorClips.length})`;
         request.onStage?.(colorStage);
         if(!usedMasks.length&&!depthKeys.length){
-          // Without a matte every stage is per-pixel, so the exact OCIO grade bakes into a 129³ table. Measured on
-          // S-Log3 4K: 0.04 of an 8-bit step mean error, 1.5 worst pixel, versus ~1 s per frame graded in Python.
+          // Without a matte every stage is per-pixel. Delivery-quality 8-bit exports use 97³ with tetrahedral
+          // sampling (SIMD on x86); three real Canon Log 3 shots differed from 129³ by 0.04–0.06 of an 8-bit
+          // step on average, under half a step at p99. Parsing 129³ in every short pass was a large fixed cost.
+          // Masters, maximum/lossless quality and internal alpha/frame bakes keep the original 129³ table.
           // The table is made only of these three fields (write_cube in color-render.py). The bake is not tied to
           // this pass's signal: another pass or export may be waiting on the same table.
-          acesCube=(await cachedLut(['aces-v1',job.stages,job.inputCube??null,job.managed],async file=>{await run(python,[path.resolve('scripts/color-render.py'),jobPath,'--cube','129',file]);},tables)).file;
+          const delivery = !isProRes && !request.transparent && !request.sampledFrame && !settings.quality?.startsWith('Maximum') && settings.quality !== 'Visually lossless';
+          const size = delivery ? 97 : 129;
+          acesInterpolation = delivery ? 'tetrahedral' : 'trilinear';
+          acesCube=(await cachedLut(['aces-v2',size,job.stages,job.inputCube??null,job.managed],async file=>{await run(python,[path.resolve('scripts/color-render.py'),jobPath,'--cube',String(size),file]);},tables)).file;
           onProgress?.(++colorsDone/colorClips.length*colorBudget);
         } else {
         await run(python,[path.resolve('scripts/color-render.py'),jobPath],{signal:request.signal,jsonProgress:'stderr',onProgress:p=>{
@@ -1235,7 +1253,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       const canvas = Math.min(1, largest / projectWidth), canvasWidth = Math.max(2, Math.round(projectWidth * canvas)), canvasHeight = Math.max(2, Math.round(projectHeight * canvas));
       const fit = `w=${canvasWidth}:h=${canvasHeight}:force_original_aspect_ratio=decrease`;
       const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && !['EQ', 'Compressor', 'Limiter', 'Stabilize', 'Depth'].includes(e.name));
-      video.push(`fps=${fps}`, `trim=duration=${length}`, 'setsar=1', ...videoFilters(clip, lutPath, source.asset, maskStreams, videoIndex === index, fitFirst ? fit : undefined));
+      video.push(`fps=${fps}`, `trim=duration=${length}`, 'setsar=1', ...videoFilters(clip, lutPath, source.asset, maskStreams, videoIndex === index, fitFirst ? fit : undefined, acesInterpolation));
       // After grade and matte (both in source orientation), before crop (measured on what the viewer sees).
       if (p.flipH && !isTitle(clip) && !isShape(clip)) video.push('hflip');
       const left = property('cropLeft', 0, 0, 16384), right = property('cropRight', 0, 0, 16384), top = property('cropTop', 0, 0, 16384), bottom = property('cropBottom', 0, 0, 16384);
@@ -1268,7 +1286,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       const visible = onScreen(offset, offset + length);
       // A transition window composites its two sides normally, as the preview's side canvases do.
       const place = (layer: string, enable: string) => filters.push(...blend === 'Normal' ? [`[${currentVideo}][${layer}]${overlayPlace(shiftedX, shiftedY)}:enable='${enable}'[v${index}]`]
-        : blendFilters({ under: currentVideo, layer, output: `v${index}`, mode: blend, tag: `bm${index}`, width, height, fps, duration, x: `(W-w)/2+${shiftedX}`, y: `(H-h)/2+${shiftedY}`, enable, transparent: request.transparent }));
+        : blendFilters({ under: currentVideo, layer, output: `v${index}`, mode: blend, tag: `bm${index}`, width, height, fps, duration, x: `(W-w)/2+${shiftedX}`, y: `(H-h)/2+${shiftedY}`, enable, transparent: request.transparent,
+          region: !rotation && !motion && !streamed ? blendRegion(width, height, scaledWidth, scaledHeight, shiftedX, shiftedY) : undefined }));
       if (!touching.length) place(`clipv${index}`, visible);
       else {
         // One branch per window plus the body, so the clip outside its transitions is untouched.

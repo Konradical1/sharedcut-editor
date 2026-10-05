@@ -17,6 +17,37 @@ test('native progress reads split JSON from either stream without swallowing fai
   await assert.rejects(run(process.execPath, ['-e', 'console.error("broken encoder");process.exit(1)'], { jsonProgress: 'stderr' }), /broken encoder/);
 });
 
+test('delivery ACES sampling stays close to master color and preserves master paths', { timeout: 60000, skip: !existsSync(process.env.FRAME_LINE_COLOR_PYTHON || venvPython('.venv-color')) }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'render-color-precision-'));
+  try {
+    const input = path.join(dir, 'colors.png');
+    await run(process.env.FFMPEG_PATH || 'ffmpeg', ['-v','error','-y','-f','lavfi','-i','testsrc=s=128x72','-frames:v','1',input]);
+    const clip = { id:'c',projectId:'p',timelineId:'t',trackId:'v',mediaId:'a',name:'Color sample',start:0,duration:1/24,sourceIn:0,color:'red',disabled:false,
+      properties:{colorPipeline:'nodes-v2',inputProfile:'S-Log3',inputGamut:'S-Gamut3.Cine'},effects:[] } as RenderRequest['clips'][number];
+    let id=0; const nodes=starterGrade(clip, undefined, ()=>String(++id));
+    for (const effect of nodes.at(-1)!.effects ?? []) if (effect.type==='cst') Object.assign(effect,{toneMapping:'aces2',gamutMapping:'none'});
+    const request: RenderRequest = { project:{id:'p',resolution:'128 × 72',fps:24} as RenderRequest['project'],timeline:{id:'t',projectId:'p',name:'Test',duration:1/24},clips:[clip],nodes,
+      tracks:[{id:'v',timelineId:'t',name:'Video',kind:'video',number:1,muted:false,hidden:false,solo:false,locked:false,gain:0,pan:0}],
+      assets:[{path:input,asset:{id:'a',projectId:'p',name:'colors',kind:'image',duration:1,fps:24,resolution:'128 × 72',binId:'',size:'',thumbnail:'',status:'ready',progress:100}}],
+      settings:{codec:'H.264',audio:'Disabled'},outputPath:path.join(dir,'unused.mp4') };
+    const sample = async (codec: string, quality: string) => {
+      let pixels: Buffer | undefined;
+      await renderTimeline({...request,settings:{...request.settings,codec,quality},outputPath:path.join(dir,codec.includes('ProRes')?'unused.mov':'unused.mp4'),
+        decoder:async ([command,...args])=>{ pixels=await run(command,args,{binary:true}); }});
+      assert.equal(pixels?.length,128*72*8); return pixels!;
+    };
+    const master = await sample('H.264','Maximum · 50 Mb/s'), delivery = await sample('H.264','High · 20 Mb/s');
+    const errors: number[] = [];
+    for(let i=0;i<master.length;i+=8) for(let c=0;c<3;c++) errors.push(Math.abs(master.readUInt16LE(i+c*2)-delivery.readUInt16LE(i+c*2))/257);
+    errors.sort((a,b)=>a-b);
+    assert.ok(errors.reduce((a,b)=>a+b,0)/errors.length<.2,'Mean difference stays below a fifth of an 8-bit value');
+    assert.ok(errors[Math.floor(errors.length*.99)]<2,'At least 99% of channels stay within two 8-bit values');
+    assert.deepEqual(await sample('H.265 / HEVC','High · 20 Mb/s'),delivery);
+    assert.deepEqual(await sample('H.264','Visually lossless'),master);
+    assert.deepEqual(await sample('Apple ProRes 4444','Automatic'),master);
+  } finally { await rm(dir,{recursive:true,force:true}); }
+});
+
 test('ACES export reports its color stage before encoding, stays monotonic, and finishes a playable file', { timeout: 60000, skip: !existsSync(process.env.FRAME_LINE_COLOR_PYTHON || venvPython('.venv-color')) }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'render-progress-'));
   try {

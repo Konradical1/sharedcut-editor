@@ -96,6 +96,13 @@ test('two Depth clips on screen both get depth, and a reversed clip decodes back
   await until(() => depthState('ca')?.status === 'ready' && depthState('cb')?.status === 'ready');
   // A dissolve: both clips play, a frame each per tick. Each used to stop the other's decode, leaving both bare.
   let preview = createDepthPreview(() => {}), a = 0, b = 0;
+  // Warm both initial windows while paused. Windows timer granularity can make the fake worker's 5 ms
+  // frame delay several times longer; measuring playback before either window is ready tests startup timing.
+  // Repeatedly asking both still catches the regression where each clip cancels the other's decoder.
+  await until(() => {
+    const first = preview.frame('ca', at(64)), second = preview.frame('cb', at(100));
+    return first.state === 'ready' && second.state === 'ready';
+  }, 2000);
   for (let i = 0; i < 60; i++) {
     if (preview.frame('ca', at(64 + i)).state === 'ready') a++;
     if (preview.frame('cb', at(100 + i)).state === 'ready') b++;

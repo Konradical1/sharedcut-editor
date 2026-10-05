@@ -151,6 +151,13 @@ the server log) now says where any export spends its time. What changed, and why
   RGB, so only H.264/H.265 exports stream; ProRes and any other keyed property keep the per-frame path.
 - **Stabilize export bakes are kept** in `FRAME_LINE_DATA/stabilize/exports` by content identity (16 GB, oldest out),
   so a re-export reuses them and the optical-flow cache keyed on them.
+- **Final compositing avoids full-frame float blends for small stationary layers.** Normal placement stays the same;
+  both blend inputs are cropped to the layer's visible bounds before float conversion. Add, transparent compositions,
+  rotating and moving layers retain the full-frame path. Tests compare all other blend modes across fades and clipped edges.
+- **Automatic/High H.264/H.265 ACES tables use 97³ tetrahedral sampling.** Parsing a separate 129³ text table for every
+  short graded clip was a large fixed cost. On three real Canon Log 3 shots the change averaged 0.04–0.06 of an 8-bit
+  code value, with p99 below half a value; this is a numerical approximation, not pixel identity. Maximum, Visually
+  lossless, ProRes and internal frame/alpha bakes retain 129³ trilinear sampling. Encoder quality settings are unchanged.
 
 `server/transitions.ts` holds the shared overlay pack in `FRAME_LINE_DATA/transitions/`, listed and
 served through authenticated `/api/transitions` endpoints modelled on shared fonts. Ids are pattern

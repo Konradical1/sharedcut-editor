@@ -322,6 +322,7 @@ export const topics: Record<string, string> = {
     `presets (codec · size · quality): ${PRESETS.filter(p => p.name !== 'Custom').map(presetLine).join(' | ')} | Custom = your overrides. No preset = Quick Export at the project's own size (Deliver's default). A preset size of another shape (vertical project) falls back to the project size. Changing codec or size makes it Custom.`,
     `codec: ${CODECS.join(' | ')}. ProRes writes .mov, the rest .mp4 (the name's extension follows). Short forms work: h264, h265, prores, prores4444.`,
     `quality (H.264/H.265; ProRes ignores it): ${QUALITIES.join(' | ')}. Default ${PRESETS[0].quality}. Short: auto, high, max, lossless.`,
+    'Automatic/High H.264/H.265 exports load smaller ACES grading tables for faster rendering; Maximum, Visually lossless and ProRes keep master precision. Small stationary blend layers process only their covered area. These paths also apply to job export.',
     `audio: ${AUDIO.join(' | ')}. Default ${AUDIO[0]}; Linear PCM needs ProRes. Short: aac320, aac192, pcm24, pcm16, off.`,
     `fps: default the project's; Deliver offers ${FPS.join(', ')} (server takes 1–120).`,
     `resolution "W×H": the project's aspect (±0.01), even sides 16–4096. Deliver offers the project size and ${SIZES.join(', ')} of that shape.`,
