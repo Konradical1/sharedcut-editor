@@ -31,7 +31,7 @@ const ORIGIN = process.env.ORIGIN ?? 'https://sharedcut.com';
 const PROJECT = process.env.PROJECT ?? 'project-7694cce382b0915d28eed8117c563129367ccda0';
 const TIMELINE = process.env.TIMELINE ?? 'Part 1 v2';
 const SECONDS = Number(process.env.SECONDS ?? 30), PASSES = Number(process.env.PASSES ?? 2), FPS = Number(process.env.FPS ?? 30);
-const START_EDITS = Number(process.env.START_EDITS ?? 0);
+const START_SECONDS = Number(process.env.START_SECONDS ?? 0);
 const HW_THREADS = Number(process.env.HW_THREADS ?? 0), HW_MEMORY = Number(process.env.HW_MEMORY ?? 0);
 const DOWN_MBPS = Number(process.env.DOWN_MBPS ?? 0), RTT_MS = Number(process.env.RTT_MS ?? 0), CPU_RATE = Number(process.env.CPU_RATE ?? 1);
 const out = process.argv[2] ?? 'artifacts/qa/remote-playback.json';
@@ -148,8 +148,8 @@ for (let pass = 0; pass < PASSES; pass++) {
   }
   // The editor has no Home shortcut: step back edit by edit so every pass plays the same opening seconds.
   for (let i = 0; i < 500 && timecode(await page.locator('.transport-time').textContent()) > 0; i++) await page.getByRole('button', { name: /^(Previous edit|First frame)$/ }).first().click();
-  // START_EDITS=N plays from the Nth edit instead of the opening (the timeline's later stretches are not the graded opening).
-  for (let i = 0; i < START_EDITS; i++) await page.getByRole('button', { name: 'Next edit', exact: true }).first().click();
+  // START_SECONDS=N plays from the first edit point at or after N seconds instead of the opening (later stretches are not the graded opening).
+  for (let i = 0; i < 1500 && START_SECONDS > 0 && timecode(await page.locator('.transport-time').textContent()) < START_SECONDS; i++) await page.getByRole('button', { name: 'Next edit', exact: true }).first().click();
   await page.evaluate(() => window.qaReset());
   const cdp = process.env.PROFILE && pass === PASSES - 1 ? await context.newCDPSession(page) : undefined;
   if (cdp) { await cdp.send('Profiler.enable'); await cdp.send('Profiler.setSamplingInterval', { interval: 500 }); await cdp.send('Profiler.start'); }

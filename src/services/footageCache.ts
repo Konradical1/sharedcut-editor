@@ -39,10 +39,6 @@ const STREAM_GUESS = 1.5e6;
 // A failed file is tried again after 2 s, 4, 8 and so on, but never less often than once a minute: a server restart or a
 // bad stretch of line is over in seconds, and "never again" would leave the clip unfilled until the page is reloaded.
 const RETRY_MAX_MS = 60_000;
-// While playing, background downloads (the rest of long clips, files far from the playhead) take line capacity the
-// picture decoders need, unless the line carries what playback reads at least this many times over.
-const AMPLE_LINK = 4;
-let playing = false;
 let shown = '', notified = -Infinity, notifyTimer: ReturnType<typeof setTimeout> | undefined;
 /** Subscribers re-render at most four times a second, and only when something they show changed. */
 function notify() {
@@ -186,7 +182,7 @@ export function update(state: TimelineState, options: Options, urlFor: (asset: M
   latest = [state, options, urlFor];
   const now = performance.now();
   if (now - lastUpdate < 400) return;
-  lastUpdate = now; plannedHead = state.playhead; playing = !!state.playing;
+  lastUpdate = now; plannedHead = state.playhead;
   const nextDisabled = state.settings.footageCache === false;
   if (nextDisabled !== disabled && supported()) navigator.serviceWorker.controller?.postMessage?.({ type: 'footage-enabled', enabled: !nextDisabled });
   disabled = nextDisabled;
@@ -339,30 +335,6 @@ async function loadLayout(url: string, signal: AbortSignal): Promise<Layout> {
   return index;
 }
 const storedBytes=()=>[...stored.values()].reduce((sum,chunks)=>sum+[...chunks.values()].reduce((n,size)=>n+size,0),0);
-/** Playback reads the shots at the playhead and the cuts about to open at the same time; a shot further on is not read yet. */
-const READ_TOGETHER_S = 2;
-/** A line whose chunks all arrive in under 50 ms never records a rate, but this much footage across it proves it is fast. */
-const UNTIMED_FAST_BYTES = 8 * CHUNK;
-const roomRate = () => linkRate() || (transferred >= UNTIMED_FAST_BYTES ? Infinity : 0);
-/** Bytes per second playback reads from the files it reads together; 0 until every one of their indexes is read. */
-function liveNeed(entries: Wanted[]) {
-  let need = 0;
-  for (const url of new Set(entries.filter(entry => !entry.background && entry.order < READ_TOGETHER_S).map(entry => entry.url))) {
-    const layout = indexes.get(url);
-    if (!layout) return 0;
-    if ('tracks' in layout) need += bitrateOf(layout);
-  }
-  return need;
-}
-/**
- * How many background downloads may run beside the urgent ones. Paused, or on a line with room to spare: as many as
- * there are slots. Playing on a line without it, playback's own reads come first: none start while urgent bytes are
- * outstanding, and only one at a time after, so a chunk the decoder needs next never shares the line with four others.
- */
-export function backgroundSlots(isPlaying: boolean, rate: number, need: number, urgentPending: boolean) {
-  if (!isPlaying || !need || rate >= AMPLE_LINK * need) return Infinity;
-  return urgentPending ? 0 : 1;
-}
 function pump() {
   clearTimeout(retryTimer);
   if (disabled || clearing || !controlled) return;
@@ -382,23 +354,15 @@ function pump() {
     return rest === undefined ? [] : [{ entry, index, chunk: rest, priority: (later ? 3e5 : 1e5) + away }];
   }).sort((a, b) => a.priority - b.priority);
   const nearBudget=storedBytes()>=CAP_BYTES*.9;
-  const urgent = (task: { entry: Wanted; priority: number }) => !task.entry.background && task.priority < 1e5;
-  // A shot whose download is waiting out a failure holds nothing back: the rest keeps filling meanwhile.
-  const urgentUrls = new Set(tasks.filter(task => urgent(task) && (failures.get(task.entry.url)?.next ?? 0) <= Date.now()).map(task => task.entry.url));
-  const slots = backgroundSlots(playing, roomRate(), liveNeed(entries), urgentUrls.size > 0);
-  let deferredRunning = new Set(tasks.filter(task => !urgent(task) && inFlight.has(task.entry.url) && !urgentUrls.has(task.entry.url)).map(task => task.entry.url)).size;
   // Several files at once, one request each: a dense multi-layer edit reaches every next cut in parallel.
-  for (const task of tasks) {
-    const { entry, index, chunk, priority } = task, deferred = !urgent(task);
+  for (const { entry, index, chunk, priority } of tasks) {
     if(nearBudget&&priority>=1e5)continue;
-    if (deferred && deferredRunning >= slots) continue;
     if (inFlight.size >= concurrency) break;
     if (inFlight.has(entry.url)) continue;
     const failure = failures.get(entry.url);
     if (failure && failure.next > Date.now()) continue;
     const controller = new AbortController(), epoch = generation;
     inFlight.set(entry.url, controller);
-    if (deferred) deferredRunning++;
     transferStart ||= performance.now();
     const timeout = setTimeout(() => controller.abort(new Error('Media download timed out')), 30000);
     const run = async () => {
