@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
-import type { Clip, MediaAsset, Track } from '../state/models.ts';
+import type { Clip, GradeNode, MediaAsset, Track } from '../state/models.ts';
 import { gradeValues } from './grade.ts';
-import { efficientPlayback, focusClip, gradePixels, playbackLayers, playbackUrl, projectSize, sourceTime, upcomingClips } from './playback.ts';
+import { efficientPlayback, focusClip, gradePixels, playbackLayers, playbackUrl, projectSize, sourceTime, upcomingClips, usesColor } from './playback.ts';
 
 test('preview quality selects a smaller stream, audio selects its own stream, and old imports fall back', () => {
   const asset = { sourceUrl: '/original', proxyUrl: '/full', proxyVariants: { '1/2': '/half', '1/4': '/quarter' }, audioProxyUrl: '/audio' } as unknown as MediaAsset;
@@ -271,6 +271,20 @@ test('warm-up opens the next cuts on every layer within the horizon, soonest fir
   assert.equal(kind(stalled, false).length, 4);
   const lean = upcomingClips({ ...state, tracks: dense, clips: denseClips }, new Set(), true);
   assert.deepEqual([kind(lean, true).length, kind(lean, false).length], [2, 4], 'efficient mode keeps two pictures but still warms the next sounds');
+});
+
+test('a clip uses the colour pipeline for a grade, a look or an input interpretation, and not for plain footage', () => {
+  const clip = (properties: Record<string, unknown> = {}) => ({ id: 'c', properties }) as unknown as Clip;
+  const node = (enabled: boolean) => ({ enabled }) as unknown as GradeNode;
+  assert.equal(usesColor(clip(), []), false);
+  assert.equal(usesColor(clip(), [node(false)]), false, 'a disabled node grades nothing');
+  assert.equal(usesColor(clip(), [node(false), node(true)]), true);
+  assert.equal(usesColor(clip({ resolveLookUrl: '/api/projects/p/resolve/x.cube' }), []), true);
+  assert.equal(usesColor(clip({ inputExposure: 1 }), []), true);
+  assert.equal(usesColor(clip({ inputExposure: 0, inputTemperature: 0 }), []), false);
+  assert.equal(usesColor(clip({ yuvMatrix: 'bt709' }), []), true);
+  assert.equal(usesColor(clip({ dataLevels: 'Auto' }), []), false);
+  assert.equal(usesColor(clip({ dataLevels: 'Full' }), []), true);
 });
 
 /** attachPlayback against fake media elements, a manual clock and a manual frame pump. */

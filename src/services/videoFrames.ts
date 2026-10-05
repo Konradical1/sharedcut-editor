@@ -1,8 +1,29 @@
-/** Explicitly decoded pictures. Encoded bytes remain in the automatic persistent footage cache. */
-export function createVideoFrames(url: string, fps: number, changed: () => void, cacheEnabled = true) {
+/** The displayed pictures prepare() always names (the one on screen and the next two); a deeper look-ahead is opt-in. */
+export const NEAR_PICTURES = 3;
+/** A graded layer's colour copy takes 20-100 ms and up to 300 ms on a slow computer: copy this far ahead of the clock, within a byte budget. */
+const AHEAD_SECONDS = .25, AHEAD_BYTES = 16 * 1024 ** 2, AHEAD_MAX = 10;
+
+/** How many displayed pictures (one every `step` source seconds) prepare() names when asked to look deep. Never fewer than NEAR_PICTURES. */
+export function aheadCount(step: number, frameBytes: number): number {
+  const byTime = Math.ceil(AHEAD_SECONDS / Math.max(step, 1e-3) - 1e-9), byBytes = frameBytes > 0 ? Math.floor(AHEAD_BYTES / frameBytes) : NEAR_PICTURES;
+  return Math.max(NEAR_PICTURES, Math.min(AHEAD_MAX, byTime, byBytes));
+}
+
+/** Is the source picture [start, end) one a clock stepping from `target` by `step` will show? Frames the clock steps over are never drawn. */
+export function isShownPicture(start: number, end: number, target: number, step: number): boolean {
+  // Timestamps are whole microseconds, so a picture that starts on a clock step can read a hair late: allow 10 µs.
+  const index = Math.max(0, Math.ceil((start - target - 1e-5) / Math.max(step, 1e-6)));
+  return target + index * step < end - 1e-6;
+}
+
+/**
+ * Explicitly decoded pictures. Encoded bytes remain in the automatic persistent footage cache.
+ * `arrived` is called with a picture the clock will show within AHEAD_SECONDS as it lands, so its colour copy starts at once.
+ */
+export function createVideoFrames(url: string, fps: number, changed: () => void, cacheEnabled = true, arrived?: (frame: VideoFrame) => void) {
   const worker = new Worker(new URL('./videoDecodeWorker.ts', import.meta.url), { type: 'module' });
   const frames: VideoFrame[] = [];
-  let target = 0, generation = 0, pending = 0, disposed = false, ended = false, error = '', frameBytes = 0;
+  let target = 0, generation = 0, pending = 0, disposed = false, ended = false, error = '', frameBytes = 0, step = 1 / fps;
   const start = (frame: VideoFrame) => frame.timestamp / 1e6;
   const end = (frame: VideoFrame) => start(frame) + (frame.duration ? frame.duration / 1e6 : 1 / fps);
   const clear = () => { for (const frame of frames) frame.close(); frames.length = 0; };
@@ -22,7 +43,8 @@ export function createVideoFrames(url: string, fps: number, changed: () => void,
       pending = Math.max(0, pending - 1);
       const frame: VideoFrame = message.frame;
       try { frameBytes = frame.allocationSize(); } catch { frameBytes = frame.codedWidth * frame.codedHeight * 4; }
-      if (end(frame) <= target + 1e-6) frame.close(); else frames.push(frame);
+      if (end(frame) <= target + 1e-6) frame.close();
+      else { frames.push(frame); if (arrived && start(frame) < target + AHEAD_SECONDS && isShownPicture(start(frame), end(frame), target, step)) arrived(frame); }
       fill(); changed();
     } else if (message.type === 'end') { pending = 0; ended = true; changed(); }
     else if (message.type === 'error') { pending = 0; error = message.error || 'Video decoding failed.'; changed(); }
@@ -51,9 +73,12 @@ export function createVideoFrames(url: string, fps: number, changed: () => void,
       // Select the actual presentation interval, not the nearest snapshot or a source-FPS estimate.
       return frameAt(time);
     },
-    prepare(time: number, step = 1 / fps) {
+    /** The next displayed pictures, nearest first; `deep` names the whole look-ahead window rather than the next three. */
+    prepare(time: number, displayStep = 1 / fps, deep = false) {
       // Prepare the next displayed samples, not just adjacent source frames (e.g. 60 fps into 24 fps).
-      return [...new Set([0,1,2].map(offset=>frameAt(time+offset*step)).filter((frame):frame is VideoFrame=>!!frame))];
+      step = displayStep;
+      const count = deep ? aheadCount(displayStep, frameBytes) : NEAR_PICTURES;
+      return [...new Set(Array.from({ length: count }, (_, offset) => frameAt(time + offset * displayStep)).filter((frame): frame is VideoFrame => !!frame))];
     },
     dispose() { disposed = true; worker.terminate(); clear(); },
   };

@@ -15,7 +15,7 @@ import { effectValue, effectEnabled, detailPixels, loudnessTarget } from './effe
 import { eqBiquads, kWeighting, loudnessWindow } from './audioDsp.ts';
 import type { Clip, GradeNode, MediaAsset, Project, Settings, Timeline, Track } from '../state/models.ts';
 import { gradeValues } from './grade.ts';
-import { createVideoFrames } from './videoFrames.ts';
+import { createVideoFrames, NEAR_PICTURES } from './videoFrames.ts';
 import { createScrubFrames } from './scrubFrames.ts';
 import { createColorPreview, ColorPending } from './colorPreview.ts';
 import { createFlowPreview } from './flowPreview.ts';
@@ -65,6 +65,8 @@ const QUIET_SEEK_MS = 600;
 const LAYER_RETRY_MS = 2000, LAYER_RETRY_MAX_MS = 30000;
 /** Paused scrub decoders kept open, least recently used first out. */
 const SCRUB_POOL = 6;
+/** New look-ahead colour copies a tick may start beyond the next three pictures, across all layers (a burst of GPU readbacks would stall the tick). */
+const MAX_AHEAD_COPIES = 2;
 
 export function efficientPlayback(mode: Settings['performanceMode'] | undefined, device: { hardwareConcurrency?: number; deviceMemory?: number } = typeof navigator === 'undefined' ? {} : navigator) {
   if (mode === 'On') return true;
@@ -213,6 +215,12 @@ export function upcomingClips(state: Pick<PlaybackState, 'clips' | 'tracks' | 'm
   const chosen = [...lanes.values()].flatMap(lane => lane.sort((a, b) => a.start - b.start).slice(0, efficient || stalled ? 1 : 2)).sort(order);
   const cap = efficient ? EFFICIENT_WARM_CAP : WARM_CAP;
   return [...chosen.filter(video).slice(0, cap.video), ...chosen.filter(clip => !video(clip)).slice(0, cap.audio)].sort(order);
+}
+
+/** Does this clip's picture go through the colour pipeline: a grade, a look, or an input interpretation? */
+export function usesColor(clip: Clip, nodes: GradeNode[]): boolean {
+  const p = clip.properties;
+  return !!p.resolveLookUrl || nodes.some(node => node.enabled) || !!Number(p.inputExposure) || !!Number(p.inputTemperature) || !!p.yuvMatrix || (!!p.dataLevels && p.dataLevels !== 'Auto');
 }
 
 export function gradePixels(pixels: Uint8ClampedArray, grade: ReturnType<typeof gradeValues>) {
@@ -447,7 +455,11 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     if(decoder.frames?.failed){decoder.frames.dispose();decoder.frames=undefined;decoder.framesFailed=true;}
     if (decoder.framesFailed || !(media instanceof HTMLVideoElement) || typeof VideoDecoder==='undefined' || typeof Worker==='undefined' || !/\.mp4(?:\?|$)/i.test(decoder.url) || clip.properties.reverse || clip.properties.freeze || Number(clip.properties.speed??100)>200) return undefined;
     media.pause(); media.preload='none';
-    return decoder.frames??=createVideoFrames(decoder.url,fps,()=>{dirty=true;},cacheEnabled);
+    // A graded layer's picture is copied for the colour pipeline as it lands, not at the next tick (see aheadCopies in tick).
+    return decoder.frames??=createVideoFrames(decoder.url,fps,()=>{dirty=true;},cacheEnabled,frame=>{
+      const now=getState(),current=byId(now.clips).get(clip.id)??clip;
+      if(now.playing&&color&&usesColor(current,nodesOf(now.nodes,clip.id)))color.prepare(media,frame);
+    });
   };
   const draw = (target: CanvasRenderingContext2D, clip: Clip, width: number, height: number, projectWidth: number, projectHeight: number, time: number, fps: number) => {
     const p=clip.properties;
@@ -516,6 +528,17 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // layer drawn last, which a logo or title on top pins; the picture counters read this instead.
     const pictureStamps: string[] = [];
     let missing = false, loading = false, picture = false, warning = '', autoplayBlocked = false;
+    // Playing, a graded layer copies the raw planes of the next pictures (0.25 s of display) ahead of the clock, so the copy is done
+    // when the picture is drawn; at most MAX_AHEAD_COPIES new ones a tick across all layers. The next three always are, as before.
+    let aheadCopies = 0;
+    const deepFor = (clip: Clip) => state.playing && !!color && usesColor(clip, nodesOf(state.nodes, clip.id));
+    const prepareColor = (media: HTMLVideoElement, list: VideoFrame[]) => {
+      for (const [index, frame] of list.entries()) {
+        const ahead = index >= NEAR_PICTURES;
+        if (ahead && aheadCopies >= MAX_AHEAD_COPIES) break;
+        if (color?.prepare(media, frame) && ahead) aheadCopies++;
+      }
+    };
     // Layers drawn around this frame because they failed, by decoder or transition: the rest of the picture and
     // the sound carry on, and the viewer names them with a Retry instead of stopping the playhead.
     const skipped = new Map<string, string>();
@@ -752,7 +775,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
             if(element.readyState>=2)failures.delete(soundId);
           }
         }
-        for(const frame of frames.prepare(pictureTime,Math.max(.001,rate*Number(clip.properties.speed??100)/100)/previewFps))color?.prepare(media,frame);
+        prepareColor(media,frames.prepare(pictureTime,Math.max(.001,rate*Number(clip.properties.speed??100)/100)/previewFps,deepFor(clip)));
         if(!queuedFrame){
           decoder.waitingSince??=performance.now();
           // Only a link too slow for the file is a reason for the smaller one (preferLowStream knows the line and what is
@@ -1059,7 +1082,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
             if(sound){warmIds.add(`${clip.id}:audio`);const element=sound.element as HTMLMediaElement;element.pause();element.muted=true;if(element.readyState>=1&&!element.seeking&&Math.abs(element.currentTime-time)>.05)seeks.push([element,time]);}
           }
           media.muted=true;frames.update(time);
-          for(const frame of frames.prepare(time,Math.max(.001,Number(clip.properties.speed??100)/100)/previewFps))color?.prepare(media as HTMLVideoElement,frame);
+          prepareColor(media as HTMLVideoElement,frames.prepare(time,Math.max(.001,Number(clip.properties.speed??100)/100)/previewFps,deepFor(clip)));
           continue;
         }
         media.preload='auto';

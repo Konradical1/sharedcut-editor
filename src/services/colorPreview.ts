@@ -156,8 +156,11 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
   const decoded=new WeakMap<HTMLVideoElement,{pending?:Decoded;ready?:Decoded}>();let lastFrame:Decoded|undefined;
   // Measurement only: how long each raw-plane copy took, and how often a draw had to ask for one itself (no earlier prepare) or wait.
   const probe=createCopyProbe();
+  let started=0;
   const frameFor=(video:HTMLVideoElement,snapshot?:VideoFrame,demand=false)=>{
     if(nativeFrames.has(video))return undefined;
+    // A picture already copied or being copied needs neither a clone nor a lookup: its timestamp never changes.
+    if(snapshot){const known=snapshots.get(snapshot);if(known&&(known.pending||known.ready))return known.ready??known.pending!;}
     let frame:VideoFrame;
     try { frame=snapshot?snapshot.clone():new VideoFrame(video); } catch { nativeFrames.add(video);return undefined; }
     const state=(snapshot?snapshots.get(snapshot):decoded.get(video))??{};
@@ -168,7 +171,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     if(!['I420','I422','I444','NV12','I420P10','I422P10','I444P10','I420P12','I422P12','I444P12'].includes(current.format)){frame.close();nativeFrames.add(video);return undefined;}
     let buffer:Uint8Array<ArrayBuffer>;
     try { buffer=new Uint8Array(frame.allocationSize()); } catch { frame.close();nativeFrames.add(video);return undefined; }
-    state.pending=current;
+    state.pending=current;started++;
     current.requestedAt=performance.now();current.demand=demand;
     // Keep presenting the completed snapshot while the next GPU readback is in flight.
     Promise.resolve().then(()=>frame.copyTo(buffer)).then(layout=>{current.layout=layout;current.data=buffer;}).catch(()=>{nativeFrames.add(video);}).finally(()=>{probe.copied(performance.now()-current.requestedAt!,!!current.demand);state.ready=current;state.pending=undefined;frame.close();onReady();});
@@ -181,8 +184,11 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
   return {
     preload,
     probe:probe.read,
-    prepare(video: HTMLVideoElement, snapshot?: VideoFrame) {
+    /** Starts the raw-plane copy of this picture if none is under way; true when it started one. */
+    prepare(video: HTMLVideoElement, snapshot?: VideoFrame): boolean {
+      const before = started;
       if (typeof VideoFrame !== 'undefined' && (snapshot || video.readyState >= 2 && !video.seeking)) frameFor(video,snapshot);
+      return started !== before;
     },
     draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame) {
       const key=preload(clip,asset),look=key?looks.get(key):neutral;
@@ -295,7 +301,7 @@ function createSoftwareColorPreview(onReady:()=>void) {
     return key;
   };
   return {
-    preload,probe:createCopyProbe().read,prepare(_video:HTMLVideoElement,_snapshot?:VideoFrame){},
+    preload,probe:createCopyProbe().read,prepare(_video:HTMLVideoElement,_snapshot?:VideoFrame):boolean{return false;},
     draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame){
       const key=preload(clip,asset),look=key?looks.get(key):undefined;
       if(look instanceof Error)throw look;if(key&&!look)throw new ColorPending('Preparing color…');
