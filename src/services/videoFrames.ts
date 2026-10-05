@@ -44,7 +44,11 @@ export function createVideoFrames(url: string, fps: number, changed: () => void,
       const frame: VideoFrame = message.frame;
       try { frameBytes = frame.allocationSize(); } catch { frameBytes = frame.codedWidth * frame.codedHeight * 4; }
       if (end(frame) <= target + 1e-6) frame.close();
-      else { frames.push(frame); if (arrived && start(frame) < target + AHEAD_SECONDS && isShownPicture(start(frame), end(frame), target, step)) arrived(frame); }
+      else {
+        frames.push(frame);
+        // A copy that cannot start here is retried by the next tick's prepare; it must never cost the picture its place in the queue.
+        if (arrived && start(frame) < target + AHEAD_SECONDS && isShownPicture(start(frame), end(frame), target, step)) { try { arrived(frame); } catch { /* retried by prepare */ } }
+      }
       fill(); changed();
     } else if (message.type === 'end') { pending = 0; ended = true; changed(); }
     else if (message.type === 'error') { pending = 0; error = message.error || 'Video decoding failed.'; changed(); }

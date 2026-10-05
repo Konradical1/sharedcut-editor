@@ -99,6 +99,11 @@ test('pictures about to be shown are announced as they land, and prepare looks a
     const deep = queue.prepare(0, 1 / 30, true);
     assert.equal(deep.length, 8, 'a deep look names the eight shown pictures');
     assert.ok(deep.every((frame, i) => !i || frame.timestamp > deep[i - 1].timestamp), 'nearest first');
+    const failing = createVideoFrames('/api/media/a/files/stream.mp4', 60, () => {}, true, () => { throw new Error('copy could not start'); });
+    try {
+      failing.prepare(0, 1 / 30); failing.update(0); await flush();
+      assert.equal(failing.prepare(0, 1 / 30).length, 3, 'an arrival hook that throws leaves every picture in the queue');
+    } finally { failing.dispose(); }
   } finally {
     queue.dispose(); for (const [key, value] of originals) { if (value) Object.defineProperty(globalThis, key, value); else Reflect.deleteProperty(globalThis, key); }
   }
