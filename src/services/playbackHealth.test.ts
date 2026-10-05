@@ -211,6 +211,12 @@ test('footage playing under a logo counts every picture, and a freeze frame unde
   assert.ok((unaware.reporter.take() as PlaybackReport).worstFreezeMs > 5_000, 'without the hint a repeated footage picture reads as a freeze');
 });
 
+test('a logo drawn on top of footage does not set the target rate: the footage clip does', () => {
+  // 24p footage (v1) under a logo in a 30 fps project: the logo's still image has no rate of its own.
+  const r = rig({ targetFps: picture => picture.clipId === 'v1' ? 24 : 30 }); playUnderLogo(r, 11_000);
+  assert.equal((r.reporter.take() as PlaybackReport).targetFps, 24);
+});
+
 test('nothing is built or sent while sharing is off, and sharing back on resumes at once', () => {
   const r = rig();
   r.state.sharing = false;
@@ -312,6 +318,17 @@ test('the player writes the picture attributes the reporter reads from the frame
   assert.match(source, /canvas\.dataset\.pictureStamp = pictureStamps\.join\('\|'\);/);
   assert.match(source, /canvas\.dataset\.playbackEngine=engine;/);
   assert.match(source, /canvas\.dataset\.automaticLow=String\(automaticLow\);/);
+});
+
+test('a graded video-element layer re-stamps its picture with the colour copy that was actually drawn', () => {
+  // The stamp is first written from element.currentTime, before the colour draw. On the native element path the copy can lag
+  // the element, so the entry pushed for this layer (by index, not "the last one") is rewritten after the draw, as sourceTimestamp is.
+  // Without it a slow copy shows 30 pictures/s of element time while the screen changes 12 times a second. Pinned like the lines above:
+  // no test builds the stamp inside the player.
+  const source = readFileSync(new URL('./playback.ts', import.meta.url), 'utf8');
+  assert.match(source, /const stampAt = [^;\r\n]*pictureStamps\.push\(`\$\{clip\.id\}@\$\{sourceTimestamp\}`\) - 1 : -1;/);
+  assert.match(source, /finishLayer\(framed,asset,time,layerTarget,element instanceof HTMLVideoElement\?element:undefined,warp,queuedFrame,flip,stampAt\);/);
+  assert.match(source, /if\(element\)\{sourceTimestamp=result\.dataset\.sourceTimestamp \?\? '';if\(stampAt>=0\)pictureStamps\[stampAt\]=`\$\{clip\.id\}@\$\{sourceTimestamp\}`;\}/);
 });
 
 test('the Settings switch writes the key the reporter reads, and the harness marks its runs', () => {

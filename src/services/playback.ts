@@ -455,7 +455,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     if(decoder.frames?.failed){decoder.frames.dispose();decoder.frames=undefined;decoder.framesFailed=true;}
     if (decoder.framesFailed || !(media instanceof HTMLVideoElement) || typeof VideoDecoder==='undefined' || typeof Worker==='undefined' || !/\.mp4(?:\?|$)/i.test(decoder.url) || clip.properties.reverse || clip.properties.freeze || Number(clip.properties.speed??100)>200) return undefined;
     media.pause(); media.preload='none';
-    // A graded layer's picture is copied for the colour pipeline as it lands, not at the next tick (see aheadCopies in tick).
+    // A graded layer's picture is copied for the colour pipeline as it lands, not at the next tick. Arrival shares aheadCount's time and byte budget
+    // (videoFrames.ts), not tick's MAX_AHEAD_COPIES cap; the pictures beyond that are copied by tick.
     return decoder.frames??=createVideoFrames(decoder.url,fps,()=>{dirty=true;},cacheEnabled,frame=>{
       const now=getState(),current=byId(now.clips).get(clip.id)??clip;
       if(now.playing&&color&&usesColor(current,nodesOf(now.nodes,clip.id)))color.prepare(media,frame);
@@ -860,7 +861,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       const sourceWidth = queuedFrame?.displayWidth ?? (element instanceof HTMLVideoElement ? element.videoWidth : element.naturalWidth);
       const sourceHeight = queuedFrame?.displayHeight ?? (element instanceof HTMLVideoElement ? element.videoHeight : element.naturalHeight);
       if (!sourceWidth || !sourceHeight) continue;
-      if (queuedFrame || element instanceof HTMLVideoElement) pictureStamps.push(`${clip.id}@${sourceTimestamp}`);
+      const stampAt = queuedFrame || element instanceof HTMLVideoElement ? pictureStamps.push(`${clip.id}@${sourceTimestamp}`) - 1 : -1;
       layerContext.clearRect(0, 0, width, height);
       const fit = Math.min(width / sourceWidth, height / sourceHeight);
       layerContext.drawImage(queuedFrame??element, (width - sourceWidth * fit) / 2, (height - sourceHeight * fit) / 2, sourceWidth * fit, sourceHeight * fit);
@@ -870,7 +871,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       // While the analysis runs, hold the original at the crop the solve will apply so the framing never jumps.
       const framed = stabilizeFx && !stabilizeSolveFor ? {...clip, properties:{...clip.properties, zoom: Number(clip.properties.zoom ?? 100) * stabilizeZoom(stabilizeSettings(original, stabilizeFx))}} : clip;
       const warp = stabilizeSolveFor ? {solve:stabilizeSolveFor,time:sourceTime(original,time,sourceFps,asset.duration||Infinity),sourceWidth,sourceHeight} : undefined;
-      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip);
+      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip,stampAt);
     }
     flush(Infinity);
     };
@@ -879,7 +880,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
      *  matte on the stabilized frame instead of the original framing. */
     const warpTransform = (warp:LayerWarp) => stabilizeLayerTransform(warp.solve,warp.time,width,height,warp.sourceWidth,warp.sourceHeight);
     const mirrorLayer = () => { layerContext.save(); layerContext.setTransform(-1, 0, 0, 1, width, 0); layerContext.globalCompositeOperation = 'copy'; layerContext.drawImage(layer, 0, 0); layerContext.restore(); };
-    const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp,snapshot?:VideoFrame,flip=false) => {
+    const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp,snapshot?:VideoFrame,flip=false,stampAt=-1) => {
       let masks=new Map<string,SmartMaskPixels>();
       try {
         const nodes = evaluateNodes(nodesOf(state.nodes, clip.id),focusing?.clip??clip,focusing?.time??time).filter(node=>node.enabled);
@@ -917,7 +918,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           color ??= createColorPreview(()=>{dirty=true;});
           const previewAsset=element?.src.includes('/files/')?{...asset,colorMatrix:'bt709'}:asset;
           const result = color.draw(layer,clip,previewAsset,nodes,element,sampleTime=>loadMasks(element?sampleTime:sourceTime(clip,time,asset.fps||24,asset.duration)),snapshot);
-          if(element)sourceTimestamp=result.dataset.sourceTimestamp ?? '';
+          // The copy shown can lag the element (native path): the picture counters follow what was drawn, so re-stamp this layer's entry.
+          if(element){sourceTimestamp=result.dataset.sourceTimestamp ?? '';if(stampAt>=0)pictureStamps[stampAt]=`${clip.id}@${sourceTimestamp}`;}
           canvas.dataset.colorPrecision=result.dataset.colorPrecision??'8-bit RGB fallback';
           layerContext.clearRect(0,0,width,height); layerContext.drawImage(result,0,0);
           // Show key (viewer only): where the node grades, white where it grades fully (Invert included).

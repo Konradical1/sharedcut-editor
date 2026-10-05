@@ -19,7 +19,7 @@ const BUILD_FILE = /\/assets\/.*-([\w-]{8})\.js(?:$|\?)/;
 const DEV_BUILD = 'dev';
 
 type Dataset = Record<string, string | undefined>;
-/** What the last painted picture came from. */
+/** What the last painted picture came from: `clipId` is its first footage clip (the layer drawn last when no stamp names one). */
 export type PictureFacts = { clipId: string; engine: string; automaticLow: boolean };
 export type ReporterDeps = {
   /** Milliseconds on a monotonic clock. */
@@ -130,9 +130,10 @@ export function createHealthReporter(deps: ReporterDeps): HealthReporter {
   const stops = [
     listen(deps.target, 'frameline:frame', event => {
       const { dataset } = (event as CustomEvent<{ dataset: Dataset }>).detail;
-      picture = { clipId: dataset.sourceClip ?? '', engine: dataset.playbackEngine ?? '', automaticLow: dataset.automaticLow === 'true' };
-      // Held on purpose only when every footage layer in the picture is a freeze frame.
       const clips = pictureClips(dataset);
+      // The first footage clip sets the target rate and speed; sourceClip is the layer drawn last, which a logo on top would pin to a still.
+      picture = { clipId: clips[0] ?? '', engine: dataset.playbackEngine ?? '', automaticLow: dataset.automaticLow === 'true' };
+      // Held on purpose only when every footage layer in the picture is a freeze frame.
       collector.onFrame(attempt(() => clips.length > 0 && clips.every(id => deps.isHeld?.(id) === true), false) ? undefined : frameStamp(dataset));
     }),
     listen(deps.target, 'frameline:playback-health', event => collector.onHealth((event as CustomEvent<HealthDetail>).detail)),

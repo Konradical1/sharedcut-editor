@@ -1,6 +1,6 @@
 /** The displayed pictures prepare() always names (the one on screen and the next two); a deeper look-ahead is opt-in. */
 export const NEAR_PICTURES = 3;
-/** A graded layer's colour copy takes 20-100 ms and up to 300 ms on a slow computer: copy this far ahead of the clock, within a byte budget. */
+/** A graded layer's colour copy takes 20-100 ms and up to 300 ms on a slow computer: copy this far ahead of the clock, within a byte budget (shared by the tick path and the arrival hook). */
 const AHEAD_SECONDS = .25, AHEAD_BYTES = 16 * 1024 ** 2, AHEAD_MAX = 10;
 
 /** How many displayed pictures (one every `step` source seconds) prepare() names when asked to look deep. Never fewer than NEAR_PICTURES. */
@@ -9,16 +9,21 @@ export function aheadCount(step: number, frameBytes: number): number {
   return Math.max(NEAR_PICTURES, Math.min(AHEAD_MAX, byTime, byBytes));
 }
 
+/** Which displayed picture (0 is the one on screen now) is the first a clock stepping from `target` by `step` reaches at or after source time `start`. */
+export function displayIndex(start: number, target: number, step: number): number {
+  // Timestamps are whole microseconds, so a picture that starts on a clock step can read a hair late: allow 10 µs.
+  return Math.max(0, Math.ceil((start - target - 1e-5) / Math.max(step, 1e-6)));
+}
+
 /** Is the source picture [start, end) one a clock stepping from `target` by `step` will show? Frames the clock steps over are never drawn. */
 export function isShownPicture(start: number, end: number, target: number, step: number): boolean {
-  // Timestamps are whole microseconds, so a picture that starts on a clock step can read a hair late: allow 10 µs.
-  const index = Math.max(0, Math.ceil((start - target - 1e-5) / Math.max(step, 1e-6)));
-  return target + index * step < end - 1e-6;
+  return target + displayIndex(start, target, step) * step < end - 1e-6;
 }
 
 /**
  * Explicitly decoded pictures. Encoded bytes remain in the automatic persistent footage cache.
- * `arrived` is called with a picture the clock will show within AHEAD_SECONDS as it lands, so its colour copy starts at once.
+ * `arrived` is called with a picture the clock will show as it lands, so its colour copy starts at once, but only if it is among the
+ * aheadCount(step, bytes) pictures nearest the clock: within AHEAD_SECONDS and the AHEAD_BYTES budget. The rest wait for prepare().
  */
 export function createVideoFrames(url: string, fps: number, changed: () => void, cacheEnabled = true, arrived?: (frame: VideoFrame) => void) {
   const worker = new Worker(new URL('./videoDecodeWorker.ts', import.meta.url), { type: 'module' });
@@ -46,8 +51,9 @@ export function createVideoFrames(url: string, fps: number, changed: () => void,
       if (end(frame) <= target + 1e-6) frame.close();
       else {
         frames.push(frame);
+        // Only the pictures aheadCount names (the tick path's time and byte budget) are copied on arrival; the tick path picks up any beyond that.
         // A copy that cannot start here is retried by the next tick's prepare; it must never cost the picture its place in the queue.
-        if (arrived && start(frame) < target + AHEAD_SECONDS && isShownPicture(start(frame), end(frame), target, step)) { try { arrived(frame); } catch { /* retried by prepare */ } }
+        if (arrived && start(frame) < target + AHEAD_SECONDS && displayIndex(start(frame), target, step) < aheadCount(step, frameBytes) && isShownPicture(start(frame), end(frame), target, step)) { try { arrived(frame); } catch { /* retried by prepare */ } }
       }
       fill(); changed();
     } else if (message.type === 'end') { pending = 0; ended = true; changed(); }

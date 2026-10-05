@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { aheadCount, createVideoFrames, isShownPicture } from './videoFrames.ts';
+import { aheadCount, createVideoFrames, displayIndex, isShownPicture } from './videoFrames.ts';
 
 for (const [fps, bytes] of [[24, 960*540*1.5], [60, 1920*1080*4]]) test(`explicit decoding sustains ${fps} fps at ${bytes} bytes/frame, seeks safely and releases resources`,async()=>{
   const originals=['Worker','location'].map(key=>[key,Object.getOwnPropertyDescriptor(globalThis,key)] as const);
@@ -64,6 +64,9 @@ test('a picture is one the clock will show only if the clock lands inside it', (
   // A clip slowed to 30 %: the clock moves 0.01 s a picture, so every source picture is shown.
   assert.deepEqual([0, 1, 2, 3].map(k => isShownPicture(k / 60, (k + 1) / 60, 0, .01)), [true, true, true, true]);
   assert.equal(isShownPicture(.5, .55, .52, 1 / 30), true, 'the picture the clock is inside now');
+  // The display index counts clock steps to a picture: clamped at the one on screen, and a whole-microsecond start on a step is not a step late.
+  assert.equal(displayIndex(.5, .52, 1 / 30), 0, 'a picture already under the clock is index 0, never negative');
+  assert.deepEqual([0, 2, 4].map(k => displayIndex(Math.round(k / 60 * 1e6) / 1e6, 0, 1 / 30)), [0, 1, 2], 'microsecond rounding keeps a picture on its step');
 });
 
 test('pictures about to be shown are announced as they land, and prepare looks as deep as asked', async () => {
@@ -104,6 +107,41 @@ test('pictures about to be shown are announced as they land, and prepare looks a
       failing.prepare(0, 1 / 30); failing.update(0); await flush();
       assert.equal(failing.prepare(0, 1 / 30).length, 3, 'an arrival hook that throws leaves every picture in the queue');
     } finally { failing.dispose(); }
+  } finally {
+    queue.dispose(); for (const [key, value] of originals) { if (value) Object.defineProperty(globalThis, key, value); else Reflect.deleteProperty(globalThis, key); }
+  }
+});
+
+// A 30 fps source on a 30 fps timeline, so every picture in the queue is shown and only the byte budget can stop the copies.
+for (const [bytes, expected] of [[960 * 540 * 1.5, 8], [3_110_400, 5], [8_294_400, 3]]) test(`arrival copies stay inside the byte budget: ${bytes} B pictures announce ${expected}`, async () => {
+  const originals = ['Worker', 'location'].map(key => [key, Object.getOwnPropertyDescriptor(globalThis, key)] as const);
+  class Frame {
+    timestamp: number; duration = 1e6 / 30; codedWidth = 1920; codedHeight = 1080; closed = false;
+    constructor(time: number) { this.timestamp = Math.round(time * 1e6); }
+    allocationSize() { return bytes; }
+    close() { this.closed = true; }
+  }
+  class FakeWorker {
+    onmessage?: (event: any) => void; next = 0;
+    postMessage(message: any) {
+      if (message.type === 'open') return;
+      if (message.type === 'seek') this.next = Math.floor(message.time * 30 + 1e-6);
+      for (let i = 0; i < message.count; i++) {
+        const frame = new Frame(this.next++ / 30), generation = message.generation;
+        queueMicrotask(() => this.onmessage?.({ data: { type: 'frame', frame, generation } }));
+      }
+    }
+    terminate() {}
+  }
+  Object.defineProperty(globalThis, 'Worker', { configurable: true, value: FakeWorker });
+  Object.defineProperty(globalThis, 'location', { configurable: true, value: { href: 'https://editor.test/' } });
+  const announced: number[] = [];
+  const queue = createVideoFrames('/api/media/a/files/stream.mp4', 30, () => {}, true, frame => announced.push(frame.timestamp));
+  try {
+    queue.prepare(0, 1 / 30);
+    queue.update(0); for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(announced, Array.from({ length: expected }, (_, k) => Math.round(k / 30 * 1e6)), 'only the pictures aheadCount names are copied on arrival; the tick path picks up the rest');
+    assert.equal(announced.length, aheadCount(1 / 30, bytes), 'arrival and prepare share one budget');
   } finally {
     queue.dispose(); for (const [key, value] of originals) { if (value) Object.defineProperty(globalThis, key, value); else Reflect.deleteProperty(globalThis, key); }
   }
