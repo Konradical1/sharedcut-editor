@@ -1459,6 +1459,8 @@ async function renderStabilizedTimeline(request: RenderRequest) {
     // Resolve every matte against the original before the source is swapped for the bake, then move each one
     // with the picture's own matrices. Stabilize first, Smart Mask on top of the stabilized frame.
     const documents=activeSmartMasks(clip,request.nodes);
+    // Said here, before the analysis and the bake, rather than by renderFlowTimeline after the first 45 % of the export.
+    if(clip.properties.opticalFlow&&documents.length)throw Error(`${clip.name}: Smart Mask and optical-flow retiming need a shared warped matte. Disable optical flow for this clip.`);
     // Moving the mattes owns the front fifth of this clip's slice; the bake owns the rest.
     const mattes=documents.length?.2:0;
     const report=(fraction:number)=>request.onProgress?.((index+Math.max(0,Math.min(1,fraction)))/candidates.length*45);

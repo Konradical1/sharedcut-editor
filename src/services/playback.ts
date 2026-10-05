@@ -898,7 +898,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if (options.compare) { if (flip) mirrorLayer(); draw(referenceTarget, clip, width, height, projectWidth, projectHeight, time, project?.fps ?? 24); if (flip) mirrorLayer(); }
       // While the analysis runs, hold the original at the crop the solve will apply so the framing never jumps.
       const framed = stabilizeFx && !stabilizeSolveFor ? {...clip, properties:{...clip.properties, zoom: Number(clip.properties.zoom ?? 100) * stabilizeZoom(stabilizeSettings(original, stabilizeFx))}} : clip;
-      const warp = stabilizeSolveFor ? {solve:stabilizeSolveFor,time:sourceTime(original,time,sourceFps,asset.duration||Infinity),sourceWidth,sourceHeight,blend:Boolean(original.properties.opticalFlow)} : undefined;
+      const warp = stabilizeSolveFor ? {solve:stabilizeSolveFor,time:sourceTime(original,time,sourceFps,asset.duration||Infinity),sourceWidth,sourceHeight,blend:decoder===interpolated} : undefined;
       beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip,stampAt);
     }
     flush(Infinity);
