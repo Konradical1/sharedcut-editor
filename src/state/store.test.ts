@@ -1674,3 +1674,22 @@ test('opening a project lands on its edit even when a composition timeline loads
   state().openProject('city-after-dark');
   assert.equal(state().timelineId, main.id);
 });
+
+test('a property sent as text becomes a number, text that is not one is refused, and a no-op trim adds no history', () => {
+  state().updateProperty('c3', 'speed', '50' as unknown as number);
+  assert.equal(clip().properties.speed, 50);
+  const before = clip().properties.x;
+  state().updateProperty('c3', 'x', 'abc' as unknown as number);
+  assert.equal(clip().properties.x, before);
+  assert.match(state().notifications.at(-1)!.title, /x must be a number/);
+  const history = state().operations.length;
+  state().trimClip('c3', clip().start, clip().duration);
+  assert.equal(state().operations.length, history, 'trimming to the same span is not an undo step');
+});
+
+test('pen points given without a box are frame positions, fitted like the pen tool draws them', () => {
+  state().addShape('pen', { closed: true, points: [{ x: .1, y: .1 }, { x: .9, y: .1 }, { x: .5, y: .9 }] });
+  const doc = getShape(clip(state().selectedClipId!));
+  assert.deepEqual([doc.x, doc.y, +doc.width.toFixed(3), +doc.height.toFixed(3)], [.1, .1, .8, .8]);
+  assert.deepEqual(doc.points[2], { x: .5, y: 1 });
+});

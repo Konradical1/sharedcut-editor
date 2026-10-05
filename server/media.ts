@@ -12,7 +12,8 @@ import { renderCaptionTimeline } from './captionRender.ts';
 import { bakeAnimatedGraphics, streamableGraphic } from './graphicsRender.ts';
 import { shownSourceTime } from '../src/services/motionTracker.ts';
 import { isCaption } from '../src/services/captions.ts';
-import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, sampleKeyframes, validateKeyframes } from '../src/services/animation.ts';
+import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, isAnimated, sampleKeyframes, validateKeyframes } from '../src/services/animation.ts';
+export { isAnimated };
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { isTitle, getText, drawText, validateText } from '../src/services/text.ts';
 import { isShape, getShape, drawShape, validateShape } from '../src/services/shapes.ts';
@@ -660,7 +661,6 @@ export function blendFilters(o: { under: string; layer: string; output: string; 
 }
 
 /** A clip whose own span changes over time, and so cannot be composited in a single pass. */
-export const isAnimated = (clip: Clip) => Boolean(Object.keys(clip.keyframes ?? {}).some(key => key !== 'properties.gain') || isTitle(clip) && getText(clip).typingEnabled);
 
 /**
  * Keyed gain as one `volume` expression in clip time (T = t + `from`), so ducking renders in the single
@@ -963,7 +963,10 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       // One spare frame per side: a blend whose float duration ends a hair past the last input frame never
       // emits that frame. The window is cut back to its exact frame count right after the blend.
       if (!label) { filters.push(`color=c=black@0:s=${width}x${height}:r=${rate}:d=${(whole + 2 / fps).toFixed(5)},trim=end_frame=${(total + 1) * samples},format=${pixels},setsar=1[${name}]`); return; }
-      const chain = [`trim=start=${Math.max(0, start - .5 / fps).toFixed(6)}:end=${(end - .5 / fps).toFixed(6)}`, 'setpts=PTS-STARTPTS', `fps=${rate}`, 'setsar=1'];
+      // A quarter frame early, not half: the side is already on the 1/fps grid and trim rounds its seconds to that
+      // time base, so a half-frame cut sits on the rounding point and toFixed decided the frame. A one-frame window
+      // (a still at 11.5) lost its only frame and came out black; longer ones lost the last or gained one at the start.
+      const chain = [`trim=start=${Math.max(0, start - .25 / fps).toFixed(6)}:end=${(end - .25 / fps).toFixed(6)}`, 'setpts=PTS-STARTPTS', `fps=${rate}`, 'setsar=1'];
       if (pre || post) chain.push(`tpad=start_mode=clone:start=${pre * samples}:stop_mode=clone:stop=${post * samples}`);
       chain.push(...(definition.ffmpeg.side?.(role, plan) ?? []));
       chain.push(`format=${pixels}`, `trim=end_frame=${total * samples}`, 'setpts=PTS-STARTPTS', `tpad=stop_mode=clone:stop=${samples}`);
@@ -1069,7 +1072,10 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     const sourceStep = 1 / Math.max(1, source.asset.fps || fps);
     // Hold the source frame containing the requested time. A fractional seek
     // followed by a one-frame -t can otherwise decode zero frames in FFmpeg.
-    const seek = source.asset.kind === 'image' ? sourceIn : p.freeze ? Math.floor(sourceIn / sourceStep + 1e-7) * sourceStep : sourceIn + (p.reverse ? geo.duration - localEnd : localStart) * speed;
+    // A range that starts inside a window held past the media (a still at 6.5 of a 6 s clip) seeks the last frame:
+    // -ss 6.5 -t 0 decoded nothing to clone, and the window showed only its other side. Sound reads the same input,
+    // so only a clip nobody hears here (its own body is outside the range then).
+    const seek = source.asset.kind === 'image' ? sourceIn : p.freeze ? Math.floor(sourceIn / sourceStep + 1e-7) * sourceStep : Math.min(sourceIn + (p.reverse ? geo.duration - localEnd : localStart) * speed, audible ? Infinity : Math.floor(source.asset.duration / sourceStep - 1e-7) * sourceStep);
     const sourceLength = p.freeze ? sourceStep : length * speed;
     // A transition window reaches past the media when neither clip at the cut has handles left. The
     // preview holds the last frame there (`sourceTime` clamps), so the export clones it too rather

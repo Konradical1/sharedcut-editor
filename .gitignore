@@ -24,3 +24,4 @@ __pycache__/
 
 # agent session cookies (scripts/agent/agent-session.mjs)
 cookie.txt
+dist-mcp/

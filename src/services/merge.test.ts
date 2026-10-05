@@ -21,3 +21,12 @@ test('three-way collaboration merge preserves independent edits, additions, and 
   assert.deepEqual(mergeState(base, local, { ...remote, clips: [{ id: 'a', x: 5, y: 4 }] }).conflicts, ['/clips/a/x']);
   assert.deepEqual(mergeState(base, { ...local, clips: [] }, remote).conflicts, ['/clips/a']);
 });
+
+test('an operation made locally since the base stays first in newest-first history after a merge', () => {
+  const base = { operations: [{ id: 'old' }], clips: [{ id: 'a' }] };
+  const local = { operations: [{ id: 'mine' }, { id: 'old' }], clips: [{ id: 'a' }, { id: 'new-clip' }] };
+  const remote = { operations: [{ id: 'theirs' }, { id: 'old' }], clips: [{ id: 'a' }, { id: 'their-clip' }] };
+  const merged = mergeState(base, local, remote).value;
+  assert.deepEqual(merged.operations.map(x => x.id), ['mine', 'theirs', 'old']);
+  assert.deepEqual(merged.clips.map(x => x.id), ['a', 'their-clip', 'new-clip'], 'other lists keep remote order with new items after');
+});

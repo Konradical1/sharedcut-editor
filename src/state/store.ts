@@ -5,7 +5,7 @@ import { eligibility, proposedNodes, type AssistantMode, type BalanceValues, typ
 import { captionDocument, captionPreset, groupCaptionWords, isCaption, restyleCaption, validateCaption, type CaptionJob, type CaptionSet, type CaptionWord } from '../services/captions.ts';
 import { isComposition, retimeTitleClip, validateCompositions } from '../services/compositions.ts';
 import { ADJUSTMENT_DURATION, ADJUSTMENT_MEDIA, isAdjustment } from '../services/adjustment.ts';
-import { defaultShape, getShape, isShape, validateShape, type ShapeDocument } from '../services/shapes.ts';
+import { defaultShape, fitPenPoints, getShape, isShape, validateShape, type ShapeDocument } from '../services/shapes.ts';
 import { createTitleTemplate } from '../services/titleTemplates.ts';
 import { animationProperties, boundedAnimationValue, copyAnimatedNodes, evaluateClip, evaluateNodes, frameTime, retimedDuration, setAnimatedValue, trimAnimation, validateKeyframes } from '../services/animation.ts';
 import type { Keyframe, KeyframeValue } from './models.ts';
@@ -82,9 +82,14 @@ export interface EditorStore extends PersistedState {
   setKeyframes(clipId: string, path: string, keys: Keyframe[], gesture?: string): void;
   keyframeProperty(clipId: string, path: string, value?: KeyframeValue): void;
   unlinkClip(id: string): void; linkClip(id: string): void;
-  moveClip(id: string, start: number, trackId?: string): void; trimClip(id: string, start: number, duration: number): void; fitTrim(id: string, start: number, duration: number): {start:number;duration:number}|null;
+  /** Moves the clip (with its linked clips, and the selection it belongs to) to `start` seconds, onto `trackId` if given; it overwrites whatever it lands on. */
+  moveClip(id: string, start: number, trackId?: string): void;
+  /** New start and duration in timeline seconds: moving the start trims the head and sourceIn follows; the media's length and the neighbours clamp it. */
+  trimClip(id: string, start: number, duration: number): void;
+  fitTrim(id: string, start: number, duration: number): {start:number;duration:number}|null;
   /** Where a trim tool drag of `delta` seconds on `edge` would put every clip it touches (delta clamped to handles, a frame, and the neighbours), or null when there is no room. */
   planTrimEdit(id: string, tool: TrimTool, edge: 'left' | 'right', delta: number): TrimPlan | null;
+  /** Edits an edge by `delta` seconds with a trim tool: ripple (trim and shift what follows), roll (move the cut), slip (change source in/out in place), slide (move between neighbours). */
   trimEdit(id: string, tool: TrimTool, edge: 'left' | 'right', delta: number): void;
   /** Markers selected on the current timeline (Delete, ⌘C act on them), and the last markers copied. */
   selectedMarkerIds: string[]; markerClipboard: Marker[] | null;
@@ -95,9 +100,19 @@ export interface EditorStore extends PersistedState {
   deleteMarkers(ids: string[]): void; copyMarkers(ids: string[]): void; pasteMarkers(): void;
   /** Close the gaps between the selected clips (Resolve's Delete Gaps), rippling everything after them as one undo. */
   deleteGaps(ids: string[]): void;
-  /** `ripple` also closes the time the clips held on their tracks; `insert` pushes later clips right instead of overwriting them. */
-  deleteGap(trackId:string,start:number,end:number):void; splitClip(id: string): void; deleteClip(id: string, ripple?: boolean): void; duplicateClip(id: string): void; copyClip(id: string): void; pasteClip(insert?: boolean): void;
-  addMediaToTimeline(mediaId: string | string[], start?: number, trackId?: string, insert?: boolean): void; updateTrack(id: string, patch: Partial<Track>, gesture?: string): void; moveTrack(id: string, direction: 'up' | 'down'): void; deleteTrack(id: string): void; createTrack(kind: 'video' | 'audio'): void; setTimeline(id: string): void;
+  /** Closes the empty span between clips on a track (pass the gap's exact bounds), pulling later clips left. */
+  deleteGap(trackId:string,start:number,end:number):void;
+  /** Cuts the clip and its linked clips at the playhead, which must be inside it. */
+  splitClip(id: string): void;
+  /** `ripple` also closes the time the clips held on their tracks. */
+  deleteClip(id: string, ripple?: boolean): void;
+  duplicateClip(id: string): void; copyClip(id: string): void;
+  /** Pastes at the playhead; `insert` pushes later clips right instead of overwriting them. */
+  pasteClip(insert?: boolean): void;
+  /** Places ready media (one id, or several laid end to end) at `start` on `trackId`; video brings its linked audio; `insert` pushes later clips right. */
+  addMediaToTimeline(mediaId: string | string[], start?: number, trackId?: string, insert?: boolean): void;
+  updateTrack(id: string, patch: Partial<Track>, gesture?: string): void; moveTrack(id: string, direction: 'up' | 'down'): void; deleteTrack(id: string): void; createTrack(kind: 'video' | 'audio'): void; setTimeline(id: string): void;
+  /** 'in' is the cut before the clip (a dissolve between two clips goes on the incoming clip's 'in'); 'out' only fades out a clip with nothing after it. */
   addTransition(clipId: string, side: TransitionSide, name: string, patch?: { duration?: number; align?: TransitionAlign; params?: TransitionParams }): void;
   updateTransition(clipId: string, side: TransitionSide, patch: { name?: string; duration?: number; align?: TransitionAlign; curve?: [number, number, number, number]; params?: TransitionParams }, gesture?: string): void;
   removeTransition(clipId: string, side: TransitionSide): void;
@@ -120,8 +135,11 @@ export interface EditorStore extends PersistedState {
   useAcesOutput(clipId:string):void;
   restoreResolveGrade(clipId:string):void; initializeColorGrade(clipId:string):void; arrangeColorNodes(clipId:string):void; moveColorNode(id:string,beforeId:string|null,position?:{x:number;y:number}):void;
   updateNode(id: string, patch: Partial<GradeNode>, gesture?: string): void; applyGrade(nodes: { name: string; parameters: Record<string, number> }[]): void;
-  /** Redo re-applies your most recent undo; any new edit of yours clears what can be redone. */
-  undo(): void; redo(): void; saveSnapshot(name: string, note: string): void; restoreSnapshot(id: string): void;
+  /** Takes back your most recent edit in this project (never a collaborator's). */
+  undo(): void;
+  /** Re-applies your most recent undo; any new edit of yours clears what can be redone. */
+  redo(): void;
+  saveSnapshot(name: string, note: string): void; restoreSnapshot(id: string): void;
   addComment(text: string, target?: { clipId?: string; range?: [number, number] }): void;
   replyComment(id: string, text: string): void; resolveComment(id: string): void;
   enqueueRender(name: string, preset: string, settings: Record<string, string>): void; updateRender(id: string, patch: Partial<RenderJob>): void;
@@ -304,7 +322,9 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const old = entity(state, change);
       const keys = [...new Set([...Object.keys(change.value ?? {}), ...change.unset ?? []])];
       const absent = old && !change.replace ? keys.filter(key => readField(old, key) === undefined) : [];
-      return { ...change, value: old ? change.replace ? record(old) : Object.fromEntries(keys.filter(key => !absent.includes(key)).map(key => [key, structuredClone(readField(old, key))])) : null, unset: absent };
+      // No unset when nothing was absent: an empty one made every no-op (a trim clamped to the same length) look like a change.
+      const { unset: _forward, ...rest } = change;
+      return { ...rest, value: old ? change.replace ? record(old) : Object.fromEntries(keys.filter(key => !absent.includes(key)).map(key => [key, structuredClone(readField(old, key))])) : null, ...(absent.length ? { unset: absent } : {}) };
     });
     if (JSON.stringify(oldState) === JSON.stringify(changes)) return;
     const operation = collaborationService.createOperation({ projectId: state.projectId, userId: state.currentUserId, type, targetId, description, oldState, newState: changes, ...(gesture ? { gestureId: gesture } : {}) });
@@ -542,7 +562,9 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     },
     addShape(kind,box={},placement) {
       const state=get();if(!writable())return;
-      const doc={...defaultShape(kind),...box};try{validateShape(doc);}catch(error){state.notify((error as Error).message,'error');return;}
+      // Pen points without a box are frame positions (0-1), as the pen tool draws them: fit the box around them.
+      const {points,closed,...rest}=box,framed=kind==='pen'&&points?.length&&[box.x,box.y,box.width,box.height].every(v=>v===undefined);
+      let doc:ShapeDocument;try{doc=framed?{...fitPenPoints(points!,closed??true),...rest}:{...defaultShape(kind),...box};validateShape(doc);}catch(error){state.notify((error as Error).message,'error');return;}
       const start=frameTime(Math.max(0,placement?.start??state.playhead),state.projects.find(p=>p.id===state.projectId)?.fps||24),duration=5;
       if(!Number.isFinite(start))return;
       const tracks=state.tracks.filter(t=>t.timelineId===state.timelineId&&t.kind==='video'&&!t.captionSets);
@@ -840,7 +862,14 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (key === 'textDocument') { try { validateText(JSON.parse(String(value))); } catch { return; } }
       if (['__proto__', 'prototype', 'constructor'].includes(key) || key.includes('.')) return;
       const clip = editableClip(clipId, key);
-      if (!clip || (typeof value === 'number' && !Number.isFinite(value))) return;
+      if (!clip) return;
+      // A number sent as text ("50") would save as a string and then fail every render of this clip.
+      const expected = clip.properties[key] ?? defaultProperties[key];
+      if (typeof expected === 'number' && typeof value === 'string') {
+        if (!value.trim() || !Number.isFinite(Number(value))) { get().notify(`${key} must be a number`, 'error'); return; }
+        value = Number(value);
+      }
+      if (typeof value === 'number' && !Number.isFinite(value)) return;
       let next = value;
       if (typeof value === 'number') {
         if (['fadeIn','fadeOut','audioFadeIn','audioFadeOut'].includes(key)) next = clamp(value,0,clip.duration);
@@ -893,10 +922,12 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     },
     trimClip(id, start, duration) {
       const clip=editableClip(id);if(!clip||!Number.isFinite(start)||!Number.isFinite(duration)||duration<=0)return;
+      // A trim the source or a neighbour clamps back to where the clip already is records nothing (no empty undo step).
+      const unmoved=(fit:{start:number;duration:number})=>Math.abs(fit.start-clip.start)<1e-9&&Math.abs(fit.duration-clip.duration)<1e-9;
       const state=get(),group=editableGroup(clip);if(!group)return;
       const frame=1/(state.projects.find(p=>p.id===state.projectId)?.fps||24);
       if(clip.sourceIn===0&&Number(clip.properties.animationPresetDuration)===clip.duration) {
-        const fit=trimFit(clip,start,duration);if(!fit)return;
+        const fit=trimFit(clip,start,duration);if(!fit||unmoved(fit))return;
         const nextDuration=fit.duration,next={...retimeTitleClip(clip,nextDuration,1/frame),start:fit.start},changes:Change[]=[];
         const overwritten=overwriteChanges(next);if(!overwritten)return;changes.push(...overwritten);
         const retimeContents=(parent:Clip,d:number,seen=new Set<string>()):boolean=>{
@@ -913,7 +944,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         changes.push({collection:'clips',id,value:{start:next.start,duration:next.duration,properties:next.properties,keyframes:next.keyframes}});
         commit('ClipTrimmed',id,`resized ${clip.name}`,changes);return;
       }
-      const fit=trimFit(clip,start,duration);if(!fit)return;
+      const fit=trimFit(clip,start,duration);if(!fit||unmoved(fit))return;
       const target=trimmedClip(clip,fit.start,fit.duration,group);if(!target)return;
       const changes:Change[]=[];
       for(const c of group){const s=c.start+target.start-clip.start,d=c.duration+target.duration-clip.duration,value=c.id===id?target:trimmedClip(c,s,d,group);if(!value||Math.abs(value.start-s)>1e-6||Math.abs(value.duration-d)>1e-6){state.notify('Linked media has reached its source boundary','info');return;}const overwritten=overwriteChanges({...c,...value},group.map(c=>c.id));if(!overwritten)return;changes.push(...overwritten,{collection:'clips',id:c.id,value});}
@@ -1136,7 +1167,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (!connection.enabled) { get().notify('Sign in to save shared presets', 'info'); return; }
       try {
         const userId = get().currentUserId;
-        await (await import('../services/sync')).flushChanges();
+        await connection.flush();
         if (get().currentUserId !== userId || get().saveStatus !== 'Saved') throw new Error('Save the timeline before saving its preset.');
         const { preset } = await api<{ preset: TransitionPreset }>('/transitions/presets', { method: 'PUT', body: JSON.stringify({ clipId, side }) });
         if (get().currentUserId !== userId) return;

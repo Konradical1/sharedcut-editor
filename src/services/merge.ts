@@ -10,8 +10,11 @@ export function mergeState<T>(base: T, local: T, remote: T): { value: T; conflic
     if (equal(a, b)) return c;
     if (equal(a, c)) return b;
     if (keyed(a) && keyed(b) && keyed(c)) {
-      const ids = [...new Set([...c, ...b, ...a].map(item => item.id))];
       const maps = [a, b, c].map(items => new Map(items.map(item => [item.id, item])));
+      // History and snapshots are newest first: an entry made here since the base is newer than the remote's list, so it
+      // leads. Behind them it was the oldest edit, and undo (which takes the first of yours) undid a different one.
+      const fresh = path === '/operations' || path === '/snapshots' ? b.filter(item => !maps[0].has(item.id) && !maps[2].has(item.id)) : [];
+      const ids = [...new Set([...fresh, ...c, ...b, ...a].map(item => item.id))];
       return ids.map(id => merge(maps[0].get(id), maps[1].get(id), maps[2].get(id), `${path}/${id}`)).filter(item => item !== undefined);
     }
     if (object(a) && object(b) && object(c)) {

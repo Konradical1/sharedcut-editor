@@ -171,6 +171,8 @@ export function fadeLevel(clip: Clip, time: number, audio = false) {
   const fadeIn = Number(p[audio?'audioFadeIn':'fadeIn'] ?? 0), fadeOut = Number(p[audio?'audioFadeOut':'fadeOut'] ?? 0);
   return clamp(fadeIn > 0 ? elapsed/fadeIn : 1,0,1)*clamp(fadeOut > 0 ? (duration-elapsed)/fadeOut : 1,0,1);
 }
+/** Needs per-frame baking on export: any keyframe but a plain gain ramp (that renders as a volume expression), or typing. */
+export const isAnimated = (clip: Clip) => Boolean(Object.keys(clip.keyframes ?? {}).some(key => key !== 'properties.gain') || isTitle(clip) && getText(clip).typingEnabled);
 export const hasAnimatedTiming=(clip:Clip)=>['speed','freeze','reverse'].some(p=>clip.keyframes?.[`properties.${p}`]);
 export function trimAnimation(clip: Clip, start: number, duration=clip.duration-(start-clip.start)): Pick<Clip, 'keyframes' | 'properties'> & Partial<Pick<Clip,'sourceIn'>> {
   const delta = start - clip.start;

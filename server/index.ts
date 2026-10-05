@@ -1,4 +1,4 @@
-import { createPreviewCache, PreviewBusyError, type PreviewAdmission } from './previewCache.ts';
+import { createPreviewCache, createStillCache, mediaStill, stillSettings, StillSkipped, PreviewBusyError, type PreviewAdmission } from './previewCache.ts';
 import { createHostGuard, JOB_COST_BYTES, VICTIM_ORDER, type HostGuard } from './hostGuard.ts';
 import { createHostHealthLog } from './hostHealthLog.ts';
 import { canSeeHealth, createPlaybackReports, type Identity } from './playbackReports.ts';
@@ -157,7 +157,7 @@ function send(res: ServerResponse, status: number, body: unknown) {
   res.on('close', () => stream.destroy()); stream.on('error', () => res.destroy()); stream.pipe(res); stream.end(json);
 }
 const contentTypes: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon', '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.m4a': 'audio/mp4', '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.woff2': 'font/woff2' };
-function streamFile(req: IncomingMessage, res: ServerResponse, path: string, type?: string, download?: string, immutable?: boolean) {
+export function streamFile(req: IncomingMessage, res: ServerResponse, path: string, type?: string, download?: string, immutable?: boolean) {
   let size = 0, modified = 0; try { const file = statSync(path); size = file.size; modified = file.mtimeMs; } catch { fail(404, 'File not found.'); }
   // Prepared media, overlays and hashed bundles are written once under a versioned name and never
   // rewritten, so a viewer reuses its copy instead of re-pulling the file on every page load. The
@@ -192,8 +192,12 @@ function streamFile(req: IncomingMessage, res: ServerResponse, path: string, typ
   }
   if (!gzip) headers['Content-Length'] = Math.max(0, end - start + 1); res.writeHead(status, headers);
   if (req.method === 'HEAD' || size === 0) { res.end(); return; }
-  const stream = createReadStream(path, { start, end }); stream.on('error', () => res.destroy()); res.on('close', () => stream.destroy());
-  if (gzip) void pipeline(stream, createGzip(), res).catch(() => res.destroy()); else stream.pipe(res);
+  // A route that awaited (a shared frame render) can get here after its viewer left: 'close' has already fired, so a
+  // stream piped into the dead response would pause forever and hold its file open. pipeline destroys the read stream
+  // when the response closes mid-transfer, and the response when the read fails.
+  if (res.destroyed) return;
+  const stream = createReadStream(path, { start, end });
+  void (gzip ? pipeline(stream, createGzip(), res) : pipeline(stream, res)).catch(() => res.destroy());
 }
 
 // hostMonitor: write data/host-health.log. Only the real server asks for it; a test server would launch PowerShell and nvidia-smi for nothing.
@@ -581,6 +585,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   };
   // No depth service: a preview never reads depth (readsDepth skips those ranges), and must never start a run for a viewer.
   // One log line per new preview job names who asked. The host guard refuses a preview while memory is short (429, the browser backs off).
+  // Live state, not a copy: the caches keep only what can reach the range and copy just that (the media rows alone
+  // were 6.6 MB a poll), then ask for it again every second per chunk.
+  const previewSnapshot=(project:Project,timeline:typeof state.timelines[number],settings:Record<string,string>)=>{
+    const clips=state.clips.filter(c=>c.projectId===project.id),ids=new Set(clips.map(c=>c.mediaId));
+    return {project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips,tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:state.nodes.filter(n=>n.projectId===project.id),assets:state.media.filter(m=>m.projectId===project.id&&ids.has(m.id)).map(asset=>({asset,path:originalPath(asset.id)})),settings,smartMaskDir:join(dataDir,'smart-masks'),stabilizeDir:stabilizeDirectory,resolveDir:resolveDir(project.id)};
+  };
+  const stills=createStillCache(join(dataDir,'frames'),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)}),{log:line=>console.warn(line),admit:admitPreview});
   const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)} ),{log:line=>console.warn(line),admit:admitPreview});
   const startRender = (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>) => {
     db.prepare('INSERT OR REPLACE INTO render_snapshots(id,data) VALUES(?,?)').run(job.id, JSON.stringify(snapshot));
@@ -1549,13 +1560,28 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const width=numberField(body.width,160,1920),height=numberField(body.height,90,1920);
           if(!Number.isInteger(width)||!Number.isInteger(height)||width%2||height%2)fail(400,'Invalid preview dimensions.');
           const settings={resolution:`${width} × ${height}`,fps:String(fps),codec:'H.264',quality:'Automatic',audio:'Disabled',rangeIn:String(from),rangeOut:String(end)};
-          const clips=state.clips.filter(c=>c.projectId===project.id);
-          const ids=new Set(clips.map(c=>c.mediaId));
-          // Live state, not a copy: the cache keeps only what can reach this range and copies just that (the media rows alone
-          // were 6.6 MB a poll), then asks for it again every second per chunk.
-          const snapshot={project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips,tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:state.nodes.filter(n=>n.projectId===project.id),assets:state.media.filter(m=>m.projectId===project.id&&ids.has(m.id)).map(asset=>({asset,path:originalPath(asset.id)})),settings,smartMaskDir:join(dataDir,'smart-masks'),stabilizeDir:stabilizeDirectory,resolveDir:resolveDir(project.id)};
-          try { const result=timelinePreviews.request(snapshot,{userId,chunk});send(res,200,result); }
+          try { const result=timelinePreviews.request(previewSnapshot(project,timeline,settings),{userId,chunk});send(res,200,result); }
           catch(error){if(error instanceof PreviewBusyError){res.setHeader('Retry-After',String(error.retryAfterSeconds));fail(429,'Preview queue busy');}throw error;}
+          return;
+        }
+        if(path==='/api/frames'&&method==='GET'){
+          // One composited frame as a small JPEG for viewers and agents (the MCP's frame tool); mediaId shows a file's own picture.
+          const q=url.searchParams,project=requireProject(textField(q.get('projectId'),160,true),userId);
+          const mediaId=q.get('mediaId'),asset=mediaId?state.media.find(m=>m.id===mediaId&&m.projectId===project.id)??fail(404,'Media not found.'):undefined;
+          if(asset?.kind==='audio')fail(409,'Audio has no picture.');
+          const timeline=asset?undefined:state.timelines.find(t=>t.id===q.get('timelineId')&&t.projectId===project.id)??fail(404,'Timeline not found.');
+          const base=asset?mediaStill(project,asset,originalPath(asset.id)):previewSnapshot(project,timeline!,{});
+          const still=stillSettings(project,base.timeline.duration,numberField(Number(q.get('t')??0),0,86400),numberField(Number(q.get('w')??512),64,1920));
+          const aborted=new AbortController();res.on('close',()=>{if(!res.writableFinished)aborted.abort();});
+          try{
+            const file=await stills.still({...base,settings:still.settings},aborted.signal);
+            res.setHeader('X-Frame-Time',String(still.time));res.setHeader('X-Frame-Index',String(still.frame));
+            streamFile(req,res,file,'image/jpeg');
+          }catch(error){
+            if(error instanceof StillSkipped){send(res,409,{error:error.message,live:error.live});return;}
+            if(error instanceof PreviewBusyError){res.setHeader('Retry-After',String(error.retryAfterSeconds));fail(429,'Frame queue busy');}
+            throw error;
+          }
           return;
         }
         const timelinePreviewRoute=/^\/api\/timeline-previews\/([a-f0-9]{64})\/video\.mp4$/.exec(path);

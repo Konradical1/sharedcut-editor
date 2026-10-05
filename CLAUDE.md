@@ -70,6 +70,20 @@ or source-motion-blur matting.
 If a feature genuinely cannot be done cross-platform, say so and ask before writing it
 Mac-only.
 
+## Every feature ships with its MCP surface
+
+`mcp/` is the SharedCut MCP server (Claude/Codex control the editor through it; `mcp/README.md`). It runs
+the editor store headless, so it can only do what the store and the API can do. **Any feature or change
+you make must be reachable from it in the same commit.** That is not optional and not a follow-up.
+
+- New or changed store action (a method on `EditorStore`): classify it in `ACTIONS` in `mcp/catalog.ts`.
+  Give it a doc comment in the interface; `help actions` shows that comment to the model.
+- New server route or job flow: a job in `mcp/jobs/<feature>.ts` (one-line `doc`) or an entry in `ROUTES`
+  in `mcp/coverage.test.ts` saying why it needs none. New catalogs (effects, presets, kinds) are read from
+  code; if a feature has non-obvious recipes, add them to that module's help `topics`.
+- Keep it token-lean: one-line docs, compact results, ids as `@handles`. `mcp/server.test.ts` caps the tool list.
+- `npm test` fails (`mcp/coverage.test.ts`) when a store action or route is missing from the MCP.
+
 ## Branches
 
 - `main` — the Windows line. Merge target, and where the port lands.
