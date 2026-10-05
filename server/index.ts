@@ -15,6 +15,7 @@ import { captionAvailable, transcribeTimeline } from './captions.ts';
 import { captionSignature, captionPresets, validateCaptionSets, isCaption, type CaptionJob } from '../src/services/captions.ts';
 import { isShape, getShape, validateShape } from '../src/services/shapes.ts';
 import { isComposition, validateCompositions } from '../src/services/compositions.ts';
+import { isAdjustment } from '../src/services/adjustment.ts';
 import { validateKeyframes } from '../src/services/animation.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
 import { flowChunkSeconds, flowTiming, type FlowPreview } from '../src/services/opticalFlow.ts';
@@ -703,7 +704,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const check = (document: PersistedState | PersistedState['snapshots'][number]['state'], projectId?: string, bound?: Set<string>) => {
       const localTimelines=new Map((document.timelines??next.timelines).map(t=>[t.id,t.projectId]));
       const localTracks = new Map(document.tracks.map(item => [item.id, item.timelineId])); const clips = new Map(document.clips.map(item => [item.id, item.projectId]));
-      for (const clip of document.clips) if ((projectId && clip.projectId !== projectId) || localTimelines.get(clip.timelineId) !== clip.projectId || localTracks.get(clip.trackId) !== clip.timelineId || (!isTitle(clip) && !isShape(clip) && !isComposition(clip) && !isLeakMedia(clip.mediaId) && media.get(clip.mediaId) !== clip.projectId)) fail(400, 'A clip references missing or inaccessible media, track, or timeline.');
+      for (const clip of document.clips) if ((projectId && clip.projectId !== projectId) || localTimelines.get(clip.timelineId) !== clip.projectId || localTracks.get(clip.trackId) !== clip.timelineId || (!isTitle(clip) && !isShape(clip) && !isComposition(clip) && !isAdjustment(clip) && !isLeakMedia(clip.mediaId) && media.get(clip.mediaId) !== clip.projectId)) fail(400, 'A clip references missing or inaccessible media, track, or timeline.');
       for (const node of document.nodes) if ((projectId && node.projectId !== projectId) || clips.get(node.clipId) !== node.projectId) fail(400, 'A grade references a missing clip.');
       // A mask binding involves one clip and its own grades; `bound` limits the check to clips whose side changed.
       const grades = new Map<string, typeof document.nodes>(); for (const node of document.nodes) { let list = grades.get(node.clipId); if (!list) grades.set(node.clipId, list = []); list.push(node); }

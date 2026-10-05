@@ -4,6 +4,7 @@ import { starterGrade, primaryDefaults, interpretation, validateGradeNode, acesO
 import { eligibility, proposedNodes, type AssistantMode, type BalanceValues, type LookOption, type ShotNote } from '../services/colorAssistant.ts';
 import { captionDocument, captionPreset, groupCaptionWords, isCaption, restyleCaption, validateCaption, type CaptionJob, type CaptionSet, type CaptionWord } from '../services/captions.ts';
 import { isComposition, retimeTitleClip, validateCompositions } from '../services/compositions.ts';
+import { ADJUSTMENT_DURATION, ADJUSTMENT_MEDIA, isAdjustment } from '../services/adjustment.ts';
 import { defaultShape, getShape, isShape, validateShape, type ShapeDocument } from '../services/shapes.ts';
 import { createTitleTemplate } from '../services/titleTemplates.ts';
 import { animationProperties, boundedAnimationValue, copyAnimatedNodes, evaluateClip, evaluateNodes, frameTime, retimedDuration, setAnimatedValue, trimAnimation, validateKeyframes } from '../services/animation.ts';
@@ -54,6 +55,7 @@ export interface EditorStore extends PersistedState {
   clipboard: Clip | null; clipboardClips: Clip[]; clipboardNodes: GradeNode[]; clipPreview: Clip | null; draggingMediaId: string | null; inspectorTab: string;
   shapeTool: string | null; compositionTrail: {timelineId:string;playhead:number;clipId:string}[]; selectedClipIds: string[];
   addShape(kind:string,box?:Partial<ShapeDocument>,placement?:{start:number;trackId:string}):void;
+  addAdjustment(placement?:{start:number;trackId:string}):void;
   updateShape(id:string,doc:ShapeDocument,gesture?:string):void;
   editShapePoint(id:string,index:number,action:'delete'|'corner'):void;
   selectClips(ids:string[]):void; createComposition(name?:string):void; openComposition(id:string):void; leaveComposition(index?:number):void;
@@ -553,6 +555,22 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       changes.push(...overwritten,{collection:'clips',id:clip.id,value:record(clip),replace:true});
       commit('ClipAdded',clip.id,`added ${clip.name}`,changes);get().selectClip(clip.id);set({shapeTool:null,textTool:false,playing:false});
     },
+    addAdjustment(placement) {
+      const state=get();if(!writable())return;
+      const start=frameTime(Math.max(0,placement?.start??state.playhead),state.projects.find(p=>p.id===state.projectId)?.fps||24),duration=ADJUSTMENT_DURATION;
+      if(!Number.isFinite(start))return;
+      const tracks=state.tracks.filter(t=>t.timelineId===state.timelineId&&t.kind==='video'&&!t.captionSets);
+      // It adjusts what is below it, so a click puts it on the top picture track, or a new one above everything.
+      const top=tracks.reduce<Track|undefined>((best,t)=>!best||t.number>best.number?t:best,undefined);
+      let track=placement?tracks.find(t=>t.id===placement.trackId&&!t.locked):top&&!top.locked&&!top.hidden&&!state.clips.some(c=>c.trackId===top.id&&c.start<start+duration&&c.start+c.duration>start)?top:undefined;
+      if(placement&&!track)return;
+      const changes:Change[]=[];
+      if(!track){track={id:createId('track'),timelineId:state.timelineId,name:'Adjustment',kind:'video',number:Math.max(0,...tracks.map(t=>t.number))+1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0};changes.push({collection:'tracks',id:track.id,value:record(track),replace:true});}
+      const clip:Clip={id:createId('adjustment'),projectId:state.projectId,timelineId:state.timelineId,trackId:track.id,mediaId:ADJUSTMENT_MEDIA,name:'Adjustment layer',start,duration,sourceIn:0,color:'#6f8f9e',disabled:false,properties:{},effects:[]};
+      const overwritten=placement?overwriteChanges(clip):[];if(!overwritten)return;
+      changes.push(...overwritten,{collection:'clips',id:clip.id,value:record(clip),replace:true});
+      commit('ClipAdded',clip.id,`added ${clip.name}`,changes);get().selectClip(clip.id);set({shapeTool:null,textTool:false,playing:false});
+    },
     updateShape(id,doc,gesture) {
       const clip=editableClip(id,'shapeDocument');if(!clip||!isShape(clip))return;
       try{validateShape(doc);}catch(error){get().notify((error as Error).message,'error');return;}
@@ -1028,7 +1046,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     },
     duplicateClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) {const group=selectedGroup(clip)??[clip];insertClip(clip,clip.start+Math.max(...group.map(c=>c.start+c.duration))-Math.min(...group.map(c=>c.start)),`${clip.name} copy`);} },
     copyClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) { const group=selectedGroup(clip)??[clip],ids=new Set(group.map(c=>c.id));set({ markerClipboard: null, clipboard: structuredClone(clip),clipboardClips:structuredClone([clip,...group.filter(c=>c.id!==clip.id)]),clipboardNodes:structuredClone(get().nodes.filter(n=>ids.has(n.clipId))) }); get().notify('Clip copied'); } },
-    pasteClip(insert = false) { const state = get(); if (!state.clipboard) return; if (state.clipboard.projectId !== state.projectId || (!isTitle(state.clipboard) && !isShape(state.clipboard) && !isComposition(state.clipboard) && !state.media.some(media => media.id === state.clipboard!.mediaId && media.projectId === state.projectId))) { state.notify('Copy a clip from this project first', 'info'); return; } // The earliest copied clip lands on the playhead, the rest keep their offsets from it.
+    pasteClip(insert = false) { const state = get(); if (!state.clipboard) return; if (state.clipboard.projectId !== state.projectId || (!isTitle(state.clipboard) && !isShape(state.clipboard) && !isComposition(state.clipboard) && !isAdjustment(state.clipboard) && !state.media.some(media => media.id === state.clipboard!.mediaId && media.projectId === state.projectId))) { state.notify('Copy a clip from this project first', 'info'); return; } // The earliest copied clip lands on the playhead, the rest keep their offsets from it.
       const first=Math.min(state.clipboard.start,...state.clipboardClips.map(c=>c.start));insertClip(state.clipboard, state.playhead+state.clipboard.start-first,state.clipboard.name,true,undefined,insert); },
     // A drop can carry the whole bin. Ready clips land end to end from the drop point, sharing one
     // gesture id so the hundred-clip drop is a single undo.

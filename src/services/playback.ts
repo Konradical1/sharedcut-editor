@@ -11,6 +11,7 @@ import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, trimAnima
 import { bloomPass, leakRange, isLeakMedia, leakIdOf, timelineTransitions, transitionDefinitions, transitionProgress, type TransitionRecord } from './transitions.ts';
 import { drawText, getText, isTitle } from './text.ts';
 import { drawShape, getShape, isShape } from './shapes.ts';
+import { adjustmentAsset, isAdjustment } from './adjustment.ts';
 import { effectValue, effectEnabled, detailPixels, loudnessTarget } from './effects.ts';
 import { eqBiquads, kWeighting, loudnessWindow } from './audioDsp.ts';
 import type { Clip, GradeNode, MediaAsset, Project, Settings, Timeline, Track } from '../state/models.ts';
@@ -179,7 +180,7 @@ export function playbackLayers(state: Pick<PlaybackState, 'clips' | 'tracks' | '
     return [evaluateClip(extendClip(clip, span.start, span.end - span.start), state.playhead, fps)];
   }).filter(clip=>!clip.disabled);
   return active.flatMap(clip => {
-    const track = trackOf(clip), asset = isLeakMedia(clip.mediaId) ? leakAsset(clip, state.leaks) : isTitle(clip) || isShape(clip) || clip.mediaId==='frameline-composition' ? { id: clip.mediaId, hasAudio:clip.mediaId==='frameline-composition', projectId: clip.projectId, name: clip.name, kind: 'image', binId: '', thumbnail: '', duration: clip.duration, resolution: '', fps: 0, size: '', status: 'ready', progress: 100 } as MediaAsset : media.get(clip.mediaId);
+    const track = trackOf(clip), asset = isLeakMedia(clip.mediaId) ? leakAsset(clip, state.leaks) : isAdjustment(clip) ? adjustmentAsset(clip) : isTitle(clip) || isShape(clip) || clip.mediaId==='frameline-composition' ? { id: clip.mediaId, hasAudio:clip.mediaId==='frameline-composition', projectId: clip.projectId, name: clip.name, kind: 'image', binId: '', thumbnail: '', duration: clip.duration, resolution: '', fps: 0, size: '', status: 'ready', progress: 100 } as MediaAsset : media.get(clip.mediaId);
     if (!track || !asset) return [];
     const separateAudio = active.some(other => other.id !== clip.id && trackOf(other)?.kind === 'audio' && other.mediaId === clip.mediaId && other.start === clip.start && other.sourceIn === clip.sourceIn && other.duration === clip.duration);
     return [{ clip, track, asset, visual: track.kind === 'video' && !track.hidden && asset.kind !== 'audio', audible: (asset.kind === 'audio' || !!asset.hasAudio) && !clip.properties.freeze && !track.muted && (!solo || track.solo) && !(track.kind === 'video' && (clip.properties.audioDetached || separateAudio)) }];
@@ -708,6 +709,14 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         layerContext.clearRect(0,0,width,height);layerContext.drawImage(group.canvas,0,0);
         beginSide();finishLayer(clip,asset,time,layerTarget,undefined);
         continue;
+      }
+      if(isAdjustment(clip)) {
+        if(!visual)continue;
+        // Everything below is already in `target`: that composite is this layer's picture. A transition side still
+        // reads it, so an adjustment dissolving in or out fades its look, as Premiere's does.
+        if(options.compare){layerContext.clearRect(0,0,width,height);layerContext.drawImage(referenceTarget.canvas,0,0);draw(referenceTarget,clip,width,height,projectWidth,projectHeight,time,project?.fps??24);}
+        layerContext.clearRect(0,0,width,height);layerContext.drawImage(target.canvas,0,0);
+        picture=true;beginSide();finishLayer(clip,asset,time,layerTarget,undefined);continue;
       }
       if(isTitle(clip)||isShape(clip)) {
         if(!visual)continue;

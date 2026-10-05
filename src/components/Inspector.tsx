@@ -5,6 +5,7 @@ import { PanelTabPresence, usePanelTabPresence } from './PanelTabPresence';
 import CaptionInspector from './CaptionInspector';
 import { isCaption } from '../services/captions';
 import { isComposition } from '../services/compositions';
+import { isAdjustment } from '../services/adjustment';
 import TransitionInspector from './TransitionInspector';
 import { transitionName } from '../services/transitions';
 import { evaluateClip, frameTime } from '../services/animation';
@@ -153,28 +154,30 @@ export default function Inspector() {
   const caption=selected&&isCaption(selected);
   const title = selected && isTitle(selected);
   const shape = selected && isShape(selected);
+  const adjustment = selected && isAdjustment(selected);
   const hasTransition = !!selected && (!!transitionName(selected,'in') || !!transitionName(selected,'out'));
   const storedOrDefault = storedTab==='Transition' && !hasTransition ? 'Video' : storedTab;
-  const tab = caption ? 'Caption' : storedOrDefault==='Transition' ? 'Transition' : title ? (storedOrDefault==='Effects'?'Effects':'Text') : shape && !['Shape','Effects'].includes(storedOrDefault) ? 'Shape' : storedOrDefault;
+  const tab = caption ? 'Caption' : storedOrDefault==='Transition' ? 'Transition' : title ? (storedOrDefault==='Effects'?'Effects':'Text') : shape && !['Shape','Effects'].includes(storedOrDefault) ? 'Shape' : adjustment && !['Video','Effects','Transition'].includes(storedOrDefault) ? 'Video' : storedOrDefault;
   usePanelTabPresence('inspector', selected ? tab : undefined);
   const setTab=(inspectorTab:string)=>useEditorStore.setState({inspectorTab});
   const s=useEditorStore.getState;
   return <section className="inspector panel" data-cursor-clip={selected?.id}><header className="panel-header"><SlidersHorizontal size={15}/><h2>Inspector</h2><span className="spacer"/><IconButton label="Close inspector" onClick={()=>s().setSidePanel(null)}><X size={14}/></IconButton></header>{!selected?<EmptyState icon={<SlidersHorizontal size={26}/>} title="Make a selection" description="Select a timeline clip to see its properties."/>:<>
-    <div className="inspector-clip"><span className="inspector-clip-icon">{title?<Type size={13}/>:shape?<Shapes size={13}/>:<Film size={13}/>}</span><b title={selected.name}>{selected.name}</b><span className="inspector-clip-meta" title={`${asset?.resolution??'1920 × 1080'} · ${fpsLabel(asset?.fps)} fps`}>{asset?.resolution??'1920 × 1080'} · {fpsLabel(asset?.fps)} fps</span></div>
-    <div className="inspector-tabs">{[...(caption?['Caption']:title?['Text','Effects']:shape?['Shape','Effects']:['Video','Audio','Effects','Info']),...(hasTransition?['Transition']:[])].map(t=><button key={t} className={tab===t?'active':''} onClick={()=>setTab(t)}>{t}<PanelTabPresence panel="inspector" tab={t} clipId={selected.id}/></button>)}</div>
+    <div className="inspector-clip"><span className="inspector-clip-icon">{title?<Type size={13}/>:shape?<Shapes size={13}/>:adjustment?<SlidersHorizontal size={13}/>:<Film size={13}/>}</span><b title={selected.name}>{selected.name}</b><span className="inspector-clip-meta" title={`${asset?.resolution??'1920 × 1080'} · ${fpsLabel(asset?.fps)} fps`}>{asset?.resolution??'1920 × 1080'} · {fpsLabel(asset?.fps)} fps</span></div>
+    <div className="inspector-tabs">{[...(caption?['Caption']:title?['Text','Effects']:shape?['Shape','Effects']:adjustment?['Video','Effects']:['Video','Audio','Effects','Info']),...(hasTransition?['Transition']:[])].map(t=><button key={t} className={tab===t?'active':''} onClick={()=>setTab(t)}>{t}<PanelTabPresence panel="inspector" tab={t} clipId={selected.id}/></button>)}</div>
     <div className="inspector-scroll" data-cursor-surface="inspector" data-cursor-clip={selected.id} data-cursor-context={tab}>
       {tab==='Caption'&&<CaptionInspector key={selected.id} id={selected.id}/>}
       {tab==='Transition'&&<TransitionInspector/>}
       {tab==='Text'&&title&&<TextInspector/>}{isComposition(selected)&&<button className="composition-open" onClick={()=>s().openComposition(selected.id)}><Layers size={14}/>Open composition</button>}
       {tab==='Shape'&&<ShapeInspector/>}
+      {tab==='Video'&&adjustment&&<p className="inspector-note">Everything on the tracks below this clip takes its transform, effects and color. Grade it in Color like any shot.</p>}
       {tab==='Video'&&<>
         <Section title="Transform" icon={<SlidersHorizontal size={12}/>}><Property name="x" label="Position X" suffix="px"/><Property name="y" label="Position Y" suffix="px"/><Property name="zoom" label="Zoom" initial={100} min={1} max={800} suffix="%"/><Property name="rotation" label="Rotation" min={-360} max={360} suffix="°"/><Property name="anchorX" label="Anchor X" suffix="px"/><Property name="anchorY" label="Anchor Y" suffix="px"/><label className="inspector-checks" data-cursor-anchor="flipH"><input type="checkbox" aria-label="Flip horizontal" checked={Boolean(selected.properties.flipH)} onChange={e=>s().updateProperty(selected.id,'flipH',e.target.checked)}/>Flip horizontal</label><MotionBlurControl/></Section>
         {asset?.kind==='video'&&!isComposition(selected)&&<Section title="Tracking" icon={<Crosshair size={12}/>} open={!!selected.motionTrackers?.length}><MotionTrackerInspector clip={selected}/></Section>}
         <Section title="Crop" icon={<Crop size={12}/>} open={false}>{['Left','Right','Top','Bottom'].map(side=><Property key={side} name={`crop${side}`} label={side} min={0} max={1920} suffix="px"/>)}</Section>
         <Section title="Composite" icon={<Layers size={12}/>}><Property name="opacity" label="Opacity" initial={100} min={0} max={100} suffix="%"/><Property name="fadeIn" label="Fade in" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><Property name="fadeOut" label="Fade out" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><label className="inspector-select-row"><span>Blend mode</span><select data-cursor-anchor="blend-mode" aria-label="Blend mode" value={String(selected.properties.blendMode??'Normal')} onChange={e=>s().updateProperty(selected.id,'blendMode',e.target.value)}>{blendModeNames.map(x=><option key={x}>{x}</option>)}</select></label></Section>
-        <Section title="Speed" icon={<Gauge size={12}/>}><Property name="speed" label="Speed" initial={100} min={1} max={800} suffix="%"/>
+        {!adjustment&&<Section title="Speed" icon={<Gauge size={12}/>}><Property name="speed" label="Speed" initial={100} min={1} max={800} suffix="%"/>
           {asset?.kind==='video'&&<OpticalFlowControl clipId={selected.id} enabled={Boolean(selected.properties.opticalFlow)}/>}
-          <p className="inspector-note">Without keyframes, Speed changes the whole clip and its duration. Add a diamond, move the playhead, then change Speed to create a ramp within the clip.</p><div className="inspector-checks">{[['reverse','Reverse'],['freeze','Freeze frame']].map(([key,label])=><label data-cursor-anchor={key} key={key}><input type="checkbox" checked={Boolean(selected.properties[key])} onChange={e=>s().updateProperty(selected.id,key,e.target.checked)}/>{label}</label>)}</div></Section>
+          <p className="inspector-note">Without keyframes, Speed changes the whole clip and its duration. Add a diamond, move the playhead, then change Speed to create a ramp within the clip.</p><div className="inspector-checks">{[['reverse','Reverse'],['freeze','Freeze frame']].map(([key,label])=><label data-cursor-anchor={key} key={key}><input type="checkbox" checked={Boolean(selected.properties[key])} onChange={e=>s().updateProperty(selected.id,key,e.target.checked)}/>{label}</label>)}</div></Section>}
       </>}
       {tab==='Audio'&&<><Section title="Clip audio" icon={<Volume2 size={12}/>}><Property name="gain" label="Gain" initial={0} min={-60} max={12} step={.5} suffix="dB"/><Property name="pan" label="Pan" initial={0} min={-100} max={100}/><Property name="audioFadeIn" label="Audio fade in" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><Property name="audioFadeOut" label="Audio fade out" min={0} max={selected.duration} step={1/(asset?.fps||24)} suffix="s"/><NormalizeControl clip={selected} loudness={(asset as {loudness?:number}|undefined)?.loudness}/></Section><div className="inspector-audio-preview"><Volume2 size={28}/><p>Shape your sound in the Audio workspace.</p><button className="button button-secondary" onClick={()=>s().setWorkspace('audio')}>Open mixer</button></div></>}
       {tab==='Effects'&&<>

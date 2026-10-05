@@ -1,4 +1,5 @@
 import { ease, linearCurve } from './animation.ts';
+import { isAdjustment } from './adjustment.ts';
 import { isShape } from './shapes.ts';
 import { isTitle } from './text.ts';
 import type { Clip, MediaAsset, Track } from '../state/models.ts';
@@ -891,7 +892,7 @@ export const transitionShare = (name: string, params: TransitionParams, align: T
  * compositions) and stills are unbounded because they are drawn rather than decoded.
  */
 export function availableHandle(clip: Clip, edge: TransitionSide, asset?: MediaAsset): number {
-  if (isTitle(clip) || isShape(clip) || clip.mediaId === 'frameline-composition') return 3600;
+  if (isTitle(clip) || isShape(clip) || isAdjustment(clip) || clip.mediaId === 'frameline-composition') return 3600;
   if (!asset || asset.kind === 'image' || clip.properties?.freeze) return 3600;
   const speed = Math.max(.01, Number(clip.properties?.speed ?? 100) / 100);
   const media = Number(asset.duration) || 0;

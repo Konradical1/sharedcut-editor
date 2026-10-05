@@ -16,6 +16,7 @@ import { animatedSourceOffset, evaluateClip, evaluateNodes, fadeLevel, sampleKey
 import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { isTitle, getText, drawText, validateText } from '../src/services/text.ts';
 import { isShape, getShape, drawShape, validateShape } from '../src/services/shapes.ts';
+import { adjustmentAsset, isAdjustment } from '../src/services/adjustment.ts';
 import { effectDefinitions, effectValue, effectEnabled, loudnessTarget } from '../src/services/effects.ts';
 import { eqBiquads } from '../src/services/audioDsp.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
@@ -756,6 +757,7 @@ function framedTransitions(records: TransitionRecord[], rangeIn: number, fps: nu
 // Pictures a pass may decode at once, the longest stretch it takes, and clips per sound pass (bounded by
 // Windows' command line: each input spends ~380 characters on its path and whitelists).
 const PASS_INPUTS = 6, PASS_SECONDS = 20, PASS_SOUNDS = 48;
+const ADJUSTMENT_LABELS = 100_000;
 
 /**
  * Frame ranges for the picture passes of one export. A single FFmpeg graph with every clip in it opens every
@@ -873,7 +875,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   if (!request.pass && !request.sampledFrame) {
     // Frames this range holds, counted the way the base source and -t emit them: every frame starting before the out point.
     const frame = (seconds: number) => Math.round((seconds - rangeIn) * fps), total = Math.ceil(duration * fps - 1e-6);
-    const spans = clips.filter(clip => { const track = tracks.find(t => t.id === clip.trackId); return track?.kind === 'video' && !track.hidden; })
+    const spans = clips.filter(clip => { const track = tracks.find(t => t.id === clip.trackId); return track?.kind === 'video' && !track.hidden && !isAdjustment(clip); })
       .map(clip => { const span = clipSpan(clip, transitions); return { from: Math.max(0, frame(span.start)), to: Math.min(total, frame(span.end)) }; })
       .filter(span => span.to > span.from);
     const passes = renderPasses(spans, transitions.map(record => ({ from: frame(record.start), to: frame(record.end) })), total, PASS_INPUTS, Math.round(PASS_SECONDS * fps));
@@ -900,7 +902,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   // FFmpeg's 10-bit YUV overlay darkens translucent RGB on transparent bases.
   // ponytail: groups composite in 8-bit RGB; use a 16-bit RGB compositor when HDR nesting is supported.
   const args = exportCommon(threads), filters = soundOnly || request.decoder ? [] : [`color=c=${request.transparent?'black@0':'black'}:s=${width}x${height}:r=${fps}:d=${duration},format=${request.transparent?'rgba':'yuv444p10le'},setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[base]`];
-  let inputIndex = 0, currentVideo = 'base', videoDecoders = 0;
+  let inputIndex = 0, currentVideo = 'base', videoDecoders = 0, adjustments = 0;
   const audioLabels: string[] = [];
   // Each side of a cut is split off its own clip chain, so the untouched body of the clip stays
   // bit-identical and only the window pays for the transition.
@@ -1033,6 +1035,12 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       const png=path.join(lutDir,`graphic-${inputIndex}.png`);await writeFile(png,await image.encode('png'));
       source={path:png,asset:{id:clip.mediaId,projectId:project.id,name:clip.name,kind:'image',binId:'',thumbnail:'',duration:clip.duration,resolution:project.resolution,fps:0,size:'',status:'ready',progress:100}};
     }
+    // An adjustment clip's picture is the composite the tracks below have made so far: split it off the running stream.
+    const adjust = isAdjustment(clip);
+    if (adjust) {
+      if (track.hidden || track.kind !== 'video' || soundOnly || request.decoder) continue;
+      source = { path: '', asset: adjustmentAsset(clip, project.resolution) };
+    }
     if (!source && isLeakMedia(clip.mediaId)) {
       // A leak expanded onto an audio track plays from the shared pack, not from project media.
       const file = request.overlayPath?.(leakIdOf(clip.mediaId));
@@ -1075,15 +1083,17 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     // run past the media, a clip whose stored trim does is still a broken edit.
     if (source.asset.kind !== 'image' && !p.freeze && clip.sourceIn + clip.duration * speed > source.asset.duration + .1) throw new Error(`${clip.name}: the trim and speed extend beyond the original media. Shorten the clip or reduce its speed.`);
     if (p.reverse && sourceLength > 60) throw new Error(`${clip.name}: reverse playback buffers frames in memory. Export reverse segments of 60 seconds or less.`);
-    if (source.asset.kind === 'image') args.push('-loop', '1', '-framerate', String(fps));
+    if (adjust) {}
+    else if (source.asset.kind === 'image') args.push('-loop', '1', '-framerate', String(fps));
     // Float noise like 7e-15 stringifies in exponent form, which FFmpeg's -ss parser rejects.
     else args.push('-ss', Math.max(0, seek).toFixed(6));
     // Passes that run side by side give each decoder their share of threads; a picture pass holds only a few
     // decoders, so it can also use the GPU (4:2:2 falls back to software on Ada NVDEC; Blackwell decodes it).
     // Every video decoder is capped, split or not: a render that takes all its threads for each decoder holds about 1 GB per 4K one.
     if (visual && source.asset.kind === 'video') { args.push(...(request.pass === 'video' ? await decodeAccel() : []), '-threads', String(Math.min(DECODE_THREADS, Number(threads)))); videoDecoders++; }
-    args.push('-t', String(source.asset.kind === 'image' ? length : decoded), ...safeInput, '-i', source.path);
-    const index = inputIndex++;
+    if (!adjust) args.push('-t', String(source.asset.kind === 'image' ? length : decoded), ...safeInput, '-i', source.path);
+    // ponytail: labels only, no FFmpeg input; offset past any real input index (a pass holds at most 128 clips).
+    const index = adjust ? ADJUSTMENT_LABELS + adjustments++ : inputIndex++;
     if (visual) {
       let base: Cube | undefined, lookId: string | undefined;
       if (p.resolveLookUrl && p.bypassResolveLook !== true) {
@@ -1094,8 +1104,10 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       let videoIndex=index,acesCube:string|undefined;
       const usedMasks=activeSmartMasks(clip,request.nodes),depthKeys=activeDepthKeys(clip,request.nodes),maskStreams=new Map<string,{index:number;timing:string[]}>();
       const exactColor=usedMasks.length>0||depthKeys.length>0||clip.properties.colorPipeline==='nodes-v2'&&hasACES(request.nodes,clip.id);
+      if(exactColor&&adjust&&(usedMasks.length||depthKeys.length))throw Error(`${clip.name}: Smart Masks and depth keys need source footage. Grade masked looks on the clips themselves, not on an adjustment clip.`);
       if(exactColor){
-        const metadata=await probeMedia(source.path,request.signal),colorSource=interpretation(clip,source.asset);
+        // An adjustment clip only reaches the 129³ table bake, which reads the stages and not the file.
+        const metadata=adjust?{width:projectWidth,height:projectHeight,fps,frameRate:String(fps),colorMatrix:'bt709'} as Awaited<ReturnType<typeof probeMedia>>:await probeMedia(source.path,request.signal),colorSource=interpretation(clip,source.asset);
         const jobPath=path.join(lutDir,`${index}.json`),output=path.join(lutDir,`${index}.mkv`);
         const matrix=String(p.yuvMatrix||source.asset.colorMatrix||metadata.colorMatrix||'auto').replace('bt2020-ncl','bt2020nc');
         const masks=usedMasks.map(document=>{
@@ -1164,7 +1176,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         }
         }
       }
-      const video = [`setpts=PTS-STARTPTS`];
+      if (adjust) { filters.push(`[${currentVideo}]split[adjkeep${index}][adjsrc${index}]`); currentVideo = `adjkeep${index}`; }
+      const video = adjust ? [`trim=start=${offset.toFixed(6)}:duration=${length.toFixed(6)}`, `setpts=PTS-STARTPTS`] : [`setpts=PTS-STARTPTS`];
       if (p.freeze) video.push('trim=end_frame=1', `tpad=stop_mode=clone:stop_duration=${length}`);
       else {
         if (p.reverse && source.asset.kind !== 'image') video.push('reverse');
@@ -1220,7 +1233,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       const anchorX = property('anchorX', 0, -100000, 100000) * width / projectWidth+(shape?(shape.x+shape.width/2-.5)*width:0), anchorY = property('anchorY', 0, -100000, 100000) * height / projectHeight+(shape?(shape.y+shape.height/2-.5)*height:0);
       const shiftedX = motion?0:x + anchorX - zoom * (anchorX * Math.cos(rotation) - anchorY * Math.sin(rotation));
       const shiftedY = motion?0:y + anchorY - zoom * (anchorX * Math.sin(rotation) + anchorY * Math.cos(rotation));
-      filters.push(`[${videoIndex}:v:0]${video.join(',')}[${motion?'motionbase':'clipv'}${index}]`);
+      filters.push(`[${adjust?`adjsrc${index}`:`${videoIndex}:v:0`}]${video.join(',')}[${motion?'motionbase':'clipv'}${index}]`);
       if(motion)filters.push(...motionBlurFilters(`motionbase${index}`,`clipv${index}`,poses,width,height,projectWidth,projectHeight,fps,length));
       if (request.decoder) { currentVideo = `clipv${index}`; continue; }
       const touching = transitions.filter(record => record.outgoingId === clip.id || record.incomingId === clip.id);

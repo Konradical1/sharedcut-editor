@@ -1,5 +1,6 @@
 import { isTitle } from './text.ts';
 import { isShape } from './shapes.ts';
+import { isAdjustment } from './adjustment.ts';
 import type { Clip, Effect } from '../state/models.ts';
 
 export interface EffectParameter { key: string; label: string; initial: number; min: number; max: number; step?: number; suffix?: string }
@@ -32,11 +33,11 @@ export const loudnessTargets = [{ lufs: -14, label: 'Web' }, { lufs: -16, label:
 export const loudnessTarget = (clip: Clip) => loudnessTargets.find(t => t.lufs === Number(clip.properties.normalizeTarget))?.lufs ?? loudnessTargets[0].lufs;
 export function acceptsEffect(clip: Clip, kind: string | undefined, name: string) {
   if(clip.properties.captionSet)return false;
-  if(name==='Smart Mask'||name==='Stabilize')return kind==='video'&&!isTitle(clip)&&!isShape(clip)&&!clip.properties.compositionId;
+  if(name==='Smart Mask'||name==='Stabilize')return kind==='video'&&!isTitle(clip)&&!isShape(clip)&&!isAdjustment(clip)&&!clip.properties.compositionId;
   // One Depth per clip: its sections already chain light, fog, lens and glow in physical order.
-  if(name==='Depth')return (kind==='video'||kind==='image')&&!isTitle(clip)&&!isShape(clip)&&!clip.properties.compositionId&&!clip.effects.some(e=>e.name==='Depth');
+  if(name==='Depth')return (kind==='video'||kind==='image')&&!isTitle(clip)&&!isShape(clip)&&!isAdjustment(clip)&&!clip.properties.compositionId&&!clip.effects.some(e=>e.name==='Depth');
   const definition = effectDefinitions[name];
-  if(isTitle(clip)||isShape(clip))kind='image';
+  if(isTitle(clip)||isShape(clip)||isAdjustment(clip))kind='image';
   return !!definition && (definition.kind !== 'video' || kind !== 'audio') && (definition.kind !== 'audio' || kind !== 'image');
 }
 

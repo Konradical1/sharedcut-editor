@@ -1,5 +1,6 @@
 import { isShape, getShape, validateShape } from './shapes.ts';
 import { isComposition, validateCompositions } from './compositions.ts';
+import { isAdjustment } from './adjustment.ts';
 import { isTitle, getText, validateText } from './text.ts';
 import type { CollaborativeLock, GradeNode, MediaAsset, Operation, Presence, Project, RenderJob, Settings, Snapshot, Timeline, User, ProjectState } from '../state/models.ts';
 
@@ -63,7 +64,7 @@ export const projectService: ProjectService = {
     if (!state || Object.keys(requirements).some(key => !validCollection(state[key], key)) || typeof state.currentUserId !== 'string' || !hasShape(state.settings, { uiScale: 'string', timelineDensity: 'string', reducedMotion: 'boolean' })) throw new Error('The local project cache could not be read. The demo has been recovered.');
     const typed = state as PersistedState;
     if (!typed.users.some(user => user.id === typed.currentUserId) || !typed.projects.some(project => project.id === 'city-after-dark') || typed.projects.some(project => project.members.some(member => !hasShape(member, { userId: 'string', role: 'string' }))) || typed.comments.some(comment => comment.replies.some(reply => !hasShape(reply, { id: 'string', userId: 'string', text: 'string', timestamp: 'number' }))) || typed.snapshots.some(snapshot => ['clips', 'tracks', 'nodes', 'comments'].some(key => !validCollection((snapshot.state as unknown as Record<string, unknown>)[key], key)))) throw new Error('The local project cache is incomplete. The demo has been recovered.');
-    if (typed.clips.some(clip => clip.start < 0 || clip.duration <= 0 || clip.sourceIn < 0 || !typed.tracks.some(track => track.id === clip.trackId && track.timelineId === clip.timelineId) || (!isTitle(clip) && !isShape(clip) && !isComposition(clip) && !typed.media.some(asset => asset.id === clip.mediaId && asset.projectId === clip.projectId))) || typed.nodes.some(node => !typed.clips.some(clip => clip.id === node.clipId && clip.projectId === node.projectId))) throw new Error('The local timeline cache is damaged. The demo has been recovered.');
+    if (typed.clips.some(clip => clip.start < 0 || clip.duration <= 0 || clip.sourceIn < 0 || !typed.tracks.some(track => track.id === clip.trackId && track.timelineId === clip.timelineId) || (!isTitle(clip) && !isShape(clip) && !isComposition(clip) && !isAdjustment(clip) && !typed.media.some(asset => asset.id === clip.mediaId && asset.projectId === clip.projectId))) || typed.nodes.some(node => !typed.clips.some(clip => clip.id === node.clipId && clip.projectId === node.projectId))) throw new Error('The local timeline cache is damaged. The demo has been recovered.');
     if (typed.operations.some(operation => [...operation.oldState as unknown[], ...operation.newState as unknown[]].some(item => {
       if (!item || typeof item !== 'object') return true;
       const change = item as { collection: string; id: string; value: unknown; replace?: boolean; unset?: unknown };
