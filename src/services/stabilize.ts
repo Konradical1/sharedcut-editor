@@ -26,10 +26,13 @@ export function stabilizeRange(clip: Clip, sourceFps: number, sourceDuration: nu
 /** Zoom the crop budget implies, before any smooth extra zoom the solve adds around whip pans. */
 export const stabilizeZoom = (settings: StabilizeSettings) => 1 / (1 - 2 * Math.min(.45, Math.max(0, settings.crop / 100)));
 
-/** The warp for a source time, indexed exactly as the export render indexes it. */
-export function stabilizeMatrixAt(solve: StabilizeSolve, sourceTime: number): number[] {
-  const index = Math.round((sourceTime - solve.from) * solve.fps);
-  return solve.matrices[Math.max(0, Math.min(solve.matrices.length - 1, index))];
+/** The warp for a source time, indexed exactly as the export render indexes it. `blend`: the picture shows a time between two
+ *  source frames (optical flow), so the two analysed warps around it are mixed, as the export mixes the two stabilized frames. */
+export function stabilizeMatrixAt(solve: StabilizeSolve, sourceTime: number, blend = false): number[] {
+  const last = solve.matrices.length - 1, position = (sourceTime - solve.from) * solve.fps, pick = (index: number) => solve.matrices[Math.max(0, Math.min(last, index))];
+  if (!blend) return pick(Math.round(position));
+  const low = Math.floor(position), mix = Math.max(0, Math.min(1, position - low)), from = pick(low), to = pick(low + 1);
+  return from.map((value, i) => value + (to[i] - value) * mix);
 }
 
 /** Re-express a source-pixel warp for a canvas where the source sits letterboxed at `scale` from (`left`,`top`).
@@ -44,7 +47,7 @@ export function stabilizeTransform(matrix: number[], scale: number, left: number
  *  The element is usually a proxy while the solve is measured on the original, so its translations are in original
  *  pixels: the scale that carries them onto the layer is the letterboxed width over the analysed width, not over
  *  the proxy's. Aspect is preserved by every proxy, so the letterbox rectangle itself is the element's. */
-export function stabilizeLayerTransform(solve: StabilizeSolve, sourceTime: number, width: number, height: number, elementWidth: number, elementHeight: number) {
+export function stabilizeLayerTransform(solve: StabilizeSolve, sourceTime: number, width: number, height: number, elementWidth: number, elementHeight: number, blend = false) {
   const fit = Math.min(width / elementWidth, height / elementHeight), boxWidth = elementWidth * fit, boxHeight = elementHeight * fit;
-  return stabilizeTransform(stabilizeMatrixAt(solve, sourceTime), boxWidth / solve.width, (width - boxWidth) / 2, (height - boxHeight) / 2);
+  return stabilizeTransform(stabilizeMatrixAt(solve, sourceTime, blend), boxWidth / solve.width, (width - boxWidth) / 2, (height - boxHeight) / 2);
 }

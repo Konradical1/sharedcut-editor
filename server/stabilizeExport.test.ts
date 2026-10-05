@@ -11,6 +11,7 @@ import { venvPython } from './platform.ts';
 import { maskAnalysis, maskSourceFingerprint } from './smartMask.ts';
 import { createSmartMask, smartMaskSignature, type SmartMaskManifest } from '../src/services/smartMask.ts';
 import { stabilizePython } from './stabilize.ts';
+import { flowPython } from './opticalFlow.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
 
@@ -29,7 +30,6 @@ test('Stabilize export bakes a shaky clip and rejects conflicting effects', { ti
     const stabilize = { id: 'fx', name: 'Stabilize', enabled: true, amount: 100, parameters: { crop: 6 } };
     const clip: Clip = { id: 'clip', projectId: 'project', timelineId: 'timeline', mediaId: 'asset', name: 'Shaky', trackId: 'v1', start: 0, duration: 2, sourceIn: .5, color: 'red', disabled: false, properties: { ...defaultProperties }, effects: [stabilize] };
     const request: RenderRequest = { project, timeline: { id: 'timeline', projectId: 'project', name: 'test', duration: 2 }, tracks: [track], clips: [clip], nodes: [], assets: [{ asset, path: source }], settings: { resolution: '280 × 160', fps: '24', rangeIn: '0', rangeOut: '2', audio: 'Disabled' }, outputPath: path.join(dir, 'out.mp4'), stabilizeDir: path.join(dir, 'cache') };
-    await assert.rejects(renderTimeline({ ...request, clips: [{ ...clip, properties: { ...clip.properties, opticalFlow: true } }] }), /optical flow/);
     if (!existsSync(stabilizePython())) { console.log('Stabilize worker not installed; skipping the bake.'); return; }
     const progress: number[] = [];
     await renderTimeline({ ...request, onProgress: value => progress.push(value) });
@@ -41,6 +41,21 @@ test('Stabilize export bakes a shaky clip and rejects conflicting effects', { ti
     // Speed edits reuse the same analysis and keep working on the baked media.
     await renderTimeline({ ...request, clips: [{ ...clip, duration: 1, properties: { ...clip.properties, speed: 200 } }], settings: { ...request.settings, rangeOut: '1' }, outputPath: path.join(dir, 'fast.mp4') });
     assert.ok(Math.abs((await probeMedia(path.join(dir, 'fast.mp4'))).duration - 1) < .1);
+    if (!existsSync(flowPython())) { console.log('Optical flow worker not installed; skipping the flow chain.'); return; }
+    // Stabilize bakes first, optical flow then interpolates the stabilized frames: at half speed the held render repeats
+    // every frame (two identical pictures in a row), the flow render has a new picture on every one.
+    const slow = { ...clip, duration: 2, properties: { ...clip.properties, speed: 50 } };
+    const stillest = async (name: string, flow: boolean) => {
+      const file = path.join(dir, name);
+      await renderTimeline({ ...request, clips: [{ ...slow, properties: { ...slow.properties, opticalFlow: flow } }], outputPath: file });
+      const size = 280 * 160, raw = await run(ffmpeg, ['-v', 'error', '-i', file, '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { binary: true });
+      // The last picture repeats the one before it (nothing lies beyond the clip to interpolate toward), so it is not counted.
+      const steps = Array.from({ length: raw.length / size - 2 }, (_, k) => raw.subarray(k * size, (k + 1) * size).reduce((sum, value, i) => sum + Math.abs(value - raw[(k + 1) * size + i]), 0) / size);
+      assert.ok(Math.abs((await probeMedia(file)).duration - 2) < .1, `${name} keeps the clip's length`);
+      return Math.min(...steps);
+    };
+    const held = await stillest('held.mp4', false), smooth = await stillest('smooth.mp4', true);
+    assert.ok(smooth > held + 1, `optical flow after Stabilize interpolates: still-frame step ${smooth.toFixed(2)} vs ${held.toFixed(2)} held`);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 

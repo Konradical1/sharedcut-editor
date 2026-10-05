@@ -48,6 +48,20 @@ test('a source time picks the frame the export render would warp', () => {
   assert.deepEqual(stabilizeMatrixAt(s, 99), s.matrices[2]);
 });
 
+test('with optical flow the warp blends the two analysed frames around the source time', () => {
+  // Flow shows pictures between source frames; a nearest-frame warp would step every other picture and shake the slow motion.
+  const s = solve([[1, 0, 0, 0, 1, 0], [1, 0, -4, 0, 1, 3], [1, 0, -8, 0, 1, 6]]);
+  const near = (actual: number[], expected: number[], message: string) => assert.ok(actual.every((value, i) => Math.abs(value - expected[i]) < 1e-9), `${message}: ${actual}`);
+  near(stabilizeMatrixAt(s, 2 + .5 / 24, true), [1, 0, -2, 0, 1, 1.5], 'half way between two frames');
+  near(stabilizeMatrixAt(s, 2 + 1.25 / 24, true), [1, 0, -5, 0, 1, 3.75], 'a quarter past the second frame');
+  near(stabilizeMatrixAt(s, 2 + 1 / 24, true), s.matrices[1], 'on an analysed frame it is that frame’s matrix');
+  near(stabilizeMatrixAt(s, 0, true), s.matrices[0], 'before the range it holds the first');
+  near(stabilizeMatrixAt(s, 99, true), s.matrices[2], 'after the range it holds the last');
+  near(stabilizeMatrixAt(s, 2 + 1.4 / 24), s.matrices[1], 'without flow it still rounds to the nearest frame');
+  const layer = stabilizeLayerTransform(s, 2 + .5 / 24, 960, 540, 1920, 1080, true);
+  near(layer as unknown as number[], stabilizeTransform([1, 0, -2, 0, 1, 1.5], .5, 0, 0), 'the layer transform takes the blended matrix');
+});
+
 test('the warp is re-expressed for the letterboxed layer it is drawn on', () => {
   // Source pixels: translate by (-8, 6) about the frame centre.
   const identity = stabilizeTransform([1, 0, 0, 0, 1, 0], .5, 100, 20);

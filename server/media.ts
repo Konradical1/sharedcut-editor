@@ -1446,7 +1446,8 @@ async function renderStabilizedTimeline(request: RenderRequest) {
   const candidates=clips.filter(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c));
   const maskArtifacts=new Map(request.maskArtifacts),stabilized=new Map(request.stabilized);
   for(const [index,clip] of candidates.entries()) {
-    if(clip.properties.opticalFlow)throw Error(`${clip.name}: Stabilize and optical flow cannot share a clip yet. Disable optical flow or remove Stabilize.`);
+    // Optical flow needs no check: the bake below is source-time media, so the recursive render hands it to renderFlowTimeline,
+    // which interpolates the stabilized frames (stabilize first, then retime).
     // ponytail: the key would need the depth warped like the picture (stabilizeWarpMattes does it for subjects).
     if(activeDepthKeys(clip,request.nodes).length)throw Error(`${clip.name}: a depth key and Stabilize cannot share a clip in export yet. Remove the depth key or Stabilize.`);
     const source=assets.find(a=>a.asset.id===clip.mediaId),track=tracks.find(t=>t.id===clip.trackId);
@@ -1486,7 +1487,8 @@ async function renderStabilizedTimeline(request: RenderRequest) {
       const audioId=`stabilize-audio-${clip.id}`;
       tracks.push({...track,id:audioId,kind:'audio'});
       // The original carries the sound; the bake is picture only.
-      clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name))});
+      // opticalFlow off: the sound is never interpolated, and renderFlowTimeline would otherwise bake this clip's picture a second time.
+      clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,opticalFlow:false,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name))});
     }
   }
   await renderTimeline({...request,clips,assets,tracks,maskArtifacts,stabilized,onProgress:p=>request.onProgress?.(45+p*.55)});

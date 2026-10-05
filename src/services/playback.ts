@@ -744,7 +744,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       };
       // Stabilize is a per-frame warp of the picture this clip already decodes: no substitute media, so
       // speed, reverse, freeze, the colour pipeline and Smart Mask all keep reading real source time.
-      const stabilizeFx = visual && asset.kind === 'video' && !original.properties.opticalFlow ? stabilizeEffect(original) : undefined;
+      // Under optical flow that picture is the interpolated one, warped by the matrices around its source time.
+      const stabilizeFx = visual && asset.kind === 'video' ? stabilizeEffect(original) : undefined;
       const sourceFps = asset.fps || project?.fps || 24;
       let stabilizeSolveFor: StabilizeSolve | undefined;
       if (stabilizeFx) {
@@ -897,15 +898,15 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if (options.compare) { if (flip) mirrorLayer(); draw(referenceTarget, clip, width, height, projectWidth, projectHeight, time, project?.fps ?? 24); if (flip) mirrorLayer(); }
       // While the analysis runs, hold the original at the crop the solve will apply so the framing never jumps.
       const framed = stabilizeFx && !stabilizeSolveFor ? {...clip, properties:{...clip.properties, zoom: Number(clip.properties.zoom ?? 100) * stabilizeZoom(stabilizeSettings(original, stabilizeFx))}} : clip;
-      const warp = stabilizeSolveFor ? {solve:stabilizeSolveFor,time:sourceTime(original,time,sourceFps,asset.duration||Infinity),sourceWidth,sourceHeight} : undefined;
+      const warp = stabilizeSolveFor ? {solve:stabilizeSolveFor,time:sourceTime(original,time,sourceFps,asset.duration||Infinity),sourceWidth,sourceHeight,blend:Boolean(original.properties.opticalFlow)} : undefined;
       beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip,stampAt);
     }
     flush(Infinity);
     };
-    type LayerWarp = { solve:StabilizeSolve; time:number; sourceWidth:number; sourceHeight:number };
+    type LayerWarp = { solve:StabilizeSolve; time:number; sourceWidth:number; sourceHeight:number; blend:boolean };
     /** The stabilize warp in this layer's pixels. Picture and matte take the same one, which is what puts the
      *  matte on the stabilized frame instead of the original framing. */
-    const warpTransform = (warp:LayerWarp) => stabilizeLayerTransform(warp.solve,warp.time,width,height,warp.sourceWidth,warp.sourceHeight);
+    const warpTransform = (warp:LayerWarp) => stabilizeLayerTransform(warp.solve,warp.time,width,height,warp.sourceWidth,warp.sourceHeight,warp.blend);
     const mirrorLayer = () => { layerContext.save(); layerContext.setTransform(-1, 0, 0, 1, width, 0); layerContext.globalCompositeOperation = 'copy'; layerContext.drawImage(layer, 0, 0); layerContext.restore(); };
     const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp,snapshot?:VideoFrame,flip=false,stampAt=-1) => {
       let masks=new Map<string,SmartMaskPixels>();
