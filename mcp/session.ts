@@ -27,7 +27,7 @@ export class ApiFailure extends Error {
   data: any;
   constructor(status: number, data: any, path: string) { super(data?.error ? `${data.error} (${status})` : `${path} -> ${status}`); this.status = status; this.data = data; }
 }
-export const SIGN_IN = 'Not signed in to SharedCut. Run `npm run mcp:login` in the SharedCut folder, then retry.';
+export const SIGN_IN = 'Not signed in to SharedCut. Run `npm run login` in the sharedcut-mcp folder (`npm run mcp:login` in the SharedCut repo), then retry.';
 
 // Every request the store makes is a relative /api/... fetch from a browser page. Point those at the server with the
 // session cookie, and remember them: an action's fire-and-forget request must land before its result is reported.

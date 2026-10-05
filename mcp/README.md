@@ -31,6 +31,18 @@ codex mcp add sharedcut -- node /path/to/SharedCut/mcp/server.ts
 The session is stored in `~/sharedcut-agent/mcp.json`. Set `FRAME_LINE_URL` / `FRAME_LINE_COOKIE` to point at
 another server (a throwaway test server, say).
 
+## Other users
+
+Other people install the standalone build from the public repo https://github.com/Konradical1/sharedcut-mcp
+(no SharedCut source needed; they sign in with their own sharedcut.com account and see only projects shared with them).
+To publish a new version after MCP or editor changes:
+
+```sh
+git clone https://github.com/Konradical1/sharedcut-mcp.git /tmp/sharedcut-mcp
+npm run mcp:bundle -- /tmp/sharedcut-mcp
+cd /tmp/sharedcut-mcp && git commit -am "SharedCut MCP <version>" && git push
+```
+
 ## Tools
 
 | Tool | Does |

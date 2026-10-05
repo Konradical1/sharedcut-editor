@@ -94,7 +94,7 @@ export const TOOLS: Record<string, Tool> = {
       await ready();
       const route = String(path).replace(/^\/?(api\/)?/, '/');
       // Signing out would revoke the session this server runs on (and release the user's locks everywhere).
-      if (/^\/auth\/(logout|login|signup)/.test(route)) throw new Error('Sign-in routes are off limits here; use npm run mcp:login.');
+      if (/^\/auth\/(logout|login|signup)/.test(route)) throw new Error('Sign-in routes are off limits here; sign in with npm run login (npm run mcp:login in the SharedCut repo).');
       const data = await call(route, { method, ...(body !== undefined ? { json: resolveHandles(body, store.getState()) } : {}) });
       if (method !== 'GET') await refresh();
       if (save) {

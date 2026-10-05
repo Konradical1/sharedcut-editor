@@ -49,7 +49,7 @@ export async function login(urlArg?: string) {
   if (!token) throw new Error('The server did not return a session.');
   mkdirSync(dirname(CONFIG_FILE), { recursive: true, mode: 0o700 });
   writeFileSync(CONFIG_FILE, JSON.stringify({ url, cookie: `frameline_session=${token}`, email, savedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
-  console.log(`Signed in to ${url} as ${data.user?.name ?? email}. The session lasts 30 days; run npm run mcp:login again after that.`);
+  console.log(`Signed in to ${url} as ${data.user?.name ?? email}. The session lasts 30 days; sign in again after that (npm run login, or npm run mcp:login in the SharedCut repo).`);
 }
 
 function register(cli: string, add: string[], remove: string[]) {
