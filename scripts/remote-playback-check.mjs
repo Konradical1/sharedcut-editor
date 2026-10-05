@@ -26,6 +26,7 @@ import { createServer } from 'node:http';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
+import { headline, realtimeFactor } from './playbackHeadline.mjs';
 
 const ORIGIN = process.env.ORIGIN ?? 'https://sharedcut.com';
 const PROJECT = process.env.PROJECT ?? 'project-7694cce382b0915d28eed8117c563129367ccda0';
@@ -103,7 +104,9 @@ await context.addInitScript(({ hw, mem }) => {
   if (mem) Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: () => mem });
   window.qaReset = () => { window.qa = { frames: [], health: [] }; };
   window.qaReset();
-  window.addEventListener('frameline:frame', (e) => window.qa.frames.push([performance.now(), e.detail?.dataset?.sourceTimestamp]));
+  // pictureStamp names every footage layer's picture; sourceTimestamp is only the layer drawn last, which a logo on top pins
+  // (the live OLD client has no pictureStamp, so it falls back to the old stamp).
+  window.addEventListener('frameline:frame', (e) => { const d = e.detail?.dataset; window.qa.frames.push([performance.now(), d?.pictureStamp || d?.sourceTimestamp]); });
   // [at, loading, engine, reason, error, playhead, showing the automatic low stream ("reduced bandwidth" note)]
   window.addEventListener('frameline:playback-health', (e) => { const d = e.detail; if (d.playing) window.qa.health.push([performance.now(), d.loading, d.engine, d.loading ? d.reason : '', d.error ?? '', d.playhead, !!document.querySelector('.viewer-demo-note')?.textContent?.includes('reduced bandwidth')]); });
   // What the footage worker downloads and saves, for the whole session: [at, bytes, ms] and [at, url, bytes].
@@ -134,6 +137,7 @@ const report = { origin: ORIGIN, timeline: TIMELINE, dist: process.env.DIST ?? n
 report.firstPictureAt = await page.waitForFunction(() => document.querySelector('.viewer canvas')?.dataset.hasPicture === 'true', null, { timeout: 60000 }).then(stamp, () => null);
 report.firstPictureAfterTabS = report.firstPictureAt === null ? null : +(report.firstPictureAt - report.tabAt).toFixed(1);
 report.beforeFirstPicture = await page.evaluate(() => window.qaNetSummary(0));
+report.canvasSize = await page.evaluate(() => { const c = document.querySelector('.viewer canvas'); return c ? `${c.width}x${c.height}` : null; });
 report.gpu = await page.evaluate(() => { const gl = document.createElement('canvas').getContext('webgl2'), ext = gl?.getExtension('WEBGL_debug_renderer_info'); return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'no webgl2'; });
 if (process.env.QUALITY) await page.getByRole('combobox', { name: 'Preview quality', exact: true }).selectOption(process.env.QUALITY);
 
@@ -194,8 +198,10 @@ for (let pass = 0; pass < PASSES; pass++) {
     metrics.hotspots = [...self].sort((a, b) => b[1] - a[1]).slice(0, 15).map(([k, v]) => `${(100 * v / total).toFixed(1)}% ${k}`);
   }
   const p = { pass, endedAt, ...(link ? { link: link.stats(startedAt, endedAt) } : {}), cached: /on this computer/i.test(footage ?? ''), from: startTime, to: endTime, advancedSeconds: +(timecode(endTime) - timecode(startTime)).toFixed(2), wallSeconds: SECONDS, status: statusText?.slice(0, 120), footage: footage?.slice(0, 60), ...metrics };
+  p.realtimeFactor = +realtimeFactor(p).toFixed(2);
   report.passes.push(p);
   console.log(JSON.stringify(p));
+  console.log(`HEADLINE ${headline(p)}`);
   if (pass < PASSES - 1) await page.waitForTimeout(Number(process.env.CACHE_WAIT ?? 30000));
 }
 // With DIST, Chrome's worker update check bypasses routing: confirm which footage worker actually served the run.

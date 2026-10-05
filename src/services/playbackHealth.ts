@@ -51,10 +51,22 @@ export const healthSharingEnabled = (settings: Readonly<Record<string, unknown>>
 
 export const isVideoEngine = (engine: string): boolean => VIDEO_ENGINES.includes(engine);
 
-/** Names one source picture so a repeat is not counted twice. Undefined for stills and graphics, which would read as a freeze. */
+/**
+ * Names one source picture so a repeat is not counted twice. Undefined for stills and graphics, which would read as a freeze.
+ * `pictureStamp` (every footage layer's clip and time) wins: sourceClip and sourceTimestamp name only the layer drawn last,
+ * so a logo or title above the footage pins them to one value and every picture looks like a repeat.
+ */
 export function frameStamp(data: Dataset): string | undefined {
-  const { sourceClip, sourceTimestamp, playbackEngine } = data;
-  return sourceClip && sourceTimestamp !== undefined && isVideoEngine(playbackEngine ?? '') ? `${sourceClip}@${sourceTimestamp}` : undefined;
+  const { sourceClip, sourceTimestamp, playbackEngine, pictureStamp } = data;
+  if (!isVideoEngine(playbackEngine ?? '')) return undefined;
+  if (pictureStamp) return pictureStamp;
+  return sourceClip && sourceTimestamp !== undefined ? `${sourceClip}@${sourceTimestamp}` : undefined;
+}
+
+/** The clips whose footage is in this picture: those named in `pictureStamp`, else the layer drawn last. */
+export function pictureClips(data: Dataset): string[] {
+  const named = (data.pictureStamp ?? '').split('|').filter(Boolean).map(part => part.slice(0, Math.max(0, part.lastIndexOf('@'))));
+  return named.length ? named : data.sourceClip ? [data.sourceClip] : [];
 }
 
 /** The Viewer's quality names, as short labels. */
@@ -119,7 +131,9 @@ export function createHealthReporter(deps: ReporterDeps): HealthReporter {
     listen(deps.target, 'frameline:frame', event => {
       const { dataset } = (event as CustomEvent<{ dataset: Dataset }>).detail;
       picture = { clipId: dataset.sourceClip ?? '', engine: dataset.playbackEngine ?? '', automaticLow: dataset.automaticLow === 'true' };
-      collector.onFrame(attempt(() => deps.isHeld?.(picture.clipId) === true, false) ? undefined : frameStamp(dataset));
+      // Held on purpose only when every footage layer in the picture is a freeze frame.
+      const clips = pictureClips(dataset);
+      collector.onFrame(attempt(() => clips.length > 0 && clips.every(id => deps.isHeld?.(id) === true), false) ? undefined : frameStamp(dataset));
     }),
     listen(deps.target, 'frameline:playback-health', event => collector.onHealth((event as CustomEvent<HealthDetail>).detail)),
     listen(deps.worker, 'message', event => {

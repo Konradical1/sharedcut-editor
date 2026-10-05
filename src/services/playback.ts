@@ -510,6 +510,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     const seeks: [HTMLMediaElement, number][] = [];
     const activeIds = new Set<string>(), warmIds = new Set<string>(), activeGroups = new Set<string>(), trackLevels: Record<string, number> = {};
     let sourceClip = '', sourceTimestamp = '', engine = ''; let decodedAhead = Infinity;
+    // One `clip@time` per layer that shows footage (nested compositions included). sourceClip/sourceTimestamp name only the
+    // layer drawn last, which a logo or title on top pins; the picture counters read this instead.
+    const pictureStamps: string[] = [];
     let missing = false, loading = false, picture = false, warning = '', autoplayBlocked = false;
     // Layers drawn around this frame because they failed, by decoder or transition: the rest of the picture and
     // the sound carry on, and the viewer names them with a Retry instead of stopping the playhead.
@@ -832,6 +835,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       const sourceWidth = queuedFrame?.displayWidth ?? (element instanceof HTMLVideoElement ? element.videoWidth : element.naturalWidth);
       const sourceHeight = queuedFrame?.displayHeight ?? (element instanceof HTMLVideoElement ? element.videoHeight : element.naturalHeight);
       if (!sourceWidth || !sourceHeight) continue;
+      if (queuedFrame || element instanceof HTMLVideoElement) pictureStamps.push(`${clip.id}@${sourceTimestamp}`);
       layerContext.clearRect(0, 0, width, height);
       const fit = Math.min(width / sourceWidth, height / sourceHeight);
       layerContext.drawImage(queuedFrame??element, (width - sourceWidth * fit) / 2, (height - sourceHeight * fit) / 2, sourceWidth * fit, sourceHeight * fit);
@@ -1015,7 +1019,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       finally{state=timeline;focusing=undefined;}
     }else if(prepared){
       renderLayers(state.timelineId,state.playhead,context,referenceContext,false,true);
-      context.drawImage(prepared.frame,0,0,width,height);picture=true;engine='render-cache';warning='Rendered preview · ready';sourceClip=`preview:${prepared.key}`;sourceTimestamp=String(state.playhead);
+      context.drawImage(prepared.frame,0,0,width,height);picture=true;engine='render-cache';warning='Rendered preview · ready';sourceClip=`preview:${prepared.key}`;sourceTimestamp=String(state.playhead);pictureStamps.push(`${sourceClip}@${sourceTimestamp}`);
     }else renderLayers(state.timelineId,state.playhead,context,referenceContext);
     if(!prepared&&!loading&&state.playing&&performance.now()-renderStarted>1000/previewFps*.7){
       if(++expensiveFrames>=6){expensiveUntil=performance.now()+15000;expensiveFrames=0;}
@@ -1093,6 +1097,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       output.drawImage(composite, 0, 0);
       canvas.dataset.hasPicture = String(picture);
       canvas.dataset.sourceClip = sourceClip; canvas.dataset.sourceTimestamp = sourceTimestamp;
+      canvas.dataset.pictureStamp = pictureStamps.join('|');
       window.dispatchEvent(new CustomEvent('frameline:frame', { detail: canvas }));
     }
     for (const [media, time] of seeks) media.currentTime = time;

@@ -27,7 +27,7 @@ export type ReportEnv = Pick<PlaybackReport, 'build' | 'quality' | 'source' | 'c
 };
 export type ReportCollector = {
   /**
-   * A picture was painted. `stamp` names the source picture (the frame event's `dataset.sourceTimestamp`), so a repeat of
+   * A picture was painted. `stamp` names the source picture (the frame event's `dataset.pictureStamp`, else `sourceClip@sourceTimestamp`), so a repeat of
    * the same one is not counted twice. Leave it out when unknown, e.g. a held still image, which would otherwise read as a freeze.
    */
   onFrame(stamp?: string): void;

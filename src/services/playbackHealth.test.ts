@@ -5,7 +5,7 @@ import type { PlaybackReport } from './playbackReportTypes.ts';
 import type { DeviceFacts } from './playbackReport.ts';
 import {
   MIN_SEND_GAP_MS, SERVER_REPORT_GAP_MS, buildIdFromScripts, cachedPercent, constantSpeed, createHealthReporter, frameStamp, healthSharingEnabled,
-  installHealthReporter, isFrozenClip, pictureSource, qualityLabel, reportTargetFps, takeHealthReport,
+  installHealthReporter, isFrozenClip, pictureClips, pictureSource, qualityLabel, reportTargetFps, takeHealthReport,
   type HealthReporter, type ReporterDeps,
 } from './playbackHealth.ts';
 
@@ -25,6 +25,22 @@ test('a frame is named by clip and source time only for pictures that come from 
   assert.equal(frameStamp({ sourceClip: 'c1', sourceTimestamp: '0', playbackEngine: '' }), undefined, 'a held still image repeats one stamp and must not read as a freeze');
   assert.equal(frameStamp({ sourceClip: '', sourceTimestamp: '', playbackEngine: 'webcodecs' }), undefined);
   assert.equal(frameStamp({}), undefined);
+});
+
+test('the picture stamp names every footage layer, and wins over the stamp of the layer drawn last', () => {
+  const footage = { sourceClip: 'logo', sourceTimestamp: '0', playbackEngine: 'webcodecs', pictureStamp: 'v1@2.5|v2@7' };
+  assert.equal(frameStamp(footage), 'v1@2.5|v2@7', 'a logo drawn last must not pin the stamp');
+  assert.equal(frameStamp({ ...footage, pictureStamp: 'v1@2.55|v2@7' }) !== frameStamp(footage), true, 'any footage layer moving is a new picture');
+  assert.equal(frameStamp({ ...footage, pictureStamp: '' }), 'logo@0', 'no stamp: the old one');
+  assert.equal(frameStamp({ ...footage, pictureStamp: undefined }), 'logo@0');
+  assert.equal(frameStamp({ ...footage, playbackEngine: '' }), undefined, 'a still-only picture is still unknown');
+});
+
+test('the clips in a picture are the ones its stamp names, else the layer drawn last', () => {
+  assert.deepEqual(pictureClips({ sourceClip: 'logo', pictureStamp: 'v1@2.5|v2@7' }), ['v1', 'v2']);
+  assert.deepEqual(pictureClips({ sourceClip: 'logo', pictureStamp: '' }), ['logo']);
+  assert.deepEqual(pictureClips({ sourceClip: 'logo' }), ['logo']);
+  assert.deepEqual(pictureClips({}), []);
 });
 
 test('the viewer quality setting becomes the short label the report carries', () => {
@@ -174,6 +190,27 @@ test('a frozen clip repeats one picture on purpose and is not reported as a stal
   assert.ok(broken.reporter.take(), 'a hint that throws costs the hint, not the report');
 });
 
+/** Footage that moves every tick under a logo that never does: sourceClip and sourceTimestamp name only the logo. */
+function playUnderLogo(r: Rig, ms: number, held = false) {
+  for (let elapsed = 0; elapsed < ms; elapsed += TICK_MS) {
+    r.clock.t += TICK_MS;
+    const dataset = { sourceClip: 'logo', sourceTimestamp: '0', playbackEngine: 'webcodecs', automaticLow: 'false', pictureStamp: held ? 'v1@4' : `v1@${r.clock.t / 1000}` };
+    send(r.win, 'frameline:frame', { dataset });
+    send(r.win, 'frameline:playback-health', { playing: true, playhead: 65, loading: false, engine: 'webcodecs', reason: '' });
+  }
+}
+
+test('footage playing under a logo counts every picture, and a freeze frame under it is still held on purpose', () => {
+  const live = rig(); playUnderLogo(live, 11_000);
+  const report = live.reporter.take() as PlaybackReport;
+  assert.ok(report.fps > 29, `every footage picture counts (${report.fps})`);
+  assert.ok(report.worstFreezeMs < 100, `no false freeze (${report.worstFreezeMs} ms)`);
+  const frozen = rig({ isHeld: clipId => clipId === 'v1' }); playUnderLogo(frozen, 11_000, true);
+  assert.ok((frozen.reporter.take() as PlaybackReport).worstFreezeMs < 100, 'a held footage clip is not a stall even with a logo drawn last');
+  const unaware = rig(); playUnderLogo(unaware, 11_000, true);
+  assert.ok((unaware.reporter.take() as PlaybackReport).worstFreezeMs > 5_000, 'without the hint a repeated footage picture reads as a freeze');
+});
+
 test('nothing is built or sent while sharing is off, and sharing back on resumes at once', () => {
   const r = rig();
   r.state.sharing = false;
@@ -272,6 +309,7 @@ test('the player writes the picture attributes the reporter reads from the frame
   // player would silently turn every picture into "unknown" or "stream". Pinned the way the struggle counter is.
   const source = readFileSync(new URL('./playback.ts', import.meta.url), 'utf8');
   assert.match(source, /canvas\.dataset\.sourceClip = sourceClip; canvas\.dataset\.sourceTimestamp = sourceTimestamp;/);
+  assert.match(source, /canvas\.dataset\.pictureStamp = pictureStamps\.join\('\|'\);/);
   assert.match(source, /canvas\.dataset\.playbackEngine=engine;/);
   assert.match(source, /canvas\.dataset\.automaticLow=String\(automaticLow\);/);
 });
