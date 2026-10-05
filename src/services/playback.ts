@@ -204,12 +204,30 @@ const WARM_CAP = { video: 6, audio: 4 }, EFFICIENT_WARM_CAP = { video: 2, audio:
 export function upcomingClips(state: Pick<PlaybackState, 'clips' | 'tracks' | 'media' | 'projectId' | 'timelineId' | 'playhead' | 'playing'>, open: Set<string>, efficient: boolean, first: Set<string> = new Set(), stalled = false): Clip[] {
   const tracks = byId(state.tracks), media = byId(state.media), horizon = state.playing ? WARM_HORIZON.playing : WARM_HORIZON.paused;
   const lanes = new Map<string, Clip[]>();
-  for (const clip of timelineClips(state.clips, state.projectId, state.timelineId)) {
-    if (clip.disabled || open.has(clip.id) || !(clip.start > state.playhead && clip.start - state.playhead < horizon) || !media.has(clip.mediaId)) continue;
-    const track = tracks.get(clip.trackId);
-    if (!track || (track.kind === 'video' ? track.hidden : track.muted || !state.playing)) continue;
-    lanes.set(track.id, [...lanes.get(track.id) ?? [], clip]);
-  }
+  // A composition's own cuts are warmed too, timed on this timeline (renderLayers plays them under their own ids):
+  // with only the outer timeline looked at, a composition's footage opened cold at its cut and stalled it.
+  const visit = (timelineId: string, offset: number, rate: number, from: number, until: number, ancestry: string[]) => {
+    for (const nested of timelineClips(state.clips, state.projectId, timelineId)) {
+      const track = tracks.get(nested.trackId);
+      if (nested.disabled || !track) continue;
+      // Outer-timeline span, cut to the composition clip that shows it.
+      const natural = offset + nested.start / rate, start = Math.max(from, natural), end = Math.min(until, offset + (nested.start + nested.duration) / rate);
+      if (end <= start) continue;
+      if (nested.mediaId === 'frameline-composition') {
+        const id = String(nested.properties.compositionId ?? ''), speed = Number(nested.properties.speed ?? 100) / 100;
+        // ponytail: reversed or frozen compositions are not looked into; they open at the cut as before.
+        if (!id || ancestry.includes(id) || ancestry.length >= 32 || track.hidden || nested.properties.reverse || nested.properties.freeze || !(speed > 0)) continue;
+        if (start < state.playhead + horizon && end > state.playhead) visit(id, offset + nested.start / rate - nested.sourceIn / (rate * speed), rate * speed, start, end, [...ancestry, timelineId]);
+        continue;
+      }
+      if (open.has(nested.id) || !(start > state.playhead && start - state.playhead < horizon) || !media.has(nested.mediaId)) continue;
+      if (track.kind === 'video' ? track.hidden : track.muted || !state.playing) continue;
+      // A clip already running when its composition starts is warmed from the source second shown there.
+      const skipped = (start - natural) * rate;
+      lanes.set(track.id, [...lanes.get(track.id) ?? [], start === nested.start ? nested : { ...nested, start, duration: nested.duration - skipped, sourceIn: nested.sourceIn + skipped * Number(nested.properties.speed ?? 100) / 100 }]);
+    }
+  };
+  visit(state.timelineId, 0, 1, -Infinity, Infinity, []);
   const order = (a: Clip, b: Clip) => Number(first.has(b.id)) - Number(first.has(a.id)) || a.start - b.start;
   const video = (clip: Clip) => tracks.get(clip.trackId)!.kind === 'video';
   const chosen = [...lanes.values()].flatMap(lane => lane.sort((a, b) => a.start - b.start).slice(0, efficient || stalled ? 1 : 2)).sort(order);

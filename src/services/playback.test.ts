@@ -273,6 +273,20 @@ test('warm-up opens the next cuts on every layer within the horizon, soonest fir
   assert.deepEqual([kind(lean, true).length, kind(lean, false).length], [2, 4], 'efficient mode keeps two pictures but still warms the next sounds');
 });
 
+test('warm-up looks inside an upcoming composition, timing its cuts on the outer timeline', () => {
+  const track = (id: string, timelineId: string, kind = 'video') => ({ id, timelineId, kind, number: 1, muted: false, hidden: false }) as Track;
+  const clip = (id: string, timelineId: string, trackId: string, start: number, mediaId = 'm', properties = {}, sourceIn = 0) => ({ id, projectId: 'p', timelineId, trackId, mediaId, start, duration: 2, sourceIn, properties, effects: [], disabled: false }) as unknown as Clip;
+  const tracks = [track('v1', 't'), track('cv1', 'comp'), track('cv2', 'comp'), track('dv1', 'deep')];
+  const clips = [clip('comp-clip', 't', 'v1', 11, 'frameline-composition', { compositionId: 'comp', speed: 200 }, 1),
+    clip('plate', 'comp', 'cv1', 1), clip('particles', 'comp', 'cv2', 1.4), clip('early', 'comp', 'cv1', 0), clip('inner-comp', 'comp', 'cv2', 3, 'frameline-composition', { compositionId: 'deep' }),
+    clip('deep-shot', 'deep', 'dv1', 0), clip('loop', 'deep', 'dv1', .5, 'frameline-composition', { compositionId: 'comp' })];
+  const state = { projectId: 'p', timelineId: 't', playhead: 10, playing: true, tracks, clips, media: [{ id: 'm', kind: 'video' }] as MediaAsset[] };
+  const warm = upcomingClips(state, new Set(), false);
+  assert.deepEqual(warm.map(c => [c.id, c.start, c.sourceIn]), [['plate', 11, 0], ['early', 11, 1], ['particles', 11.2, 0], ['deep-shot', 12, 0]],
+    'inner cuts at 2x speed from source second 1; one already running at the in point starts there; a nesting loop is skipped');
+  assert.deepEqual(upcomingClips({ ...state, playhead: 11.1 }, new Set(['plate', 'early']), false).map(c => c.id), ['particles', 'deep-shot'], 'cuts inside a composition already on screen are warmed too');
+});
+
 test('a clip uses the colour pipeline for a grade, a look or an input interpretation, and not for plain footage', () => {
   const clip = (properties: Record<string, unknown> = {}) => ({ id: 'c', properties }) as unknown as Clip;
   const node = (enabled: boolean) => ({ enabled }) as unknown as GradeNode;
