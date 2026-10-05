@@ -26,6 +26,8 @@ const MAX_MS = 3_600_000, MAX_FPS = 240, MAX_RTT_MS = 60_000, MAX_MBPS = 100_000
 const GREEN_FPS_PCT = 93, RED_FPS_PCT = 60, GREEN_LOADING_PCT = 5, RED_LOADING_PCT = 25, GREEN_FREEZE_MS = 400, RED_FREEZE_MS = 2500;
 // Diagnosis thresholds.
 const DOMINANT_SHARE = 0.5, LONG_TASK_SHARE = 0.2, LOW_LINK_MBPS = 15, HIGH_RTT_MS = 400;
+/** Below this share of time waiting for a picture, the connection and the server are not what held playback back. */
+const MIN_CAUSE_LOADING_PCT = 5;
 const SLOW_NET_TYPES: readonly string[] = ['slow-2g', '2g', '3g'];
 const HOST_LOW_FREE_GB = 3, HOST_LOW_COMMIT_GB = 3, HOST_BUSY_QUEUED = 6, HOST_BUSY_LAG_MS = 200;
 
@@ -117,6 +119,9 @@ function causeOf(report: PlaybackReport, host: HostInfo): { label: string; note:
   const computerBound = share(wait.color + wait.decode) >= DOMINANT_SHARE || busyThread;
   const downloadBound = share(wait.buffer + wait.seek) >= DOMINANT_SHARE;
   const slowLink = linkEvidence(report), strain = hostStrain(host);
+  // A browser that is hardly waiting is not held up by the connection or the server: its own drawing speed is the limit.
+  // (A shaped or mobile-looking network type alone must not turn a smooth-but-under-target picture into "Connection too slow".)
+  if (report.loadingPct < MIN_CAUSE_LOADING_PCT) return { label: 'Computer too slow', note: 'not waiting on downloads' };
   const mixed = { label: 'Mixed causes', note: null };
   if (downloadBound || (!computerBound && slowLink)) {
     if (strain) return { label: 'Server busy', note: strain };
@@ -128,7 +133,7 @@ function causeOf(report: PlaybackReport, host: HostInfo): { label: string; note:
 
 function waitingPart(report: PlaybackReport): string {
   const pct = Math.round(report.loadingPct);
-  if (pct < 1) return '';
+  if (report.loadingPct < MIN_CAUSE_LOADING_PCT) return ''; // too little to name; the cause line already says it is not waiting
   if (waitTotal(report.waitMs) <= 0) return `, ${pct}% waiting`;
   const [biggest] = [...WAIT_KEYS].sort((a, b) => report.waitMs[b] - report.waitMs[a]);
   return `, ${pct}% waiting on ${WAIT_LABELS[biggest]}`;

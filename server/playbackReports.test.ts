@@ -124,6 +124,15 @@ test('diagnose blames the server when downloads dominate and the host is short o
   assert.match(diagnose(base, host({ commitHeadroomGB: 1 })), /^Server busy: /);
 });
 
+test('diagnose does not blame the connection or the server for a browser that is hardly waiting', () => {
+  // 25 of 30 pictures/s with 0.6% loading on a network that merely looks slow: the machine's own drawing speed is the limit.
+  const hardlyWaiting = report({ fps: 25.3, loadingPct: 0.6, waitMs: { color: 0, decode: 0, buffer: 0, seek: 0, other: 60 }, linkMbps: null, netType: '3g', rttMs: 900 });
+  assert.equal(diagnose(hardlyWaiting, host()), 'Computer too slow: 25 of 30 pictures/s, not waiting on downloads');
+  assert.match(diagnose(hardlyWaiting, host({ freeGB: 0.5 })), /^Computer too slow/);
+  // At exactly the line, real waiting is back in play and the old rules apply.
+  assert.match(diagnose({ ...hardlyWaiting, loadingPct: 5, waitMs: { color: 0, decode: 0, buffer: 400, seek: 0, other: 0 } }, host()), /^Connection too slow/);
+});
+
 test('diagnose admits mixed causes when nothing points at one side', () => {
   const base = report({ fps: 12, loadingPct: 40, waitMs: { color: 0, decode: 0, buffer: 4000, seek: 0, other: 0 }, linkMbps: 50 });
   assert.equal(diagnose(base, host()), 'Mixed causes: 12 of 30 pictures/s, 40% waiting on the download');
