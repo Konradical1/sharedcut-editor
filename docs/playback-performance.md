@@ -72,3 +72,20 @@ Final runs on the current Newspaper edit, both at Full preview with Auto activat
 | Opaque hardware frames, native fallback | 23.7 fps | 0 | 56.8 | 67.2 ms |
 
 Reports: [CPU-throttled](../artifacts/qa/playback-chromebook-simulation.json), [native fallback](../artifacts/qa/playback-native-frame-fallback.json). Worst playback gaps were 90.6 ms and 83.7 ms respectively. An upcoming shape no longer consumes the limited media preload slot; that previously left the next cut cold. The benchmark now uses the current pointer-based ruler controls, releases each seek gesture, and expects frame-snapped times at the project's fractional frame rate. These are Mac Chrome simulations, not physical ChromeOS measurements or a matched before/after speedup claim.
+
+## Chromebook-class playback — October 5, 2026
+
+Measured on sharedcut.com with `scripts/remote-playback-check.mjs` on the real "Girls Soccer" timeline (79 min; the first two minutes are 54 colour-graded 60 fps clips of 1.2-1.7 s). A Chromebook-class browser is posed with `HW_THREADS=4 HW_MEMORY=4` (so Efficient playback Auto switches on, as on a real one), `CPU_RATE=4` (main thread four times slower) and `DOWN_MBPS=40 RTT_MS=40`. `START_SECONDS=720` plays minute 12 instead of the opening.
+
+| Opening, Chromebook profile | Timeline seconds played per 30 s | Rendered pictures/s | Time waiting for a picture |
+| --- | ---: | ---: | ---: |
+| Before | 23-25 (0.75-0.79 of real time) | 14-17 | 22-25% |
+| After | 28-30 (0.94-0.99) | 21-25 | 2-7% |
+
+Minute 12 (ungraded) is unchanged at about real time with 0% waiting; a fast machine plays the opening at 28 pictures/s.
+
+**Cause.** A graded clip's picture is drawn from a raw-plane copy of the decoded frame (`VideoFrame.copyTo`). The copy was requested only from the render tick and only three pictures ahead (about 67 ms), but it takes 20-100 ms and up to 300 ms on a throttled page, so the picture often waited for it ("Preparing color frame"). The copies now start about a quarter second ahead of the clock and again as each picture arrives from the decoder (`videoFrames.ts` `prepare` and the `arrived` hook, `colorPreview.ts` early return, `playback.ts` `prepareColor`), inside a byte budget. Colour output is unchanged (`scripts/color-gpu-check.mjs` passes; 24 paused frames are pixel-identical to the previous build).
+
+**Measuring.** Pictures per second by canvas stamp was wrong whenever a still overlay sits on top (the opening has a logo PNG on a higher track that overwrote the stamp); `canvas.dataset.pictureStamp` now follows the footage layers. Judge a change by timeline seconds played per wall second, `renderedPerSec` and `loadingPct`, which the check prints as a headline per pass. A run's first pass after a quiet period can start slowly because the host's disk is cold; compare runs in both orders.
+
+**Tried and rejected.** Holding back "deferred" background downloads while playing on a line without room to spare starved the next cuts of a dense edit (loading 33% against 20% at 40 Mbps) and was removed. Efficient playback warming a second upcoming clip gained only 0.015 of real time, because the stalls are mid-clip waits on late copies, not cold cuts.
