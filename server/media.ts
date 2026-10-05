@@ -18,6 +18,7 @@ import { createCanvas, GlobalFonts } from '@napi-rs/canvas';
 import { isTitle, getText, drawText, validateText } from '../src/services/text.ts';
 import { isShape, getShape, drawShape, validateShape } from '../src/services/shapes.ts';
 import { adjustmentAsset, isAdjustment } from '../src/services/adjustment.ts';
+import { placement, streamsTransform, transformFilters } from './streamedTransform.ts';
 import { effectDefinitions, effectValue, effectEnabled, loudnessTarget } from '../src/services/effects.ts';
 import { eqBiquads } from '../src/services/audioDsp.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
@@ -723,6 +724,9 @@ export interface RenderRequest {
   /** Internal: the clips as the render started. Depth reads its run from these (depthRun), however a pass, an In/Out
    *  range, a preview chunk, a bake or a per-frame render cuts a clip by now. */
   wholeClips?: Clip[];
+  /** Keyframed position, zoom and rotation render in the streaming pass (streamedTransform.ts) rather than one render per
+   *  frame. Decided once, from the codec the export ends in, and carried into its compositions and passes. */
+  streamTransforms?: boolean;
 }
 
 /** The source span of a clip's one depth run, shared by every reader: the editor (POST /api/depth), an export's wait
@@ -800,7 +804,9 @@ function unseen(clip: Clip, request: Pick<RenderRequest, 'tracks' | 'settings'>)
   const silent = request.settings.audio === 'Disabled' || track.muted || soloed && !track.solo;
   return silent && (track.kind === 'audio' || track.hidden);
 }
-const animationWork = (request: Pick<RenderRequest, 'clips' | 'timeline' | 'tracks' | 'settings'>) => request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && isAnimated(c) && !unseen(c, request));
+/** Whether the clip needs one render per frame: animated in a way the streaming pass cannot draw. */
+const perFrame = (clip: Clip, request: Pick<RenderRequest, 'streamTransforms'>) => isAnimated(clip) && !(request.streamTransforms && streamsTransform(clip));
+const animationWork = (request: Pick<RenderRequest, 'clips' | 'timeline' | 'tracks' | 'settings' | 'streamTransforms'>) => request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && perFrame(c, request) && !unseen(c, request));
 
 /** A vertical project exported at 1920 × 1080 is squashed, not letterboxed; refuse it up front. */
 export function exportAspect(resolution: string | undefined, projectResolution: string) {
@@ -812,6 +818,8 @@ export function exportAspect(resolution: string | undefined, projectResolution: 
 export async function renderTimeline(request: RenderRequest): Promise<void> {
   exportAspect(request.settings.resolution, request.project.resolution);
   if (!request.wholeClips) request = { ...request, wholeClips: request.clips };
+  // `perspective` draws 8-bit RGB: fine for an export that ends in 8-bit H.264/H.265, not for 10-bit ProRes.
+  if (request.streamTransforms === undefined) request = { ...request, streamTransforms: !(request.settings.codec ?? '').includes('ProRes') };
   if (!request.pass) {
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&isCaption(c)))return renderCaptionTimeline(request);
   rejectDepth(request);
@@ -1211,10 +1219,19 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       if (scaledWidth * scaledHeight > 64_000_000) throw new Error(`${clip.name}: zoom requires too much memory at this resolution. Reduce Zoom.`);
       const poses=request.transformSamples?.[clip.id];
       const motion=poses&&poses.length>1;
+      const shape=isShape(clip)?getShape(clip):undefined, anchorShift={x:shape?(shape.x+shape.width/2-.5)*width:0,y:shape?(shape.y+shape.height/2-.5)*height:0};
+      // Keyframed position, zoom and rotation: each output frame's placement, sampled the way a per-frame render
+      // evaluates the clip, drawn by one perspective filter in this pass (streamedTransform.ts).
+      const streamed = !motion && !request.decoder && request.streamTransforms && streamsTransform(clip)
+        ? Array.from({ length: Math.ceil(length * fps - 1e-6) + 1 }, (_, frame) => {
+          const at = evaluateClip(clip, geo.start + localStart + frame / fps, fps).properties;
+          const value = (key: string, fallback: number, min: number, max: number) => finite(at[key] ?? fallback, `${clip.name} ${key}`, min, max);
+          return placement({ x: value('x', 0, -100000, 100000), y: value('y', 0, -100000, 100000), zoom: value('zoom', 100, 1, 800), rotation: value('rotation', 0, -360, 360), anchorX: value('anchorX', 0, -100000, 100000), anchorY: value('anchorY', 0, -100000, 100000) }, width, height, projectWidth, projectHeight, anchorShift);
+        }) : undefined;
       // The clip is graded, cropped and padded on a canvas only as large as it ends up on the output, never larger
       // than the project canvas: a 4K project exported at 1080p used to grade, convert and pad every 4K frame and
       // only then shrink it. Crop stays measured in project pixels, scaled onto that canvas.
-      const largest = motion ? Math.max(...poses.map(pose => Math.max(pose.scaleX, pose.scaleY))) * width : scaledWidth;
+      const largest = motion ? Math.max(...poses.map(pose => Math.max(pose.scaleX, pose.scaleY))) * width : streamed ? Math.max(...streamed.map(frame => frame.zoom)) * width : scaledWidth;
       const canvas = Math.min(1, largest / projectWidth), canvasWidth = Math.max(2, Math.round(projectWidth * canvas)), canvasHeight = Math.max(2, Math.round(projectHeight * canvas));
       const fit = `w=${canvasWidth}:h=${canvasHeight}:force_original_aspect_ratio=decrease`;
       const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && !['EQ', 'Compressor', 'Limiter', 'Stabilize', 'Depth'].includes(e.name));
@@ -1227,9 +1244,11 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       if (left + right >= projectWidth || top + bottom >= projectHeight) throw new Error(`${clip.name}: crop removes the entire frame.`);
       const [cropLeft, cropRight, cropTop, cropBottom] = [left, right, top, bottom].map(value => Math.round(value * canvas));
       if (left || right || top || bottom) video.push(`crop=${Math.max(1, canvasWidth - cropLeft - cropRight)}:${Math.max(1, canvasHeight - cropTop - cropBottom)}:${cropLeft}:${cropTop}`, `pad=${canvasWidth}:${canvasHeight}:${cropLeft}:${cropTop}:color=black@0`);
-      if(!motion)video.push(`scale=${scaledWidth}:${scaledHeight}`);
-      const rotation = property('rotation', 0, -360, 360) * Math.PI / 180;
-      if (rotation&&!motion) video.push(`rotate=${rotation}:ow=rotw(${rotation}):oh=roth(${rotation}):c=none`);
+      const still = placement({ x: property('x', 0, -100000, 100000), y: property('y', 0, -100000, 100000), zoom: zoom * 100, rotation: property('rotation', 0, -360, 360), anchorX: property('anchorX', 0, -100000, 100000), anchorY: property('anchorY', 0, -100000, 100000) }, width, height, projectWidth, projectHeight, anchorShift);
+      const rotation = still.rotation;
+      if (streamed) video.push(...transformFilters(streamed, width, height, Math.min(2, Math.max(1, largest / width))));
+      else if(!motion)video.push(`scale=${scaledWidth}:${scaledHeight}`);
+      if (rotation&&!motion&&!streamed) video.push(`rotate=${rotation}:ow=rotw(${rotation}):oh=roth(${rotation}):c=none`);
       const opacity = property('opacity', 100, 0, 100);
       if (opacity < 100) video.push(`colorchannelmixer=aa=${opacity / 100}`);
       const fadeDuration=property('fadeDuration',clip.duration,.001,86400),fadeOrigin=property('fadeOrigin',0,-86400,86400);
@@ -1240,11 +1259,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         if(fadeOut)video.push(`fade=t=out:st=${fadeDuration-fadeOut}:d=${fadeOut}:alpha=1`);
       }
       video.push(`setpts=PTS-STARTPTS+round(${offset}/TB)`, 'scale=out_color_matrix=bt709:out_range=tv', `format=${request.transparent?'rgba':'yuva444p10le'}`, 'setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709');
-      const x = property('x', 0, -100000, 100000) * width / projectWidth, y = property('y', 0, -100000, 100000) * height / projectHeight;
-      const shape=isShape(clip)?getShape(clip):undefined;
-      const anchorX = property('anchorX', 0, -100000, 100000) * width / projectWidth+(shape?(shape.x+shape.width/2-.5)*width:0), anchorY = property('anchorY', 0, -100000, 100000) * height / projectHeight+(shape?(shape.y+shape.height/2-.5)*height:0);
-      const shiftedX = motion?0:x + anchorX - zoom * (anchorX * Math.cos(rotation) - anchorY * Math.sin(rotation));
-      const shiftedY = motion?0:y + anchorY - zoom * (anchorX * Math.sin(rotation) + anchorY * Math.cos(rotation));
+      // A motion-blurred or streamed layer is already placed on a full output frame.
+      const shiftedX = motion || streamed ? 0 : still.shiftX, shiftedY = motion || streamed ? 0 : still.shiftY;
       filters.push(`[${adjust?`adjsrc${index}`:`${videoIndex}:v:0`}]${video.join(',')}[${motion?'motionbase':'clipv'}${index}]`);
       if(motion)filters.push(...motionBlurFilters(`motionbase${index}`,`clipv${index}`,poses,width,height,projectWidth,projectHeight,fps,length));
       if (request.decoder) { currentVideo = `clipv${index}`; continue; }
@@ -1412,7 +1428,7 @@ async function renderFlattenedTransitions(request: RenderRequest) {
       if (!sides.length) continue;
       // The window is rendered whole, so a keyframed *participant* would need per-frame baking of
       // the blend itself. Animation elsewhere on the timeline is fine and is baked afterwards.
-      const animated = sides.find(isAnimated);
+      const animated = sides.find(side => perFrame(side, request));
       if (animated) throw new Error(`${animated.name}: a transition cannot sit on a keyframed clip. Remove the keyframes on that clip, or the ${record.name} transition, before exporting.`);
       const track = request.tracks.find(item => item.id === sides[0].trackId);
       if (!track) continue;
@@ -2001,7 +2017,7 @@ async function renderAnimatedTimeline(request: RenderRequest) {
     }
     // Whatever animation is left lies outside the export range by construction — a window is clamped
     // to it. Dropping those remnants is what guarantees the flattened timeline cannot route back here.
-    clips=clips.filter(clip=>!(clip.timelineId===request.timeline.id&&isAnimated(clip)));
+    clips=clips.filter(clip=>!(clip.timelineId===request.timeline.id&&perFrame(clip,request)));
     await renderTimeline({...request,clips,tracks,assets,onProgress:p=>request.onProgress?.(total?90+p/10:p)});
   } finally {await rm(directory,{recursive:true,force:true});}
 }
