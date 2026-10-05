@@ -34,4 +34,6 @@ export interface ProjectState { timelines?: Timeline[]; clips: Clip[]; tracks: T
 export interface Snapshot { id: string; projectId: string; name: string; note: string; userId: string; timestamp: number; state: ProjectState }
 export interface RenderJob { id: string; projectId: string; name: string; preset: string; status: 'rendering' | 'waiting' | 'complete' | 'failed'; progress: number; remaining: string; settings: Record<string, string>; outputUrl?: string; error?: string }
 export interface Notification { id: string; title: string; detail?: string; kind: 'success' | 'info' | 'error'; timestamp: number }
+// Other keys are read with a fallback, so an account that never set one gets its default. sharePlaybackHealth
+// (Settings -> Playback -> "Share playback health with the owner") is on unless it is exactly false: see healthSharingEnabled.
 export interface Settings { uiScale: string; timelineDensity: string; reducedMotion: boolean; [key: string]: string | number | boolean }

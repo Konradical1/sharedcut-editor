@@ -32,6 +32,7 @@ const PROJECT = process.env.PROJECT ?? 'project-7694cce382b0915d28eed8117c563129
 const TIMELINE = process.env.TIMELINE ?? 'Part 1 v2';
 const SECONDS = Number(process.env.SECONDS ?? 30), PASSES = Number(process.env.PASSES ?? 2), FPS = Number(process.env.FPS ?? 30);
 const START_EDITS = Number(process.env.START_EDITS ?? 0);
+const HW_THREADS = Number(process.env.HW_THREADS ?? 0), HW_MEMORY = Number(process.env.HW_MEMORY ?? 0);
 const DOWN_MBPS = Number(process.env.DOWN_MBPS ?? 0), RTT_MS = Number(process.env.RTT_MS ?? 0), CPU_RATE = Number(process.env.CPU_RATE ?? 1);
 const out = process.argv[2] ?? 'artifacts/qa/remote-playback.json';
 const cookie = (process.env.FRAME_LINE_COOKIE ?? readFileSync(join(homedir(), 'sharedcut-agent', 'cookie.txt'), 'utf8')).trim();
@@ -95,7 +96,11 @@ if (process.env.DIST) {
     await route.fulfill({ status: 200, body: readFileSync(target), headers: { 'content-type': types[extname(target)] ?? 'application/octet-stream', 'cache-control': 'no-store', ...(path.endsWith('worker.js') ? { 'service-worker-allowed': '/' } : {}) } });
   });
 }
-await context.addInitScript(() => {
+await context.addInitScript(({ hw, mem }) => {
+  window.__sharedcutHarness = true; // the playback report then marks this run as a test, never as a person
+  // HW_THREADS / HW_MEMORY: report a Chromebook-class machine (2-4 cores, 4 GB) so Efficient playback Auto switches on as it does there.
+  if (hw) Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: () => hw });
+  if (mem) Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: () => mem });
   window.qaReset = () => { window.qa = { frames: [], health: [] }; };
   window.qaReset();
   window.addEventListener('frameline:frame', (e) => window.qa.frames.push([performance.now(), e.detail?.dataset?.sourceTimestamp]));
@@ -114,7 +119,7 @@ await context.addInitScript(() => {
     const slowestChunkMs = spans.map(([from, to]) => Math.round(to - from)).sort((a, b) => b - a).slice(0, 5);
     return { workerMbps: busy ? +(bytes * 8 / 1e3 / busy).toFixed(2) : 0, workerMB: +(bytes / 1e6).toFixed(1), savedMB, slowestChunkMs };
   };
-});
+}, { hw: HW_THREADS, mem: HW_MEMORY });
 const page = await context.newPage();
 if (CPU_RATE > 1) await (await context.newCDPSession(page)).send('Emulation.setCPUThrottlingRate', { rate: CPU_RATE });
 const t0 = Date.now(), consoleErrors = [], failed = [];

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type PointerEvent } from 'react';
+import { lazy, useEffect, useRef, useState, type PointerEvent } from 'react';
 import { MotionConfig } from 'motion/react';
 import { ChevronLeft, ChevronDown, PanelLeft, SlidersHorizontal, Scissors, Palette, AudioLines, ArrowUpRight, History, Camera, Users, MessageSquare, Radio, Settings, Check, Cloud, X, MonitorPlay } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
@@ -7,6 +7,7 @@ import type { Workspace } from './state/models';
 import { Brand, Button, IconButton, timecode } from './components/ui';
 import { ServerControl } from './components/AccountControls';
 import { RemoteCursors, PeoplePanel, CommentsPanel, Notifications } from './components/Collaboration';
+import { LazySuspense } from './components/StaleBuildBanner';
 const Dashboard = lazy(() => import('./components/Dashboard'));
 const AuthScreen = lazy(() => import('./components/AuthScreen'));
 const SettingsDialog = lazy(() => import('./components/SettingsDialog'));
@@ -20,6 +21,7 @@ const AudioWorkspace = lazy(() => import('./workspaces/AudioWorkspace'));
 const DeliverWorkspace = lazy(() => import('./workspaces/DeliverWorkspace'));
 import { useEditorShortcuts, useFocusRelease } from './shortcuts';
 import { connectSession, signOut, resolveSyncConflict } from './services/sync';
+import { startPlaybackReporting } from './services/playbackHealthStart';
 // keep the media panel wide enough for every icon tab to stay visible (see .edit-media in styles.css)
 const MIN_MEDIA_WIDTH=232;
 
@@ -44,6 +46,8 @@ function Editor({onHome}:{onHome:()=>void}) {
   const saveStatus=useEditorStore(s=>s.saveStatus);
   const revealedMediaId=useEditorStore(s=>s.revealedMediaId);
   useEffect(()=>{if(revealedMediaId)setMediaVisible(true);},[revealedMediaId]);
+  // One playback report collector for as long as the editor is open; its reports ride on the presence heartbeat.
+  useEffect(()=>startPlaybackReporting(),[]);
   const users=useEditorStore(s=>s.users);
   const liveMode=useEditorStore(s=>s.liveMode);
   const followUserId=useEditorStore(s=>s.followUserId);
@@ -79,11 +83,11 @@ function Editor({onHome}:{onHome:()=>void}) {
       </div>
     </header>
     <main className="editor-main">
-      <Suspense fallback={<div className="workspace-loading"><Brand compact/><span>Loading workspace…</span></div>}>{workspace==='edit'?<div className="edit-workspace" style={{gridTemplateRows:`minmax(0, ${split}fr) 6px minmax(0, ${1-split}fr)`}}>
+      <LazySuspense key={workspace} fallback={<div className="workspace-loading"><Brand compact/><span>Loading workspace…</span></div>}>{workspace==='edit'?<div className="edit-workspace" style={{gridTemplateRows:`minmax(0, ${split}fr) 6px minmax(0, ${1-split}fr)`}}>
         <div className="edit-upper">{mediaVisible&&<><div className="edit-media" style={{width:leftWidth}}><MediaPanel onClose={()=>setMediaVisible(false)}/></div><div role="separator" aria-label="Resize media panel" aria-orientation="vertical" tabIndex={0} className="panel-resizer" onPointerDown={e=>resize(e,'left')} onKeyDown={e=>{if(e.key==='ArrowRight')setLeftWidth(Math.min(420,leftWidth+10));if(e.key==='ArrowLeft')setLeftWidth(Math.max(MIN_MEDIA_WIDTH,leftWidth-10));}}/></>}<Viewer/>{sidePanel&&<><div role="separator" aria-label="Resize side panel" aria-orientation="vertical" tabIndex={0} className="panel-resizer" onPointerDown={e=>resize(e,'right')} onKeyDown={e=>{if(e.key==='ArrowLeft')setRightWidth(Math.min(420,rightWidth+10));if(e.key==='ArrowRight')setRightWidth(Math.max(220,rightWidth-10));}}/><aside className="edit-inspector" style={{width:rightWidth}}>{rightPanel}</aside></>}</div>
         <div role="separator" aria-label="Resize timeline" aria-orientation="horizontal" tabIndex={0} className="panel-resizer horizontal" onPointerDown={e=>resize(e,'vertical')} onKeyDown={e=>{if(e.key==='ArrowUp')setSplit(Math.max(.35,split-.03));if(e.key==='ArrowDown')setSplit(Math.min(.7,split+.03));}}/>
         <Timeline/>
-      </div>:workspace==='color'?<ColorWorkspace/>:workspace==='audio'?<AudioWorkspace/>:<DeliverWorkspace/>}</Suspense>
+      </div>:workspace==='color'?<ColorWorkspace/>:workspace==='audio'?<AudioWorkspace/>:<DeliverWorkspace/>}</LazySuspense>
       {workspace!=='edit'&&sidePanel&&sidePanel!=='inspector'&&<aside className="floating-side-panel">{rightPanel}</aside>}
       <RemoteCursors/>
     </main>
@@ -116,7 +120,7 @@ export default function App() {
   const home=()=>{useEditorStore.getState().setPlaying(false);useEditorStore.getState().setLiveMode('independent');navigate('/');};
   const logout=()=>{void signOut().then(()=>navigate('/login')).catch(error=>useEditorStore.getState().notify(error.message,'error'));};
   return <MotionConfig reducedMotion={settings.reducedMotion?'always':'user'}><div className="app-root">
-    <Suspense fallback={<div className="workspace-loading page-loading"><Brand/><span>Loading…</span></div>}>{session==='loading'?<div className="workspace-loading page-loading"><Brand/><span>Connecting to server…</span></div>:session==='error'?<div className="workspace-loading page-loading"><Brand/><span>Could not connect to your studio server.</span><p>{connectionError}</p><Button onClick={()=>window.location.reload()}>Retry connection</Button></div>:session==='signedOut'?<AuthScreen onDone={home}/>:isEditor&&knownProject?<Editor onHome={home}/>:<Dashboard onOpenProject={id=>navigate(`/project/${encodeURIComponent(id)}`)} onOpenAuth={logout}/>}</Suspense>
-    <Suspense fallback={null}>{(modal==='settings'||modal==='timeline-settings')&&<SettingsDialog initialCategory={modal==='timeline-settings'?'Timeline':'General'} onClose={()=>useEditorStore.getState().setModal(null)}/>}</Suspense><SnapshotDialog/><Notifications/>
+    <LazySuspense fallback={<div className="workspace-loading page-loading"><Brand/><span>Loading…</span></div>}>{session==='loading'?<div className="workspace-loading page-loading"><Brand/><span>Connecting to server…</span></div>:session==='error'?<div className="workspace-loading page-loading"><Brand/><span>Could not connect to your studio server.</span><p>{connectionError}</p><Button onClick={()=>window.location.reload()}>Retry connection</Button></div>:session==='signedOut'?<AuthScreen onDone={home}/>:isEditor&&knownProject?<Editor onHome={home}/>:<Dashboard onOpenProject={id=>navigate(`/project/${encodeURIComponent(id)}`)} onOpenAuth={logout}/>}</LazySuspense>
+    <LazySuspense fallback={null} quiet>{(modal==='settings'||modal==='timeline-settings')&&<SettingsDialog initialCategory={modal==='timeline-settings'?'Timeline':'General'} onClose={()=>useEditorStore.getState().setModal(null)}/>}</LazySuspense><SnapshotDialog/><Notifications/>
   </div></MotionConfig>;
 }

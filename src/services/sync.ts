@@ -6,9 +6,16 @@ import type { PersistedState } from './index.ts';
 import type { CollaborativeLock, DragPreview, Presence, User, MediaAsset } from '../state/models.ts';
 import { api, ApiError, connection } from './api.ts';
 import { mergeState } from './merge.ts';
-import { presenceDue, receivedPresence } from './presence.ts';
+import { receivedPresence } from './presence.ts';
+import { backoffDelay } from './backoff.ts';
+import { createPresencePacer } from './syncPacing.ts';
+import { takeHealthReport } from './playbackHealth.ts';
 
-type Envelope = { incremental?: boolean; baseRevision?: number; delta?: StateDelta; revision: number; lockRevision?: number; state?: PersistedState; presence?: Presence[]; locks?: CollaborativeLock[] };
+// serverStartedAt: when the answering server process started, the same in every answer it gives. Lock changes are
+// numbered from that start, so a different stamp means a restart and the lock counter this tab remembers is void.
+type Envelope = { incremental?: boolean; baseRevision?: number; delta?: StateDelta; revision: number; lockRevision?: number; serverStartedAt?: number; state?: PersistedState; presence?: Presence[]; locks?: CollaborativeLock[] };
+// A refused live-update stream is reopened after 0.5-1 s, then 1-2, 2-4 ... never waiting more than 30 s.
+const EVENTS_RETRY_BASE_MS = 1000, EVENTS_RETRY_MAX_MS = 30_000, EVENTS_RETRY_JITTER = 0.5, EVENT_SOURCE_CLOSED = 2;
 // The server answers 400 to a preview of more than 1000 items, which reads as offline mid-drag; collaborators see a partial ghost instead.
 const PREVIEW_ITEMS = 1000;
 // A preview this big is the biggest thing presence carries; while it is in motion it goes out at the running-playhead 4 Hz, not at every 50 ms tick.
@@ -33,6 +40,8 @@ let storageFull = false;
 let serverRevision = -1;
 let serverLockRevision = -1;
 let lockRevision = -1;
+// null until the first answer; undefined once seen from a server that does not stamp its start.
+let serverStartedAt: number | undefined | null = null;
 let refreshQueued = false;
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
 let retryAttempt = 0;
@@ -84,7 +93,7 @@ function resetSession(session: 'loading' | 'signedOut' = 'signedOut') {
   generation++;
   stopped?.(); stopped = undefined; clearTimeout(timer);
   baseline = null; incremental = false; refreshing = null; refreshAgain = false; revision = -1; mediaRevision = -1; conflicted = false; conflictBase = null; saving = null;
-  serverRevision = -1; serverLockRevision = -1; lockRevision = -1; refreshQueued = false; dirtySince = 0;
+  serverRevision = -1; serverLockRevision = -1; lockRevision = -1; serverStartedAt = null; refreshQueued = false; dirtySince = 0;
   clearTimeout(retryTimer); retryTimer = undefined; retryAttempt = 0;
   // Clear server data while the demo persistence subscriber is still disabled.
   connection.enabled = true;
@@ -105,8 +114,15 @@ export function receiveImportedMedia(asset: MediaAsset, version: number) {
   if (!baseline || !connection.enabled || !Number.isSafeInteger(version) || version < mediaRevision || !baseline.projects.some(p => p.id === asset.projectId)) return;
   receiveMedia({ revision: version, state: { ...baseline, media: baseline.media.some(m => m.id === asset.id) ? baseline.media.map(m => m.id === asset.id ? asset : m) : [asset, ...baseline.media] } });
 }
+// A restarted server counts lock changes from zero again; without this every lock update would look older than the
+// last one seen, and a tab would show no collaborator's lock until it reloaded.
+function noteServerStart(stamp: number | undefined) {
+  if (serverStartedAt !== null && stamp !== serverStartedAt) { lockRevision = -1; serverLockRevision = -1; }
+  serverStartedAt = stamp;
+}
 function receive(envelope: Envelope, base = baseline) {
   if (envelope.revision < revision) return;
+  noteServerStart(envelope.serverStartedAt);
   if (envelope.lockRevision !== undefined) {
     if (envelope.lockRevision < lockRevision) envelope = { ...envelope, locks: undefined };
     serverLockRevision = Math.max(serverLockRevision, envelope.lockRevision!);
@@ -300,7 +316,7 @@ export async function connectSession() {
   sealHistory(envelope.state.operations);
   baseline = envelope.state; incremental = envelope.incremental === true;
   revision = envelope.revision;
-  serverRevision = envelope.revision; serverLockRevision = envelope.lockRevision ?? -1; lockRevision = serverLockRevision;
+  serverRevision = envelope.revision; serverLockRevision = envelope.lockRevision ?? -1; lockRevision = serverLockRevision; serverStartedAt = envelope.serverStartedAt;
   refreshQueued = false; retryAttempt = 0; clearTimeout(retryTimer); retryTimer = undefined;
   conflicted = false;
   apply(envelope.state);
@@ -345,6 +361,8 @@ export async function connectSession() {
   });
   // Exchange only ephemeral presence at 20Hz; project persistence has its own slower poll.
   const clientId = createId('presence'), presenceAbort = new AbortController();
+  const pacer = createPresencePacer();
+  let events: EventSource | undefined, eventsFailures = 0, eventsTimer: ReturnType<typeof setTimeout> | undefined;
   let pollingPresence = false, lastPresence = 0, presenceRetryAt = 0, presenceFailures = 0, lastPublished = 0;
   let publishedProject: string | null = null, publishedCursor = false, presenceRefreshPending = false, publishedPlaying = false, publishedPaced = false;
   let publishedSignature = '';
@@ -369,13 +387,14 @@ export async function connectSession() {
       // Starting and stopping go out at once; only a playhead already known to be running is held to 4 Hz.
       // The drag's first preview (nothing big published yet) and its end (preview null) are never held; only the updates between them are.
       const paced = (preview?.clips?.length ?? 0) > PACED_PREVIEW_CLIPS && publishedPaced;
-      if (!presenceDue(signature, publishedSignature, Date.now() - lastPublished, s.playing && publishedPlaying || paced) && (paced || incremental && events?.readyState === 1 || Date.now() - lastPublished < 100)) return;
-      const response = await api<{ presence: Presence[]; serverTime?: number }>('/presence', { method: 'POST', signal: AbortSignal.any([presenceAbort.signal, AbortSignal.timeout(5000)]), body: JSON.stringify({ clientId, active, projectId: s.projectId, timelineId: s.timelineId, cursor, playhead: s.playhead, selectedClipId: s.selectedClipId, mediaTab: s.mediaPresenceTab, inspectorTab: s.inspectorPresenceTab, activity: s.workspace, online: true, presenting: s.liveMode === 'presenting', playing: s.playing && !s.playbackBuffering, preview }) });
+      // With the live-update stream down presence is polled, and an idle tab slows to once per 2 s instead of 10 posts a second.
+      if (!pacer.due({ signature, published: publishedSignature, sinceMs: Date.now() - lastPublished, playing: s.playing && publishedPlaying || paced, paced, streamUp: incremental && events?.readyState === 1, othersPresent: s.presence.length > 0 })) return;
+      const response = await api<{ presence: Presence[]; serverTime?: number }>('/presence', { method: 'POST', signal: AbortSignal.any([presenceAbort.signal, AbortSignal.timeout(5000)]), body: JSON.stringify({ clientId, active, projectId: s.projectId, timelineId: s.timelineId, cursor, playhead: s.playhead, selectedClipId: s.selectedClipId, mediaTab: s.mediaPresenceTab, inspectorTab: s.inspectorPresenceTab, activity: s.workspace, online: true, presenting: s.liveMode === 'presenting', playing: s.playing && !s.playbackBuffering, preview, health: takeHealthReport() }) });
       publishedProject = s.projectId; publishedCursor = !!cursor;
       publishedSignature = signature; lastPublished = Date.now(); publishedPlaying = s.playing; publishedPaced = (preview?.clips?.length ?? 0) > PACED_PREVIEW_CLIPS;
       presenceFailures = 0; presenceRetryAt = 0;
       receivePresence({ ...response, projectId: s.projectId });
-    } catch (error) { presenceRetryAt = Date.now() + Math.min(3000, 250 * 2 ** presenceFailures++); if (session === generation) { if (!(error instanceof ApiError && error.status < 500)) useEditorStore.setState({ serverOnline: false }); /* a 4xx (rejected preview, held item) means the server answered */ if (error instanceof ApiError && error.status === 401) resetSession(); } }
+    } catch (error) { presenceRetryAt = Date.now() + backoffDelay(presenceFailures++, 250, 3000, 0.5); if (session === generation) { if (!(error instanceof ApiError && error.status < 500)) useEditorStore.setState({ serverOnline: false }); /* a 4xx (rejected preview, held item) means the server answered */ if (error instanceof ApiError && error.status === 401) resetSession(); } }
     finally { pollingPresence = false; if (presenceRefreshPending) { presenceRefreshPending = false; void pollPresence(); } }
   };
   const refreshPresence = () => { if (pollingPresence) presenceRefreshPending = true; else void pollPresence(); };
@@ -383,7 +402,6 @@ export async function connectSession() {
   window.addEventListener('blur', refreshPresence);
   window.addEventListener('focus', refreshPresence);
   if (typeof document !== 'undefined') document.addEventListener('visibilitychange', refreshPresence);
-  const events = typeof EventSource === 'undefined' ? undefined : new EventSource(`/api/events?clientId=${encodeURIComponent(clientId)}`);
   const changed = (event: MessageEvent) => {
     try {
       const data = JSON.parse(event.data);
@@ -392,10 +410,6 @@ export async function connectSession() {
     } catch { /* a frame we cannot parse still means something changed */ }
     void refreshState();
   };
-  events?.addEventListener('change', changed as EventListener);
-  events?.addEventListener('transitions', () => { if (session === generation) useEditorStore.getState().loadLeaks(); });
-  events?.addEventListener('open', () => { if (session === generation) { useEditorStore.getState().loadLeaks(); void refreshState(); } });
-  events?.addEventListener('error', () => { if (session === generation) useEditorStore.setState({ serverOnline: false }); });
   let presenceServerTime = 0;
   const receivePresence = (data: { projectId?: string; presence: Presence[]; serverTime?: number }) => {
     const state = useEditorStore.getState();
@@ -405,9 +419,24 @@ export async function connectSession() {
     // Every setState runs every store selector; an unchanged reply (alone in the project) skips that.
     if (presence !== state.presence || !state.serverOnline) useEditorStore.setState({ presence, serverOnline: true });
   };
-  events?.addEventListener('presence', ((event: MessageEvent) => {
-    try { receivePresence(JSON.parse(event.data)); } catch { /* the next heartbeat recovers */ }
-  }) as EventListener);
+  const connectEvents = () => {
+    if (typeof EventSource === 'undefined' || session !== generation) return;
+    const source = new EventSource(`/api/events?clientId=${encodeURIComponent(clientId)}`);
+    events = source;
+    source.addEventListener('change', changed as EventListener);
+    source.addEventListener('transitions', () => { if (session === generation) useEditorStore.getState().loadLeaks(); });
+    source.addEventListener('open', () => { eventsFailures = 0; if (session === generation) { useEditorStore.getState().loadLeaks(); void refreshState(); } });
+    source.addEventListener('error', () => {
+      if (session !== generation) return;
+      useEditorStore.setState({ serverOnline: false });
+      // The browser retries a dropped stream itself. One the server refused (the tunnel answers 502 while the server restarts) is closed for good, so open a new one after a growing wait.
+      if (source.readyState === EVENT_SOURCE_CLOSED) { source.close(); eventsTimer = setTimeout(connectEvents, backoffDelay(eventsFailures++, EVENTS_RETRY_BASE_MS, EVENTS_RETRY_MAX_MS, EVENTS_RETRY_JITTER)); }
+    });
+    source.addEventListener('presence', ((event: MessageEvent) => {
+      try { receivePresence(JSON.parse(event.data)); } catch { /* the next heartbeat recovers */ }
+    }) as EventListener);
+  };
+  connectEvents();
   let polling = false;
   const poll = setInterval(async () => {
     if (polling || session !== generation) return;
@@ -427,7 +456,7 @@ export async function connectSession() {
   window.addEventListener('pointerup', finishGesture);
   window.addEventListener('pagehide', closePresence);
   window.addEventListener('beforeunload', leave);
-  stopped = () => { presenceAbort.abort(); window.removeEventListener('pointerup', finishGesture); closePresence(); events?.close(); clearInterval(presencePoll); clearInterval(poll); clearInterval(catchUp); clearTimeout(timer); unsubscribe(); window.removeEventListener('beforeunload', leave); window.removeEventListener('pagehide', closePresence); window.removeEventListener('blur', refreshPresence); window.removeEventListener('focus', refreshPresence); if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', refreshPresence); };
+  stopped = () => { presenceAbort.abort(); window.removeEventListener('pointerup', finishGesture); closePresence(); clearTimeout(eventsTimer); events?.close(); clearInterval(presencePoll); clearInterval(poll); clearInterval(catchUp); clearTimeout(timer); unsubscribe(); window.removeEventListener('beforeunload', leave); window.removeEventListener('pagehide', closePresence); window.removeEventListener('blur', refreshPresence); window.removeEventListener('focus', refreshPresence); if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', refreshPresence); };
   if (!conflicted) await flushChanges().catch(error => {
     // Loading succeeded; retain the recovered editor and show a save error in place.
     if (session === generation) useEditorStore.getState().notify(error.message, 'error');

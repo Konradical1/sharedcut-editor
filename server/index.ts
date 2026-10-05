@@ -1,4 +1,9 @@
-import { createPreviewCache } from './previewCache.ts';
+import { createPreviewCache, PreviewBusyError, type PreviewAdmission } from './previewCache.ts';
+import { createHostGuard, JOB_COST_BYTES, VICTIM_ORDER, type HostGuard } from './hostGuard.ts';
+import { createHostHealthLog } from './hostHealthLog.ts';
+import { canSeeHealth, createPlaybackReports, type Identity } from './playbackReports.ts';
+import { liveChildren, setStartGate } from './processTree.ts';
+import type { HostHealth } from '../src/services/playbackReportTypes.ts';
 import { validateMotionBlur } from '../src/services/motionBlur.ts';
 import { workQueue, heavyJob } from './workQueue.ts';
 import { stateDelta, applyStateDelta, stateEqual, shareState } from '../src/services/stateDelta.ts';
@@ -190,7 +195,9 @@ function streamFile(req: IncomingMessage, res: ServerResponse, path: string, typ
   if (gzip) void pipeline(stream, createGzip(), res).catch(() => res.destroy()); else stream.pipe(res);
 }
 
-export function createFrameLineServer(options: { dataDir?: string; distDir?: string; maxUploadBytes?: number; legacyEveryMs?: number } = {}) {
+// hostMonitor: write data/host-health.log. Only the real server asks for it; a test server would launch PowerShell and nvidia-smi for nothing.
+// hostGuard: a test hands in a guard with a made-up memory reading.
+export function createFrameLineServer(options: { dataDir?: string; distDir?: string; maxUploadBytes?: number; legacyEveryMs?: number; hostMonitor?: boolean; hostGuard?: HostGuard } = {}) {
   const dataDir = resolve(options.dataDir ?? process.env.FRAME_LINE_DATA ?? 'data');
   const distDir = resolve(options.distDir ?? 'dist');
   const maxUploadBytes = options.maxUploadBytes ?? Number(process.env.FRAME_LINE_MAX_UPLOAD_BYTES ?? 10 * 1024 ** 3);
@@ -259,6 +266,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   // (the importer issues them automatically) prepares them from the originals already on disk.
   const DEFER_PREP = process.env.FRAME_LINE_DEFER_PREP === '1';
   const queue = workQueue(MEDIA_CONCURRENCY); let closed = false;
+  // Host guard: heavy starts (render passes, media encodes, Python workers) ask it before they spawn, and previews are refused
+  // while memory is short. data/host-guard.mode holds off, observe (the default: log what it would do) or enforce, and is re-read
+  // every second, so the mode changes without a restart. See docs/WINDOWS_NATIVE.md.
+  const guard = options.hostGuard ?? createHostGuard({ modePath: join(dataDir, 'host-guard.mode'), log: message => console.warn(message) });
+  const removeStartGate = setStartGate(guard); guard.start();
   const flowDirectory = join(dataDir, 'optical-flow');
   const masks = smartMaskService(join(dataDir, 'smart-masks'));
   const motionTrackers = motionTrackerService(join(dataDir, 'motion-trackers'));
@@ -328,7 +340,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const known = [...new Set([userId, ...projects.flatMap(project => project.members.map(member => member.userId))])].sort().join('\n');
     let shown = memo!.lists.get('users');
     if (shown?.source !== allUsers || shown.dependency !== known) { const keep = new Set(known.split('\n')); memo!.lists.set('users', shown = { source: allUsers, dependency: known, list: allUsers.map(user => keep.has(user.id) ? user : { ...user, email: '' }) }); }
-    return { revision, lockRevision, state: { ...state, projects, timelines, tracks: pick('tracks', state.tracks, item => timelineIds.has(item.timelineId), timelines), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, pick(key, state[key as Collection] as Entry[], item => ids.has(item.projectId))])), users: shown.list as User[], currentUserId: userId, settings: account.settings }, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
+    return { revision, lockRevision, serverStartedAt, state: { ...state, projects, timelines, tracks: pick('tracks', state.tracks, item => timelineIds.has(item.timelineId), timelines), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, pick(key, state[key as Collection] as Entry[], item => ids.has(item.projectId))])), users: shown.list as User[], currentUserId: userId, settings: account.settings }, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
   };
   // ponytail: sixteen recent views per account, 32 accounts; older clients recover with a full snapshot.
   // The views share their entities with the state, so each costs a few arrays of references.
@@ -400,11 +412,15 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const ephemeralView = (account: Account) => {
     expired(); const userId = account.user.id;
     const ids = new Set(state.projects.filter(project => visibleTo(project, userId)).map(project => project.id));
-    return { revision, lockRevision, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
+    return { revision, lockRevision, serverStartedAt, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
   };
   // Locks and presence carry no workspace revision, so clients need their own change counter to
-  // learn that a short-circuited poll still owes them a lock update.
-  let lockRevision = 0;
+  // learn that a short-circuited poll still owes them a lock update. It starts at the server's start time, never at 0: a tab
+  // keeps the highest number it has seen and ignores lower ones, so after a restart every open tab would have shown no
+  // collaborator's lock until it reloaded. `serverStartedAt` rides on every state answer so a tab can also tell a restart
+  // (even a rollback to a build that counts from 0) and forget the old number.
+  const serverStartedAt = Date.now();
+  let lockRevision = serverStartedAt;
   // A burst of writes (bulk edits, media progress) wakes every client once at the final revision
   // instead of once per change, which otherwise storms each client with full-state fetches.
   let broadcastTimer: ReturnType<typeof setTimeout> | undefined;
@@ -488,11 +504,62 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   /** Settles once every job of this asset has ended; the startup migration's chain never holds it up, unlike queue.drain. */
   const assetJobs = (id: string) => Promise.all([...queued].filter(([, key]) => key === id || key.endsWith(`-${id}`)).map(([job]) => job));
   // `done` runs however the job ends, including cancelled before it started. `prepare` waits outside the queue first.
+  // Previews, filmstrips and waveforms are the work the host guard stops first when memory runs out: while one of them runs,
+  // its abort is on the guard's list (the abort reaches its FFmpeg tree through the job's signal).
+  const victimKind = (id: string) => VICTIM_ORDER.find(kind => id.startsWith(`${kind}-`));
   const addWork = (id: string, work: (signal: AbortSignal) => Promise<void>, render = false, done?: () => void, prepare?: (signal: AbortSignal) => Promise<void>) => {
     const controller = new AbortController(); aborters.set(id, controller);
     let ended!: () => void; const job = new Promise<void>(resolve => { ended = resolve; }); queued.set(job, id);
-    queue.add(async () => { try { if (!closed && !controller.signal.aborted) await work(controller.signal); }
-      finally { if (aborters.get(id) === controller) aborters.delete(id); queued.delete(job); ended(); done?.(); } }, render, prepare && (() => prepare(controller.signal)));
+    const kind = victimKind(id);
+    queue.add(async () => { let forget: (() => void) | undefined;
+      try { if (!closed && !controller.signal.aborted) { forget = kind ? guard.registerVictim(kind, () => controller.abort()) : undefined; await work(controller.signal); } }
+      finally { forget?.(); if (aborters.get(id) === controller) aborters.delete(id); queued.delete(job); ended(); done?.(); } }, render, prepare && (() => prepare(controller.signal)));
+  };
+  // Playback reports ride on presence posts: one browser's allowance is a report every 5 s, and nothing here may break editing.
+  const reports = createPlaybackReports({ dir: join(dataDir, 'playback-reports'), onError: (message, error) => console.error(message, error) });
+  const REPORT_GAP_MS = 5_000, REPORT_KEPT_MS = 60_000, MAX_REPORT_CLIENTS = 256, REPORT_FLUSH_MS = 60_000, REPORT_PRUNE_MS = 3_600_000;
+  const lastReportAt = new Map<string, number>();
+  const takeReport = (identity: Identity, block: unknown) => {
+    if (block === undefined) return;
+    try {
+      const now = Date.now(), key = `${identity.userId}\u0000${identity.clientId}`, last = lastReportAt.get(key);
+      if (last !== undefined && now - last < REPORT_GAP_MS) return;
+      lastReportAt.delete(key); lastReportAt.set(key, now);
+      if (lastReportAt.size > MAX_REPORT_CLIENTS) lastReportAt.delete(lastReportAt.keys().next().value!);
+      reports.ingest(identity, block, now);
+    } catch (error) { console.warn('A playback report was dropped:', error); }
+  };
+  // Once a minute the finished minutes go to today's file and silent browsers' allowances are forgotten; once an hour files
+  // older than 14 days go. Neither can throw.
+  let reportsFlushedAt = 0, reportsPrunedAt = 0;
+  const reportsTick = (now: number) => {
+    for (const [key, at] of lastReportAt) if (now - at > REPORT_KEPT_MS) lastReportAt.delete(key);
+    if (now - reportsFlushedAt >= REPORT_FLUSH_MS) { reportsFlushedAt = now; void reports.flushMinute(now); }
+    if (now - reportsPrunedAt >= REPORT_PRUNE_MS) { reportsPrunedAt = now; void reports.prune(now); }
+  };
+  // One line every 30 s in data/host-health.log: memory, commit headroom, power, GPU, event-loop lag, queues, live children.
+  const hostHealth = createHostHealthLog({
+    path: join(dataDir, 'host-health.log'), sample: () => guard.sample(), children: liveChildren,
+    queues: () => { const held = guard.snapshot(); return { jobs: aborters.size, exportsWaiting: state.renderJobs.filter(job => job.status === 'waiting').length, exportsRendering: state.renderJobs.filter(job => job.status === 'rendering').length, guardWaiting: held.queued, guardRunning: held.running, previews: held.previewsRunning }; },
+    onError: error => console.error('Host health log failed:', error),
+  });
+  if (options.hostMonitor) hostHealth.start();
+  /** What the Health page shows of the host: the guard's own counts plus the last health-log line, with waiting exports counted as queued. */
+  const hostSnapshot = (): HostHealth => {
+    const held = guard.snapshot(), line = hostHealth.latest();
+    return { ...held, at: Date.now(), queued: held.queued + state.renderJobs.filter(job => job.status === 'waiting').length, pagesPerSec: line?.pagesPerSec ?? null, eventLoopLagMs: line?.eventLoopLagMs ?? null, onBattery: line?.onBattery ?? null, gpuMemUsedGB: line?.gpuMemUsedGB ?? null, gpuTempC: line?.gpuTempC ?? null };
+  };
+  const onlineIdentities = (): Identity[] => [...presence.keys()].flatMap(key => {
+    const [projectId, userId, , clientId] = JSON.parse(key) as string[];
+    return [{ userId, name: accountById(userId)?.user.name ?? '', clientId, projectId }];
+  });
+  // A preview never waits for memory: it is refused, and the browser backs off. One log line a minute says why.
+  const REFUSAL_LOG_MS = 60_000;
+  let refusalLoggedAt = 0;
+  const admitPreview = (): PreviewAdmission => {
+    const admission = guard.tryAdmit({ kind: 'preview', costBytes: JOB_COST_BYTES.previewPass, label: 'timeline preview' });
+    if (!admission.ok && Date.now() - refusalLoggedAt >= REFUSAL_LOG_MS) { refusalLoggedAt = Date.now(); console.warn(`Timeline preview refused: ${admission.reason}`); }
+    return admission;
   };
   /** An export's depth runs (Depth clips' and depth keys'), awaited (and held, until `releases` run) before the export joins the render queue:
    *  waiting there for minutes would hold every other export and all media preparation. A run that fails fails the export here,
@@ -512,7 +579,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     aborters.get(job.id)?.abort();
   };
   // No depth service: a preview never reads depth (readsDepth skips those ranges), and must never start a run for a viewer.
-  const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)} ));
+  // One log line per new preview job names who asked. The host guard refuses a preview while memory is short (429, the browser backs off).
+  const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)} ),{log:line=>console.warn(line),admit:admitPreview});
   const startRender = (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>) => {
     db.prepare('INSERT OR REPLACE INTO render_snapshots(id,data) VALUES(?,?)').run(job.id, JSON.stringify(snapshot));
     const releases: (() => void)[] = [];
@@ -740,7 +808,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const settings = { ...DEFAULT_SETTINGS, ...incoming.settings };
     try { transaction(() => { if (!same(settings, account.settings)) { account.settings = settings; saveAccount(account); } for (const [id, backup] of backups) backupProject(id, userId, expiresAt, backup); state = next; persist(); }); }
     catch (error) { state = previousState; revision = previousRevision; account.settings = previousSettings; throw error; }
-    for (const [, backup] of backups) for (const item of [...backup.media, ...backup.renderJobs]) aborters.get(item.id)?.abort();
+    for (const [id, backup] of backups) { timelinePreviews.cancelProject(id); for (const item of [...backup.media, ...backup.renderJobs]) aborters.get(item.id)?.abort(); }
     return true;
   }
 
@@ -980,6 +1048,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         if (projectRoute && method === 'DELETE') {
           const project = requireProject(projectRoute[1], userId); if (roleFor(project, userId) !== 'Owner') fail(403, 'Only the project owner can delete this project.');
           const backup = projectBundle(project), expiresAt = Date.now() + PROJECT_RECOVERY_MS, previous = state, previousRevision = revision;
+          timelinePreviews.cancelProject(project.id);
           for (const item of [...backup.media, ...backup.renderJobs]) aborters.get(item.id)?.abort();
           try { transaction(() => { backupProject(project.id, userId, expiresAt, backup); removeProject(project.id); persist(); }); }
           catch (error) { state = previous; revision = previousRevision; throw error; }
@@ -995,6 +1064,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           try { persist(); } catch (error) { state.projects = previous; throw error; }
           if (body.role !== 'Editor') for (const [key, lock] of locks) if (lock.projectId === project.id && lock.userId === targetId) { locks.delete(key); lockChanged(); }
           send(res, 200, { project: view(account).state.projects.find(item => item.id === project.id) }); return;
+        }
+        if (path === '/api/health/report' && method === 'GET') {
+          // Only accounts named in FRAME_LINE_HEALTH_USERS; everyone else gets exactly what an unknown route gets.
+          if (!canSeeHealth(userId, process.env)) fail(404, 'API endpoint not found.');
+          expired(); send(res, 200, reports.summary({ now: Date.now(), host: hostSnapshot(), onlineIdentities: onlineIdentities() })); return;
         }
         if (path === '/api/events' && method === 'GET') {
           res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' }); res.write(`event: change\ndata: ${JSON.stringify({ revision, locks: lockRevision })}\n\n`);
@@ -1035,6 +1109,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
 
             const selectedClipId = typeof body.selectedClipId === 'string' && state.clips.some(clip => clip.id === body.selectedClipId && clip.projectId === project.id) ? body.selectedClipId : undefined;
             presence.set(key, { session, active: body.active ?? !!cursor, person: { preview, userId, projectId: project.id, cursor: body.active === false ? null : cursor, playhead: numberField(body.playhead ?? 0, 0, 86400 * 7), selectedClipId, mediaTab: ['Media','SFX','Captions','Effects','Transitions','Titles','Shapes'].includes(body.mediaTab) ? body.mediaTab : undefined, inspectorTab: selectedClipId && ['Video','Audio','Effects','Info','Caption','Text','Shape','Transition'].includes(body.inspectorTab) ? body.inspectorTab : undefined, focusedField: typeof body.focusedField === 'string' ? body.focusedField.slice(0, 100) : undefined, activity: typeof body.activity === 'string' ? body.activity.slice(0, 160) : 'Editing', online: true, updatedAt: Date.now(), ...(body.timelineId && state.timelines.some(timeline => timeline.id === body.timelineId && timeline.projectId === project.id) ? { timelineId: body.timelineId } : {}), presenting: body.presenting === true, playing: body.playing === true } });
+            takeReport({ userId, name: account.user.name, clientId, projectId: project.id }, body.health);
           }
           for (const subscriber of subscribers.values()) if (subscriber.session === session && subscriber.clientId === clientId) subscriber.projectId = body.online === false ? undefined : project.id;
           broadcastPresence(project.id);
@@ -1475,9 +1550,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const settings={resolution:`${width} × ${height}`,fps:String(fps),codec:'H.264',quality:'Automatic',audio:'Disabled',rangeIn:String(from),rangeOut:String(end)};
           const clips=state.clips.filter(c=>c.projectId===project.id);
           const ids=new Set(clips.map(c=>c.mediaId));
-          const snapshot=structuredClone({project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips,tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:state.nodes.filter(n=>n.projectId===project.id),assets:state.media.filter(m=>m.projectId===project.id&&ids.has(m.id)).map(asset=>({asset,path:originalPath(asset.id)})),settings,smartMaskDir:join(dataDir,'smart-masks'),stabilizeDir:stabilizeDirectory,resolveDir:resolveDir(project.id)});
-          try { const result=timelinePreviews.request(snapshot);send(res,200,result); }
-          catch(error){if((error as Error).message==='Preview queue busy')fail(429,'Preview queue busy');throw error;}
+          // Live state, not a copy: the cache keeps only what can reach this range and copies just that (the media rows alone
+          // were 6.6 MB a poll), then asks for it again every second per chunk.
+          const snapshot={project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips,tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:state.nodes.filter(n=>n.projectId===project.id),assets:state.media.filter(m=>m.projectId===project.id&&ids.has(m.id)).map(asset=>({asset,path:originalPath(asset.id)})),settings,smartMaskDir:join(dataDir,'smart-masks'),stabilizeDir:stabilizeDirectory,resolveDir:resolveDir(project.id)};
+          try { const result=timelinePreviews.request(snapshot,{userId,chunk});send(res,200,result); }
+          catch(error){if(error instanceof PreviewBusyError){res.setHeader('Retry-After',String(error.retryAfterSeconds));fail(429,'Preview queue busy');}throw error;}
           return;
         }
         const timelinePreviewRoute=/^\/api\/timeline-previews\/([a-f0-9]{64})\/video\.mp4$/.exec(path);
@@ -1626,7 +1703,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   });
   // cloudflared pools idle origin connections for 90 s. Node's 5 s default closed them under it and reset requests.
   server.requestTimeout = 60 * 60_000; server.keepAliveTimeout = 120_000; server.headersTimeout = 121_000;
-  const housekeeping = setInterval(() => { expired(); purgeExpiredProjects(); const now = Date.now(); for (const [key, value] of authAttempts) if (value.reset < now) authAttempts.delete(key); for (const [res, subscriber] of subscribers) { if (!db.prepare('SELECT token FROM sessions WHERE token=? AND expiresAt>?').get(subscriber.session, now)) { res.end(); subscribers.delete(res); } else res.write(': heartbeat\n\n'); } }, 10_000); housekeeping.unref();
+  const housekeeping = setInterval(() => { expired(); purgeExpiredProjects(); timelinePreviews.sweep(); const now = Date.now(); reportsTick(now); for (const [key, value] of authAttempts) if (value.reset < now) authAttempts.delete(key); for (const [res, subscriber] of subscribers) { if (!db.prepare('SELECT token FROM sessions WHERE token=? AND expiresAt>?').get(subscriber.session, now)) { res.end(); subscribers.delete(res); } else res.write(': heartbeat\n\n'); } }, 10_000); housekeeping.unref();
   purgeExpiredProjects();
   // Settle what the restart interrupted. Saved entities are frozen, so every change is a new object,
   // and a list is replaced only when something in it changed.
@@ -1761,11 +1838,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     for (const job of stabilizeJobs.values()) job.controller.abort();
     for (const controller of aborters.values()) controller.abort();
     await Promise.all([...services, flowQueue]);
+    // The guard and the health log stop with the server; the minute of reports still open is written, since a restart is exactly when the next one is wanted.
+    guard.stop(); hostHealth.stop(); removeStartGate(); await reports.flushMinute(Date.now() + REPORT_FLUSH_MS);
     clearInterval(housekeeping); clearInterval(uploadSweep); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const app = createFrameLineServer(); const port = Number(process.env.PORT ?? 4310); const host = process.env.HOST ?? '127.0.0.1';
+  const app = createFrameLineServer({ hostMonitor: true }); const port = Number(process.env.PORT ?? 4310); const host = process.env.HOST ?? '127.0.0.1';
   app.server.listen(port, host, () => console.log(`SharedCut server listening at http://${host}:${port}`));
   // SIGBREAK is Ctrl+Break and SIGHUP a closed console window on Windows; both still get a clean close.
   let stopping = false; for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP'] as const) process.on(signal, () => { if (!stopping) { stopping = true; void app.close().then(() => process.exit(0), error => { console.error('Shutdown failed:', error); process.exit(1); }); } });

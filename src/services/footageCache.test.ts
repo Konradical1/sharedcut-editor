@@ -4,6 +4,7 @@ import vm from 'node:vm';
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
+import { backoffDelay } from './backoff.ts';
 
 const CHUNK = 1 << 20;
 const pathOf = (key: string | Request) => { const url = new URL(typeof key === 'string' ? key : key.url, 'https://sharedcut.test'); return url.pathname + url.search; };
@@ -19,7 +20,7 @@ function harness({ badIndex = false, quota = false, status = 206, registrationFa
     caches: { open: async () => ({ keys: async () => [...cache.keys()].map(key=>new Request(new URL(key,'https://sharedcut.test'))), match: async (key: string | Request) => cache.get(pathOf(key))?.clone(), delete: async (key: string | Request) => cache.delete(pathOf(key)) }), delete: async () => { cache.clear(); } },
     setTimeout: (fn: () => void, ms = 0) => { timers.set(++timer, fn); delays.push(ms); return timer; }, clearTimeout: (id: number) => timers.delete(id),
     Date: class extends Date { static now() { return now; } },
-    AbortController, Error, Request, Response, URL, Uint8Array, JSON, Math,
+    AbortController, Error, Request, Response, URL, Uint8Array, JSON, Math, backoffDelay,
     useSyncExternalStore: (subscribe: (listener: () => void) => void, snapshot: () => number) => { sandbox.subscribed?.forEach((listener: () => void) => subscribe(listener)); return snapshot(); },
     animatedSourceOffset: (clip: any, t: number) => clip.properties.freeze ? 0 : t,
     transitions: [], timelineTransitions: () => sandbox.transitions, moovExtent: () => 16, parseMp4Index: () => badIndex ? null : { moovEnd: 16 },
@@ -40,7 +41,7 @@ function harness({ badIndex = false, quota = false, status = 206, registrationFa
     }),
   };
   const source = ts.transpileModule(readFileSync(new URL('./footageCache.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText.replace(/^import .*;\n/gm, '').replace(/\bexport /g, '');
-  vm.runInNewContext(source + '\nglobalThis.api = { update, clipCached, clipFootageStatus, setDecoderStatus, clearFootageCache, retryFootage, preferLowStream, evict, useFootageVersion };', sandbox);
+  vm.runInNewContext(source + '\nglobalThis.api = { update, clipCached, clipFootageStatus, setDecoderStatus, clearFootageCache, retryFootage, preferLowStream, evict, useFootageVersion, backgroundSlots };', sandbox);
   const state = { timelineId: 't', projectId: 'p', playhead: 0, playing: false, settings: {},
     clips: Array.from({ length: count }, (_, i) => ({ id: `c${i}`, name: `Clip ${i}`, mediaId: `m${i}`, timelineId: 't', projectId: 'p', trackId: 'v', start: i * 10, duration: 5, sourceIn: 0, properties: {} as Record<string, unknown> })),
     tracks: [{ id: 'v', kind: 'video', timelineId: 't' }, { id: 'a', kind: 'audio', timelineId: 't' }] as any[],
@@ -50,7 +51,7 @@ function harness({ badIndex = false, quota = false, status = 206, registrationFa
   const drain = async (rounds = 12) => { for (let i = 0; i < rounds; i++) { pending.splice(0).forEach(job => job.resolve()); await flush(); } };
   const subscribe = (listener: () => void) => { sandbox.subscribed = [listener]; sandbox.api.useFootageVersion(); sandbox.subscribed = undefined; };
   const tick = () => { const due = [...timers.values()]; timers.clear(); due.forEach(fn => fn()); };
-  return { ...sandbox.api as Record<'clipCached' | 'clipFootageStatus' | 'setDecoderStatus' | 'clearFootageCache' | 'retryFootage' | 'preferLowStream' | 'evict', any>, cache, saved:(url:string,index:number)=>{cache.set(`${url}?fc=${index}`,new Response('',{headers:{'Content-Length':String(CHUNK)}}));handlers.message({data:{cache:'footage-v3',type:'footage-stored',url,index,size:CHUNK}});}, meta:(url:string,used:number)=>cache.set(`${url}?fc=meta`,new Response(JSON.stringify({size:3*CHUNK,type:'video/mp4',used}))), transfer:(bytes:number,milliseconds:number,ago=0)=>handlers.message({data:{cache:'footage-v3',type:'footage-transfer',bytes,milliseconds,ago}}), state, sandbox, update, drain, subscribe, tick, delays, pending, requests, ranges, timers, advance: (ms: number) => { now += ms; }, recover: () => { badIndex = false; quota = false; status = 206; registrationFails = false; }, metrics: () => ({ peak, calls }) };
+  return { ...sandbox.api as Record<'clipCached' | 'clipFootageStatus' | 'setDecoderStatus' | 'clearFootageCache' | 'retryFootage' | 'preferLowStream' | 'evict' | 'backgroundSlots', any>, cache, storageError: (url: string) => handlers.message({ data: { cache: 'footage-v3', type: 'footage-storage-error', url } }), saved:(url:string,index:number)=>{cache.set(`${url}?fc=${index}`,new Response('',{headers:{'Content-Length':String(CHUNK)}}));handlers.message({data:{cache:'footage-v3',type:'footage-stored',url,index,size:CHUNK}});}, meta:(url:string,used:number)=>cache.set(`${url}?fc=meta`,new Response(JSON.stringify({size:3*CHUNK,type:'video/mp4',used}))), transfer:(bytes:number,milliseconds:number,ago=0)=>handlers.message({data:{cache:'footage-v3',type:'footage-transfer',bytes,milliseconds,ago}}), state, sandbox, update, drain, subscribe, tick, delays, pending, requests, ranges, timers, advance: (ms: number) => { now += ms; }, recover: () => { badIndex = false; quota = false; status = 206; registrationFails = false; }, metrics: () => ({ peak, calls }) };
 }
 const flush = async () => { for (let i = 0; i < 8; i++) await new Promise(resolve => setImmediate(resolve)); };
 
@@ -534,4 +535,112 @@ test('a chunk body that arrived in one read gives no line-speed sample', async (
   await sw.request(path, 'bytes=0-10');
   for (let i = 0; i < 100 && !sw.messages.some(message => message.type === 'footage-transfer'); i++) await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(sw.messages.find(message => message.type === 'footage-transfer').milliseconds, 0);
+});
+
+test('a download that keeps failing is retried after a growing wait that never passes a minute, and is never given up on', async () => {
+  const h = harness({ status: 503 }); h.state.clips = h.state.clips.slice(0, 1);
+  h.update(); await flush();
+  for (let attempts = 1; attempts <= 9; attempts++) {
+    h.pending.splice(0).forEach((job: any) => job.resolve()); await flush();
+    const before = h.metrics().calls, wait = Math.min(60_000, 1000 * 2 ** attempts);
+    // Jitter shortens the wait by a quarter at most: nothing before that, and a retry by the full wait.
+    h.update(wait * .75 - 500); await flush();
+    assert.equal(h.metrics().calls, before, `failure ${attempts} waits at least ${wait * .75} ms`);
+    h.update(wait * .25 + 1000); await flush();
+    assert.equal(h.metrics().calls, before + 1, `failure ${attempts} is retried within ${wait} ms`);
+  }
+  assert.match(h.clipFootageStatus('c0').detail, /retrying/, 'still reported as retrying after many failures, not as final');
+});
+
+test('after an outage a failed download comes back by itself once the server answers', async () => {
+  const h = harness({ status: 503 }); h.state.clips = h.state.clips.slice(0, 1);
+  h.update(); await flush();
+  for (let i = 0; i < 5; i++) { h.pending.splice(0).forEach((job: any) => job.resolve()); await flush(); h.update(61_000); await flush(); }
+  h.recover(); await h.drain(1);
+  h.update(61_000); await h.drain(8);
+  assert.equal(h.clipCached('c0'), true, 'five failures later the clip still fills once the server is back');
+});
+
+test('a full or blocked local cache is not retried until the user retries', async () => {
+  const h = harness(); h.state.clips = h.state.clips.slice(0, 1);
+  h.storageError('/api/media/m0/files/stream.mp4');
+  h.update(); await flush();
+  assert.equal(h.clipFootageStatus('c0').state, 'red');
+  assert.doesNotMatch(h.clipFootageStatus('c0').detail, /retrying/);
+  h.update(600_000); await flush();
+  assert.equal(h.metrics().calls, 0, 'ten minutes later nothing was requested');
+  h.retryFootage(); await flush();
+  assert.ok(h.metrics().calls > 0, 'the manual retry still works');
+});
+
+test('background downloads wait for urgent ones, and run one at a time, only while playing on a line without room to spare', () => {
+  const { backgroundSlots } = harness();
+  const mbit = (n: number) => n * 125_000, need = mbit(12);
+  assert.equal(backgroundSlots(false, mbit(1), need, true), Infinity, 'paused: everything fills');
+  assert.equal(backgroundSlots(true, mbit(1), 0, true), Infinity, 'no answer while the shots at the playhead are unknown');
+  assert.equal(backgroundSlots(true, mbit(48), need, true), Infinity, 'four times what playback needs leaves room for all');
+  assert.equal(backgroundSlots(true, mbit(47), need, true), 0, 'urgent bytes outstanding on a tight line: nothing else starts');
+  assert.equal(backgroundSlots(true, mbit(47), need, false), 1, 'nothing urgent left: one background download at a time');
+  assert.equal(backgroundSlots(true, 0, need, false), 1, 'a line not measured yet cannot be shown to have room');
+});
+
+/** Files of `bytes` bytes over 100 s; only c0 is at the playhead, every other clip is 30 s or more away. */
+function playingOn(count: number, bytes: number, playing: boolean, failing?: RegExp) {
+  const h = harness({ count, failing }); h.state.playing = playing; h.state.clips[0].duration = 100;
+  h.state.clips.forEach((clip, i) => { clip.start = i * 30; });
+  h.sandbox.parseMp4Index = () => ({ moovEnd: 16, tracks: [{ times: [0, 100], sizes: [bytes] }] });
+  h.transfer(CHUNK, 335); // 25 Mbit/s
+  return h;
+}
+test('playing on a line that cannot carry playback with room to spare, only the shot at the playhead downloads', async () => {
+  const h = playingOn(8, 150e6, true); // 12 Mbit/s a file: the line carries two of them
+  h.update(); await h.drain(1); h.update(); await flush();
+  assert.equal(h.pending.length, 1, 'not the rest of the timeline beside it');
+  assert.match(h.pending[0].url, /m0/);
+  for (let i = 0; i < 80 && h.requests.every(request => !/m7/.test(request.url)); i++) { await h.drain(1); assert.ok(h.pending.length <= 1, `${h.pending.length} downloads at round ${i}`); }
+  assert.ok(h.requests.some(request => /m7/.test(request.url)), 'the far files are still reached, one at a time, behind the urgent ones');
+});
+test('the same line paused, or with room to spare while playing, keeps filling in parallel', async () => {
+  const paused = playingOn(8, 150e6, false);
+  paused.update(); await paused.drain(1); paused.update(); await flush();
+  assert.equal(paused.pending.length, 6, 'paused behaves as before');
+  const roomy = playingOn(8, 20e6, true); // 1.6 Mbit/s a file on 25 Mbit/s
+  roomy.update(); await roomy.drain(1); roomy.update(); await flush();
+  assert.equal(roomy.pending.length, 4, 'four at once while playing, as before');
+});
+/** Three shots at the playhead and in the next 3 s, five more 40 s or later; every file runs 8 Mbit/s (1 MB a second). */
+function crowdedAhead(count = 8) {
+  const h = harness({ count }); h.state.playing = true; h.state.clips[0].duration = 100;
+  h.state.clips.forEach((clip, i) => { clip.start = [0, 1, 3][i] ?? 30 + i * 10; });
+  h.sandbox.parseMp4Index = () => ({ moovEnd: 16, tracks: [{ times: [0, 100], sizes: [100e6] }] });
+  return h;
+}
+const pendingAfterStart = async (h: ReturnType<typeof harness>) => { h.update(); await h.drain(1); h.update(); await flush(); return h.pending; };
+test('room to spare is judged on what is read at once, so a fast line is not held to the urgent downloads by shots 15 s away', async () => {
+  // 10 MB/s: five times the two shots read together, but under four times the three that start within 15 s.
+  const h = crowdedAhead(); h.transfer(CHUNK, 105);
+  const pending = await pendingAfterStart(h);
+  assert.equal(pending.length, 4, 'three urgent windows and a background download beside them');
+  assert.ok(pending.some(job => !/m[012]\//.test(job.url)), 'a far shot is being filled while playing');
+});
+test('on a 10 Mbit/s line the same shots keep playback first: only the urgent downloads run', async () => {
+  const h = crowdedAhead(); h.transfer(CHUNK, 840);
+  const pending = await pendingAfterStart(h);
+  assert.ok(pending.length >= 1 && pending.every(job => /m[012]\//.test(job.url)), `${pending.map(job => job.url)}`);
+  for (let i = 0; i < 4; i++) { await h.drain(1); assert.ok(h.pending.length <= 2); }
+});
+test('a line too quick to be timed gets room once 8 MiB of footage have crossed it, and not before', async () => {
+  // A chunk that arrives in under 50 ms says nothing about the line, so no rate is ever recorded.
+  const quick = async (megabytes: number) => { const h = crowdedAhead(); for (let i = 0; i < megabytes; i++) h.transfer(CHUNK, 10); return pendingAfterStart(h); };
+  assert.equal((await quick(7)).length, 3, 'seven chunks: not proven, only the three urgent windows');
+  assert.equal((await quick(8)).length, 4, 'eight chunks: a background download runs beside them');
+});
+test('a shot whose download is failing does not hold back the rest while it waits to retry', async () => {
+  let broken = false;
+  const h = playingOn(8, 150e6, true, { test: () => broken } as unknown as RegExp);
+  h.update(); await h.drain(1); h.update(); await flush();
+  assert.equal(h.pending.length, 1); assert.match(h.pending[0].url, /m0/);
+  broken = true; await h.drain(1);
+  assert.equal(h.pending.length, 1, 'one background download runs while m0 waits out its failure');
+  assert.doesNotMatch(h.pending[0].url, /m0/);
 });

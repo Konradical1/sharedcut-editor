@@ -105,6 +105,75 @@ A build without Depth refuses every save once a Depth subject or depth key exist
 never back past Depth.
 Depth-assisted Smart Mask cleanup (cut SAM leaks at depth jumps, fill holes at the subject's depth) was tried on the soccer and hurdles clips and rejected: at every threshold it cut off hands, feet and arms, while leaks onto players at the same distance stayed and hole filling made them solid.
 
+## Host guard and playback health
+
+One laptop can be the server and somebody's workstation. The host guard (`server/hostGuard.ts`) keeps SharedCut's own jobs
+from using up its memory, and two plain-text trails say what happened. Nothing here needs a database, so a damaged file
+cannot stop the server from booting.
+
+**Mode switch, no restart.** `data\host-guard.mode` holds one word, `off`, `observe` or `enforce`, and is re-read about once a
+second. Either file encoding works: plain UTF-8 (with or without a byte-order mark) and the UTF-16 that Windows PowerShell 5
+writes for `echo enforce > data\host-guard.mode`. A file that holds some other word is ignored (one line in the server log
+says so) and the mode stays what `FRAME_LINE_HOST_GUARD` says. Without the file, `FRAME_LINE_HOST_GUARD` decides, and the
+default is `observe`. Switch with `Set-Content -NoNewline data\host-guard.mode enforce`, back with `observe`.
+
+- `observe` (default) changes nothing. It admits every job at once and logs what `enforce` would have done: jobs that
+  would have waited or been refused, export passes that would have been fewer, and under memory pressure `observe: would
+  have stopped N preview job(s) at X GiB usable`. Nothing is stopped and no export shows "Low memory".
+- `enforce` holds heavy starts while memory is short and runs the pressure response (below).
+- `off` does nothing and reads no memory figures; in particular it never starts PowerShell for the commit-headroom reading.
+
+**Switch to `enforce` only after reading `data\host-health.log`.** The thresholds are not calibrated for blocking yet. On
+this Dell the commit-headroom reading (`commitHeadroomGB`) swings between about 1 and 10 GiB while 10 to 12 GiB of RAM is free
+(`freeGB`), and the guard uses the smaller of the two, so at those readings `enforce` would hold exports and refuse previews
+on a healthy machine. On macOS the free-memory reading is too low (cached pages are not counted), so stay in `observe`
+there. Enforce is worth turning on once `commitHeadroomGB` stays comfortably above the 6 GiB preview reserve at class load.
+
+**What `enforce` does.**
+- Heavy starts ask first: each render pass encode, each media-preparation encode, and the Python workers (Depth, optical
+  flow, Stabilize, motion tracker, Smart Mask). A job starts only if the smaller of available memory and Windows commit
+  headroom, minus memory promised to jobs started in the last 20 s, minus its own cost, stays above its reserve (4 GiB; 6 for a
+  preview) and never below a hard 3 GiB floor. Small jobs may start past a waiting big one, until the big one has waited 30 s.
+- A waiting render shows "Waiting for memory" as its stage. A job that is not an export fails with a retry message after
+  10 minutes; an export keeps waiting.
+- ffprobe, `-version`, `--check` probes and stream copies are never held, so `/api/health` and the tunnel watchdog never wait.
+- A split export uses fewer parallel passes when memory is short (never more than before, and never more threads per pass).
+- A timeline preview is never queued for memory: it is refused with HTTP 429 and the browser backs off.
+- Pressure response, `enforce` only: if memory stays under 2 GiB for 5 s, running previews are stopped first, then
+  filmstrip and waveform jobs (20 s apart). Exports, AI jobs and uploads are never stopped; they only show "Low memory".
+
+Only the 1.9 GiB of a 4K render pass is measured; the other costs are estimates in `JOB_COST_BYTES`. In `observe` mode the
+server log shows `Host guard: ... would have waited` lines and, 20 s after each start, `cost check` lines with the real drop,
+so the table can be corrected before `enforce`.
+
+**The decoder thread cap is not part of the guard.** A video decoder gets at most `FRAME_LINE_DECODE_THREADS` threads (8) in
+every render and every mode, `off` included. It is read when the server starts, so changing it needs a restart. Its effect on
+export time has not been measured.
+
+**Trails.** `data\host-health.log` gets one JSON line every 30 s (available memory, commit headroom, pages per second,
+battery, GPU memory and temperature, event-loop lag, queue sizes, live ffmpeg and Python children) and rotates at 5 MB to
+`host-health.log.1`, so a hard reset leaves its last minutes. `data\playback-reports\YYYY-MM-DD.jsonl` holds one row per
+browser and minute of the numbers browsers send inside their presence posts (pictures per second, loading share, longest
+freeze, link speed; no clip or project names), kept 14 days. A browser is taken at most once every 5 s.
+
+**Health page.** `GET /api/health/report` returns the browsers and the host, but only for the account ids listed in
+`FRAME_LINE_HEALTH_USERS` (comma separated, in `.env`; it is read when the server starts). Anyone else gets the same
+"API endpoint not found." as a route that does not exist. The page diagnoses each browser in a plain sentence (smooth, or
+whose side is slow: the computer, the connection or the server) and shows the guard's mode ("Watching only", "Enforcing" or "Off"). `/api/health` itself now spawns
+nothing per call: the ffmpeg and ffprobe version check is cached for 60 s.
+
+| Variable | Default / purpose |
+| --- | --- |
+| `FRAME_LINE_HOST_GUARD` | `observe`; `off`, `observe` or `enforce` when `data\host-guard.mode` is absent |
+| `FRAME_LINE_HEALTH_USERS` | Unset (nobody); account ids that may open the Health page |
+| `FRAME_LINE_DECODE_THREADS` | `8`; most threads one video decoder may take in a render |
+| `FRAME_LINE_POWERSHELL` / `FRAME_LINE_NVIDIA_SMI` | `powershell.exe` / `nvidia-smi`; used only for the commit-headroom, paging, battery and GPU readings |
+
+Lock counters now start at the server's start time and every state answer carries `serverStartedAt`, so open tabs keep seeing
+collaborators' locks after a restart. Rolling back is a revert and a restart: the new files are plain text that older builds
+ignore, and no workspace table was added. One catch: an older build counts locks from 0 again, so after a rollback ask everyone
+with an open tab to reload it; until they do, those tabs ignore every lock update.
+
 ## Verification
 
 ```powershell

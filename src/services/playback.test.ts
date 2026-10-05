@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import type { Clip, MediaAsset, Track } from '../state/models.ts';
 import { gradeValues } from './grade.ts';
 import { efficientPlayback, focusClip, gradePixels, playbackLayers, playbackUrl, projectSize, sourceTime, upcomingClips } from './playback.ts';
@@ -543,4 +544,14 @@ test('a failed layer is drawn around, named with a retry and reopened in the bac
     playback.dispose();
     globals.forEach((key, index) => { if (original[index]) Object.defineProperty(globalThis, key, original[index]!); else Reflect.deleteProperty(globalThis, key); });
   }
+});
+
+test('a loading tick neither counts toward nor cancels a struggle: the slow computer that spends half its time loading is still noticed', () => {
+  // The counter lives in the playback loop's closure, so the invariant is pinned on its source: a tick spent loading
+  // used to fall into the same else branch as a good frame and lower the count, which held it near zero by
+  // construction on a machine that loads 50% of the time (the colour path), so the rendered-preview fallback never began.
+  const source = readFileSync(new URL('./playback.ts', import.meta.url), 'utf8');
+  assert.match(source, /if\(!prepared&&!loading&&state\.playing&&performance\.now\(\)-renderStarted>1000\/previewFps\*\.7\)\{\s*if\(\+\+expensiveFrames>=\d+\)/, 'only a fully loaded slow frame counts');
+  assert.match(source, /\}else if\(!loading\)expensiveFrames=Math\.max\(0,expensiveFrames-1\);/, 'only a loaded, fast frame lowers the count');
+  assert.doesNotMatch(source, /\}else expensiveFrames=Math\.max\(0,expensiveFrames-1\);/);
 });

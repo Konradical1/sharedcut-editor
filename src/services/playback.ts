@@ -1019,7 +1019,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     }else renderLayers(state.timelineId,state.playhead,context,referenceContext);
     if(!prepared&&!loading&&state.playing&&performance.now()-renderStarted>1000/previewFps*.7){
       if(++expensiveFrames>=6){expensiveUntil=performance.now()+15000;expensiveFrames=0;}
-    }else expensiveFrames=Math.max(0,expensiveFrames-1);
+    }else if(!loading)expensiveFrames=Math.max(0,expensiveFrames-1);
     // Warm upcoming pictures and their looks independently of the audio clips.
     const upcoming=transitionsOf(state.clips,state.timelineId,state.media).filter(record=>record.start>state.playhead&&record.start-state.playhead<1.5);
     // Every warmed decoder is another preload="auto" stream competing for the same link, so nothing past the
@@ -1125,6 +1125,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // shot after the asset is back on Stream). An alpha graphic's StreamLow is its 1/4 file, which it may be asked for by name.
     const clipById=byId(state.clips);
     const automaticLow=options.quality==='Stream'&&!options.original&&[...activeIds].some(id=>{const decoder=decoders.get(id),asset=mediaById.get(clipById.get(id)?.mediaId??''),low=asset?.proxyVariants?.StreamLow;return !!decoder?.automaticLow&&!!low&&decoder.url===low&&playbackUrl(asset!,options,true)!==low;});
+    canvas.dataset.automaticLow=String(automaticLow);
     const fallbackActive = [...activeIds].some(id => { const decoder = decoders.get(id); return decoder && [...streamFallbacks.values()].includes(decoder.url); });
     loadingSince = loading ? loadingSince ?? performance.now() : undefined;
     // A paused seek that lands within a moment is a scrub, not buffering: hold the last picture quietly.

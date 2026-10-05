@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { animatedWindows, audioFilters, cachedLut, isAnimated, measureLoudness, releaseLuts, retimeSchedule, getMediaCapabilities, prepareMedia, prepareWaveform, probeMedia, renderPasses, renderTimeline } from './media.ts';
+import { animatedWindows, audioFilters, bakesWholeClips, cachedLut, isAnimated, measureLoudness, releaseLuts, retimeSchedule, getMediaCapabilities, prepareMedia, prepareWaveform, probeMedia, renderPasses, renderTimeline, run } from './media.ts';
 import { eqBiquads, responseDb } from '../src/services/audioDsp.ts';
 import { blendModeNames } from '../src/services/blendModes.ts';
 import type { RenderRequest } from './media.ts';
@@ -535,4 +535,48 @@ test('Normalize loudness measures the clip and exports it at the chosen target',
       assert.ok(Math.abs(exported! - target) < .3, `${JSON.stringify(properties)}: ${exported} LUFS, wanted ${target}`);
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('bakesWholeClips names the clips renderTimeline sends to a whole-clip bake, on this timeline only', () => {
+  const video: Track = { id: 'v1', timelineId: 't', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
+  const sound: Track = { ...video, id: 'a1', kind: 'audio', number: 2 };
+  const clip = (extra: Partial<Clip> = {}): Clip => ({ id: 'c', projectId: 'p', timelineId: 't', trackId: 'v1', mediaId: 'm', name: 'c', start: 0, duration: 4, sourceIn: 0, color: '', disabled: false, properties: { ...defaultProperties }, effects: [], ...extra });
+  const bakes = (item: Clip, audio = 'Disabled') => bakesWholeClips({ clips: [item], timeline: { id: 't', projectId: 'p', name: 't', duration: 30 }, tracks: [video, sound], settings: { audio } });
+  const keys = { 'properties.zoom': [{ id: 'k1', time: 0, value: 100, interpolation: 'linear' as const }, { id: 'k2', time: 1, value: 110, interpolation: 'linear' as const }] };
+  const stabilize = { id: 's', name: 'Stabilize', enabled: true, amount: 100 };
+  assert.equal(bakes(clip()), false, 'a plain clip');
+  assert.equal(bakes(clip({ mediaId: 'frameline-composition' })), true, 'a composition renders its whole timeline');
+  assert.equal(bakes(clip({ mediaId: 'frameline-composition', disabled: true })), false);
+  assert.equal(bakes(clip({ mediaId: 'frameline-composition', timelineId: 'other' })), false, 'another timeline is not this render');
+  assert.equal(bakes(clip({ effects: [stabilize] })), true, 'Stabilize bakes each clip first');
+  assert.equal(bakes(clip({ effects: [{ ...stabilize, enabled: false }] })), false);
+  assert.equal(bakes(clip({ effects: [{ ...stabilize, amount: 0 }] })), false);
+  assert.equal(bakes(clip({ properties: { ...defaultProperties, opticalFlow: true } })), true, 'optical flow retiming');
+  assert.equal(bakes(clip({ keyframes: keys })), true, 'a keyframed picture renders one FFmpeg per frame');
+  assert.equal(bakes(clip({ keyframes: { 'properties.gain': keys['properties.zoom'] } })), false, 'gain keys stay in the static pass');
+  assert.equal(bakes(clip({ trackId: 'a1', keyframes: keys })), false, 'keys on sound nobody hears are skipped, as renderTimeline skips them');
+  assert.equal(bakes(clip({ trackId: 'a1', keyframes: keys }), 'AAC · 320 kb/s · 48 kHz'), true, 'but audible ones are baked');
+  assert.equal(bakes(clip({ mediaId: 'frameline-title', keyframes: keys })), false, 'an animated title is drawn once through the canvas');
+  assert.equal(bakes(clip({ mediaId: 'frameline-title', keyframes: keys, properties: { ...defaultProperties, blendMode: 'Screen' } })), true, 'a blended one keeps the per-frame bake');
+});
+
+test('a single-pass render refuses a range that would split, before it starts anything', async () => {
+  const track: Track = { id: 'v1', timelineId: 't', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
+  const source: MediaAsset = { id: 'm', projectId: 'p', name: 'm.mp4', kind: 'video', binId: 'all', duration: 20, fps: 24, resolution: '320 × 180', size: '', status: 'ready', progress: 100, thumbnail: '' };
+  // Eight half-second shots in four seconds: more than six decoders for one pass, the exporter's own limit.
+  const clips = Array.from({ length: 8 }, (_, i): Clip => ({ id: `c${i}`, projectId: 'p', timelineId: 't', trackId: 'v1', mediaId: 'm', name: `c${i}`, start: i / 2, duration: .5, sourceIn: 0, color: '', disabled: false, properties: { ...defaultProperties }, effects: [] }));
+  assert.ok(renderPasses(clips.map((_, i) => ({ from: i * 12, to: i * 12 + 12 })), [], 96).length > 1, 'an export of these shots splits into passes');
+  const request: RenderRequest = { project: { id: 'p', resolution: '320 × 180', fps: 24 } as Project, timeline: { id: 't', projectId: 'p', name: 't', duration: 10 }, tracks: [track], nodes: [], clips,
+    assets: [{ asset: source, path: path.join(tmpdir(), 'frameline-never-opened.mp4') }], settings: { resolution: '320 × 180', fps: '24', codec: 'H.264', audio: 'Disabled', rangeIn: '0', rangeOut: '4' }, outputPath: path.join(tmpdir(), 'frameline-never-written.mp4'), singlePass: true, threads: 4 };
+  await assert.rejects(renderTimeline(request), /too many clips for a quick preview/);
+  assert.equal(existsSync(request.outputPath), false);
+});
+
+test('an aborted signal ends run() and its child promptly, at any priority: the end of a cancelled preview\'s chain', { timeout: 10000 }, async () => {
+  const controller = new AbortController(), started = Date.now();
+  const finished = run(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { signal: controller.signal, nice: 19 });
+  setTimeout(() => controller.abort(), 300);
+  await assert.rejects(finished, /Canceled by you/);
+  assert.ok(Date.now() - started < 5000, 'the child was killed, not waited for');
+  await assert.rejects(run(process.execPath, ['-e', ''], { signal: controller.signal }), /Canceled by you/, 'an already aborted signal never starts it');
 });

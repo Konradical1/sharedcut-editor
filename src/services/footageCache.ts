@@ -2,6 +2,7 @@
 import { useSyncExternalStore } from 'react';
 import { byteRange, moovExtent, parseMp4Index, type Mp4Index } from './mp4Index.ts';
 import { animatedSourceOffset } from './animation.ts';
+import { backoffDelay } from './backoff.ts';
 import { timelineTransitions, type TransitionRecord } from './transitions.ts';
 import type { Clip, MediaAsset, Settings, Track } from '../state/models.ts';
 
@@ -35,6 +36,13 @@ let transferred = 0, transferStart = 0, transferLast = 0, networkRate = 0, seede
 const transfers: [number, number, number][] = [], lowered = new Set<string>();
 // ponytail: one bitrate for a Stream file whose index is not loaded yet (960-wide CRF 16 runs ~8-16 Mbit/s).
 const STREAM_GUESS = 1.5e6;
+// A failed file is tried again after 2 s, 4, 8 and so on, but never less often than once a minute: a server restart or a
+// bad stretch of line is over in seconds, and "never again" would leave the clip unfilled until the page is reloaded.
+const RETRY_MAX_MS = 60_000;
+// While playing, background downloads (the rest of long clips, files far from the playhead) take line capacity the
+// picture decoders need, unless the line carries what playback reads at least this many times over.
+const AMPLE_LINK = 4;
+let playing = false;
 let shown = '', notified = -Infinity, notifyTimer: ReturnType<typeof setTimeout> | undefined;
 /** Subscribers re-render at most four times a second, and only when something they show changed. */
 function notify() {
@@ -178,7 +186,7 @@ export function update(state: TimelineState, options: Options, urlFor: (asset: M
   latest = [state, options, urlFor];
   const now = performance.now();
   if (now - lastUpdate < 400) return;
-  lastUpdate = now; plannedHead = state.playhead;
+  lastUpdate = now; plannedHead = state.playhead; playing = !!state.playing;
   const nextDisabled = state.settings.footageCache === false;
   if (nextDisabled !== disabled && supported()) navigator.serviceWorker.controller?.postMessage?.({ type: 'footage-enabled', enabled: !nextDisabled });
   disabled = nextDisabled;
@@ -276,7 +284,7 @@ export function clipFootageStatus(clipId: string): FootageStatus {
   const values = { cached, total, progress: total ? Math.floor(cached / total * 100) : 0, playback: decoder };
   if (!disabled && controlled && complete) return { ...values, state: 'green', detail: 'Saved on this computer' };
   const failure = entries.reduce<Failure | undefined>((worst, entry) => { const next = failures.get(entry.url); return next && (!worst || next.attempts > worst.attempts) ? next : worst; }, undefined);
-  if (failure) return { ...values, state: failure.attempts >= 3 ? 'red' : 'yellow', detail: `${failure.error}${failure.attempts < 3 ? ' · retrying shortly' : ''}` };
+  if (failure) return { ...values, state: failure.attempts >= 3 ? 'red' : 'yellow', detail: `${failure.error}${Number.isFinite(failure.next) ? ' · retrying shortly' : ''}` };
   if (!entries.length || disabled || !controlled) return { ...values, state: registrationError ? 'red' : 'gray', detail: disabled ? 'Cache off · streaming' : registrationError || (!supported() ? 'Local cache requires HTTPS or localhost' : !controlled ? 'Starting local cache…' : 'Not cached on this computer') };
   const busy = entries.some(entry => inFlight.has(entry.url));
   return { ...values, state: busy ? 'blue' : 'gray', detail: entries.every(entry => indexes.has(entry.url)) ? `${values.progress}% cached on this computer` : busy ? 'Reading media index' : 'Queued' };
@@ -331,6 +339,30 @@ async function loadLayout(url: string, signal: AbortSignal): Promise<Layout> {
   return index;
 }
 const storedBytes=()=>[...stored.values()].reduce((sum,chunks)=>sum+[...chunks.values()].reduce((n,size)=>n+size,0),0);
+/** Playback reads the shots at the playhead and the cuts about to open at the same time; a shot further on is not read yet. */
+const READ_TOGETHER_S = 2;
+/** A line whose chunks all arrive in under 50 ms never records a rate, but this much footage across it proves it is fast. */
+const UNTIMED_FAST_BYTES = 8 * CHUNK;
+const roomRate = () => linkRate() || (transferred >= UNTIMED_FAST_BYTES ? Infinity : 0);
+/** Bytes per second playback reads from the files it reads together; 0 until every one of their indexes is read. */
+function liveNeed(entries: Wanted[]) {
+  let need = 0;
+  for (const url of new Set(entries.filter(entry => !entry.background && entry.order < READ_TOGETHER_S).map(entry => entry.url))) {
+    const layout = indexes.get(url);
+    if (!layout) return 0;
+    if ('tracks' in layout) need += bitrateOf(layout);
+  }
+  return need;
+}
+/**
+ * How many background downloads may run beside the urgent ones. Paused, or on a line with room to spare: as many as
+ * there are slots. Playing on a line without it, playback's own reads come first: none start while urgent bytes are
+ * outstanding, and only one at a time after, so a chunk the decoder needs next never shares the line with four others.
+ */
+export function backgroundSlots(isPlaying: boolean, rate: number, need: number, urgentPending: boolean) {
+  if (!isPlaying || !need || rate >= AMPLE_LINK * need) return Infinity;
+  return urgentPending ? 0 : 1;
+}
 function pump() {
   clearTimeout(retryTimer);
   if (disabled || clearing || !controlled) return;
@@ -350,15 +382,23 @@ function pump() {
     return rest === undefined ? [] : [{ entry, index, chunk: rest, priority: (later ? 3e5 : 1e5) + away }];
   }).sort((a, b) => a.priority - b.priority);
   const nearBudget=storedBytes()>=CAP_BYTES*.9;
+  const urgent = (task: { entry: Wanted; priority: number }) => !task.entry.background && task.priority < 1e5;
+  // A shot whose download is waiting out a failure holds nothing back: the rest keeps filling meanwhile.
+  const urgentUrls = new Set(tasks.filter(task => urgent(task) && (failures.get(task.entry.url)?.next ?? 0) <= Date.now()).map(task => task.entry.url));
+  const slots = backgroundSlots(playing, roomRate(), liveNeed(entries), urgentUrls.size > 0);
+  let deferredRunning = new Set(tasks.filter(task => !urgent(task) && inFlight.has(task.entry.url) && !urgentUrls.has(task.entry.url)).map(task => task.entry.url)).size;
   // Several files at once, one request each: a dense multi-layer edit reaches every next cut in parallel.
-  for (const { entry, index, chunk, priority } of tasks) {
+  for (const task of tasks) {
+    const { entry, index, chunk, priority } = task, deferred = !urgent(task);
     if(nearBudget&&priority>=1e5)continue;
+    if (deferred && deferredRunning >= slots) continue;
     if (inFlight.size >= concurrency) break;
     if (inFlight.has(entry.url)) continue;
     const failure = failures.get(entry.url);
     if (failure && failure.next > Date.now()) continue;
     const controller = new AbortController(), epoch = generation;
     inFlight.set(entry.url, controller);
+    if (deferred) deferredRunning++;
     transferStart ||= performance.now();
     const timeout = setTimeout(() => controller.abort(new Error('Media download timed out')), 30000);
     const run = async () => {
@@ -377,7 +417,7 @@ function pump() {
     void run().then(() => { if (epoch === generation && !controller.signal.aborted) failures.delete(entry.url); }).catch(error => {
       if (epoch !== generation || controller.signal.aborted && controller.signal.reason?.name === 'AbortError') return;
       const attempts = (failures.get(entry.url)?.attempts ?? 0) + 1;
-      failures.set(entry.url, { attempts, next: attempts >= 3 ? Infinity : Date.now() + 1000 * 2 ** attempts, error: error instanceof Error ? error.message : 'Media download failed' });
+      failures.set(entry.url, { attempts, next: Date.now() + backoffDelay(attempts, 1000, RETRY_MAX_MS), error: error instanceof Error ? error.message : 'Media download failed' });
     }).finally(() => { clearTimeout(timeout); inFlight.delete(entry.url); notify(); pump(); });
   }
   const next = Math.min(...entries.map(e => failures.get(e.url)?.next ?? Infinity).filter(t => t > Date.now()));

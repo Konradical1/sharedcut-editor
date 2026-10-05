@@ -33,6 +33,10 @@ Recovery logs: `~/Library/Logs/sharedcut-health.log` and `sharedcut-health.err.l
 
 After a restart, sign into this Mac to start these user services. The Mac must remain awake and online; closing a laptop lid or losing Internet still interrupts hosting. Once connectivity returns, the periodic check retries automatically. Keep this project at its current path because the installed services reference it.
 
+### Host memory guard and health trail
+
+The server watches its own memory: heavy jobs (render passes, media encodes, Python workers) pass a guard that starts in `observe` mode, which only logs what `enforce` would have done and changes nothing. `enforce` holds heavy starts until memory is free, refuses timeline previews instead of queueing them, and under sustained memory pressure stops previews, filmstrips and waveforms first; read `data/host-health.log` before switching to it. `off` does nothing. `data/host-health.log` (one line every 30 s, rotated at 5 MB) and `data/playback-reports/` (one row per browser and minute, 14 days) leave a trail after a crash, and the Health page turns the reports into a plain diagnosis per browser. Switch the guard with the word `off`, `observe` or `enforce` in `data/host-guard.mode` (UTF-8 or PowerShell 5 UTF-16 both work), no restart needed. The video decoder thread cap (`FRAME_LINE_DECODE_THREADS`, 8) is always on and needs a restart to change. Details and the full variable list: `docs/WINDOWS_NATIVE.md`.
+
 ### Import YouTube and Spotify links
 
 Install Python 3.12, then run `npm run setup:imports` once on the server. Docker images include the importer. In a project, choose **Media → Import link**, paste a single YouTube video or Spotify track URL, and choose **Import**. YouTube supports video with audio at up to 720p, 1080p, or 4K, or audio only. Quality is capped at the selection and the available source; files enter the existing proxy, thumbnail, and waveform pipeline.
@@ -70,6 +74,8 @@ The default server listens only on `127.0.0.1`. Before allowing access from othe
 | `FFMPEG_PATH` / `FFPROBE_PATH` | `ffmpeg` / `ffprobe`; executable paths |
 | `FRAME_LINE_MAX_UPLOAD_BYTES` | `10737418240`; maximum bytes per upload, 10 GiB |
 | `FRAME_LINE_TRUST_PROXY` | Unset; set to `1` only behind a trusted HTTPS reverse proxy |
+| `FRAME_LINE_HOST_GUARD` | `observe`; memory guard for heavy jobs (`off`, `observe`, `enforce`), also switchable without a restart through `data/host-guard.mode` |
+| `FRAME_LINE_HEALTH_USERS` | Unset; comma-separated account ids that may open the playback Health page (`/api/health/report`) |
 
 For a temporary test on the same local network, run `HOST=0.0.0.0 npm start` and open the server’s LAN address on the other machine. Public (Class) projects are available to registered accounts on that installation. Use HTTPS for Internet hosting and verified Resolve bundle uploads.
 

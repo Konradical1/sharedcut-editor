@@ -1,5 +1,6 @@
 import { venvPython, quotedFilterPath } from './platform.ts';
-import { killProcessTree } from './processTree.ts';
+import { exportPassCount, admitStart, killProcessTree, trackChild } from './processTree.ts';
+import { JOB_COST_BYTES, type AdmitRequest } from './hostGuard.ts';
 import { readCameraColor, type CameraColor } from './cameraMetadata.ts';
 import { resolveSmartMaskArtifact } from './smartMask.ts';
 import { activeDepthKeys, nodeMaskId, smartMaskFrame, type SmartMaskManifest } from '../src/services/smartMask.ts';
@@ -38,20 +39,35 @@ import { gpuJob } from './workQueue.ts';
 import { depthDiskFloor, type depthService } from './depth.ts';
 import { depthFocusAt } from '../src/services/depth.ts';
 
-type ProcessOptions = { signal?: AbortSignal; onProgress?: (percent: number) => void; duration?: number; binary?: boolean; maxBytes?: number; jsonProgress?: boolean | 'stderr' };
+type ProcessOptions = { signal?: AbortSignal; onProgress?: (percent: number) => void; duration?: number; binary?: boolean; maxBytes?: number; jsonProgress?: boolean | 'stderr'; /** Process priority (nice 0-19, 19 is Idle on Windows); defaults to BACKGROUND_NICE. */ nice?: number;
+  /** Heavy starts only: the host guard may hold the run until there is memory for it. Probes and stream copies leave this out and never wait. */
+  guard?: Pick<AdmitRequest, 'kind' | 'costBytes' | 'label' | 'onStatus'> };
 const ffmpeg = () => process.env.FFMPEG_PATH || 'ffmpeg';
 const ffprobe = () => process.env.FFPROBE_PATH || 'ffprobe';
 // Accept self-contained media only: playlist/concat inputs could read other server files.
 const safeInput = ['-protocol_whitelist', 'file,pipe', '-format_whitelist', 'mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,mpeg,mpegts,mxf,wav,mp3,aac,flac,aiff,ogg,caf,au,flv,image2,image2pipe,jpeg_pipe,png_pipe,webp_pipe,bmp_pipe,tiff_pipe,gif,apng'];
 
-export function run(command: string, args: string[], options: ProcessOptions = {}): Promise<Buffer> {
+export async function run(command: string, args: string[], options: ProcessOptions = {}): Promise<Buffer> {
+  if (options.signal?.aborted) throw new Error('Canceled by you');
+  const release = options.guard ? await admitRun(options.guard, options.signal) : undefined;
+  try { return await spawnProcess(command, args, options); } finally { release?.(); }
+}
+
+/** The guard rejects a cancelled wait as "Cancelled."; a run reports its own wording. Any other refusal is passed on as it is. */
+async function admitRun(guard: NonNullable<ProcessOptions['guard']>, signal?: AbortSignal) {
+  try { return await admitStart({ ...guard, signal }); }
+  catch (error) { throw signal?.aborted ? new Error('Canceled by you') : error; }
+}
+
+function spawnProcess(command: string, args: string[], options: ProcessOptions): Promise<Buffer> {
   if (options.signal?.aborted) return Promise.reject(new Error('Canceled by you'));
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, detached: process.platform !== 'win32' });
+    trackChild(child);
     // Preparation is background work and must never outrank the request loop that serves uploads
     // and playback. At equal priority, ffmpeg saturating every core pushed a trivial /api/health
     // from 57ms to 6.5s and dragged a local 64 MB/s import down to 1 MB/s.
-    try { setPriority(child.pid!, BACKGROUND_NICE); } catch { /* Not permitted here; thread budget still caps the load. */ }
+    try { setPriority(child.pid!, options.nice ?? BACKGROUND_NICE); } catch { /* Not permitted here; thread budget still caps the load. */ }
     const chunks: Buffer[] = [];
     let size = 0, stderr = '', progressBuffer = '', jsonBuffer = '', failure: Error | undefined, killTimer: ReturnType<typeof setTimeout> | undefined;
     const abort = () => { failure = new Error('Canceled by you'); killProcessTree(child, 'SIGTERM'); killTimer = setTimeout(() => killProcessTree(child), 2000); killTimer.unref(); };
@@ -90,12 +106,31 @@ export function run(command: string, args: string[], options: ProcessOptions = {
   });
 }
 
-export async function getMediaCapabilities() {
+/**
+ * A reading served from its last result. A result younger than `ttlMs` is returned as it is; an older one is returned at
+ * once while a single refresh runs in the background (a failed refresh keeps the old answer and is retried by a later
+ * call). Only the very first call waits for the read, and a failed first read is not remembered.
+ */
+export function refreshing<T>(read: () => Promise<T>, ttlMs: number, now: () => number = Date.now): () => Promise<T> {
+  let last: { at: number; value: T } | undefined, flight: Promise<T> | undefined;
+  return () => {
+    if (last && now() - last.at < ttlMs) return Promise.resolve(last.value);
+    flight ??= read().then(value => { last = { at: now(), value }; return value; }).finally(() => { flight = undefined; });
+    if (!last) return flight;
+    flight.catch(() => undefined);
+    return Promise.resolve(last.value);
+  };
+}
+
+async function probeMediaCapabilities() {
   try {
     await Promise.all([run(ffmpeg(), ['-version']), run(ffprobe(), ['-version'])]);
-    return { available: true, ffmpeg: ffmpeg(), ffprobe: ffprobe(), hwaccel: await decodeAccelName() };
-  } catch (error) { return { available: false, ffmpeg: ffmpeg(), ffprobe: ffprobe(), error: (error as Error).message }; }
+    return { available: true as const, ffmpeg: ffmpeg(), ffprobe: ffprobe(), hwaccel: await decodeAccelName() };
+  } catch (error) { return { available: false as const, ffmpeg: ffmpeg(), ffprobe: ffprobe(), error: (error as Error).message }; }
 }
+/** /api/health answers from this, so the tunnel watchdog's checks spawn nothing: the two version probes run once a minute in the background. */
+const CAPABILITIES_TTL_MS = 60_000;
+export const getMediaCapabilities = refreshing(probeMediaCapabilities, CAPABILITIES_TTL_MS);
 
 const clampNumber = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 function finite(value: unknown, name: string, min: number, max: number): number {
@@ -227,6 +262,12 @@ const exportCommon = (threads = exportThreads) => ['-hide_banner', '-loglevel', 
  */
 // Measured on a 32-thread, 32 GB host: 2 passes 57 s, 3 passes 50 s, 4 passes 45 s for the same re-export.
 const EXPORT_PASSES = Math.max(1, Math.min(8, Number(process.env.FRAME_LINE_EXPORT_JOBS) || Math.min(4, Math.floor(cores / 8), Math.floor(totalmem() / 2 ** 33))));
+// A 4K 4:2:2 software decoder holds about 1 GB at default threads, 0.6 GB at 8, 0.3 GB at 4 (the biggest single memory lever of a
+// render), so no video decoder gets more than this many threads. FRAME_LINE_DECODE_THREADS overrides.
+const DECODE_THREADS = Math.max(1, Math.floor(Number(process.env.FRAME_LINE_DECODE_THREADS)) || 8);
+/** Host guard cost of one encode: the measured 4K pass when it opens video decoders, a sound-sized step when it opens none. Estimates beyond the 4K pass; observe mode logs the real drop. */
+export const encodeCostBytes = (videoDecoders: number) => videoDecoders > 0 ? JOB_COST_BYTES.renderPass : JOB_COST_BYTES.soundStem;
+const PREPARE_GUARD = { kind: 'prepare', costBytes: JOB_COST_BYTES.prepare, label: 'Media preparation' } as const;
 
 /**
  * A long edit's filter graph outgrew Windows' 32,767-character command line (46,877 for a 45 s cut: spawn
@@ -375,7 +416,7 @@ export async function encodePreviews(options: { video: string; prepared: boolean
   pictures.forEach((output, i) => args.push('-map', `[o${i}]`, ...audioInput === undefined ? [] : ['-map', `${audioInput}:a:0?`, ...audioCodec], ...recipes[output].codec, '-movflags', '+faststart', path.join(temp, recipes[output].name)));
   if (outputs.includes('audio') && audioInput !== undefined) args.push('-map', `${audioInput}:a:0`, '-vn', ...audioCodec, '-movflags', '+faststart', path.join(temp, AUDIO_VARIANT));
   if (options.onProgress) args.push('-progress', 'pipe:1', '-nostats');
-  await run(ffmpeg(), args, { signal: options.signal, duration: metadata.duration, onProgress: options.onProgress });
+  await run(ffmpeg(), args, { signal: options.signal, duration: metadata.duration, onProgress: options.onProgress, guard: PREPARE_GUARD });
   return outputs.map(output => output === 'audio' ? AUDIO_VARIANT : recipes[output].name);
 }
 
@@ -506,7 +547,7 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
     temp = await mkdtemp(path.join(outputDir, '.preview-'));
     const staged = path.join(temp, proxyName);
     if (metadata.hasAlpha) {
-      await run(ffmpeg(), [...common, ...input, '-map', '0:v:0', '-map', '0:a:0?', '-vf', `scale=w='min(1920,iw)':h=-2:flags=lanczos`, ...alphaVideo(metadata.fps), '-c:a', 'libopus', '-b:a', '128k', '-progress', 'pipe:1', '-nostats', staged], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7) });
+      await run(ffmpeg(), [...common, ...input, '-map', '0:v:0', '-map', '0:a:0?', '-vf', `scale=w='min(1920,iw)':h=-2:flags=lanczos`, ...alphaVideo(metadata.fps), '-c:a', 'libopus', '-b:a', '128k', '-progress', 'pipe:1', '-nostats', staged], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7), guard: PREPARE_GUARD });
     } else if (metadata.kind === 'image') {
       await run(ffmpeg(), [...common, ...input, '-vf', 'scale=w=1920:h=1920:force_original_aspect_ratio=decrease', '-frames:v', '1', staged], { signal });
     } else if (metadata.kind === 'audio') {
@@ -665,6 +706,12 @@ export interface RenderRequest {
   leakSound?: boolean;
   /** Internal: thread budget when several FFmpeg passes share the export. */
   threads?: number;
+  /** A timeline preview: render as one FFmpeg pass or refuse, never split into parallel passes that take export threads. */
+  singlePass?: boolean;
+  /** Process priority of the final encode (nice 19 is Idle on Windows); a preview must never outrank the editor. */
+  nice?: number;
+  /** Internal: 'Waiting for memory' or 'Low memory' while the host guard holds or squeezes an encode of this render, null when clear. */
+  onWait?: (text: string | null) => void;
   /** Depth analysis: clips with a Depth effect start or join their run and wait for it. */
   depth?: Pick<ReturnType<typeof depthService>, 'ready' | 'focus'> & Partial<Pick<ReturnType<typeof depthService>, 'freeGpu'>>;
   /** Internal: the camera original behind a Stabilize bake, keyed by clip, for a Depth that reads its analysis. */
@@ -744,14 +791,14 @@ export function renderPasses(spans: { from: number; to: number }[], windows: { f
  * A clip nobody can see or hear. Its keyframes still forced a render per frame: a speed ramp on a muted audio
  * copy cost the Newspaper export 188 s of one-frame FFmpeg runs that drew nothing.
  */
-function unseen(clip: Clip, request: RenderRequest) {
+function unseen(clip: Clip, request: Pick<RenderRequest, 'tracks' | 'settings'>) {
   const track = request.tracks.find(t => t.id === clip.trackId);
   if (!track) return false;
   const soloed = request.tracks.some(t => t.timelineId === track.timelineId && t.solo && !t.muted);
   const silent = request.settings.audio === 'Disabled' || track.muted || soloed && !track.solo;
   return silent && (track.kind === 'audio' || track.hidden);
 }
-const animationWork = (request: RenderRequest) => request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && isAnimated(c) && !unseen(c, request));
+const animationWork = (request: Pick<RenderRequest, 'clips' | 'timeline' | 'tracks' | 'settings'>) => request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled && isAnimated(c) && !unseen(c, request));
 
 /** A vertical project exported at 1920 × 1080 is squashed, not letterboxed; refuse it up front. */
 export function exportAspect(resolution: string | undefined, projectResolution: string) {
@@ -831,7 +878,11 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       .filter(span => span.to > span.from);
     const passes = renderPasses(spans, transitions.map(record => ({ from: frame(record.start), to: frame(record.end) })), total, PASS_INPUTS, Math.round(PASS_SECONDS * fps));
     const sounds = audio === 'Disabled' ? [] : clips.filter(clip => { const track = tracks.find(t => t.id === clip.trackId); return track && !track.muted && (!solo || track.solo) && inRange(clip.start, clip.start + clip.duration); });
-    if (passes.length > 1 || sounds.length > PASS_SOUNDS) return renderSplit(request, { passes, sounds, fps, total, duration });
+    if (passes.length > 1 || sounds.length > PASS_SOUNDS) {
+      // A preview is one pass or nothing: parallel passes would each take export threads and a decoder per clip.
+      if (request.singlePass) throw new Error('This part stacks too many clips for a quick preview. It plays live in the editor.');
+      return renderSplit(request, { passes, sounds, fps, total, duration });
+    }
   }
   // One pass holds every clip it renders; a split export keeps each pass far below this.
   if ((request.only ? clips.filter(clip => request.only!.has(clip.id)) : clips).length > 128) throw new Error('This render range stacks more than 128 clips at once. Export shorter ranges.');
@@ -849,7 +900,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   // FFmpeg's 10-bit YUV overlay darkens translucent RGB on transparent bases.
   // ponytail: groups composite in 8-bit RGB; use a 16-bit RGB compositor when HDR nesting is supported.
   const args = exportCommon(threads), filters = soundOnly || request.decoder ? [] : [`color=c=${request.transparent?'black@0':'black'}:s=${width}x${height}:r=${fps}:d=${duration},format=${request.transparent?'rgba':'yuv444p10le'},setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709[base]`];
-  let inputIndex = 0, currentVideo = 'base';
+  let inputIndex = 0, currentVideo = 'base', videoDecoders = 0;
   const audioLabels: string[] = [];
   // Each side of a cut is split off its own clip chain, so the untouched body of the clip stays
   // bit-identical and only the window pays for the transition.
@@ -1029,7 +1080,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     else args.push('-ss', Math.max(0, seek).toFixed(6));
     // Passes that run side by side give each decoder their share of threads; a picture pass holds only a few
     // decoders, so it can also use the GPU (4:2:2 falls back to software on Ada NVDEC; Blackwell decodes it).
-    if (visual && source.asset.kind === 'video') args.push(...(request.pass === 'video' ? await decodeAccel() : []), ...(request.threads ? ['-threads', threads] : []));
+    // Every video decoder is capped, split or not: a render that takes all its threads for each decoder holds about 1 GB per 4K one.
+    if (visual && source.asset.kind === 'video') { args.push(...(request.pass === 'video' ? await decodeAccel() : []), '-threads', String(Math.min(DECODE_THREADS, Number(threads)))); videoDecoders++; }
     args.push('-t', String(source.asset.kind === 'image' ? length : decoded), ...safeInput, '-i', source.path);
     const index = inputIndex++;
     if (visual) {
@@ -1084,7 +1136,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         }
         const hdr=hdrTransform(source.asset.colorTransfer),camera=clip.properties.colorPipeline!=='nodes-v2'?colorTransform(clip,source.asset,[],base):undefined;
         const inputCube=camera||hdr?makeCube(rgb=>{const sdr=hdr?hdr(rgb):rgb;return camera?camera(sdr):sdr;},65):undefined;
-        const job={input:source.path,output,ffmpeg:ffmpeg(),image:source.asset.kind==='image',seek:renderSeek,duration:decoded,width:metadata.width,height:metadata.height,fps:source.asset.kind==='image'?fps:metadata.frameRate||metadata.fps,numericFps:metadata.fps||fps,threads:Number(exportThreads),frames:frameTimes?.length??Math.ceil(decoded*(metadata.fps||fps)),frameTimes,masks:[...masks,...depthMasks],alpha:masks.length>0,managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)};
+        const job={input:source.path,output,ffmpeg:ffmpeg(),image:source.asset.kind==='image',seek:renderSeek,duration:decoded,width:metadata.width,height:metadata.height,fps:source.asset.kind==='image'?fps:metadata.frameRate||metadata.fps,numericFps:metadata.fps||fps,threads:Number(request.singlePass?threads:exportThreads),frames:frameTimes?.length??Math.ceil(decoded*(metadata.fps||fps)),frameTimes,masks:[...masks,...depthMasks],alpha:masks.length>0,managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)};
         await writeFile(jobPath,JSON.stringify(job));
         const python=process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color');
         if(!existsSync(python))throw Error('OpenColorIO export is not installed. Run npm run setup:color on the server.');
@@ -1256,7 +1308,10 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   await mkdir(path.dirname(outputPath), { recursive: true });
   request.onStage?.('Encoding video and audio');
   onProgress?.(colorBudget);
-  try { await run(ffmpeg(), args, { signal, duration, onProgress: p => onProgress?.(colorBudget+p*(100-colorBudget)/100) }); onProgress?.(100); }
+  // A preview was admitted once as a whole job (previewCache); every other encode, split pass or frame bake, asks for its own memory.
+  const wait = request.onWait ?? ((text: string | null) => request.onStage?.(text ?? 'Encoding video and audio'));
+  const guard = request.singlePass ? undefined : { kind: 'export' as const, costBytes: encodeCostBytes(videoDecoders), label: 'Render pass', onStatus: wait };
+  try { await run(ffmpeg(), args, { signal, duration, nice: request.nice, guard, onProgress: p => onProgress?.(colorBudget+p*(100-colorBudget)/100) }); onProgress?.(100); }
   catch (error) { await rm(outputPath, { force: true }); throw error; }
   } finally { releaseLuts(tables); for (const release of depthHolds) release(); await rm(lutDir, { recursive: true, force: true }); }
 }
@@ -1281,8 +1336,11 @@ async function renderSplit(request: RenderRequest, plan: { passes: { from: numbe
     const report = () => onProgress?.(progress.reduce((sum, value, index) => sum + value * weights[index], 0));
     let joined = 0;
     request.onStage?.(`Rendering video · 0/${pictures.length} parts`);
-    await inParallel(work, EXPORT_PASSES, signal, async (item, index, passSignal) => {
-      const pass = { ...request, signal: passSignal, threads, onStage: undefined, onProgress: (value: number) => { progress[index] = value; report(); } };
+    // `threads` stays computed from the ceiling: fewer passes under memory pressure must never mean more decoder threads each.
+    const passes = exportPassCount(EXPORT_PASSES, JOB_COST_BYTES.renderPass);
+    const onWait = request.onWait ?? ((text: string | null) => request.onStage?.(text ?? `Rendering video · ${joined}/${pictures.length} parts`));
+    await inParallel(work, passes, signal, async (item, index, passSignal) => {
+      const pass = { ...request, signal: passSignal, threads, onStage: undefined, onWait, onProgress: (value: number) => { progress[index] = value; report(); } };
       if (item.stem) await renderTimeline({ ...pass, pass: 'audio', only: item.stem.only, leakSound: item.stem === stems[0], outputPath: item.stem.file });
       // The last part ends at the export's own out point, which may cut into its final frame.
       else await renderTimeline({ ...pass, pass: 'video', outputPath: item.picture!.file, settings: { ...settings, audio: 'Disabled', rangeIn: String(rangeIn + item.picture!.from / fps), ...(item.picture!.to === plan.total ? {} : { rangeOut: String(rangeIn + item.picture!.to / fps) }) } });
@@ -1463,6 +1521,18 @@ function renderedTimelines<T extends Shown & Pick<RenderRequest, 'timelines'>>(r
 }
 /** Whether rendering this request reads depth anywhere (a Depth bake or a depth key), compositions included. */
 export const readsDepth = (request: Shown & Pick<RenderRequest, 'nodes' | 'timelines'>) => renderedTimelines(request).some(part => shownClips(part, readsDepthClip(request.nodes)).length > 0);
+/**
+ * Whether rendering these clips first bakes whole clips: a composition (its entire timeline, whatever the range), Stabilize,
+ * optical flow, or keyframes (one FFmpeg run per frame, several at once). Each test is the one renderTimeline's dispatch
+ * makes before it renders anything (composition, Stabilize, optical flow, then the per-frame animation bake that streamable
+ * titles and shapes skip), and they look at every clip of the timeline. Hand over only the clips that can reach the range
+ * and a composition elsewhere in the project no longer counts.
+ */
+export function bakesWholeClips(request: Pick<RenderRequest, 'clips' | 'timeline' | 'tracks' | 'settings'>): boolean {
+  const own = request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled);
+  return own.some(c => c.mediaId === 'frameline-composition' || stabilizeEffect(c) || c.properties.opticalFlow)
+    || animationWork(request).some(c => !streamableGraphic(c));
+}
 /** Refused by name before anything is decoded or baked. */
 function rejectDepth(request: RenderRequest) {
   for (const clip of depthClips(request)) {

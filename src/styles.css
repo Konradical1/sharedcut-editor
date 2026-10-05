@@ -387,3 +387,30 @@
 /* Trim tool live readout: how far the edit has moved, at the edge being dragged. */
 .trim-readout{position:absolute;top:2px;z-index:13;transform:translateX(-50%);padding:2px 6px;background:#0e191e;border:1px solid #3b5560;border-radius:3px;color:#e6fff5;font-size:9px;white-space:nowrap;pointer-events:none}
 .clip-depth{position:absolute;left:0;bottom:3px;height:2px;width:var(--depth);z-index:6;background:#a98bff;opacity:.8;pointer-events:none;transition:width .3s}.timeline-scroll[data-playing] .clip-depth{transition:none}
+
+/* ---- Health page (owner only): the host card and one row per person, each with a traffic light that also has a word. ---- */
+.health-page{display:flex;flex-direction:column;gap:14px;font-size:11px;color:var(--text)}
+.health-page h3,.health-page h4{font-size:10px;font-weight:550;letter-spacing:1px;text-transform:uppercase;color:var(--muted)}
+.health-note{color:var(--muted);line-height:1.7}
+.health-host,.health-person{background:#ffffff08;border:1px solid #ffffff14;border-radius:7px;padding:12px 14px}
+.health-host h4{margin-bottom:10px}
+.health-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px 16px;margin:0}
+.health-facts>div{min-width:0}
+.health-facts dt{font-size:9px;letter-spacing:.3px;color:var(--muted)}
+.health-facts dd{margin:2px 0 0;font-size:12px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.health-people{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:8px}
+.health-person{--light:#727b81}
+.health-person[data-light=green]{--light:#7fd69b}
+.health-person[data-light=amber]{--light:#f2c878}
+.health-person[data-light=red]{--light:#ee8f8b}
+.health-person-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.health-dot{width:10px;height:10px;border-radius:50%;background:var(--light);flex-shrink:0}
+.health-light{font-size:9px;line-height:1;padding:3px 6px;border:1px solid var(--light);border-radius:4px;color:var(--light)}
+.health-seen{margin-left:auto;font-size:10px}
+.health-sentence{margin:8px 0;line-height:1.6}
+.health-person-detail{display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap}
+.health-person-detail .health-facts{flex:1;min-width:220px}
+.health-spark{flex-shrink:0;stroke:var(--light);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}
+.health-spark-empty{font-size:10px}
+.health-harness>summary{padding:4px 0;color:var(--muted);cursor:pointer}
+.health-harness .health-people{margin-top:8px}
