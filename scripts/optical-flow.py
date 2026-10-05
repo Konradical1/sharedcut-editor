@@ -5,17 +5,21 @@ motion once per pair and warp at each exact requested time. Holds and direction
 changes are just entries in the output schedule, never a resampling-rate limit.
 """
 import bisect
-from functools import lru_cache
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
+import threading
 
 import cv2
 import numpy as np
 
 cv2.setNumThreads(4)
+SHOWINFO = re.compile(r'pts_time:\s*(-?[0-9.]+(?:e-?[0-9]+)?)')
 
 
 def emit(progress):
@@ -23,23 +27,73 @@ def emit(progress):
 
 
 def probe(job):
+    """Stream geometry and rate only: nothing is decoded here."""
     result = subprocess.run([job['ffprobe'], '-v', 'error', '-select_streams', 'v:0',
-                             '-show_entries', 'frame=best_effort_timestamp_time:stream=width,height:stream_side_data=rotation',
+                             '-show_entries', 'stream=width,height,avg_frame_rate,r_frame_rate:stream_side_data=rotation',
                              '-of', 'json', job['input']], capture_output=True, check=True, text=True)
-    data = json.loads(result.stdout)
-    timestamps = [float(f['best_effort_timestamp_time']) for f in data['frames']]
-    if not timestamps or any(b <= a for a, b in zip(timestamps, timestamps[1:])):
-        raise ValueError('Optical flow requires ordered source frame timestamps.')
-    stream = data['streams'][0]
+    stream = json.loads(result.stdout)['streams'][0]
     # FFmpeg decodes phone footage upright; the coded size is sideways when the display matrix rotates 90.
     rotation = next((d['rotation'] for d in stream.get('side_data_list', []) if 'rotation' in d), 0)
     if abs(int(rotation)) % 180 == 90:
         stream = {**stream, 'width': stream['height'], 'height': stream['width']}
-    return [t - timestamps[0] for t in timestamps], stream
+    rates = [n / d for n, d in (map(float, (stream.get(key) or '0/0').split('/')) for key in ('avg_frame_rate', 'r_frame_rate')) if n > 0 and d > 0]
+    return stream, min(rates) if rates else 24.0
+
+
+def windows(requested, reach):
+    """Merged [start, end) source intervals around the requested times: every frame the schedule can read lies in one."""
+    merged = []
+    for time in sorted(requested):
+        if merged and time - reach <= merged[-1][1]: merged[-1][1] = time + reach
+        else: merged.append([time - reach, time + reach])
+    return merged
+
+
+def decode(job, requested, width, height, resize, threads, directory, rate, reach):
+    """Decode only the source window the schedule reads, seeking to it, and keep the frames within `reach` of a
+    requested time as raw 16-bit RGB in one file FFmpeg writes itself. Returns the kept frames' times (seconds from
+    the input's start, the clock `-ss` uses in the rest of the export) and the frames, memory-mapped.
+
+    Before 2026-10-05 this decoded the whole file twice (a frame-accurate ffprobe for timestamps, then a select
+    filter from frame 0) and wrote every needed frame as a 16-bit PNG: 3-10 minutes per 1.5 s clip of 4K 4:2:2.
+    The frames go to a file rather than through a pipe to Python: a Windows pipe moved 4K 16-bit frames at
+    about 150 MB/s, which was most of the decode time."""
+    spans = windows(requested, reach)
+    first, last = max(0.0, spans[0][0]), spans[-1][1]
+    raw, graph = directory / 'frames.raw', directory / 'decode.filter'
+    keep = '+'.join(f'between(t\\,{start:.6f}\\,{end:.6f})' for start, end in spans)
+    # A script avoids Windows command-line length and quoting limits; showinfo logs each kept frame's pts in order.
+    graph.write_text(f"select='{keep}',showinfo{resize},format=bgr48le")
+    result = subprocess.run([job['ffmpeg'], '-hide_banner', '-nostats', '-v', 'info', '-nostdin', '-y', '-threads', threads,
+                             '-ss', f'{first:.6f}', '-t', f'{last - first:.6f}', '-copyts', '-start_at_zero', '-i', job['input'],
+                             '-map', '0:v:0', '-filter_script:v', str(graph), '-fps_mode', 'passthrough',
+                             '-f', 'rawvideo', '-threads', threads, str(raw)], capture_output=True)
+    log = result.stderr.decode('utf-8', 'replace').splitlines()
+    if result.returncode != 0:
+        raise RuntimeError('\n'.join(line for line in log if 'rror' in line)[-4000:] or 'Optical flow decoder failed.')
+    times = [float(match.group(1)) for match in (SHOWINFO.search(line) for line in log if 'showinfo' in line.lower()) if match]
+    size = width * height * 3 * 2
+    if not times or raw.stat().st_size != len(times) * size:
+        raise RuntimeError('Optical flow decoder returned an incomplete source window.')
+    if any(b <= a for a, b in zip(times, times[1:])):
+        raise ValueError('Optical flow requires ordered source frame timestamps.')
+    return times, np.memmap(raw, dtype='<u2', mode='r', shape=(len(times), height, width, 3))
+
+
+def bracketed(times, requested, reach):
+    """Whether every requested time has its own frames among the kept ones: a frame at or before it within reach, and
+    one after it within reach unless it lies past the last frame. A source with gaps wider than `reach` fails this."""
+    for time in requested:
+        left = bisect.bisect_right(times, time + 1e-8) - 1
+        # Before the first frame is only a gap when the window could have reached further back than the file start.
+        if left < 0 and times[0] - time > 1e-6 and time > reach: return False
+        if left >= 0 and time - times[left] > reach: return False
+        if 0 <= left < len(times) - 1 and times[left + 1] - time > reach: return False
+    return True
 
 
 def render(job):
-    times, stream = probe(job)
+    stream, rate = probe(job)
     width, height = stream['width'], stream['height']
     # An export fits every source into its canvas first, so its bake need be no larger than that box.
     resize = ''
@@ -53,88 +107,107 @@ def render(job):
     cv2.setNumThreads(max(4, int(threads)))
     directory = Path(job['output']).parent / 'decoded'
     directory.mkdir()
+    requested = [max(0, frame['time']) for frame in job['frames']]
+    # Worst case every frame of the window is kept: speed at or below 100% reads them all.
+    window = (max(requested) - min(requested) + 5 / max(1.0, rate)) * rate + 2
+    if window*width*height*6 + 512*1024**2 > shutil.disk_usage(directory).free:
+        raise ValueError('Insufficient disk space for optical flow. Render a shorter range.')
+    # Three nominal frame periods hold a frame on each side of any requested time on constant-rate footage. Variable
+    # frame rate can leave wider gaps; then the window is decoded again with a two-second reach.
+    times, decoded = decode(job, requested, width, height, resize, threads, directory, rate, 3 / max(1.0, rate))
+    if not bracketed(times, requested, 3 / max(1.0, rate)):
+        del decoded
+        times, decoded = decode(job, requested, width, height, resize, threads, directory, rate, 2.0)
+    emit(10)
     schedule = []
-    for frame in job['frames']:
-        time = max(0, min(times[-1], frame['time']))
+    for frame, wanted in zip(job['frames'], requested):
+        time = max(times[0], min(times[-1], wanted))
         left = max(0, bisect.bisect_right(times, time + 1e-8) - 1)
         right = min(left + 1, len(times) - 1) if frame['interpolate'] else left
         fraction = (time - times[left]) / (times[right] - times[left]) if right != left else 0
         schedule.append((left, right, max(0, min(1, fraction))))
-    needed = sorted({i for left, right, _ in schedule for i in (left, right)})
-    if len(needed)*width*height*6 + 512*1024**2 > shutil.disk_usage(directory).free:
-        raise ValueError('Insufficient disk space for optical flow. Render a shorter range.')
-    # A script avoids Windows command-line length and quoting limits. Frame numbers
-    # come from decoded presentation order, including variable-frame-rate footage.
-    graph = directory / 'select.filter'
-    graph.write_text("select='" + '+'.join(f'eq(n\\,{i})' for i in needed) + "'" + resize)
-    subprocess.run([job['ffmpeg'], '-v', 'error', '-nostdin', '-y', '-threads', threads, '-i', job['input'],
-                    '-filter_script:v', str(graph), '-frames:v', str(len(needed)),
-                    # Fastest deflate: still lossless, half the read time of the default level on 4K 16-bit frames.
-                    '-fps_mode', 'passthrough', '-pix_fmt', 'rgb48be', '-threads', threads, '-compression_level', '1',
-                    '-start_number', '0', str(directory / '%d.png')], check=True)
-    positions = {index: position for position, index in enumerate(needed)}
-
-    @lru_cache(maxsize=4)
-    def frame(index):
-        rgb = cv2.imread(str(directory / f'{positions[index]}.png'), cv2.IMREAD_UNCHANGED)
-        if rgb is None or rgb.dtype != np.uint16 or rgb.shape != (height, width, 3):
-            raise ValueError('Optical flow decoder returned an incomplete source frame.')
-        return rgb
 
     # Motion is estimated on a bounded image, then scaled to native pixels. Color
     # stays at 16 bits throughout the warp and the pipe into the 10-bit encoder.
     scale = min(1, 960/max(width, height))
     sw, sh = max(12, round(width*scale)), max(12, round(height*scale))
     grid = np.stack(np.meshgrid(np.arange(width, dtype=np.float32), np.arange(height, dtype=np.float32)), -1)
-    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    small = np.stack(np.meshgrid(np.arange(sw, dtype=np.float32), np.arange(sh, dtype=np.float32)), -1)
+    units = np.array([width/sw, height/sh], dtype=np.float32)
+    # A DIS instance keeps state between calls, so each worker thread has its own.
+    local = threading.local()
 
-    @lru_cache(maxsize=2)
+    def gray(index):
+        # Shrink the 16-bit picture first: converting and greying 4K only to throw three quarters away cost more than DIS.
+        return cv2.cvtColor((cv2.resize(decoded[index], (sw, sh), interpolation=cv2.INTER_AREA) >> 8).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+
     def motion(left, right):
-        a, b = [cv2.resize(cv2.cvtColor((frame(i) >> 8).astype(np.uint8), cv2.COLOR_BGR2GRAY), (sw, sh)) for i in (left, right)]
+        a, b = gray(left), gray(right)
         # Do not invent movement across a cut. The source frame is held until the
         # cut timestamp, as with the FFmpeg scene-change detector.
         if np.mean(cv2.absdiff(a, b)) > 50:
             return None
-        fields = []
-        for first, second in ((a, b), (b, a)):
-            flow = cv2.resize(dis.calc(first, second, None), (width, height))
-            flow *= np.array([width/sw, height/sh], dtype=np.float32)
-            fields.append(flow)
-        return fields
+        if not hasattr(local, 'dis'): local.dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+        # Both fields stay at the motion resolution, in its own pixels; only the finished mapping is enlarged.
+        return [local.dis.calc(first, second, None) for first, second in ((a, b), (b, a))]
 
     def warp(image, flow, amount):
         # Solve the inverse mapping by fixed-point iteration. A single subtraction
         # samples flow at the destination and leaves ghosts around moving edges.
-        mapping = grid.copy()
+        # The iteration runs where the motion was measured: at native size it repeated the same interpolation of the
+        # same coarse field on up to 16x the pixels, which was most of the 1 s each 4K output frame took.
+        mapping = small.copy()
         for _ in range(3):
             displaced = cv2.remap(flow, mapping, None, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            mapping = grid - amount*displaced
-        return cv2.remap(image, mapping, None, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+            mapping = small - amount*displaced
+        # OpenCV, not numpy, for the full-size arithmetic: it is threaded and was a third of the frame time as numpy.
+        offset = cv2.resize((mapping - small) * units, (width, height), interpolation=cv2.INTER_LINEAR)
+        fixed, fraction = cv2.convertMaps(cv2.add(grid, offset), None, cv2.CV_16SC2)
+        return cv2.remap(image, fixed, fraction, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
+    def picture(left, right, fraction, fields):
+        image = decoded[left]
+        fields = fields.result() if fields else None
+        if fields is None: return image
+        first = warp(image, fields[0], fraction)
+        second = warp(decoded[right], fields[1], 1-fraction)
+        return cv2.addWeighted(first, 1-fraction, second, fraction, 0)
+
+    # Frames are independent once their pair's motion is known: several are warped at once (OpenCV releases the GIL)
+    # and written in order. A pair shared by consecutive slow-motion frames is measured once. Two pools, so a frame
+    # waiting on its motion never holds the thread that motion needs.
+    workers = max(2, min(8, int(threads) // 3))
     emit(15)
     error_path = directory / 'encoder.log'
-    with error_path.open('wb') as errors:
+    with error_path.open('wb') as errors, ThreadPoolExecutor(workers) as motions, ThreadPoolExecutor(workers) as pictures:
         encoder = subprocess.Popen([job['ffmpeg'], '-v', 'error', '-nostdin', '-y',
                                     '-f', 'rawvideo', '-pix_fmt', 'bgr48le', '-s', f'{width}x{height}',
                                     '-r', str(job['fps']), '-i', 'pipe:0', '-an', '-c:v', 'prores_ks',
                                     '-profile:v', '3', '-pix_fmt', 'yuv422p10le', '-threads', threads,
-                                    job['output']], stdin=subprocess.PIPE, stderr=errors)
+                                    job['output']], stdin=subprocess.PIPE, stderr=errors, bufsize=16 * 1024**2)
+        pairs, waiting = {}, deque()
+
+        def write(number):
+            encoder.stdin.write(np.ascontiguousarray(waiting.popleft().result(), dtype='<u2').data)
+            if number % max(1, len(schedule)//100) == 0:
+                emit(15 + 84*(number+1)/len(schedule))
         try:
             for number, (left, right, fraction) in enumerate(schedule):
-                picture = frame(left)
+                fields = None
                 if fraction > 1e-8 and left != right:
-                    fields = motion(left, right)
-                    if fields is not None:
-                        first = warp(picture, fields[0], fraction)
-                        second = warp(frame(right), fields[1], 1-fraction)
-                        picture = cv2.addWeighted(first, 1-fraction, second, fraction, 0)
-                encoder.stdin.write(picture.astype('<u2', copy=False).tobytes())
-                if number % max(1, len(schedule)//100) == 0:
-                    emit(15 + 84*(number+1)/len(schedule))
+                    if (left, right) not in pairs:
+                        pairs[(left, right)] = motions.submit(motion, left, right)
+                        # The schedule moves through the window, so only recent pairs come back.
+                        while len(pairs) > 4 * workers: pairs.pop(next(iter(pairs)))
+                    fields = pairs[(left, right)]
+                waiting.append(pictures.submit(picture, left, right, fraction, fields))
+                if len(waiting) > 2 * workers: write(number - len(waiting) + 1)
+            while waiting: write(len(schedule) - len(waiting))
             encoder.stdin.close()
             if encoder.wait() != 0:
                 raise RuntimeError(error_path.read_text(errors='replace'))
         finally:
+            for pending in waiting: pending.cancel()
             if encoder.poll() is None:
                 encoder.kill()
                 encoder.wait()

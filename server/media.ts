@@ -1206,21 +1206,27 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       // The fit to the canvas came after the grade, so a 4K source ran its table and float conversion on four times the
       // pixels the export keeps. Fitting first is what the preview does (it grades the smaller proxy), and it cut the
       // Newspaper composite from 152 s to 116 s. Pixel effects keep the old order: their radii are source pixels.
-      const fit = `w=${projectWidth}:h=${projectHeight}:force_original_aspect_ratio=decrease`;
-      const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && !['EQ', 'Compressor', 'Limiter', 'Stabilize', 'Depth'].includes(e.name));
-      video.push(`fps=${fps}`, `trim=duration=${length}`, 'setsar=1', ...videoFilters(clip, lutPath, source.asset, maskStreams, videoIndex === index, fitFirst ? fit : undefined));
-      // After grade and matte (both in source orientation), before crop (measured on what the viewer sees).
-      if (p.flipH && !isTitle(clip) && !isShape(clip)) video.push('hflip');
       const zoom = property('zoom', 100, 1, 800) / 100;
-      const left = property('cropLeft', 0, 0, 16384), right = property('cropRight', 0, 0, 16384), top = property('cropTop', 0, 0, 16384), bottom = property('cropBottom', 0, 0, 16384);
-      // Crop is measured on the fitted project canvas, preserving the original framing.
-      video.push(...(fitFirst ? [] : [`scale=${fit}`]), 'format=gbrap16le', `pad=${projectWidth}:${projectHeight}:(ow-iw)/2:(oh-ih)/2:color=black@0`);
-      if (left + right >= projectWidth || top + bottom >= projectHeight) throw new Error(`${clip.name}: crop removes the entire frame.`);
-      if (left || right || top || bottom) video.push(`crop=${projectWidth - left - right}:${projectHeight - top - bottom}:${left}:${top}`, `pad=${projectWidth}:${projectHeight}:${left}:${top}:color=black@0`);
       const scaledWidth = Math.max(2, Math.round(width * zoom / 2) * 2), scaledHeight = Math.max(2, Math.round(height * zoom / 2) * 2);
       if (scaledWidth * scaledHeight > 64_000_000) throw new Error(`${clip.name}: zoom requires too much memory at this resolution. Reduce Zoom.`);
       const poses=request.transformSamples?.[clip.id];
       const motion=poses&&poses.length>1;
+      // The clip is graded, cropped and padded on a canvas only as large as it ends up on the output, never larger
+      // than the project canvas: a 4K project exported at 1080p used to grade, convert and pad every 4K frame and
+      // only then shrink it. Crop stays measured in project pixels, scaled onto that canvas.
+      const largest = motion ? Math.max(...poses.map(pose => Math.max(pose.scaleX, pose.scaleY))) * width : scaledWidth;
+      const canvas = Math.min(1, largest / projectWidth), canvasWidth = Math.max(2, Math.round(projectWidth * canvas)), canvasHeight = Math.max(2, Math.round(projectHeight * canvas));
+      const fit = `w=${canvasWidth}:h=${canvasHeight}:force_original_aspect_ratio=decrease`;
+      const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && !['EQ', 'Compressor', 'Limiter', 'Stabilize', 'Depth'].includes(e.name));
+      video.push(`fps=${fps}`, `trim=duration=${length}`, 'setsar=1', ...videoFilters(clip, lutPath, source.asset, maskStreams, videoIndex === index, fitFirst ? fit : undefined));
+      // After grade and matte (both in source orientation), before crop (measured on what the viewer sees).
+      if (p.flipH && !isTitle(clip) && !isShape(clip)) video.push('hflip');
+      const left = property('cropLeft', 0, 0, 16384), right = property('cropRight', 0, 0, 16384), top = property('cropTop', 0, 0, 16384), bottom = property('cropBottom', 0, 0, 16384);
+      // Crop is measured on the fitted project canvas, preserving the original framing.
+      video.push(...(fitFirst ? [] : [`scale=${fit}`]), 'format=gbrap16le', `pad=${canvasWidth}:${canvasHeight}:(ow-iw)/2:(oh-ih)/2:color=black@0`);
+      if (left + right >= projectWidth || top + bottom >= projectHeight) throw new Error(`${clip.name}: crop removes the entire frame.`);
+      const [cropLeft, cropRight, cropTop, cropBottom] = [left, right, top, bottom].map(value => Math.round(value * canvas));
+      if (left || right || top || bottom) video.push(`crop=${Math.max(1, canvasWidth - cropLeft - cropRight)}:${Math.max(1, canvasHeight - cropTop - cropBottom)}:${cropLeft}:${cropTop}`, `pad=${canvasWidth}:${canvasHeight}:${cropLeft}:${cropTop}:color=black@0`);
       if(!motion)video.push(`scale=${scaledWidth}:${scaledHeight}`);
       const rotation = property('rotation', 0, -360, 360) * Math.PI / 180;
       if (rotation&&!motion) video.push(`rotate=${rotation}:ow=rotw(${rotation}):oh=roth(${rotation}):c=none`);
@@ -1443,7 +1449,10 @@ async function renderStabilizedTimeline(request: RenderRequest) {
   try {
   const clips=[...request.clips],assets=[...request.assets],tracks=[...request.tracks];
   const records=timelineTransitions(clips.filter(c=>c.projectId===request.project.id),request.timeline.id,assets.map(a=>a.asset));
-  const candidates=clips.filter(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c));
+  const stabilizing=clips.filter(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c));
+  // A clip outside the range is never drawn: it only loses the effect, so the render after the bakes does not come back here.
+  for(const clip of stabilizing.filter(c=>outsideRange(request,c,records)))clips[clips.indexOf(clip)]={...clip,effects:clip.effects.filter(e=>e.name!=='Stabilize')};
+  const candidates=stabilizing.filter(c=>!outsideRange(request,c,records));
   const maskArtifacts=new Map(request.maskArtifacts),stabilized=new Map(request.stabilized);
   for(const [index,clip] of candidates.entries()) {
     // Optical flow needs no check: the bake below is source-time media, so the recursive render hands it to renderFlowTimeline,
@@ -1746,6 +1755,22 @@ async function renderDepthTimeline(request: RenderRequest) {
 // Bakes a running export still reads: a preview renders flow alongside an export and trims the same directory.
 const bakesInUse=new Map<string,number>();
 
+/** Whether none of the clip (with its transition handles) reaches into the export range. Such a clip is never drawn,
+ *  so baking it is wasted: a 2.7 s Stabilize clip at 462 s cost the 0-115 s Girls Soccer export a minute. */
+function outsideRange(request: RenderRequest, clip: Clip, records: TransitionRecord[]) {
+  const { rangeIn, rangeOut } = exportRange(request), span = clipSpan(clip, records);
+  return span.start >= rangeOut - 1e-6 || span.end <= rangeIn + 1e-6;
+}
+
+/** The most pixels the clip's picture covers in this export: the output frame at the clip's largest zoom. A bake
+ *  needs no more than this (a 4K source in a 1080p export at 150 % needs 2880 wide, not the 4K project canvas). */
+function pictureBox(request: RenderRequest, clip: Clip): [number, number] {
+  const [width, height] = dimensions(request.settings.resolution || request.project.resolution);
+  const zooms = [clip.properties.zoom ?? 100, ...(clip.keyframes?.['properties.zoom'] ?? []).map(key => key.value)].map(Number).filter(Number.isFinite);
+  const zoom = Math.max(100, ...zooms) / 100;
+  return [Math.ceil(width * zoom / 2) * 2, Math.ceil(height * zoom / 2) * 2];
+}
+
 /** Bake optical flow before compositing; all subsequent frame reads use the same retimed footage. */
 async function renderFlowTimeline(request: RenderRequest) {
   const directory=await mkdtemp(path.join(tmpdir(),'frameline-flow-export-')),claimed:string[]=[];
@@ -1753,10 +1778,12 @@ async function renderFlowTimeline(request: RenderRequest) {
     const clips=[...request.clips],assets=[...request.assets],tracks=[...request.tracks];
     const fps=finite(request.settings.fps||request.project.fps,'Frame rate',1,120);
     const records=timelineTransitions(clips.filter(c=>c.projectId===request.project.id),request.timeline.id,assets.map(a=>a.asset));
-    const candidates=clips.filter(c=>c.timelineId===request.timeline.id&&!c.disabled&&c.properties.opticalFlow);
+    const flowing=clips.filter(c=>c.timelineId===request.timeline.id&&!c.disabled&&c.properties.opticalFlow);
+    for(const clip of flowing.filter(c=>outsideRange(request,c,records)))clips[clips.indexOf(clip)]={...clip,properties:{...clip.properties,opticalFlow:false}};
+    const candidates=flowing.filter(c=>!outsideRange(request,c,records));
     // Bakes are keyed by everything that shapes them (flowIdentity), so a re-export reuses the last one instead of
     // interpolating the same seconds again: every Newspaper attempt spent 165 s re-baking one 4.6 s ramp.
-    const bakes=await processDirectory('frameline-flow-bakes-'),canvas=dimensions(request.project.resolution);
+    const bakes=await processDirectory('frameline-flow-bakes-');
     for(const [index,clip] of candidates.entries()) {
       if(activeSmartMasks(clip,request.nodes).length)throw Error('Smart Mask and optical-flow retiming need a shared warped matte. Disable optical flow for this clip.');
       if(activeDepthKeys(clip,request.nodes).length)throw Error(`${clip.name}: a depth key cannot follow optical-flow retiming yet. Disable optical flow for this clip.`);
@@ -1764,7 +1791,7 @@ async function renderFlowTimeline(request: RenderRequest) {
       if(!source||source.asset.kind!=='video'||!track)throw new Error(`${clip.name}: optical flow requires a video source.`);
       const span=clipSpan(clip,records),geo=extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
       request.onStage?.(`Optical flow · ${clip.name}`);
-      const baked=await renderOpticalFlow({clip:geo,asset:source.asset,input:source.path,directory:bakes,fps,fit:canvas,threads:Number(exportThreads),signal:request.signal,onProgress:p=>request.onProgress?.((index+p/100)/candidates.length*45)});
+      const baked=await renderOpticalFlow({clip:geo,asset:source.asset,input:source.path,directory:bakes,fps,fit:pictureBox(request,clip),threads:Number(exportThreads),signal:request.signal,onProgress:p=>request.onProgress?.((index+p/100)/candidates.length*45)});
       claimed.push(baked.key);bakesInUse.set(baked.key,(bakesInUse.get(baked.key)??0)+1);
       const mediaId=`flow-${clip.id}`,metadata=await probeMedia(baked.output,request.signal);
       assets.push({path:baked.output,asset:{...source.asset,id:mediaId,duration:geo.duration,fps,hasAudio:false,colorRange:metadata.colorRange,colorMatrix:metadata.colorMatrix}});
@@ -1986,16 +2013,25 @@ async function renderCompositions(request: RenderRequest) {
   const directory=await mkdtemp(path.join(tmpdir(),'frameline-compositions-'));
   try {
     const clips=[...request.clips],assets=[...request.assets];
-    const parents=clips.filter(c=>c.timelineId===request.timeline.id&&c.mediaId==='frameline-composition'&&!c.disabled);
+    const records=timelineTransitions(clips.filter(c=>c.projectId===request.project.id),request.timeline.id,assets.map(a=>a.asset));
+    const nested=clips.filter(c=>c.timelineId===request.timeline.id&&c.mediaId==='frameline-composition'&&!c.disabled);
+    // A composition outside the range is never drawn; it is switched off rather than rendered.
+    for(const parent of nested.filter(c=>outsideRange(request,c,records)))clips[clips.indexOf(parent)]={...parent,disabled:true};
+    const parents=nested.filter(c=>!outsideRange(request,c,records)),fps=finite(request.settings.fps||request.project.fps,'Frame rate',1,120);
     for(const [index,parent] of parents.entries()) {
       if(request.signal?.aborted)throw new Error('Canceled by you');
       const timeline=request.timelines?.find(t=>t.id===parent.properties.compositionId&&t.projectId===request.project.id);
       if(!timeline)throw new Error(`${parent.name}: composition timeline is missing.`);
       const outputPath=path.join(directory,`${index}.mov`),mediaId=`composition-render-${parent.id}`;
+      // Only the stretch of the nested timeline the parent reads (speed, reverse, freeze and transition handles
+      // included), at the size the parent covers in this export. Girls Soccer showed 2.2 s of a 135.6 s composition
+      // and spent 15 of its 78 minutes rendering all of it in 4K ProRes 4444.
+      const span=clipSpan(parent,records),geo=extendClip(parent,Math.max(0,span.start),span.end-Math.max(0,span.start));
+      const read=stabilizeRange(geo,fps,timeline.duration),[width,height]=pictureBox(request,parent);
       request.onStage?.(`Rendering composition ${index+1}/${parents.length} · ${parent.name}`);
-      await renderTimeline({...request,timeline,onStage:undefined,compositionPath:[...ancestry,request.timeline.id],transparent:true,sampledFrame:false,outputPath,onProgress:p=>request.onProgress?.((index+p/100)/parents.length*50),settings:{...request.settings,resolution:request.project.resolution,rangeIn:'0',rangeOut:String(timeline.duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
-      clips[clips.indexOf(parent)]={...parent,mediaId};
-      assets.push({path:outputPath,asset:{id:mediaId,projectId:request.project.id,name:parent.name,kind:'video',duration:timeline.duration,binId:'',thumbnail:'',fps:Number(request.settings.fps||request.project.fps),resolution:request.project.resolution,size:'',status:'ready',progress:100,hasAudio:request.settings.audio!=='Disabled',inputProfile:'Rec.709'}});
+      await renderTimeline({...request,timeline,onStage:undefined,compositionPath:[...ancestry,request.timeline.id],transparent:true,sampledFrame:false,outputPath,onProgress:p=>request.onProgress?.((index+p/100)/parents.length*50),settings:{...request.settings,resolution:`${width} × ${height}`,rangeIn:String(read.from),rangeOut:String(read.to),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
+      clips[clips.indexOf(parent)]={...parent,mediaId,sourceIn:parent.sourceIn-read.from};
+      assets.push({path:outputPath,asset:{id:mediaId,projectId:request.project.id,name:parent.name,kind:'video',duration:read.to-read.from,binId:'',thumbnail:'',fps,resolution:`${width} × ${height}`,size:'',status:'ready',progress:100,hasAudio:request.settings.audio!=='Disabled',inputProfile:'Rec.709'}});
     }
     await renderTimeline({...request,clips,assets,onProgress:p=>request.onProgress?.(50+p*.5)});
   } finally {await rm(directory,{recursive:true,force:true});}
