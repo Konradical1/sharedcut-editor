@@ -898,10 +898,11 @@ export function importFcpxml(xml: string, projectId: string, userId: string, fon
 
 /**
  * A Final Cut import's card, from its upload plan and what the server holds now. `receivedOf` is a file's bytes on
- * the server (more than its size once complete). An import paused or stopped stays so until bytes arrive; `rate`
- * is an average of the bytes/s between arrivals at least 5 s apart, weighted 0.7 to the old value.
+ * the server (more than its size once complete). An import paused or stopped stays so until bytes arrive. `rate` takes a
+ * sample when bytes arrived at least 5 s after `anchor` (the bytes and time the last sample was measured from, which the
+ * caller moves on), weighted 0.7 to the old value; no anchor, no sample.
  */
-export function importStatus(plan: { by: string; files: { id: string; size: number }[] }, statusOf: (id: string) => string | undefined, receivedOf: (id: string) => number, previous: FcpImport | undefined, now: number): FcpImport {
+export function importStatus(plan: { by: string; files: { id: string; size: number }[] }, statusOf: (id: string) => string | undefined, receivedOf: (id: string) => number, previous: FcpImport | undefined, now: number, anchor?: { at: number; received: number }): FcpImport {
   let total = 0, received = 0, uploaded = 0, ready = 0, failed = 0;
   for (const file of plan.files) {
     const got = Math.min(file.size, receivedOf(file.id)); total += file.size; received += got;
@@ -909,9 +910,9 @@ export function importStatus(plan: { by: string; files: { id: string; size: numb
     uploaded++; const status = statusOf(file.id);
     if (status === 'ready' || status === 'failed') { ready++; if (status === 'failed') failed++; }
   }
-  const files = plan.files.length, arrived = !previous || received > previous.received, waited = previous ? now - previous.updatedAt : 0;
+  const files = plan.files.length, arrived = !previous || received > previous.received;
   const phase = uploaded < files ? (!arrived && (previous!.phase === 'paused' || previous!.phase === 'stopped') ? previous!.phase : 'uploading') : ready < files ? 'processing' : 'ready';
-  const sample = previous && arrived && waited >= 5000 ? (received - previous.received) / waited * 1000 : undefined;
+  const sample = previous && anchor && received > anchor.received && now - anchor.at >= 5000 ? (received - anchor.received) / (now - anchor.at) * 1000 : undefined;
   const rate = sample === undefined ? previous?.rate ?? 0 : previous!.rate ? .7 * previous!.rate + .3 * sample : sample;
   return { by: plan.by, phase, total, received, files, uploaded, ready, failed, rate: Math.round(rate), startedAt: previous?.startedAt ?? now, updatedAt: arrived ? now : previous!.updatedAt,
     ...(phase === 'ready' ? { doneAt: previous?.doneAt ?? now } : {}) };

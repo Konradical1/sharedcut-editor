@@ -6,6 +6,8 @@ import type { FcpImport } from '../state/models.ts';
 
 /** A font family or file name as a match key: lowercase letters and digits. "Futura PT" matches FuturaPT-Bold.otf by prefix. */
 export const fontKey = (family: string) => family.toLowerCase().replace(/[^a-z0-9]/g, '');
+/** "800 KB", "12.4 MB", "4.8 GB": file sizes as the importer and the Projects cards say them. */
+export const bytes = (value: number) => value >= 1e9 ? `${(value / 1e9).toFixed(1)} GB` : value >= 1e6 ? `${(value / 1e6).toFixed(1)} MB` : `${Math.ceil(value / 1e3)} KB`;
 /** A file or folder name as macOS compares it: case ignored, and composed (a name can reach the browser decomposed). */
 export const nameKey = (name: string) => name.normalize('NFC').toLowerCase();
 const segs = (path: string) => nameKey(path).split('/').filter(Boolean);
@@ -50,13 +52,19 @@ export async function walk(entries: FileSystemEntry[], wanted: Set<string>, onCo
 export type Match = { id: string; state: 'found' | 'ambiguous' | 'missing'; found?: Found; weak?: boolean; candidates?: Found[] };
 /**
  * Which found file is each source the server does not have yet: the one whose path agrees with the source's original
- * path in the most trailing folders. Two SD cards with the same DCIM layout are told apart by their volume name.
+ * path in the most trailing folders. Two SD cards with the same DCIM layout are told apart by their volume name. A file
+ * belongs to one source only, the one whose path agrees with it most: two clips called C0001.MP4 never share one file,
+ * and a file two of them claim equally (a loose copy) goes to neither, so each stays missing until its own card is dropped.
  */
 export function matchSources(sources: Source[], found: Found[]): Match[] {
   const byName = new Map<string, Found[]>();
   for (const f of found) { const key = segs(f.path).at(-1) ?? ''; (byName.get(key) ?? byName.set(key, []).get(key)!).push(f); }
-  return sources.filter(s => !s.uploaded).map((s): Match => {
-    const path = segs(s.sourcePath ?? s.name), scored = (byName.get(nameKey(s.name)) ?? []).map(f => ({ f, score: suffix(path, segs(f.path)) }));
+  const wanted = sources.filter(s => !s.uploaded), scores = wanted.map(s => { const path = segs(s.sourcePath ?? s.name); return (byName.get(nameKey(s.name)) ?? []).map(f => ({ f, score: suffix(path, segs(f.path)) })); });
+  // Each file's best score over every source that wants its name, and how many sources reach it.
+  const claims = new Map<Found, { score: number; count: number }>();
+  for (const list of scores) for (const { f, score } of list) { const c = claims.get(f); if (!c || score > c.score) claims.set(f, { score, count: 1 }); else if (score === c.score) c.count++; }
+  return wanted.map((s, i): Match => {
+    const scored = scores[i].filter(({ f, score }) => { const c = claims.get(f)!; return score === c.score && c.count === 1; });
     const best = Math.max(0, ...scored.map(c => c.score)), top = scored.filter(c => c.score === best).map(c => c.f);
     if (!top.length) return { id: s.id, state: 'missing' };
     // The same size and date: copies of one file, so either will do.
@@ -210,11 +218,11 @@ export function friendlyDuration(seconds: number) {
  */
 export function importCard(i: FcpImport, who: string, now = Date.now()) {
   if (i.phase === 'ready' && !(now - (i.doneAt ?? 0) < 86_400_000)) return undefined;
-  const percent = i.total ? Math.floor(i.received * 100 / i.total) : 0, unit = i.total >= 1e9 ? 1e9 : 1e6;
+  const percent = i.total ? Math.floor(i.received * 100 / i.total) : 0;
   const left = i.rate > 0 ? ` · ${friendlyDuration((i.total - i.received) / i.rate).replace(/(\d) minutes?/, '$1 min')} left` : '';
   const card = (title: string, detail: string, progress: number | undefined, label: string) => ({ phase: i.phase, title, detail, progress, label });
   switch (i.phase) {
-    case 'uploading': { const title = who ? `**${who}** is importing a project from Final Cut` : "You're importing a project from Final Cut"; return card(title, `${percent}% · ${(i.received / unit).toFixed(1)} of ${(i.total / unit).toFixed(1)} ${unit === 1e9 ? 'GB' : 'MB'}${left}`, percent, `${title.replaceAll('**', '')}, ${percent} percent`); }
+    case 'uploading': { const title = who ? `**${who}** is importing a project from Final Cut` : "You're importing a project from Final Cut"; return card(title, `${percent}% · ${bytes(i.received)} of ${bytes(i.total)}${left}`, percent, `${title.replaceAll('**', '')}, ${percent} percent`); }
     case 'paused': { const mac = who ? `${who}'s Mac` : 'your Mac'; return card(`Paused · waiting for ${mac}`, `${percent}%`, percent, `Import paused at ${percent} percent, waiting for ${mac}`); }
     case 'processing': return card('Getting it ready', `${i.ready} of ${i.files} clips ready`, i.files ? i.ready * 100 / i.files : 0, `Getting it ready, ${i.ready} of ${i.files} clips ready`);
     case 'stopped': return card(`Import stopped at ${percent}%`, `${who || 'You'} can finish it at sharedcut.com/importer`, undefined, `Import stopped at ${percent} percent`);

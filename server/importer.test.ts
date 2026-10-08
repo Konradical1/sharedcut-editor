@@ -3,7 +3,8 @@
 import assert from 'node:assert/strict';
 import test, { after } from 'node:test';
 import { createHash } from 'node:crypto';
-import { existsSync, utimesSync } from 'node:fs';
+import { existsSync, utimesSync, writeFileSync } from 'node:fs';
+import { connect } from 'node:net';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,13 +28,13 @@ ${source('a', '/Users/maya/Movies/School%20Library.fcpbundle/E/Original%20Media/
 <asset-clip ref="b" offset="4s" start="0s" duration="4s"/><asset-clip ref="c" offset="8s" start="0s" duration="2s"/></spine></sequence></project></event></library></fcpxml>`;
 
 type Reply = { status: number; data: any; cookie: string };
-async function fixture(options: { env?: Record<string, string>; maxUploadBytes?: number } = {}) {
+async function fixture(options: { env?: Record<string, string>; maxUploadBytes?: number; uploadIdleMs?: number } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'sharedcut-importer-')), env = options.env ?? {};
   // `env` holds for this server only: the server reads it as it starts.
   const start = () => {
     const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
     Object.assign(process.env, env);
-    try { return createFrameLineServer({ dataDir: dir, maxUploadBytes: options.maxUploadBytes }); } finally { restoreEnv(saved); }
+    try { return createFrameLineServer({ dataDir: dir, maxUploadBytes: options.maxUploadBytes, uploadIdleMs: options.uploadIdleMs }); } finally { restoreEnv(saved); }
   };
   let app = start(), base = '';
   const listen = async () => { await new Promise<void>(done => app.server.listen(0, '127.0.0.1', done)); base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}/api`; };
@@ -59,7 +60,8 @@ async function fixture(options: { env?: Record<string, string>; maxUploadBytes?:
   };
   const backdate = (projectId: string, ms: number) => (db: DatabaseSync) => db.prepare("UPDATE workspace_items SET data=json_set(data,'$.fcpImport.updatedAt',?) WHERE collection='projects' AND json_extract(data,'$.id')=?").run(Date.now() - ms, projectId);
   const age = (mediaId: string, ms: number) => { const when = new Date(Date.now() - ms); for (const name of ['upload.part', 'upload.json', '']) utimesSync(join(dir, 'media', mediaId, name), when, when); };
-  return { dir, call, guest, member, importXml, plan, card, init, chunk, restart, backdate, age, close: async () => { await app.close(); await rm(dir, { recursive: true, force: true }); } };
+  const port = () => (app.server.address() as { port: number }).port;
+  return { dir, call, guest, member, importXml, plan, card, init, chunk, restart, backdate, age, port, close: async () => { await app.close(); await rm(dir, { recursive: true, force: true }); } };
 }
 const until = async (check: () => Promise<boolean>, message: string) => { for (let i = 0; i < 200; i++) { if (await check()) return; await new Promise(done => setTimeout(done, 50)); } assert.fail(message); };
 
@@ -236,6 +238,10 @@ test('the import card: chunks, pause, processing, ready; a client copy never ove
     assert.deepEqual([ready.ready, ready.failed], [2, 2]); assert.ok(ready.doneAt >= ready.startedAt);
     const sources = (await f.call(owner.cookie, `/fcp/import/${id}`)).data.media;
     assert.deepEqual(sources.map((m: any) => [m.uploaded, m.received, m.status]), [[true, 10, 'failed'], [true, 10, 'failed'], [false, 0, 'failed']]);
+    // A clip retried later is not the import coming back: the card stays done.
+    assert.equal((await f.call(owner.cookie, `/media/${a}/retry`, 'POST')).status, 202);
+    assert.deepEqual(await f.card(owner.cookie, id), ready);
+    await until(async () => (await f.call(owner.cookie, `/fcp/import/${id}`)).data.media[0].status === 'failed', 'the retry never finished');
     // A class Viewer's settings save that carries a forged card: the card is ignored, the save goes through.
     assert.equal((await f.call(owner.cookie, `/projects/${id}`, 'PATCH', { access: 'class', classRole: 'Viewer' })).status, 200);
     const envelope = (await f.call(viewer.cookie, '/state')).data, before = envelope.state;
@@ -317,5 +323,106 @@ test('the Wi-Fi probe and the list of unfinished imports', async () => {
     const list = (await f.call(maya, '/fcp/import')).data.imports;
     assert.deepEqual(list.map((i: any) => [i.projectId, i.name, i.fcpImport.phase]), [[mine.data.projectId, 'My Film', 'uploading']], 'only the caller\'s own');
     assert.deepEqual((await f.call(owner.cookie, '/fcp/import')).data.imports.map((i: any) => i.projectId), [theirs.data.projectId], 'a guest\'s class-shared import is not the teacher\'s to continue');
+  } finally { await f.close(); }
+});
+
+test("a guest's cap counts every byte it holds, and a file planned away takes no more chunks", async () => {
+  const f = await fixture({ env: { FRAME_LINE_GUEST_MAX_GB: String(2048 / 1024 ** 3) } });
+  try {
+    const maya = (await f.guest()).cookie, mine = await f.importXml(maya), id = mine.data.projectId, [x, y, z] = mine.data.media.map((m: any) => m.id);
+    assert.equal((await f.plan(maya, id, [{ id: x, size: 1500 }])).status, 200);
+    await f.init(maya, x, 1500); assert.equal((await f.chunk(maya, x, 0, Buffer.alloc(1000))).status, 200);
+    // x's 1000 bytes stay on the server when a new plan leaves it out: they count, and x takes no more.
+    assert.equal((await f.plan(maya, id, [{ id: y, size: 1000 }])).status, 200, '1000 held + 1000 planned');
+    const refused = await f.chunk(maya, x, 1000, Buffer.alloc(500));
+    assert.equal(refused.status, 403); assert.equal(refused.data.error, 'Start this upload from sharedcut.com/importer.');
+    assert.equal((await f.plan(maya, id, [{ id: z, size: 1100 }])).status, 403, '1000 held + 1100 planned');
+  } finally { await f.close(); }
+});
+
+test('only an import that is sending holds disk room; a guest rations its rebuilds', async () => {
+  const f = await fixture({ maxUploadBytes: 2 ** 50 });
+  try {
+    const owner = await f.member('teacher@school.test'), one = await f.importXml(owner.cookie), two = await f.importXml(owner.cookie, '', xml('Second', 'P-2'));
+    const room = (await f.call(owner.cookie, '/uploads/probe', 'POST', Buffer.alloc(1024))).data.room, size = Math.floor(room * .6 / 1.25);
+    assert.equal((await f.plan(owner.cookie, one.data.projectId, [{ id: one.data.media[0].id, size }])).status, 200);
+    assert.equal((await f.plan(owner.cookie, two.data.projectId, [{ id: two.data.media[0].id, size }])).status, 507, 'the first import is sending');
+    // Not a byte for two minutes (a closed laptop): paused, and its room is everyone's again.
+    await f.restart(f.backdate(one.data.projectId, 120_000));
+    assert.equal((await f.card(owner.cookie, one.data.projectId)).phase, 'paused');
+    assert.equal((await f.plan(owner.cookie, two.data.projectId, [{ id: two.data.media[0].id, size }])).status, 200);
+    // Each rebuild keeps a snapshot of the edit it replaces: a guest gets 20 an hour.
+    const maya = (await f.guest()).cookie;
+    assert.equal((await f.importXml(maya, '', xml('Maya Film', 'P-3'))).status, 201);
+    for (let i = 0; i < 20; i++) assert.equal((await f.importXml(maya, 'rebuild=1', xml('Maya Film', 'P-3'))).status, 200, `rebuild ${i + 1}`);
+    assert.equal((await f.importXml(maya, 'rebuild=1', xml('Maya Film', 'P-3'))).status, 429);
+    const snapshots = new DatabaseSync(join(f.dir, 'frameline.sqlite'));
+    try { assert.equal((snapshots.prepare("SELECT COUNT(*) AS n FROM workspace_items WHERE collection='snapshots'").get() as { n: number }).n, 20, 'one each, never two with one id'); } finally { snapshots.close(); }
+  } finally { await f.close(); }
+});
+
+test('a chunk whose body stops arriving lets go of its file, so the Mac that lost its Wi-Fi can send it again', async () => {
+  const f = await fixture({ uploadIdleMs: 300 });
+  try {
+    const owner = await f.member('maya@school.test'), imported = await f.importXml(owner.cookie), a = imported.data.media[0].id;
+    assert.equal((await f.init(owner.cookie, a, 1000)).status, 200);
+    // 100 of 1,000 bytes, then nothing and no FIN: what a dropped Wi-Fi looks like from here.
+    const socket = connect(f.port(), '127.0.0.1'), closed = new Promise(done => socket.once('close', done));
+    socket.on('error', () => {});
+    socket.write(`PUT /api/media/${a}/upload HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: ${owner.cookie}\r\nContent-Length: 1000\r\nUpload-Offset: 0\r\nUpload-Checksum: x\r\n\r\n`);
+    socket.write(Buffer.alloc(100));
+    await new Promise(done => setTimeout(done, 100));
+    assert.equal((await f.init(owner.cookie, a, 1000)).data.error, 'Upload is busy.');
+    await closed;
+    const again = await f.init(owner.cookie, a, 1000);
+    assert.equal(again.status, 200, again.data.error); assert.equal(again.data.offset, 0, 'nothing half-written');
+  } finally { await f.close(); }
+});
+
+test('the plan keeps the files that arrived; an empty one ends the import; a full upload.part a kill left is finished', async () => {
+  const f = await fixture();
+  try {
+    const owner = await f.member('maya@school.test'), imported = await f.importXml(owner.cookie), id = imported.data.projectId, [a, b, c] = imported.data.media.map((m: any) => m.id);
+    assert.equal((await f.plan(owner.cookie, id, [{ id: a, size: 10 }, { id: b, size: 10 }])).status, 200);
+    await f.init(owner.cookie, a, 10); assert.equal((await f.chunk(owner.cookie, a, 0, Buffer.alloc(10))).status, 202);
+    await f.init(owner.cookie, b, 10); await f.chunk(owner.cookie, b, 0, Buffer.alloc(4));
+    // Continue upload plans only b: a still counts, so the card's total and percent never go backwards.
+    const resumed = await f.plan(owner.cookie, id, [{ id: b, size: 10 }]);
+    assert.deepEqual([resumed.data.fcpImport.total, resumed.data.fcpImport.received, resumed.data.fcpImport.files, resumed.data.fcpImport.uploaded], [20, 14, 2, 1]);
+    // b failed on the Mac, so the plan comes again without it: what arrived is getting ready.
+    assert.equal((await f.plan(owner.cookie, id, [])).data.fcpImport.phase, 'processing');
+    // Nothing found and nothing arrived: the card goes.
+    const other = await f.importXml(owner.cookie, '', xml('Other', 'P-2')), otherId = other.data.projectId;
+    await f.plan(owner.cookie, otherId, [{ id: other.data.media[0].id, size: 10 }]);
+    const ended = await f.plan(owner.cookie, otherId, []);
+    assert.deepEqual([ended.status, ended.data.fcpImport], [200, null]);
+    assert.equal((await f.call(owner.cookie, '/state')).data.state.projects.find((p: any) => p.id === otherId).fcpImport, undefined);
+    // Killed after c's last chunk was written and before it was renamed: the next init (or a status read) finishes it.
+    await f.plan(owner.cookie, id, [{ id: c, size: 10 }]); await f.init(owner.cookie, c, 10);
+    writeFileSync(join(f.dir, 'media', c, 'upload.part'), Buffer.alloc(10));
+    assert.deepEqual((await f.init(owner.cookie, c, 10)).data, { complete: true });
+    assert.ok(existsSync(join(f.dir, 'media', c, 'original')));
+    assert.equal((await f.call(owner.cookie, `/fcp/import/${id}`)).data.media.find((m: any) => m.id === c).status, 'processing');
+  } finally { await f.close(); }
+});
+
+test('a restart during "Getting it ready" prepares the clips again instead of failing them; members see only the guests beside their projects', async () => {
+  const f = await fixture();
+  try {
+    const owner = await f.member('maya@school.test'), imported = await f.importXml(owner.cookie), id = imported.data.projectId, a = imported.data.media[0].id;
+    await f.plan(owner.cookie, id, [{ id: a, size: 10 }]); await f.init(owner.cookie, a, 10); await f.chunk(owner.cookie, a, 0, Buffer.from('0123456789'));
+    const status = async () => (await f.call(owner.cookie, `/fcp/import/${id}`)).data.media.find((m: any) => m.id === a);
+    assert.equal((await status()).status, 'processing');
+    process.env.FRAME_LINE_DEFER_PREP = '0';
+    try { await f.restart(); } finally { process.env.FRAME_LINE_DEFER_PREP = '1'; }
+    // Its 10 bytes are no video, so preparing fails, with its own reason rather than "interrupted".
+    await until(async () => (await status()).status === 'failed', 'the clip was never prepared again');
+    assert.doesNotMatch((await status()).error, /interrupted/);
+    const importer = await f.guest('Sam Lee'), passerby = await f.guest('Ari Park');
+    assert.equal((await f.importXml(importer.cookie, '', xml('Sam Film', 'P-5'))).status, 201);
+    const names = (await f.call(owner.cookie, '/state')).data.state.users.map((u: any) => u.name);
+    assert.ok(names.includes('Sam Lee'), 'a class import names its guest');
+    assert.ok(!names.includes('Ari Park'), 'a guest with nothing in view is not listed');
+    assert.equal(passerby.status, 201);
   } finally { await f.close(); }
 });

@@ -20,6 +20,12 @@ test('matchSources: the longest path suffix wins; copies are one file; real ties
   assert.deepEqual(cards.map(m => [m.id, m.found?.path]), [['x', 'CARD A/DCIM/100CANON/C0001.MP4'], ['y', 'CARD B/DCIM/100CANON/C0001.MP4']]);
   const [copy] = matchSources([source('c', '/Users/maya/Desktop/A001.mov')], [found('Backup/A001.mov', 5, 7), found('Other/A001.mov', 5, 7)]);
   assert.deepEqual([copy.state, copy.found?.path, copy.weak], ['found', 'Backup/A001.mov', true], 'identical copies are picked silently; a name-only match is weak');
+  // Two clips called C0001.MP4 from two cards never take one file: dragging card 1 alone finds only card 1's clip, and a
+  // loose copy both claim equally goes to neither, so card 2's stays missing until card 2 is dropped.
+  const two = [source('c1', '/Volumes/CARD 1/PRIVATE/M4ROOT/CLIP/C0001.MP4'), source('c2', '/Volumes/CARD 2/PRIVATE/M4ROOT/CLIP/C0001.MP4')];
+  assert.deepEqual(matchSources(two, [found('CARD 1/PRIVATE/M4ROOT/CLIP/C0001.MP4')]).map(m => [m.id, m.state]), [['c1', 'found'], ['c2', 'missing']]);
+  assert.deepEqual(matchSources(two, [found('C0001.MP4')]).map(m => m.state), ['missing', 'missing']);
+  assert.deepEqual(matchSources(two, [found('C0001.MP4'), found('CARD 2/PRIVATE/M4ROOT/CLIP/C0001.MP4')]).map(m => [m.id, m.state, m.found?.path]), [['c1', 'missing', undefined], ['c2', 'found', 'CARD 2/PRIVATE/M4ROOT/CLIP/C0001.MP4']]);
   const [tie] = matchSources([source('d', '/Users/maya/Desktop/A001.mov')], [found('Backup/A001.mov', 5), found('Other/A001.mov', 6)]);
   assert.deepEqual([tie.state, tie.candidates?.map(c => c.path)], ['ambiguous', ['Backup/A001.mov', 'Other/A001.mov']]);
   const rest = matchSources([source('e', '/Users/maya/gone.mov'), source('f', '/Users/maya/here.mov', { uploaded: true })], []);
@@ -128,10 +134,11 @@ test('measureSpeed: one stream then up to four, warm-ups dropped; a failed probe
 test('importCard: what a Projects card says in each phase, and nothing a day after done', () => {
   const now = 1e12, base: FcpImport = { by: 'maya', phase: 'uploading', total: 4.8e9, received: 2.0e9, files: 38, uploaded: 10, ready: 0, failed: 0, rate: 5.2e6, startedAt: now - 6e5, updatedAt: now };
   const at = (patch: Partial<FcpImport>, who = 'Maya Chen') => importCard({ ...base, ...patch }, who, now);
-  assert.deepEqual(at({}), { phase: 'uploading', title: '**Maya Chen** is importing a project from Final Cut', detail: '41% · 2.0 of 4.8 GB · about 9 min left', progress: 41, label: 'Maya Chen is importing a project from Final Cut, 41 percent' });
+  assert.deepEqual(at({}), { phase: 'uploading', title: '**Maya Chen** is importing a project from Final Cut', detail: '41% · 2.0 GB of 4.8 GB · about 9 min left', progress: 41, label: 'Maya Chen is importing a project from Final Cut, 41 percent' });
   assert.equal(at({ rate: 0, total: 3e8, received: 1.5e8 }, '')!.title, "You're importing a project from Final Cut");
-  assert.equal(at({ rate: 0, total: 3e8, received: 1.5e8 }, '')!.detail, '50% · 150.0 of 300.0 MB', 'no time left without a measured rate');
-  assert.equal(at({ rate: 1e9 })!.detail, '41% · 2.0 of 4.8 GB · less than a minute left');
+  assert.equal(at({ rate: 0, total: 3e8, received: 1.5e8 }, '')!.detail, '50% · 150.0 MB of 300.0 MB', 'no time left without a measured rate');
+  assert.equal(at({ rate: 0, total: 22_000, received: 11_000 })!.detail, '50% · 11 KB of 22 KB', 'sizes read as the importer page says them');
+  assert.equal(at({ rate: 1e9 })!.detail, '41% · 2.0 GB of 4.8 GB · less than a minute left');
   assert.deepEqual(at({ phase: 'paused' }), { phase: 'paused', title: "Paused · waiting for Maya Chen's Mac", detail: '41%', progress: 41, label: "Import paused at 41 percent, waiting for Maya Chen's Mac" });
   assert.equal(at({ phase: 'paused' }, '')!.title, 'Paused · waiting for your Mac');
   assert.deepEqual(at({ phase: 'processing', received: 4.8e9, uploaded: 38, ready: 12 }), { phase: 'processing', title: 'Getting it ready', detail: '12 of 38 clips ready', progress: 1200 / 38, label: 'Getting it ready, 12 of 38 clips ready' });

@@ -77,7 +77,8 @@ export function ExportScene() {
     <Doc label="" className="ia-x-ghost"/>
     <Arrow className="ia-x-arrow" d="M100 312C200 330 330 300 405 245"/>
     <Cursor className="ia-x-cursor"/>
-    <Marks at={[[31.4, 6.2], [8.6, 9.4], [9, 29]]}/>
+    {/* 1 on the selected project, 2 inside the open menu at the end of Export XML's row, 3 on the file on the Desktop. */}
+    <Marks at={[[34.4, 6.2], [22.3, 9.4], [9, 29]]}/>
   </Frame>;
 }
 
@@ -147,7 +148,8 @@ export function Lanes({ lanes, done, total, state }: { lanes: Lane[]; done: { id
 
 /** A8: the sent clips, striped while SharedCut prepares them, turning mint with their picture as each is ready. */
 export function Preparing({ clips }: { clips: { id: string; ready: boolean; failed: boolean; thumbnail?: string }[] }) {
-  return <Frame className="ia-prep"><div className="ia-p-grid">{clips.slice(0, 24).map((c, i) => <span key={c.id} className={c.failed ? 'failed' : c.ready ? 'ready' : ''} style={{ transitionDelay: `${(i % 6) * .05}s` }}>{c.ready && c.thumbnail && <img src={c.thumbnail} alt=""/>}</span>)}</div></Frame>;
+  // Tiles sized to the clips (up to six a row): two clips read as two clips, not two specks in an empty panel.
+  return <Frame className="ia-prep"><div className="ia-p-grid" style={{ '--n': Math.max(1, Math.min(6, clips.length)) } as CSSProperties}>{clips.slice(0, 24).map((c, i) => <span key={c.id} className={c.failed ? 'failed' : c.ready ? 'ready' : ''} style={{ transitionDelay: `${(i % 6) * .05}s` }}>{c.ready && c.thumbnail && <img src={c.thumbnail} alt=""/>}</span>)}</div></Frame>;
 }
 
 /** A9: the project drops into a Projects grid, glows and gets its check; 20 sparks, unless motion is reduced. */

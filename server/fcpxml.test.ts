@@ -537,15 +537,22 @@ test('fonts a title needs that the library lacks are named, once each; a library
 
 test('import card: uploading, then processing, then ready; failures counted; paused held until bytes move; a smoothed rate', () => {
   const plan = { by: 'maya', files: [{ id: 'a', size: 100 }, { id: 'b', size: 50 }] };
-  const tick = (got: Record<string, number>, status: Record<string, string>, previous: FcpImport | undefined, now: number) => importStatus(plan, id => status[id], id => got[id] ?? 0, previous, now);
+  // The caller's anchor, moved as index.ts moves it: when a sample is taken.
+  let anchor: { at: number; received: number } | undefined;
+  const tick = (got: Record<string, number>, status: Record<string, string>, previous: FcpImport | undefined, now: number) => {
+    const next = importStatus(plan, id => status[id], id => got[id] ?? 0, previous, now, anchor);
+    if (!anchor || (next.received > anchor.received && now - anchor.at >= 5000)) anchor = { at: now, received: next.received };
+    return next;
+  };
   const start = tick({ a: 10 }, {}, undefined, 1000);
   assert.deepEqual(start, { by: 'maya', phase: 'uploading', total: 150, received: 10, files: 2, uploaded: 0, ready: 0, failed: 0, rate: 0, startedAt: 1000, updatedAt: 1000 });
-  const soon = tick({ a: 30 }, {}, start, 3000);
-  assert.deepEqual([soon.received, soon.updatedAt, soon.rate], [30, 3000, 0], 'under 5 s since the last bytes: no rate sample');
+  const soon = tick({ a: 40 }, {}, start, 3000);
+  assert.deepEqual([soon.received, soon.updatedAt, soon.rate], [40, 3000, 0], 'under 5 s since the anchor: no rate sample');
   const first = tick({ a: 80 }, {}, soon, 8000);
-  assert.equal(first.rate, 10, 'the first sample is taken whole: 50 bytes in 5 s');
+  assert.equal(first.rate, 10, 'the first sample counts from the anchor, so the early bytes are not lost: 70 bytes in 7 s');
   const second = tick({ a: 100, b: 20 }, { a: 'processing' }, first, 13000);
   assert.deepEqual([second.rate, second.uploaded, second.received], [9, 1, 120], '0.7 × 10 + 0.3 × 8, rounded');
+  assert.equal(importStatus(plan, () => undefined, () => 130, second, 20000).rate, 9, 'no anchor (a restart, a pause): no sample');
   const quiet = tick({ a: 100, b: 20 }, { a: 'processing' }, second, 60000);
   assert.deepEqual([quiet.updatedAt, quiet.rate], [13000, 9], 'no bytes: nothing moves');
   const paused = { ...second, phase: 'paused' as const }, stopped = { ...second, phase: 'stopped' as const };

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -33,6 +33,8 @@ const LIBRARY = '/Users/maya/Movies/School%20Library.fcpbundle/Event%201/Origina
 const film = (words = 'Game day') => fcpxml('My Film', 'FILM-1', asset('a', `${LIBRARY}/A001.mp4`) + asset('b', '/Volumes/SD%20CARD/DCIM/100CANON/C0001.mp4') + asset('c', `${LIBRARY}/A002.mp4`),
   `<asset-clip ref="a" offset="0s" start="0s" duration="2s"><title ref="t" lane="1" offset="0s" start="0s" duration="1s"><text><text-style ref="s">${words}</text-style></text><text-style-def id="s"><text-style font="Barlow Condensed" fontSize="80"/></text-style-def></title></asset-clip><asset-clip ref="b" offset="2s" start="0s" duration="2s"/><asset-clip ref="c" offset="4s" start="0s" duration="2s"/>`);
 // The resume pass: a clip bigger than one 8 MiB chunk, and a small one.
+// A poster with a title in a font nobody added: the Fonts screen as Safari shows it.
+const poster = fcpxml('Poster', 'POS-1', asset('p', '/Users/lee/Desktop/Party.mp4', 1), '<asset-clip ref="p" offset="0s" start="0s" duration="1s"><title ref="t" lane="1" offset="0s" start="0s" duration="1s"><text><text-style ref="s">Party</text-style></text><text-style-def id="s"><text-style font="Futura PT" fontSize="80"/></text-style-def></title></asset-clip>');
 const interview = fcpxml('Interview', 'INT-1', asset('i', '/Users/maya/Desktop/Interview/Interview.mp4') + asset('j', '/Users/maya/Desktop/Interview/Cutaway.mp4'),
   '<asset-clip ref="i" offset="0s" start="0s" duration="2s"/><asset-clip ref="j" offset="2s" start="0s" duration="2s"/>');
 const at = (...parts: string[]) => join(temp, 'mac', ...parts);
@@ -56,7 +58,9 @@ before(async () => {
   writeFileSync(at('Desktop', 'My Film.fcpxml'), film());
   writeFileSync(at('Desktop', 'My Film v2.fcpxml'), film('Game day!'));
   writeFileSync(at('Desktop', 'Interview.fcpxml'), interview);
-  mkdirSync(SHOTS, { recursive: true });
+  writeFileSync(at('Desktop', 'Poster.fcpxml'), poster);
+  // Every run's pictures, and only its: a state renamed or dropped leaves no stale picture behind.
+  rmSync(SHOTS, { recursive: true, force: true }); mkdirSync(SHOTS, { recursive: true });
   if (!dist) { dist = join(temp, 'dist'); execFileSync(process.execPath, [join(root, 'node_modules/vite/bin/vite.js'), 'build', '--outDir', dist, '--emptyOutDir', '--logLevel', 'error'], { cwd: root, stdio: 'inherit' }); }
   Object.assign(process.env, ENV);
   app = createFrameLineServer({ dataDir: join(temp, 'data'), distDir: dist });
@@ -143,6 +147,7 @@ test('welcome, and a guest gives a name and the class code', async () => {
   expect403 = true;
   await button(a, /Let's start/).click();
   await a.getByRole('alert').filter({ hasText: "That code didn't work. Check it with your teacher and try again." }).waitFor();
+  assert.equal(await a.evaluate(() => document.activeElement?.getAttribute('aria-describedby')), 'code-hint code-error', 'the code field keeps focus and names its error');
   await shot(a, 'you-wrong-code');
   await a.getByRole('textbox', { name: 'Class code' }).fill(CODE);
   await button(a, /Let's start/).click();
@@ -205,7 +210,7 @@ test('footage: places, a different clip with the same name, the right one droppe
 
 test('check: the Wi-Fi probe, then the size and the time', async () => {
   await button(a, /Continue without 1 clip/).click();
-  await step(a, 'Checking your Wi-Fi…');
+  await step(a, 'Checking your Wi\u2011Fi…');
   await shot(a, 'check-wifi');
   await step(a, 'Ready to upload');
   assert.match(await a.locator('.importer-lede').innerText(), /This project is .+\. It might take (about .+|less than a minute) to upload to SharedCut\./);
@@ -240,7 +245,7 @@ test('upload: lanes, a classmate sees it coming in, Wi-Fi drops and comes back, 
   await aContext.setOffline(true);
   chunks.set(() => false);
   for (const route of chunks.held.splice(0)) await route.abort('internetdisconnected').catch(() => {});
-  await a.locator('.importer-status').getByText('Wi-Fi dropped. Waiting to reconnect… Your progress is saved.').waitFor({ timeout: 3000 });
+  await a.locator('.importer-status').getByText('Wi\u2011Fi dropped. Waiting to reconnect… Your progress is saved.').waitFor({ timeout: 3000 });
   await shot(a, 'upload-offline');
   await a.waitForTimeout(2000);
   await aContext.setOffline(false);
@@ -268,6 +273,12 @@ test('a guest who opens SharedCut itself is sent back to the importer', async ()
   await a.waitForURL(`${url}/importer`);
   await a.getByText(/Welcome back, Maya\./).waitFor();
   await shot(a, 'guest-sent-to-importer');
+  // A guest has no password: forgetting her asks first, and offers to save the account.
+  await button(a, 'Not Maya? Start fresh').click();
+  await a.getByRole('alertdialog').getByText(/This forgets Maya on this Mac\./).waitFor();
+  await shot(a, 'guest-start-fresh');
+  await button(a, 'Cancel').click();
+  await a.getByText(/Welcome back, Maya\./).waitFor();
   clean();
 });
 
@@ -276,7 +287,7 @@ test('an edit that changed since its import asks what to do', async () => {
   await chooseExport(a, 'My Film v2.fcpxml');
   await a.locator('.importer-got').getByText(/Got it: My Film/).waitFor();
   await button(a, /^Continue/).click();
-  await step(a, "You've imported this project before");
+  await step(a, "You've imported My Film before");
   await shot(a, 'decide-changed');
   await a.reload();
   await step(a, 'Bring your Final Cut project to SharedCut');
@@ -326,6 +337,7 @@ test('a closed tab resumes from what arrived; Pause and Resume; the guest saves 
   assert.equal(new Set(sent.map(s => s.id)).size, 1, 'the clip that already arrived is not sent again');
   await button(a, /Pause/).click();
   await a.locator('.importer-status').getByText('Paused').waitFor();
+  await step(a, 'Paused: Interview');
   await shot(a, 'upload-paused');
   chunks.held.splice(0);
   chunks.set(() => false);
@@ -368,6 +380,8 @@ test('Projects: every state a Final Cut import card can show', async () => {
 test('reduced motion, and the keyboard alone, from Welcome to the next step', async () => {
   const context = await guestContext({ reducedMotion: 'reduce' }), page = await context.newPage();
   try {
+    // 200% zoom on a 1440 × 900 screen: focus moves without scrolling the stage and the rail out of view.
+    await page.setViewportSize({ width: 720, height: 450 });
     await page.goto(`${url}/importer`);
     await page.getByRole('textbox', { name: 'Your name' }).waitFor();
     await page.keyboard.type('Ana Ruiz');
@@ -376,6 +390,8 @@ test('reduced motion, and the keyboard alone, from Welcome to the next step', as
     await step(page, 'Export your project from Final Cut');
     const focused = () => page.evaluate(() => document.activeElement?.id === 'importer-title' && document.activeElement.textContent);
     assert.equal(await focused(), 'Export your project from Final Cut', 'the new step\'s heading has focus');
+    assert.equal(await page.evaluate(() => document.querySelector('.importer')!.scrollTop), 0, 'the page stays at its top');
+    await page.setViewportSize({ width: 1440, height: 900 });
     await page.waitForTimeout(800);
     assert.ok(await page.evaluate(() => document.getAnimations().every(animation => animation.playState !== 'running')), 'nothing moves');
     await shot(page, 'reduced-motion-export');
@@ -403,4 +419,68 @@ test('blocked: a phone, and a browser too old for the page', async () => {
       await shot(page, name);
     }
   } finally { await phone.close(); await old.close(); }
+});
+
+test('a member: Welcome, every clip found, the class checkbox, SharedCut not answering, out of room, and done', async () => {
+  const m = await bContext.newPage();
+  m.on('pageerror', e => problems.push(`page error: ${e.message}`));
+  m.on('console', message => { if (message.type() === 'error' && !/Failed to load resource/.test(message.text())) problems.push(`console: ${message.text()}`); });
+  try {
+    await m.goto(`${url}/importer`);
+    await m.getByText(/Importing as Konrad Fischer/).waitFor();
+    await shot(m, 'welcome-member');
+    await button(m, /Let's start/).click();
+    await chooseExport(m, 'Interview.fcpxml');
+    await button(m, /^Continue/).click();
+    await step(m, "Now let's find your footage");
+    await folder(m).setInputFiles(at('Desktop', 'Interview'));
+    await m.locator('.importer-footer').getByText(/2 of 2\s*clips found/).waitFor();
+    await shot(m, 'footage-all-found');
+    await button(m, /^Continue$/).click();
+    await step(m, 'Ready to upload');
+    assert.equal(await m.getByRole('checkbox', { name: 'Let my class see it on their Projects screen' }).isChecked(), true);
+    await shot(m, 'check-member');
+    // The server goes away behind the tunnel: its 502 page is not SharedCut answering.
+    const page = (route: Route) => route.fulfill({ status: 502, contentType: 'text/html', body: '<html><body>502 Bad Gateway</body></html>' });
+    await m.route('**/api/health', page); await m.route('**/api/media/*/upload', page);
+    await button(m, /Start upload/).click();
+    await m.locator('.importer-status').getByText("SharedCut isn't answering right now. We'll keep trying, and nothing is lost.").waitFor();
+    await shot(m, 'upload-not-answering');
+    // Back, but out of room.
+    await m.unroute('**/api/health'); await m.unroute('**/api/media/*/upload');
+    await m.route('**/api/media/*/upload', route => route.request().method() === 'POST' ? route.fulfill({ status: 507, json: { error: 'The server is almost out of disk space.' } }) : route.continue());
+    await m.locator('.importer-status').getByText(/SharedCut ran out of room\. Nothing is lost\./).waitFor({ timeout: 30_000 });
+    await shot(m, 'upload-no-room');
+    await m.unroute('**/api/media/*/upload');
+    await button(m, /Pause/).click(); await button(m, /Resume/).click();
+    await step(m, 'Uploaded! SharedCut is getting it ready');
+    if (!video) return clean();
+    const me = (await (await bContext.request.get(`${url}/api/auth/me`)).json()).user.id;
+    const mine = ((await (await bContext.request.get(`${url}/api/state`)).json()).state.projects as { id: string; name: string; members: { userId: string; role: string }[] }[]).find(p => p.name === 'Interview' && p.members.some(x => x.userId === me && x.role === 'Owner'))!;
+    await prepare(mine.id);
+    await step(m, /Interview is in SharedCut/);
+    await m.getByText("It's in your Projects.").waitFor();
+    await shot(m, 'done-member');
+    clean();
+  } finally { await m.close(); }
+});
+
+test('fonts in Safari: no "Add them from this Mac", the drop card leads', async () => {
+  const context = await guestContext();
+  // Window's operations live on the global object itself ([Global]), so that is where it goes.
+  await context.addInitScript(() => { delete (globalThis as { queryLocalFonts?: unknown }).queryLocalFonts; delete (Window.prototype as { queryLocalFonts?: unknown }).queryLocalFonts; });
+  try {
+    const page = await context.newPage();
+    await page.goto(`${url}/importer`);
+    await page.getByRole('textbox', { name: 'Your name' }).fill('Lee Kim');
+    await page.getByRole('textbox', { name: 'Class code' }).fill(CODE);
+    await button(page, /Let's start/).click();
+    await chooseExport(page, 'Poster.fcpxml');
+    await button(page, /^Continue/).click();
+    await step(page, "Your titles use fonts SharedCut doesn't have yet");
+    await page.getByText('Drag the font files here', { exact: true }).waitFor();
+    assert.equal(await button(page, 'Add them from this Mac').count(), 0);
+    await shot(page, 'fonts-safari');
+    clean();
+  } finally { await context.close(); }
 });

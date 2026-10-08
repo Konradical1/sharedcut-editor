@@ -98,13 +98,13 @@ test('the queue shows all files, bounds concurrency, pauses a stalled file, and 
 // uploadImport against a fake server: `script` may answer a request itself (a status, a thrown error, a delay) before
 // the fake's own resumable-upload rules do.
 type Hook = (method: string, id: string, init: RequestInit) => Promise<Response | void> | Response | void;
-function fakeImport(t: import('node:test').TestContext, sizes: Record<string, number>, { complete = [] as string[], offsets = {} as Record<string, number>, script = (() => {}) as Hook } = {}) {
+function fakeImport(t: import('node:test').TestContext, sizes: Record<string, number>, { complete = [] as string[], offsets = {} as Record<string, number>, script = (() => {}) as Hook, health = () => Response.json({}) } = {}) {
   const log: string[] = [], offset = new Map(Object.entries(sizes).map(([id, size]) => [id, complete.includes(id) ? size : offsets[id] ?? 0]));
   let inFlight = 0, most = 0, plan: any;
   t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit = {}) => {
     const method = init.method ?? 'GET', id = url.split('/')[3];
     log.push(`${method} ${url.replace('/api', '')}`);
-    if (url === '/api/health') return new Response('{}');
+    if (url === '/api/health') return health();
     if (url.startsWith('/api/fcp/import/')) { plan = JSON.parse(String(init.body)); return Response.json({ files: plan.files.map((f: any) => ({ id: f.id, received: offset.get(f.id), complete: offset.get(f.id) === sizes[f.id] })) }); }
     if (method === 'PUT') { most = Math.max(most, ++inFlight); }
     try {
@@ -204,4 +204,60 @@ test('uploadImport counts a resumed offset in its bytes but never in its rate', 
   assert.deepEqual([done.bytes, done.total, done.sent], [size, size, 1]);
   assert.ok(rates.every(rate => rate <= 16), `rates ${rates}`);
   assert.ok(rates.at(-1)! > 0);
+});
+
+test('uploadImport on a link that carries one chunk a minute: timeouts drop lanes, the extra lanes hand their files back, every file lands', async t => {
+  const { uploadImport } = await import('./upload.ts');
+  // Under ~140 KB/s a lane's 8 MiB chunk cannot land inside its 60 s: two chunks on the line at once both run out of time.
+  const going = new Set<{ overlapped: boolean }>(); let timeouts = 0;
+  fakeImport(t, { a: 100, b: 100, c: 100, d: 100 }, { script: async method => {
+    if (method !== 'PUT') return;
+    const me = { overlapped: going.size > 0 }; for (const other of going) other.overlapped = true; going.add(me);
+    await new Promise(resolve => setTimeout(resolve, 60_000)); going.delete(me);
+    if (me.overlapped) { timeouts++; throw new DOMException('The operation timed out.', 'TimeoutError'); }
+  } });
+  const widths: number[] = [];
+  const done = await onClock(t, () => uploadImport('fcp-1', ['a', 'b', 'c', 'd'].map(id => ({ assetId: id, file: blob(`${id}.bin`, 100) })), { lanes: 4, onProgress: p => widths.push(p.lanes) }));
+  assert.deepEqual([done.sent, done.failed], [4, []]);
+  assert.ok(timeouts > 0, 'the four lanes ran out of time together'); assert.equal(widths.at(-1), 1);
+});
+
+test('uploadImport: a file the server still calls busy past 20 s reads as SharedCut not answering', async t => {
+  const { uploadImport } = await import('./upload.ts');
+  let since: number | undefined;
+  // The server is still reading a request the Wi-Fi dropped: for 40 s every POST for the file hears "busy".
+  fakeImport(t, { a: 10 }, { script: method => { if (method === 'POST' && Date.now() - (since ??= Date.now()) < 40_000) return Response.json({ error: 'Upload is busy.' }, { status: 409 }); } });
+  const waiting: (string | undefined)[] = [];
+  const done = await onClock(t, () => uploadImport('fcp-1', [{ assetId: 'a', file: blob('a.bin', 10) }], { onProgress: p => waiting.push(p.waiting) }));
+  assert.equal(done.sent, 1);
+  assert.equal(waiting.slice(0, 15).filter(Boolean).length, 0, 'not at once');
+  assert.ok(waiting.includes('server'));
+});
+
+test("uploadImport: the tunnel's 502 page is not SharedCut answering; a file that failed leaves the plan so the card can finish", async t => {
+  const { uploadImport } = await import('./upload.ts');
+  const page = () => new Response('<html>502 Bad Gateway</html>', { status: 502, headers: { 'content-type': 'text/html' } });
+  let checks = 0, puts = 0;
+  const server = fakeImport(t, { a: 10, b: 10, c: 10 }, { health: () => ++checks <= 3 ? page() : Response.json({}), script: (method, id) => {
+    if (id === 'a' && method === 'PUT' && ++puts === 1) return page();
+    if (id === 'c' && method === 'POST') return Response.json({ error: 'Files must be smaller than 10 GB.' }, { status: 413 });
+  } });
+  const waiting: (string | undefined)[] = [];
+  const done = await onClock(t, () => uploadImport('fcp-1', ['a', 'b', 'c'].map(id => ({ assetId: id, file: blob(`${id}.bin`, 10) })), { onProgress: p => waiting.push(p.waiting) }));
+  assert.deepEqual([done.sent, done.failed.map(f => f.id)], [2, ['c']]);
+  assert.equal(checks, 4, 'the gate waited through three 502 pages');
+  assert.ok(waiting.includes('server'));
+  assert.equal(server.log.filter(l => l === 'PUT /fcp/import/fcp-1').length, 2);
+  assert.deepEqual(server.plan().files.map((f: { id: string }) => f.id), ['a', 'b'], 'planned again without the refused file');
+});
+
+test('uploadImport keeps the last rate while a slow lane is between acknowledgements', async t => {
+  const { uploadImport } = await import('./upload.ts');
+  // Three 8 MiB chunks, 30 s each: a 20 s window often holds none of them.
+  const size = 2 * 8 * 1024 * 1024 + 1;
+  fakeImport(t, { a: size }, { script: async method => { if (method === 'PUT') await new Promise(resolve => setTimeout(resolve, 30_000)); } });
+  const seen: { bytes: number; rate: number; sending: boolean }[] = [];
+  await onClock(t, () => uploadImport('fcp-1', [{ assetId: 'a', file: blob('a.bin', size) }], { onProgress: p => seen.push({ bytes: p.bytes, rate: p.rate, sending: p.sending.some(Boolean) }) }));
+  const after = seen.filter(p => p.bytes > 0 && p.bytes < size && p.sending);
+  assert.ok(after.length > 20); assert.ok(after.every(p => p.rate > 0), 'never 0.0 MB/s mid-upload');
 });
