@@ -192,8 +192,14 @@ export function drawText(ctx: TextCanvas, doc: TextDocument, width: number, heig
 export function textLocalPoint(point: {x:number;y:number}, properties: Clip['properties'], width:number, height:number) {
   const x = width / 2 + Number(properties.anchorX ?? 0), y = height / 2 + Number(properties.anchorY ?? 0);
   const dx = point.x * width - x - Number(properties.x ?? 0), dy = point.y * height - y - Number(properties.y ?? 0);
-  const rotation = -Number(properties.rotation ?? 0) * Math.PI / 180, zoom = Math.max(.01, Number(properties.zoom ?? 100) / 100);
-  return { x: ((dx * Math.cos(rotation) - dy * Math.sin(rotation)) / zoom + x) / width, y: ((dx * Math.sin(rotation) + dy * Math.cos(rotation)) / zoom + y) / height };
+  const rotation = -Number(properties.rotation ?? 0) * Math.PI / 180, [zx, zy] = scales({ properties });
+  return { x: ((dx * Math.cos(rotation) - dy * Math.sin(rotation)) / zx + x) / width, y: ((dx * Math.sin(rotation) + dy * Math.cos(rotation)) / zy + y) / height };
+}
+
+/** Zoom times Scale X and Scale Y: how much the clip enlarges each of its own axes (before rotation). */
+export function scales(clip: Pick<Clip, 'properties'>): [number, number] {
+  const p = clip.properties, zoom = Math.max(.01, Number(p.zoom ?? 100) / 100);
+  return [zoom * Math.max(.01, Number(p.scaleX ?? 100) / 100), zoom * Math.max(.01, Number(p.scaleY ?? 100) / 100)];
 }
 
 /** Keep animation attached to its character spans when rich-text runs split or merge. */

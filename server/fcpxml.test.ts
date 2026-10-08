@@ -178,6 +178,23 @@ test('a real Final Cut export: audition timing, sample-accurate sound, split edi
   assert.ok(!r.warnings.some(w => /Bebas/.test(w)), 'a font found in the library is not reported');
 });
 
+test('a non-uniform Final Cut scale imports as Zoom (width) and Scale Y (height ÷ width), static and keyed', () => {
+  const clip = (name: string, offset: number, transform: string) => `<asset-clip ref="r2" offset="${offset}s" name="${name}" start="0s" duration="2s">${transform}</asset-clip>`;
+  const keyed = (a: string, b: string) => `<adjust-transform><param name="scale"><keyframeAnimation><keyframe time="0s" value="${a}"/><keyframe time="1s" value="${b}"/></keyframeAnimation></param></adjust-transform>`;
+  const xml = `<fcpxml version="1.11"><resources><format id="r1" frameDuration="100/2500s" width="1920" height="1080"/>
+    <asset id="r2" start="0s" duration="60s" hasVideo="1" format="r1"><media-rep kind="original-media" src="file:///M/a.mov"/></asset></resources>
+    <library><event name="E"><project name="Stretch"><sequence format="r1" duration="8s" tcStart="0s"><spine>
+    ${clip('stretched', 0, '<adjust-transform scale="1.309 1.004"/>')}${clip('uniform keys', 2, keyed('1 1', '2 2'))}${clip('stretched keys', 4, keyed('1 1', '1.5 0.75'))}${clip('flipped', 6, '<adjust-transform scale="-2 1"/>')}
+    </spine></sequence></project></event></library></fcpxml>`;
+  const r = importFcpxml(xml, 'fcp-stretch', 'owner'), byName = (name: string) => r.clips.find(c => c.name === name)!;
+  const stretched = byName('stretched'), uniform = byName('uniform keys'), keys = byName('stretched keys'), flipped = byName('flipped');
+  near(stretched.properties.zoom, 130.9); near(stretched.properties.scaleY, 1.004 / 1.309 * 100); assert.equal(stretched.properties.scaleX, undefined);
+  assert.deepEqual(uniform.keyframes?.['properties.zoom']?.map(k => k.value), [100, 200]); assert.equal(uniform.keyframes?.['properties.scaleY'], undefined, 'a uniform keyed scale gets no Scale Y channel');
+  assert.deepEqual(keys.keyframes?.['properties.zoom']?.map(k => k.value), [100, 150]); assert.deepEqual(keys.keyframes?.['properties.scaleY']?.map(k => k.value), [100, 50]);
+  near(flipped.properties.zoom, 200); near(flipped.properties.scaleY, 50); assert.equal(flipped.properties.flipH, true);
+  assert.ok(!r.warnings.some(w => /uniform/i.test(w)), r.warnings.join('; '));
+});
+
 test('bundle reading maps original paths to the copied files', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'sharedcut-fcp-bundle-'));
   try {

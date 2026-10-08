@@ -1687,6 +1687,18 @@ test('a property sent as text becomes a number, text that is not one is refused,
   assert.equal(state().operations.length, history, 'trimming to the same span is not an undo step');
 });
 
+test('Scale X and Scale Y take text numbers, clamp to 1–800 and key like zoom on clips stored before they existed', () => {
+  const { scaleX, scaleY, ...old } = clip().properties;
+  store.setState({ clips: state().clips.map(c => c.id === 'c3' ? { ...c, properties: old } : c), playhead: clip().start + .5 });
+  state().updateProperty('c3', 'scaleX', '130' as unknown as number);
+  state().updateProperty('c3', 'scaleY', 5000);
+  assert.deepEqual([clip().properties.scaleX, clip().properties.scaleY], [130, 800]);
+  state().updateProperty('c3', 'scaleY', 0);
+  assert.equal(clip().properties.scaleY, 1);
+  state().keyframeProperty('c3', 'properties.scaleX');
+  assert.deepEqual(clip().keyframes?.['properties.scaleX']?.map(k => k.value), [130], 'the Inspector keyframe toggle keys it');
+});
+
 test('pen points given without a box are frame positions, fitted like the pen tool draws them', () => {
   state().addShape('pen', { closed: true, points: [{ x: .1, y: .1 }, { x: .9, y: .1 }, { x: .5, y: .9 }] });
   const doc = getShape(clip(state().selectedClipId!));

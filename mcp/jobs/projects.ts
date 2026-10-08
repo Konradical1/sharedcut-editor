@@ -163,7 +163,7 @@ function settingsRows() {
 
 /** Inspector clip properties: unit and meaning here; default, range and animatable come from the app. */
 const INSPECTOR: Record<string, string> = {
-  x: 'px from frame centre', y: 'px from frame centre', zoom: '%', rotation: '°', anchorX: 'px pivot offset', anchorY: 'px pivot offset', flipH: 'mirror',
+  x: 'px from frame centre', y: 'px from frame centre', zoom: '%', scaleX: '% width stretch × zoom', scaleY: '% height stretch × zoom', rotation: '°', anchorX: 'px pivot offset', anchorY: 'px pivot offset', flipH: 'mirror',
   motionBlur: 'blur animated position/scale', motionBlurStrength: '% shutter (50 = half frame)', motionBlurSamples: '16|32|64 quality',
   cropLeft: 'px of the source, ≤ its width', cropRight: 'px, ≤ source width', cropTop: 'px, ≤ source height', cropBottom: 'px, ≤ source height',
   opacity: '%', fadeIn: 's, ≤ clip duration', fadeOut: 's, ≤ clip duration', blendMode: 'one of the blendMode names above',
@@ -194,7 +194,7 @@ export const topics: Record<string, string> = {
     'on a property that has keys, updateProperty(clip,key,v) sets a key at the playhead instead of the static value; clear the channel to go static again.',
     'all channels at once: setAnimationChannels(clip, {path:[keys], …}, gesture?) · paths left out are REMOVED.',
     'one undo step: pass the same gesture string as the last argument of every setKeyframes/updateProperty/updateEffect/updateNode in one act call (updateProperty on a keyed property drops it). Use a new string each call ("g7"): undo takes every edit of yours that shares it.',
-    'values clamp to the animation range (opacity 0–100, zoom 1–800, rotation ±360, gain −60–12, text.x ±4 …). speed/reverse/freeze keys retime the whole link group (ramps: help motion).',
+    'values clamp to the animation range (opacity 0–100, zoom/scaleX/scaleY 1–800, rotation ±360, gain −60–12, text.x ±4 …). speed/reverse/freeze keys retime the whole link group (ramps: help motion).',
     'read: get{id:clip, path:"keyframes"}; the timeline line lists keyed paths as kf …. A wrong path, type or duplicate time changes nothing (act notes "changed nothing").',
   ].join('\n'),
   ids: [

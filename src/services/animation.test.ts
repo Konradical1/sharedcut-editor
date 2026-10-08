@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { useEditorStore as store } from '../state/store.ts';
-import { animationProperties, animatedSourceOffset, copyAnimatedNodes, ease, evaluateClip, evaluateNodes, fadeLevel, sampleKeyframes, setAnimatedValue, trimAnimation, validateKeyframes } from './animation.ts';
+import { animationProperties, animatedSourceOffset, boundedAnimationValue, copyAnimatedNodes, ease, evaluateClip, evaluateNodes, fadeLevel, sampleKeyframes, setAnimatedValue, trimAnimation, validateKeyframes } from './animation.ts';
 import { edgeScrollVelocity, rulerStep, timelineZoom } from './timeline.ts';
 import { presetDocument } from './text.ts';
 import { defaultShape } from './shapes.ts';
@@ -103,4 +103,12 @@ test('easeInOutCubic and easeOutBack handles validate, keep time monotonic and o
  assert.ok(inOut.every((v,i)=>!i||v>=inOut[i-1]-1e-9),'easeInOutCubic is monotonic');
  assert.ok(Array.from({length:99},(_,i)=>ease((i+1)/100,[.34,1.56,.64,1])).some(v=>v>1.02),'easeOutBack overshoots');
  assert.throws(()=>validateKeyframes({'properties.zoom':[{id:'a',time:0,value:1,interpolation:'bezier',curve:[1.2,0,.5,1]},{id:'b',time:1,value:2,interpolation:'linear'}]}));
+});
+
+test('Scale X and Scale Y animate like zoom on every clip, old ones without the keys included',()=>{
+ const clip={id:'c',projectId:'p',timelineId:'t',trackId:'v',mediaId:'m',name:'Old',start:0,duration:2,sourceIn:0,color:'',disabled:false,effects:[],properties:{zoom:100}} as Clip;
+ const listed=animationProperties(clip).filter(p=>/scale[XY]$/.test(p.path));
+ assert.deepEqual(listed.map(p=>[p.path,p.label,p.value]),[['properties.scaleX','Scale X',100],['properties.scaleY','Scale Y',100]]);
+ for(const path of ['properties.scaleX','properties.scaleY'])assert.deepEqual([boundedAnimationValue(path,0),boundedAnimationValue(path,1e4),boundedAnimationValue(path,130.9)],[1,800,130.9]);
+ assert.equal(evaluateClip({...clip,keyframes:{'properties.scaleY':keys(50,9000)}},1).properties.scaleY,800,'keys clamp to the animation range');
 });

@@ -1,7 +1,7 @@
 import type { Clip, Track } from '../state/models.ts';
 import { evaluateClip } from './animation.ts';
 import { getShape, isShape, type ShapeDocument } from './shapes.ts';
-import { getText, isTitle, type TextDocument } from './text.ts';
+import { getText, isTitle, scales, type TextDocument } from './text.ts';
 
 export interface SnapBox { x: number; y: number; width: number; height: number }
 export interface SnapGuide { axis: 'x' | 'y'; at: number }
@@ -27,24 +27,24 @@ export function snapTime(moving: number[], fixed: number[], tolerance: number) {
  * Rotation is deliberately ignored: a rotated box has no horizontal or vertical edges to snap to.
  */
 export function shapeBox(clip: Clip, doc: ShapeDocument, width: number, height: number): SnapBox {
-  const zoom = Math.max(.01, Number(clip.properties.zoom ?? 100) / 100);
+  const [zx, zy] = scales(clip);
   const pivotX = (doc.x + doc.width / 2) * width + Number(clip.properties.anchorX ?? 0);
   const pivotY = (doc.y + doc.height / 2) * height + Number(clip.properties.anchorY ?? 0);
   return {
-    x: (pivotX + Number(clip.properties.x ?? 0) + zoom * (doc.x * width - pivotX)) / width,
-    y: (pivotY + Number(clip.properties.y ?? 0) + zoom * (doc.y * height - pivotY)) / height,
-    width: doc.width * zoom, height: doc.height * zoom,
+    x: (pivotX + Number(clip.properties.x ?? 0) + zx * (doc.x * width - pivotX)) / width,
+    y: (pivotY + Number(clip.properties.y ?? 0) + zy * (doc.y * height - pivotY)) / height,
+    width: doc.width * zx, height: doc.height * zy,
   };
 }
 
 /** The same for a text box, which scales about the clip anchor rather than its own centre. */
 export function textBox(clip: Clip, doc: TextDocument, width: number, height: number): SnapBox {
-  const zoom = Math.max(.01, Number(clip.properties.zoom ?? 100) / 100);
+  const [zx, zy] = scales(clip);
   const originX = .5 + Number(clip.properties.anchorX ?? 0) / width, originY = .5 + Number(clip.properties.anchorY ?? 0) / height;
   return {
-    x: originX + zoom * (doc.x - originX) + Number(clip.properties.x ?? 0) / width,
-    y: originY + zoom * (doc.y - originY) + Number(clip.properties.y ?? 0) / height,
-    width: doc.width * zoom, height: doc.height * zoom,
+    x: originX + zx * (doc.x - originX) + Number(clip.properties.x ?? 0) / width,
+    y: originY + zy * (doc.y - originY) + Number(clip.properties.y ?? 0) / height,
+    width: doc.width * zx, height: doc.height * zy,
   };
 }
 

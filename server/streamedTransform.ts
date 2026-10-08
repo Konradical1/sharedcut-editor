@@ -10,7 +10,7 @@ import { isTitle, getText } from '../src/services/text.ts';
  * sampled keyframes. That filter works in 8-bit RGB, which is why only exports that end in 8-bit (H.264, H.265)
  * stream; ProRes keeps the per-frame path and its 16-bit transform.
  */
-export const TRANSFORM_KEYS = ['properties.x', 'properties.y', 'properties.zoom', 'properties.rotation', 'properties.anchorX', 'properties.anchorY'];
+export const TRANSFORM_KEYS = ['properties.x', 'properties.y', 'properties.zoom', 'properties.scaleX', 'properties.scaleY', 'properties.rotation', 'properties.anchorX', 'properties.anchorY'];
 
 /** Whether every keyframe on the clip is one this pass can stream (gain is sound and never needed a frame render). */
 export function streamsTransform(clip: Clip) {
@@ -21,20 +21,23 @@ export function streamsTransform(clip: Clip) {
   return clip.properties.motionBlur !== true && !(isTitle(clip) && getText(clip).typingEnabled);
 }
 
-export type Placement = { zoom: number; rotation: number; shiftX: number; shiftY: number };
+/** `zoom` is the horizontal scale, `zoomY` the vertical one (equal unless Scale X/Y stretch the layer). */
+export type Placement = { zoom: number; zoomY: number; rotation: number; shiftX: number; shiftY: number };
 
 /**
  * Where a layer lands on the output: its scale, its rotation (radians, clockwise on screen, as FFmpeg's `rotate`) and
- * how far its centre sits from the frame centre, in output pixels. Rotation and zoom turn about the anchor.
- * `x`, `y` and the anchor are project pixels; `anchorShift` is an extra output-pixel anchor (a shape's own centre).
+ * how far its centre sits from the frame centre, in output pixels. Rotation and zoom turn about the anchor; Scale X/Y
+ * stretch in the layer's own axes before it turns. `x`, `y` and the anchor are project pixels; `anchorShift` is an
+ * extra output-pixel anchor (a shape's own centre).
  */
-export function placement(values: { x: number; y: number; zoom: number; rotation: number; anchorX: number; anchorY: number }, width: number, height: number, projectWidth: number, projectHeight: number, anchorShift = { x: 0, y: 0 }): Placement {
-  const zoom = values.zoom / 100, rotation = values.rotation * Math.PI / 180;
+export function placement(values: { x: number; y: number; zoom: number; scaleX?: number; scaleY?: number; rotation: number; anchorX: number; anchorY: number }, width: number, height: number, projectWidth: number, projectHeight: number, anchorShift = { x: 0, y: 0 }): Placement {
+  // Unstretched layers multiply by exactly 1, so their placement (and filter strings) are what they were before Scale X/Y.
+  const zoom = values.zoom / 100 * ((values.scaleX ?? 100) / 100), ky = (values.scaleY ?? 100) / (values.scaleX ?? 100), rotation = values.rotation * Math.PI / 180;
   const x = values.x * width / projectWidth, y = values.y * height / projectHeight;
   const ax = values.anchorX * width / projectWidth + anchorShift.x, ay = values.anchorY * height / projectHeight + anchorShift.y;
-  return { zoom, rotation,
-    shiftX: x + ax - zoom * (ax * Math.cos(rotation) - ay * Math.sin(rotation)),
-    shiftY: y + ay - zoom * (ax * Math.sin(rotation) + ay * Math.cos(rotation)) };
+  return { zoom, zoomY: zoom * ky, rotation,
+    shiftX: x + ax - zoom * (ax * Math.cos(rotation) - ky * ay * Math.sin(rotation)),
+    shiftY: y + ay - zoom * (ax * Math.sin(rotation) + ky * ay * Math.cos(rotation)) };
 }
 
 /**
@@ -71,7 +74,7 @@ export function transformFilters(frames: Placement[], width: number, height: num
   const coordinates = corners.flatMap(([sx, sy]) => {
     const xs: number[] = [], ys: number[] = [];
     for (const frame of frames) {
-      const halfWidth = frame.zoom * (layerWidth / 2 + margin), halfHeight = frame.zoom * (layerHeight / 2 + margin);
+      const halfWidth = frame.zoom * (layerWidth / 2 + margin), halfHeight = frame.zoomY * (layerHeight / 2 + margin);
       const centreX = margin + layerWidth / 2 + frame.shiftX * layerWidth / width, centreY = margin + layerHeight / 2 + frame.shiftY * layerHeight / height;
       const dx = sx * halfWidth, dy = sy * halfHeight, cos = Math.cos(frame.rotation), sin = Math.sin(frame.rotation);
       xs.push(centreX + dx * cos - dy * sin); ys.push(centreY + dx * sin + dy * cos);

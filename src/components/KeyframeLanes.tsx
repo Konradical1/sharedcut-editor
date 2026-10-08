@@ -90,7 +90,7 @@ function KeyframeLanes({ clips, pixels, width, visibleStart, visibleEnd, inline=
       const low=frozen?.low??view.manual?.low??bounds.low,high=frozen?frozen.low+frozen.range:view.manual?.high??bounds.high,range=high-low,step=graphStep(range);
       const fit=(mode:typeof view.mode)=>setViews({...views,[viewId]:{mode}});
       const zoom=(factor:number)=>{const center=(low+high)/2;setViews({...views,[viewId]:{...view,manual:{low:center-range*factor/2,high:center+range*factor/2}}});};
-      const suffix=/properties\.(speed|zoom|opacity)$/.test(path)?'%':/properties\.(x|y|anchorX|anchorY|crop.*)$/.test(path)?'px':path==='properties.rotation'?'°':path==='properties.gain'?'dB':'';
+      const suffix=/properties\.(speed|zoom|scaleX|scaleY|opacity)$/.test(path)?'%':/properties\.(x|y|anchorX|anchorY|crop.*)$/.test(path)?'px':path==='properties.rotation'?'°':path==='properties.gain'?'dB':'';
       const y=(v:number)=>130-(v-low)/range*110,x=(time:number)=>(time+clip.start)*pixels;
       const overview=numeric?graphScale(keys,[],'all',[0,clip.duration]):bounds,oy=(v:number)=>28-(v-overview.low)/(overview.high-overview.low)*24;
       const visible=keys.filter(k=>x(k.time)>visibleStart-12&&x(k.time)<visibleEnd+12);
