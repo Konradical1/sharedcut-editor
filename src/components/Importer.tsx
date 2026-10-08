@@ -4,13 +4,13 @@
 // "Wi‑Fi" is written with a non-breaking hyphen (U+2011) everywhere it is shown, so it never breaks as "Wi-" / "Fi".
 import { Component, useEffect, useLayoutEffect, useReducer, useRef, useState, type ReactNode } from 'react';
 import { AnimatePresence, MotionConfig, animate, motion, useReducedMotion } from 'motion/react';
-import { AlertTriangle, AppWindow, ArrowRight, Check, Clapperboard, CloudUpload, Coffee, Copy, Eye, EyeOff, FileOutput, FileText, Folder, FolderSearch, HardDrive, Laptop, Pause, Play, Plug, RotateCcw, Type } from 'lucide-react';
+import { AlertTriangle, AppWindow, ArrowRight, Check, Clapperboard, Coffee, Copy, Eye, EyeOff, FileText, Folder, HardDrive, Laptop, Pause, Play, Plug, RotateCcw, Share, Type } from 'lucide-react';
 import { Avatar, Brand, Button } from './ui';
 import { api, ApiError } from '../services/api';
 import { bytes, fingerprintOf, uploadImport, type ImportProgress } from '../services/upload';
 import { assignFonts, checkFile, estimateSeconds, fontKey, friendlyDuration, lanesFor, matchSources, measureSpeed, nameKey, places, walk, type Check as FileCheck, type Found, type Place, type Source, type Speed } from '../services/importer';
 import type { FcpImport, User } from '../state/models';
-import { Arrived, DeviceSwap, ExportScene, FinderScene, FontScene, Gauge, GotIt, Handoff, Lanes, NameTag, Preparing, ReadingStrip, type Lane } from './ImporterArt';
+import { Arrived, BrowserUpdate, DeviceSwap, ExportScene, FinderScene, FontDone, FontScene, Found as FoundScene, Gauge, GotIt, Handoff, Lanes, NameTag, Preparing, ReadingStrip, Received, type Lane } from './ImporterArt';
 import './importer.css';
 
 type Me = { user: User | null; code: boolean; offline?: boolean };
@@ -23,8 +23,10 @@ type Dropped = { entries: FileSystemEntry[]; files: File[] };
 type Status = 'running' | 'paused' | 'locked' | 'signedOut' | 'stuck' | 'error';
 
 const TITLE = 'Import from Final Cut · SharedCut';
+// Export, Footage and Upload are steps 1 to 3, numbered in the rail as in each step's eyebrow; You and Done are its bookends.
 const RAIL = ['You', 'Export', 'Footage', 'Upload', 'Done'];
-const RAIL_AT: Record<Step, number> = { blocked: 0, you: 0, export: 1, decide: 1, fonts: 1, footage: 2, check: 3, upload: 3, ready: 4, done: 4 };
+const RAIL_AT: Record<Step, number> = { blocked: 0, you: 0, export: 1, decide: 1, fonts: 1, footage: 2, check: 3, upload: 3, ready: 3, done: 4 };
+const WAITING = { offline: 'Waiting for Wi‑Fi', server: 'Waiting for SharedCut', full: 'SharedCut is out of room' };
 const SPOKEN: Partial<Record<Step, string>> = { export: 'Step 1 of 3: Export your project', footage: 'Step 2 of 3: Find your footage', check: 'Step 3 of 3: Check your Wi‑Fi', decide: 'You have imported this project before', fonts: 'Your titles need fonts', upload: 'Uploading', ready: 'Uploaded. SharedCut is getting it ready', done: 'Your project is in SharedCut' };
 const COLORS = ['#F06A70', '#B298F5', '#78AAEF', '#EBC876', '#87C9AC', '#ED99C4'];
 const XML = /\.(fcpxml|xml)$/i, PACKAGE = /\.(fcpbundle|fcpxmld)$/i, FONT = /\.(ttf|otf|ttc|woff2?)$/i, VIDEO = /\.(mp4|mov|m4v|mxf|avi|mts|m2ts|mkv|webm|braw|r3d|crm)$/i;
@@ -54,11 +56,24 @@ function grab(data: DataTransfer): Dropped {
 async function pool<T>(items: T[], width: number, run: (item: T) => Promise<void>) {
   let next = 0; await Promise.all(Array.from({ length: Math.min(width, items.length) }, async () => { while (next < items.length) await run(items[next++]); }));
 }
+// The words each missing font sets in the edit (its first title), for the Fonts screen's finished picture.
+async function titlesIn(file: File, families: string[]) {
+  const words: Record<string, string> = {};
+  try {
+    const doc = new DOMParser().parseFromString(await file.text(), 'application/xml');
+    for (const def of doc.querySelectorAll('text-style-def')) {
+      const family = families.find(f => fontKey(f) === fontKey(def.querySelector('text-style')?.getAttribute('font') ?? '')), text = family && !words[family] && doc.querySelector(`text-style[ref="${CSS.escape(def.id)}"]`)?.textContent?.trim();
+      if (family && text) words[family] = text;
+    }
+  } catch { /* the picture shows the project's name instead */ }
+  return words;
+}
 const message = (error: unknown) => error instanceof ApiError ? error.message : "We couldn't reach SharedCut. Check your Wi‑Fi, then try again.";
 
-function Count({ value }: { value: number }) {
-  const reduced = useReducedMotion(), [shown, setShown] = useState(value), from = useRef(value);
-  useEffect(() => { if (reduced) { setShown(value); return; } const run = animate(from.current, value, { duration: .4, onUpdate: v => setShown(Math.round(v)) }); from.current = value; return () => run.stop(); }, [value, reduced]);
+/** A number that rolls to each new value; `start` is where it rolls from when it first appears. */
+function Count({ value, start = value, duration = .4 }: { value: number; start?: number; duration?: number }) {
+  const reduced = useReducedMotion(), [shown, setShown] = useState(reduced ? value : start), from = useRef(start);
+  useEffect(() => { if (reduced) { setShown(value); return; } const run = animate(from.current, value, { duration, onUpdate: v => setShown(Math.round(v)) }); from.current = value; return () => run.stop(); }, [value, reduced]);
   return <>{shown}</>;
 }
 function Ring({ done, total }: { done: number; total: number }) {
@@ -101,9 +116,11 @@ function Importer() {
   const [maxBytes, setMaxBytes] = useState(10 * 1024 ** 3), [replay, setReplay] = useState(0), [said, setSaid] = useState(''), [toast, setToast] = useState(''), [dragging, setDragging] = useState(false);
   const [name, setName] = useState(''), [code, setCode] = useState(''), [color] = useState(() => COLORS[Math.floor(Math.random() * COLORS.length)]);
   const [youError, setYouError] = useState<{ text: string; code?: boolean }>(), [busy, setBusy] = useState(false), [shaking, setShaking] = useState(false), [claim, setClaim] = useState(false), [savedAs, setSavedAs] = useState('');
-  const [reading, setReading] = useState(false), [over, setOver] = useState(false), [xml, setXml] = useState<{ file: File; name?: string; fresh?: boolean }>(), [dry, setDry] = useState<Dry>(), [exportError, setExportError] = useState<{ text: ReactNode; fresh?: boolean; claim?: boolean }>();
-  const [job, setJobState] = useState<Job>(), [added, setAdded] = useState<Set<string>>(new Set()), [fontErrors, setFontErrors] = useState<Record<string, string>>({});
-  const [forget, setForget] = useState(false), [tried, setTried] = useState(false);
+  // over: which drop target a drag is over ('export' for the drop card, `place-N` for a footage row), '' for none.
+  const [reading, setReading] = useState(false), [over, setOver] = useState(''), [xml, setXml] = useState<{ file: File; name?: string; fresh?: boolean }>(), [dry, setDry] = useState<Dry>(), [exportError, setExportError] = useState<{ text: ReactNode; fresh?: boolean; claim?: boolean }>();
+  const [job, setJobState] = useState<Job>(), [added, setAdded] = useState<Set<string>>(new Set()), [fontErrors, setFontErrors] = useState<Record<string, string>>({}), [titles, setTitles] = useState<Record<string, string>>({});
+  // misses: footage drops that found nothing new. Leaving clips out is offered once something is found, or after two.
+  const [forget, setForget] = useState(false), [misses, setMisses] = useState(0);
   const [placeList, setPlaceList] = useState<Place[]>([]), [walking, setWalking] = useState<{ name: string; count: number }>(), [checking, setChecking] = useState<{ done: number; total: number }>(), [notes, setNotes] = useState<string[]>([]);
   const [flights, setFlights] = useState<{ key: string; name: string; from: [number, number]; to: [number, number]; i: number }[]>([]), [copied, setCopied] = useState('');
   const [speed, setSpeed] = useState<Speed>(), [sample, setSample] = useState(0), [probing, setProbing] = useState(false), [share, setShare] = useState(true), [starting, setStarting] = useState(false);
@@ -113,7 +130,8 @@ function Importer() {
   const [, render] = useReducer((n: number) => n + 1, 0);
   const reduced = useReducedMotion();
   // Matching state lives in a ref: walks, checks and the upload read and change it across awaits.
-  const foot = useRef({ pool: new Map<string, Found>(), found: {} as Record<string, Found>, checks: {} as Record<string, FileCheck | 'checking'>, use: new Set<string>(), ambig: {} as Record<string, Found[]>, lost: new Set<string>() }).current;
+  // lengths: each same-named candidate's check against its source (`id:path`), so the chooser can say which one matches.
+  const foot = useRef({ pool: new Map<string, Found>(), found: {} as Record<string, Found>, checks: {} as Record<string, FileCheck | 'checking'>, use: new Set<string>(), ambig: {} as Record<string, Found[]>, lost: new Set<string>(), lengths: new Map<string, FileCheck | 'checking'>() }).current;
   const jobRef = useRef(job), stepRef = useRef(step), moved = useRef(false), held = useRef<{ xml?: FileSystemEntry | File; fonts: File[]; footage: Dropped[] }>({ fonts: [], footage: [] });
   const imported = useRef(''), ids = useRef(new Map<string, string>()), items = useRef<{ assetId: string; file: File; fingerprint?: string }[]>([]), control = useRef<AbortController>(undefined), wake = useRef<WakeLockSentinel>(undefined), fontFor = useRef<string | undefined>(undefined);
   const etaShown = useRef<{ at: number; value?: number }>({ at: 0 }), decile = useRef(0), announced = useRef(new Set<string>());
@@ -128,6 +146,7 @@ function Importer() {
   const setJob = (next: Job | undefined) => { jobRef.current = next; setJobState(next); };
   const say = (text: string) => setSaid(current => current === text ? `${text} ` : text);
   const note = (text: string) => { setToast(text); say(text); };
+  const copy = (text: string) => void navigator.clipboard?.writeText(text).then(() => { setCopied(text); setTimeout(() => setCopied(c => c === text ? '' : c), 2000); }, () => {});
   const go = (next: Step) => { moved.current = true; stepRef.current = next; setStep(next); const spoken = SPOKEN[next]; if (spoken) say(spoken); };
   const real = (id: string) => ids.current.get(id) ?? id;
   const dryOf = (id: string) => { for (const [from, to] of ids.current) if (to === id) return from; return id; };
@@ -158,9 +177,9 @@ function Importer() {
   // Let's start: the export step, reading a project file dropped before the person said who they are.
   const begin = () => { go('export'); const x = held.current.xml; held.current.xml = undefined; if (x) void readExport(x); };
   const reset = () => {
-    control.current?.abort('pause'); setSavedAs(''); setDry(undefined); setXml(undefined); setExportError(undefined); setJob(undefined); setAdded(new Set()); setFontErrors({}); setPlaceList([]); setNotes([]);
-    foot.pool.clear(); foot.found = {}; foot.checks = {}; foot.use.clear(); foot.ambig = {}; foot.lost.clear(); announced.current.clear();
-    setSpeed(undefined); setProgress(undefined); setFailed([]); setPolled(undefined); setStartError(undefined); setNoRoom(undefined); setStatus('running'); setNudge(false); setShowClips(false); setTried(false); setForget(false);
+    control.current?.abort('pause'); setSavedAs(''); setDry(undefined); setXml(undefined); setExportError(undefined); setJob(undefined); setAdded(new Set()); setFontErrors({}); setTitles({}); setPlaceList([]); setNotes([]);
+    foot.pool.clear(); foot.found = {}; foot.checks = {}; foot.use.clear(); foot.ambig = {}; foot.lost.clear(); foot.lengths.clear(); announced.current.clear();
+    setSpeed(undefined); setProgress(undefined); setFailed([]); setPolled(undefined); setStartError(undefined); setNoRoom(undefined); setStatus('running'); setNudge(false); setShowClips(false); setMisses(0); setForget(false);
     imported.current = ''; ids.current.clear(); items.current = []; decile.current = 0; etaShown.current = { at: 0 };
   };
 
@@ -214,7 +233,7 @@ function Importer() {
     const next: Job = { mode, projectId: dry.projectId, name: dry.name, sources, fonts: mode === 'resume' ? [] : dry.missingFonts, warnings: dry.warnings };
     setJob(next);
     // Titles are measured with the library's fonts when the project is made, so fonts come before the import (not on a resume).
-    if (next.fonts.length) { go('fonts'); const files = held.current.fonts.splice(0); if (files.length) void addFonts(files); }
+    if (next.fonts.length) { go('fonts'); if (xml) void titlesIn(xml.file, next.fonts).then(setTitles); const files = held.current.fonts.splice(0); if (files.length) void addFonts(files); }
     else footage(next);
   };
 
@@ -223,7 +242,11 @@ function Importer() {
     const families = jobRef.current?.fonts ?? [], { uploads, unmatched } = assignFonts(families, files, family);
     if (unmatched.length) note(`Didn't need ${unmatched.map(f => f.name).join(', ')}.`);
     await Promise.all(uploads.map(async u => {
-      try { await api(`/fonts?name=${encodeURIComponent(u.name)}`, { method: 'POST', body: u.file }); setAdded(current => new Set([...current, ...u.families])); setFontErrors(current => { const next = { ...current }; for (const f of u.families) delete next[f]; return next; }); say(`${u.families.join(', ')} added`); }
+      try {
+        await api(`/fonts?name=${encodeURIComponent(u.name)}`, { method: 'POST', body: u.file });
+        // The Fonts screen sets the title in it too, from the file itself: no URL, so the page's font-src does not apply.
+        for (const f of u.families) void u.file.arrayBuffer().then(data => new FontFace(f, data).load()).then(face => { document.fonts.add(face); }, () => {});
+        setAdded(current => new Set([...current, ...u.families])); setFontErrors(current => { const next = { ...current }; for (const f of u.families) delete next[f]; return next; }); say(`${u.families.join(', ')} added`); }
       catch (e) { setFontErrors(current => ({ ...current, ...Object.fromEntries(u.families.map(f => [f, message(e)])) })); }
     }));
   };
@@ -278,10 +301,15 @@ function Importer() {
       const tried = foot.found[m.id]?.file, others = m.state === 'ambiguous' ? m.candidates!.filter(c => c.file !== tried) : [];
       const pick = m.state === 'found' ? m.found! : others.length === 1 ? others[0] : undefined;
       if (pick && pick.file !== tried) { foot.found[m.id] = pick; delete foot.ambig[m.id]; delete foot.checks[m.id]; foot.lost.delete(m.id); changed.push(m.id); }
-      else if (others.length > 1) { foot.ambig[m.id] = others; delete foot.found[m.id]; delete foot.checks[m.id]; foot.lost.delete(m.id); }
+      else if (others.length > 1) { foot.ambig[m.id] = others; delete foot.found[m.id]; delete foot.checks[m.id]; foot.lost.delete(m.id); lengths(m.id, others); }
     }
     render(); return changed;
   };
+  const lengths = (id: string, list: Found[]) => {
+    const source = sourceOf(id);
+    for (const c of list) { const key = `${id}:${c.path}`; if (foot.lengths.has(key)) continue; foot.lengths.set(key, 'checking'); void checkFile(c.file, source?.kind, source?.duration, maxBytes).then(r => { foot.lengths.set(key, r); render(); }); }
+  };
+  const pick = (id: string, c: Found) => { foot.found[id] = c; delete foot.checks[id]; render(); void recheck([id]); };
   const addFootage = async (d: Dropped, point?: [number, number]) => {
     const current = jobRef.current; if (!current) return;
     const found: Found[] = [], problems: string[] = [];
@@ -297,8 +325,9 @@ function Importer() {
     // Picked folders and loose files: the same rule, minus the caches and hidden files walk() skips.
     for (const file of d.files) { const path = file.webkitRelativePath || file.name; if (wanted.has(nameKey(file.name)) && !path.split('/').some(part => part.startsWith('.') || /^(Render Files|Transcoded Media|Analysis Files|Peaks Data|Thumbnail Media)$/.test(part))) found.push({ path, file }); }
     for (const f of found) { foot.pool.set(f.path, f); prints.set(f.file, fingerprintOf(f.file)); }
-    setNotes(problems); setTried(true);
+    setNotes(problems);
     const changed = rematch();
+    setMisses(n => changed.length ? n : n + 1);
     if (point && !reduced && changed.length) {
       const flying = changed.slice(0, 12).flatMap((id, i) => {
         const row = placeList.findIndex(p => p.ids.includes(id)), box = document.getElementById(`importer-place-${row}`)?.getBoundingClientRect();
@@ -347,7 +376,7 @@ function Importer() {
     const leave = (e: DragEvent) => { if (hasFiles(e) && --depth <= 0) { depth = 0; setDragging(false); } };
     // Always: a drop the page misses makes Safari open the file in this tab.
     const overWindow = (e: DragEvent) => { e.preventDefault(); if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; };
-    const drop = (e: DragEvent) => { e.preventDefault(); depth = 0; setDragging(false); setOver(false); if (e.dataTransfer) intake.current(grab(e.dataTransfer), [e.clientX, e.clientY]); };
+    const drop = (e: DragEvent) => { e.preventDefault(); depth = 0; setDragging(false); setOver(''); if (e.dataTransfer) intake.current(grab(e.dataTransfer), [e.clientX, e.clientY]); };
     addEventListener('dragenter', enter); addEventListener('dragleave', leave); addEventListener('dragover', overWindow); addEventListener('drop', drop);
     return () => { removeEventListener('dragenter', enter); removeEventListener('dragleave', leave); removeEventListener('dragover', overWindow); removeEventListener('drop', drop); };
   }, []);
@@ -362,8 +391,13 @@ function Importer() {
   const probe = async () => {
     setProbing(true); setSpeed(undefined); setSample(0); setNoRoom(undefined);
     const result = await measureSpeed(Math.max(1, planned.length), { project: knownProject, onSample: setSample });
-    setSpeed(result); setProbing(false);
-    say(result.measured ? `Your Wi‑Fi is sending about ${(result.parallel / 1e6).toFixed(1)} megabytes a second.` : "We couldn't check your Wi‑Fi.");
+    setSpeed(result); setProbing(false); say(sentence(result));
+  };
+  // Konrad's sentence: what a screen reader hears once the check settles (the screen shows the time large instead).
+  const sentence = (s: Speed) => {
+    const secs = estimateSeconds(left, s.single, s.parallel, lanesFor(s.parallel, planned.length)), when = friendlyDuration(secs);
+    return !s.measured ? `We couldn't check your Wi‑Fi. At a typical school speed it might take ${when.replace(/^about /, 'roughly ')}.`
+      : `${already > 0 ? `${already} of ${job!.sources.length} clips are already in SharedCut. ${bytes(toSend)} left: ${when}.` : `This project is ${bytes(total)}. It might take ${when} to upload to SharedCut${secs > 3600 ? ' if your Wi‑Fi stays like this' : ''}.`} Your Wi‑Fi is sending about ${(s.parallel / 1e6).toFixed(1)} MB/s right now.`;
   };
   const toCheck = () => { go('check'); void probe(); };
   const roomShort = speed?.room !== undefined && toSend * 1.25 > speed.room ? { needed: toSend * 1.25, room: speed.room } : undefined;
@@ -504,7 +538,7 @@ function Importer() {
     <p className="importer-eyebrow">FINAL CUT → SHAREDCUT</p>
     <Title focus={focus}>Bring your Final Cut project to SharedCut</Title>
     <p className="importer-lede">We'll move your edit and all its footage over Wi‑Fi. Nothing to install.</p>
-    <ul className="importer-chips" aria-label="How it works"><li><FileOutput size={16}/>Export from Final Cut</li><li><FolderSearch size={16}/>Find your footage</li><li><CloudUpload size={16}/>Upload</li></ul>
+    <ol className="importer-how" aria-label="How it works"><li><b>1</b>Export</li><li><b>2</b>Find footage</li><li><b>3</b>Upload</li></ol>
     {me?.offline && <Alert>We couldn't reach SharedCut. Check your Wi‑Fi, then reload this page.</Alert>}
     {user && imports.map(i => <div key={i.projectId} className="importer-card">
       <p>{i.fcpImport.phase === 'stopped' ? <><strong>{i.name}</strong> stopped at {percentOf(i.fcpImport)}%. Continue upload sends only what's missing.</> : <><strong>{i.name}</strong> is {percentOf(i.fcpImport)}% uploaded.</>}</p>
@@ -537,10 +571,10 @@ function Importer() {
   const exportStep = () => <>
     <p className="importer-eyebrow">STEP 1 OF 3</p>
     <Title focus={focus}>Export your project from Final Cut</Title>
-    <ol key={replay} className="importer-steps"><li>In Final Cut, click your project once in the Browser, the list of clips and projects at the top left.</li><li>Choose <strong>File › Export XML…</strong></li><li>Save it to your <strong>Desktop</strong>, then drag it onto this window.</li></ol>
+    <ol key={replay} className={`importer-steps${dry && !dry.limit ? ' done' : ''}`}><li>In Final Cut, click your project once in the Browser, the list of clips and projects at the top left.</li><li>Choose <strong>File › Export XML…</strong></li><li>Save it to your <strong>Desktop</strong>, then drag it onto this window.</li></ol>
     {reading ? <div className="importer-reading" role="status"><ReadingStrip/>Reading your project…</div>
       : dry && !dry.limit ? <div className="importer-got"><GotIt/><p>Got it: <strong>{dry.name}</strong> · {plural(dry.media.length, 'clip')} · {clock(dry.duration)}</p></div>
-      : <button className={`importer-drop${over ? ' over' : ''}`} onClick={() => xmlInput.current?.click()} onDragOver={() => setOver(true)} onDragLeave={() => setOver(false)}><FileText size={30}/><span>Drag the exported file here</span><span className="importer-link">or choose it…</span></button>}
+      : <button className={`importer-drop${over === 'export' ? ' over' : ''}`} onClick={() => xmlInput.current?.click()} onDragOver={() => setOver('export')} onDragLeave={() => setOver('')}><FileText size={30}/><span>Drag the exported file here</span><span className="importer-link">or choose it…</span></button>}
     {exportError && <Alert>{exportError.text}{exportError.fresh && xml && <Button variant="primary" onClick={() => void readXml(xml.file, xml.name, true)}>Import a separate copy</Button>}</Alert>}
     {exportError?.claim && user && <Claim user={user} saved={savedAs} onSaved={next => { savedAccount(next); if (xml) void readXml(xml.file, xml.name, xml.fresh); }}/>}
     {dry && !dry.limit && <div className="importer-actions"><Button variant="primary" className="importer-big" autoFocus onClick={afterExport}>Continue<ArrowRight size={17}/></Button><button className="importer-link" onClick={() => { setDry(undefined); setXml(undefined); }}>Use a different file</button></div>}
@@ -550,10 +584,12 @@ function Importer() {
   // Dropped the wrong export? Back to the drop card.
   const otherFile = <button className="importer-link" onClick={() => { setDry(undefined); setXml(undefined); go('export'); }}>Use a different file</button>;
   const decide = () => dry?.state === 'deleted' ? <>
+    <p className="importer-eyebrow">STEP 1 OF 3 · YOUR EDIT</p>
     <Title focus={focus}><strong>{dry.name}</strong> was deleted from SharedCut</Title>
     <p className="importer-lede">It can still be restored from Recently deleted in SharedCut, or you can import a new copy.</p>
     <div className="importer-actions"><Button variant="primary" className="importer-big" onClick={() => choose('fresh')}>Import a new copy</Button>{otherFile}</div>
   </> : <>
+    <p className="importer-eyebrow">STEP 1 OF 3 · YOUR EDIT</p>
     <Title focus={focus}>You've imported <strong>{dry?.name}</strong> before</Title>
     <p className="importer-lede">Your edit changed since then. Update the SharedCut project with your new edit? Footage you already sent is kept.</p>
     <div className="importer-actions"><Button variant="primary" className="importer-big" onClick={() => choose('rebuild')}>Update it</Button><Button className="importer-big" onClick={() => choose('fresh')}>Make a separate copy</Button>{otherFile}</div>
@@ -569,53 +605,67 @@ function Importer() {
     </li>)}</ul>
     {missing.length > 0 && <>
       <p className="importer-lede">Open <strong>Font Book</strong>, find the font, right-click it and choose <strong>Show in Finder</strong>. Then drag the font files here.</p>
-      <button className={`importer-drop${over ? ' over' : ''}`} onClick={() => { fontFor.current = undefined; fontInput.current?.click(); }} onDragOver={() => setOver(true)} onDragLeave={() => setOver(false)}><Type size={30}/><span>Drag the font files here</span><span className="importer-link">or choose them…</span></button>
+      <button className={`importer-drop${over === 'export' ? ' over' : ''}`} onClick={() => { fontFor.current = undefined; fontInput.current?.click(); }} onDragOver={() => setOver('export')} onDragLeave={() => setOver('')}><Type size={30}/><span>Drag the font files here</span><span className="importer-link">or choose them…</span></button>
     </>}
     <div className="importer-actions">
-      {'queryLocalFonts' in window && missing.length > 0 && <Button className="importer-big" onClick={() => void fromThisMac()}>Add them from this Mac</Button>}
+      {'queryLocalFonts' in window && missing.length > 0 && <Button variant="primary" className="importer-big" onClick={() => void fromThisMac()}>Add them from this Mac</Button>}
       <Button variant={missing.length ? 'secondary' : 'primary'} className="importer-big" onClick={() => job && footage(job)}>{missing.length ? 'Skip: use a similar font' : 'Continue'}<ArrowRight size={17}/></Button>
     </div>
   </>; };
 
   const footageStep = () => {
     const ok = remaining.filter(s => stateOf(s.id) === 'ok').length, missing = remaining.length - ok, busyNow = !!walking || !!checking, asking = remaining.some(s => stateOf(s.id) === 'ambiguous');
-    // Status is never color alone: each note carries the warning icon.
-    const warn = (key: string, children: ReactNode) => <li key={key}><AlertTriangle size={16}/><span>{children}</span></li>;
-    const problems = remaining.flatMap(s => { const st = stateOf(s.id), found = foot.found[s.id], check = foot.checks[s.id];
-      if (st === 'ambiguous') return [<li key={s.id} className="choose"><fieldset className="importer-choose"><legend>{foot.ambig[s.id].length === 2 ? 'Two' : foot.ambig[s.id].length} files are called <strong>{s.name}</strong>. Which one is from this project?</legend>
-        {foot.ambig[s.id].map(c => <label key={c.path}><input type="radio" name={`pick-${s.id}`} onChange={() => { foot.found[s.id] = c; delete foot.checks[s.id]; render(); void recheck([s.id]); }}/><span><b>{c.path.split('/').slice(0, -1).join(' › ') || 'Dropped file'}</b><small>{bytes(c.file.size)} · {new Date(c.file.lastModified).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</small></span></label>)}</fieldset></li>];
-      if (st === 'different' && check && check !== 'checking') return [warn(s.id, <>We found a <strong>{s.name}</strong> in {found.path.split('/')[0]}, but it's a different clip ({Math.round(check.seconds ?? 0)} s long; the project's is {Math.round(s.duration ?? 0)} s). Drag the folder it came from. <button className="importer-link" onClick={() => { foot.use.add(s.id); render(); }}>Use it anyway</button></>)];
-      if (st === 'unreadable') return [warn(s.id, <>We can't open <strong>{s.name}</strong>. If it's on a drive, plug it in and drag the folder again.</>)];
-      if (st === 'tooBig') return [warn(s.id, <><strong>{found.file.name}</strong> is {bytes(found.file.size)}. SharedCut takes files up to {bytes(maxBytes)}, so it'll be left out.</>)];
-      return [];
-    });
+    // Status is never color alone: each note carries the warning icon. Each sits under the row of the place its clip is from.
+    const warn = (key: string, children: ReactNode, action?: ReactNode) => <li key={key}><AlertTriangle size={16}/><span>{children}{action && <span className="importer-note-action">{action}</span>}</span></li>;
+    const problemOf = (s: Source): ReactNode => { const st = stateOf(s.id), found = foot.found[s.id], check = foot.checks[s.id];
+      if (st === 'ambiguous') {
+        const list = foot.ambig[s.id], length = (c: Found) => foot.lengths.get(`${s.id}:${c.path}`), same = (c: Found) => { const l = length(c); return !!l && l !== 'checking' && l.state === 'ok' && l.seconds !== undefined; };
+        // Exactly one as long as the clip in the edit: it is chosen already, and the student only confirms it.
+        const matching = list.filter(same), likely = matching.length === 1 ? matching[0] : undefined;
+        return <li key={s.id} className="choose"><fieldset className="importer-choose"><legend>{list.length === 2 ? 'Two' : list.length} files are called <strong>{s.name}</strong>. Which one is from this project?</legend>
+          {list.map(c => { const l = length(c), seconds = l && l !== 'checking' ? l.seconds : undefined;
+            return <label key={c.path}><input type="radio" name={`pick-${s.id}`} checked={c === likely} onChange={() => pick(s.id, c)}/><span><b>{c.path.split('/').slice(0, -1).join(' › ') || 'Dropped file'}</b>
+              <small>{seconds !== undefined && <>{Math.round(seconds)} s{same(c) && ' · same length as in your edit'} · </>}{bytes(c.file.size)} · {new Date(c.file.lastModified).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}</small></span>
+              {same(c) && <em className="importer-tag">Matches</em>}</label>; })}
+          {likely && <Button variant="primary" onClick={() => pick(s.id, likely)}>Use this one</Button>}</fieldset></li>;
+      }
+      if (st === 'different' && check && check !== 'checking') return warn(s.id, <>We found a <strong>{s.name}</strong> in {found.path.split('/')[0]}, but it's a different clip ({Math.round(check.seconds ?? 0)} s long; the project's is {Math.round(s.duration ?? 0)} s). Drag the folder it came from.</>, <Button onClick={() => { foot.use.add(s.id); render(); }}>Use it anyway</Button>);
+      if (st === 'unreadable') return warn(s.id, <>We can't open <strong>{s.name}</strong>. If it's on a drive, plug it in and drag the folder again.</>);
+      if (st === 'tooBig') return warn(s.id, <><strong>{found.file.name}</strong> is {bytes(found.file.size)}. SharedCut takes files up to {bytes(maxBytes)}, so it'll be left out.</>);
+      return null;
+    };
+    const problemsIn = (ids: (id: string) => boolean) => { const list = remaining.filter(s => ids(s.id)).map(problemOf).filter(Boolean); return list.length > 0 && <ul className="importer-problems">{list}</ul>; };
     return <>
       <p className="importer-eyebrow">STEP 2 OF 3</p>
       <Title focus={focus}>Now let's find your footage</Title>
       {job?.mode === 'continue' && job.sent ? <p className="importer-banner">Welcome back. <strong>{job.name}</strong> is {job.sent.percent}% uploaded. Drag in these places again.{job.sent.bytes > 0 && ` The ${bytes(job.sent.bytes)} already sent won't be sent again.`}</p>
         : already > 0 && <p className="importer-banner">Welcome back! <strong>{already} of {job!.sources.length} clips</strong> are already in SharedCut. Let's send the rest.</p>}
       <p className="importer-lede">Drag these onto this window. We only send the {plural(remaining.length, 'clip')} your project uses, nothing else on your Mac.</p>
-      <ul className="importer-places">{placeList.map((p, row) => { const n = p.ids.filter(id => stateOf(id) === 'ok').length, done = n === p.ids.length, Icon = p.kind === 'library' ? Clapperboard : p.kind === 'drive' ? HardDrive : Folder;
-        return <li key={p.path} id={`importer-place-${row}`} className={done ? 'done' : ''}>
-          <div className="importer-place-row"><Icon size={20}/><div><b>{bold(p.label)}</b><small>{p.hint && !done && `${p.hint} · `}<Count value={n}/> of {p.ids.length} found</small></div><Ring done={n} total={p.ids.length}/></div>
-          {!done && <details><summary>Show me where</summary><div className="importer-where">
+      {/* Every unfinished row is a drop target (the whole window takes the drop; the row shows where it goes). The first one
+          still missing files is open, its breadcrumb and Copy location showing, and its Choose folder… is the step's action. */}
+      <ul className="importer-places">{placeList.map((p, row) => { const n = p.ids.filter(id => stateOf(id) === 'ok').length, done = n === p.ids.length, Icon = p.kind === 'library' ? Clapperboard : p.kind === 'drive' ? HardDrive : Folder, first = p === firstOpen;
+        return <li key={p.path} id={`importer-place-${row}`} className={done ? 'done' : over === `place-${row}` ? 'open over' : 'open'} onDragOver={() => { if (!done) setOver(`place-${row}`); }} onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setOver(''); }}>
+          <div className="importer-place-row"><Icon size={20}/><div><b>{bold(p.label)}</b><small>{p.hint && !done && `${p.hint} · `}<Count value={n}/> of {p.ids.length} found</small></div>{n ? <Ring done={n} total={p.ids.length}/> : <span className="importer-drop-hint" aria-hidden="true">Drop it here</span>}</div>
+          {problemsIn(id => p.ids.includes(id))}
+          {!done && <details open={first}><summary>Show me where</summary><div className="importer-where">
             <p className="importer-crumbs">{p.crumbs.join(' › ')}</p>
             <p>In Finder, press <strong>Shift ⌘ G</strong>, paste, then press Return. Drag what opens onto this window.</p>
-            <div className="importer-actions"><Button onClick={() => void navigator.clipboard?.writeText(p.path).then(() => { setCopied(p.path); setTimeout(() => setCopied(c => c === p.path ? '' : c), 2000); })}><Copy size={14}/>{copied === p.path ? 'Copied' : 'Copy location'}</Button><Button onClick={() => folderInput.current?.click()}><Folder size={14}/>Choose folder…</Button></div>
+            <div className="importer-actions"><Button variant={first && !asking ? 'primary' : 'secondary'} onClick={() => folderInput.current?.click()}><Folder size={14}/>Choose folder…</Button><Button onClick={() => copy(p.path)}><Copy size={14}/>{copied === p.path ? 'Copied' : 'Copy location'}</Button></div>
           </div></details>}
         </li>; })}</ul>
+      {problemsIn(id => !placeList.some(p => p.ids.includes(id)))}
       {walking && <p className="importer-working" role="status"><i className="importer-spin"/>Looking through {walking.name}… {plural(walking.count, 'file')}</p>}
       {checking && <p className="importer-working" role="status"><i className="importer-spin"/>Checking clips… {checking.done} of {checking.total}</p>}
       {notes.map(n => <Alert key={n}>{n === 'zip' ? 'That came in as a zip file. Drag the folder itself from Finder instead.' : n === 'many' ? "That's a lot of files. Drag the folder your clips are in instead." : <>Your browser gave us <strong>{n.slice(8)}</strong> as a single file. Right-click it in Finder, choose <strong>Show Package Contents</strong>, and drag the folders inside onto this window.</>}</Alert>)}
-      {problems.length > 0 && <ul className="importer-problems">{problems}</ul>}
       <div className="importer-footer">
         <p><strong><Count value={ok}/> of {remaining.length}</strong> clips found</p>
-        {/* Finding the footage is the way on; leaving clips out is a quiet choice, offered once something was dropped or picked. */}
-        <div className="importer-actions">{missing ? <Button variant="primary" className="importer-big" onClick={() => folderInput.current?.click()}><Folder size={16}/>Choose folder…</Button>
-          : <Button variant="primary" className="importer-big" disabled={busyNow} onClick={toCheck}>Continue<ArrowRight size={17}/></Button>}</div>
-        {missing > 0 && tried && <div className="importer-skip"><button className="importer-link" disabled={busyNow || asking} onClick={toCheck}>Continue without {plural(missing, 'clip')}</button>
-          <small>{asking ? 'Answer "Which one is from this project?" first.' : "They'll show as missing in SharedCut. To add them later, come back here, drag in the same export, then their folders."}</small></div>}
+        {!missing ? <div className="importer-actions"><Button variant="primary" className="importer-big" disabled={busyNow} onClick={toCheck}>Continue<ArrowRight size={17}/></Button></div>
+          : firstOpen ? <p className="importer-or">Or drag <strong>{firstOpen.item}</strong> onto this window.</p>
+          : <div className="importer-actions"><Button variant="primary" className="importer-big" onClick={() => folderInput.current?.click()}><Folder size={16}/>Choose folder…</Button></div>}
         {missing > 0 && <details className="importer-help"><summary>Which clips?</summary><ul className="importer-missing">{remaining.filter(s => stateOf(s.id) !== 'ok').map(s => <li key={s.id}><b>{s.name}</b><small>{s.sourcePath}</small></li>)}</ul></details>}
+        {/* Leaving clips out is a quiet choice, offered once something was found, or after two drops that found nothing. */}
+        {missing > 0 && (ok > 0 || misses > 1) && <div className="importer-skip"><button className="importer-link" disabled={busyNow || asking} onClick={toCheck}>Continue without {plural(missing, 'clip')}</button>
+          <small>{asking ? 'Answer "Which one is from this project?" first.' : "They'll show as missing in SharedCut. To add them later, come back here, drag in the same export, then their folders."}</small></div>}
       </div>
       <details className="importer-help"><summary>Can't find a clip?</summary><p>In Final Cut, select the clip and press <strong>Shift ⌘ R</strong> to show it in Finder.</p><p>Libraries are in your Movies folder unless you saved them somewhere else.</p></details>
     </>;
@@ -623,26 +673,27 @@ function Importer() {
 
   const check = () => {
     const tooBig = remaining.filter(s => stateOf(s.id) === 'tooBig').length, notFound = remaining.length - planned.length - tooBig, long = seconds > 3 * 3600;
-    const when = friendlyDuration(seconds), roughly = when.replace(/^about /, '');
+    // The time is the big line, counting up as the gauge settles; Konrad's sentence is what a screen reader hears.
+    const when = friendlyDuration(seconds), parts = when.match(/^(\D*)(\d+)(.*)$/), cap = (text: string) => already > 0 ? text : text.replace(/^./, c => c.toUpperCase());
+    const time = parts ? <>{cap(parts[1])}<Count value={Number(parts[2])} start={0} duration={.9}/>{parts[3]}</> : cap(when);
     return <>
       <p className="importer-eyebrow">STEP 3 OF 3</p>
       <Title focus={focus}>{probing || !speed ? 'Checking your Wi‑Fi…' : 'Ready to upload'}</Title>
-      <p className="importer-stats"><strong>{bytes(total)}</strong> · {plural(planned.length, 'clip')}</p>
-      {speed && <>
-        {!speed.measured ? <p className="importer-lede">We couldn't check your Wi‑Fi. At a typical school speed it might take {seconds < 45 ? 'less than a minute' : <>roughly <strong>{roughly}</strong></>}.</p>
-          : already > 0 ? <p className="importer-lede">{already} of {job!.sources.length} clips are already in SharedCut. {bytes(toSend)} left: {seconds < 45 ? 'less than a minute' : <>about <strong>{roughly}</strong></>}.</p>
-          : <p className="importer-lede">This project is {bytes(total)}. It might take {seconds < 45 ? 'less than a minute' : <>about <strong>{roughly}</strong></>} to upload to SharedCut{seconds > 3600 ? ' if your Wi‑Fi stays like this' : ''}.</p>}
-        {speed.measured && <p className="importer-foot">Your Wi‑Fi is sending about {(speed.parallel / 1e6).toFixed(1)} MB/s right now.</p>}
-        {speed.measured && speed.parallel < 1e6 && <p className="importer-note">Your Wi‑Fi is slow right now. It'll still work, or move closer to the router and press <strong>Check again</strong>.</p>}
-        {long && <p className="importer-note">That's a long one. Start it when your Mac can stay open and plugged in for a while. If it stops, come back here and it picks up where it left off.</p>}
-      </>}
+      <div className="importer-hero" aria-hidden="true">
+        <p className={`importer-time${speed ? '' : ' waiting'}`}>{!speed ? 'Timing it…' : already > 0 ? <>{bytes(toSend)} left · {time}</> : time}</p>
+        <p className="importer-sub">{already > 0 ? `${already} of ${job!.sources.length} already in SharedCut` : `${bytes(total)} · ${plural(planned.length, 'clip')}`}{speed?.measured && <> · your Wi‑Fi ≈ {(speed.parallel / 1e6).toFixed(1)} MB/s</>}</p>
+      </div>
+      {speed && <p className="importer-sr importer-sentence">{sentence(speed)}</p>}
+      {speed && !speed.measured && <p className="importer-lede">We couldn't check your Wi‑Fi, so that's at a typical school speed.</p>}
+      {speed?.measured && speed.parallel < 1e6 && <p className="importer-note">Your Wi‑Fi is slow right now. It'll still work, or move closer to the router and press <strong>Check again</strong>.</p>}
+      {speed && long && <p className="importer-note">That's a long one. Start it when your Mac can stay open and plugged in for a while. If it stops, come back here and it picks up where it left off.</p>}
+      {(notFound > 0 || tooBig > 0) && <p className="importer-note">Left out: {[notFound && `${plural(notFound, 'clip')} not found`, tooBig && `${tooBig} too big`].filter(Boolean).join(', ')}.{notFound > 0 && <button className="importer-link" onClick={() => go('footage')}>Go back and find {notFound === 1 ? 'it' : 'them'}</button>}</p>}
       {short && <Alert>SharedCut doesn't have room for this right now. It needs about {bytes(short.needed)} and has {bytes(Math.max(0, short.room))} free. Your files are safe on your Mac. Tell your teacher, then press <strong>Check again</strong>.</Alert>}
       {startError && <Alert>{startError}</Alert>}
       {claim && claimant && user && <Claim user={user} saved={savedAs} projectId={imported.current || undefined} onSaved={savedAccount}/>}
       {guest ? <p className="importer-lands">It'll show up in SharedCut as <strong>{job?.name}</strong>, shared with your class.</p> : <>
         {(job?.mode === 'new' || job?.mode === 'fresh') && !imported.current && <label className="importer-check"><input type="checkbox" checked={share} onChange={e => setShare(e.target.checked)}/>Let my class see it on their Projects screen</label>}
         <p className="importer-lands">It'll show up in your Projects as <strong>{job?.name}</strong>.</p></>}
-      {(notFound > 0 || tooBig > 0) && <p className="importer-foot">Left out: {[notFound && `${plural(notFound, 'clip')} not found`, tooBig && `${tooBig} too big`].filter(Boolean).join(', ')}.</p>}
       {tipsRow}
       <div className="importer-actions">
         <Button variant="primary" className="importer-big" disabled={probing || !speed || !!short || starting} onClick={() => void start()}>{starting ? 'Starting…' : 'Start upload'}<ArrowRight size={17}/></Button>
@@ -653,8 +704,10 @@ function Importer() {
   };
 
   const upload = () => <>
-    <Title focus={focus}>{status === 'paused' ? 'Paused: ' : 'Uploading '}<strong>{job?.name}</strong></Title>
-    <p className="importer-percent" aria-hidden="true">{percent}%</p>
+    <p className="importer-eyebrow">STEP 3 OF 3 · UPLOADING</p>
+    {/* Waiting on the Wi-Fi or on SharedCut, the heading says so, in the stage's words, and the percent goes grey. */}
+    <Title focus={focus}>{status === 'running' && progress?.waiting ? WAITING[progress.waiting] : <>{status === 'paused' ? 'Paused: ' : 'Uploading '}<strong>{job?.name}</strong></>}</Title>
+    <p className={`importer-percent${status !== 'running' || progress?.waiting ? ' muted' : ''}`} aria-hidden="true">{percent}%</p>
     <progress className="importer-progress" max={100} value={percent} aria-label="Upload progress" aria-valuetext={`${percent} percent${eta ? `, ${friendlyDuration(eta)} left` : ''}`}/>
     {/* Speed and time only while bytes move: before the first acknowledged chunk, paused or offline, a speed reads as stalled. */}
     <p className="importer-stats">{!progress ? 'Starting…' : <>{bytes(progress.bytes)} of {bytes(progress.total)}{status === 'running' && !progress.waiting && <> · {progress.rate > 0 ? `${bytes(progress.rate)}/s · ${eta ? `${friendlyDuration(eta)} left` : 'Starting…'}` : 'Starting…'}</>}</>}</p>
@@ -664,11 +717,11 @@ function Importer() {
       {status === 'error' && <Button variant="primary" onClick={resume}>Try again</Button>}
       {status === 'signedOut' && !guest && <a className="button button-primary" href={SIGN_IN}>Sign in</a>}
       {status === 'stuck' && <Button onClick={() => go('ready')}>Finish without {unreadableNow.length === 1 ? 'it' : 'them'}</Button>}</div>}
-    {awake && <p className="importer-awake"><Coffee size={14}/>Keeping your Mac awake</p>}
+    {awake && !progress?.waiting && <p className="importer-awake"><Coffee size={14}/>Keeping your Mac awake</p>}
     {tipsRow}
     <div className="importer-actions">
       {status === 'running' && <Button className="importer-big" onClick={pause}><Pause size={15}/>Pause</Button>}
-      <Button className="importer-big" aria-expanded={showClips} onClick={() => setShowClips(!showClips)}>{showClips ? 'Hide clips' : `Show clips (${remaining.length})`}</Button>
+      <Button className="importer-big" aria-expanded={showClips} onClick={() => setShowClips(!showClips)}>{showClips ? 'Hide clips' : `Show clips (${planned.length})`}</Button>
     </div>
     {showClips && <ul className="importer-clips">{remaining.map(s => { const id = real(s.id), on = progress?.sending.includes(id), got = progress?.received[id], size = foot.found[s.id]?.file.size;
       const out = leftOut.includes(s) && (failed.some(f => f.id === id) || !planned.includes(s)) || progress?.failed.some(f => f.id === id);
@@ -677,6 +730,7 @@ function Importer() {
   </>;
 
   const ready = () => { const i = polled?.fcpImport; return <>
+    <p className="importer-eyebrow">ALMOST THERE</p>
     <Title focus={focus}>Uploaded! SharedCut is getting it ready</Title>
     {i && <><p className="importer-stats"><strong>{i.ready} of {i.files}</strong> clips ready</p><div className="progress-track importer-bar" aria-hidden="true"><i style={{ width: `${i.files ? i.ready * 100 / i.files : 0}%` }}/></div></>}
     <p className="importer-lede">{guest ? "You can close this page now. SharedCut keeps working, and your class will find it in Projects when it's done." : "You can close this page now. SharedCut keeps working, and it'll be in Projects when it's done."}</p>
@@ -684,9 +738,12 @@ function Importer() {
   </>; };
 
   const done = () => { const prepFailed = polled?.media.filter(m => m.uploaded && m.status === 'failed') ?? [], warnings = job?.warnings ?? []; return <>
-    <Title focus={focus}><strong>{job?.name ?? 'Your project'}</strong> is in SharedCut</Title>
+    <p className="importer-eyebrow">DONE</p>
+    <Title focus={focus}><span className="importer-h1-check" aria-hidden="true"><Check size={18} strokeWidth={3}/></span><strong>{job?.name ?? 'Your project'}</strong> is in SharedCut</Title>
     {claimant ? <>
-      <p className="importer-lede">{savedAs ? 'Everyone in your class can find it in Projects, and you can open it from any computer.' : 'Everyone in your class can find it in Projects. Want to edit it yourself from any computer?'}</p>
+      <p className="importer-lede">{savedAs ? 'Everyone in your class can find it in Projects, and you can open it from any computer.' : 'Everyone in your class can find it in Projects.'}</p>
+      {/* The win leads; saving the account is the optional next thing (§2.12 put the form first). */}
+      {user && !savedAs && <h2 className="importer-sub-heading">Optional: open it from any computer</h2>}
       {user && <Claim user={user} saved={savedAs} projectId={imported.current} onSaved={savedAccount}/>}
       <div className="importer-actions"><Button className="importer-big" onClick={() => { reset(); go('you'); void loadSession(); }}>I'm done</Button></div>
     </> : <>
@@ -698,38 +755,54 @@ function Importer() {
     {prepFailed.length > 0 && <details className="importer-help"><summary>{plural(prepFailed.length, 'clip')} couldn't be prepared</summary><ul className="importer-missing">{prepFailed.map(m => <li key={m.id}><b>{m.name}</b>{m.error && <small>{m.error}</small>}</li>)}</ul><p>{guest ? 'Your teacher can retry it in SharedCut.' : 'Open SharedCut to retry it.'}</p></details>}
   </>; };
 
+  const link = `${location.origin}/importer`;
   const blockedStep = () => blocked === 'phone' ? <>
+    <p className="importer-eyebrow">FINAL CUT → SHAREDCUT</p>
     <Title focus={focus}>Open this on your Mac</Title>
     <p className="importer-lede">Use the Mac that has your Final Cut library and go to <strong>sharedcut.com/importer</strong> there.</p>
+    <p className="importer-url mono">{location.host}/importer</p>
+    {/* The share sheet offers AirDrop and Messages on an iPhone; without one, or if it fails, the link is copied. */}
+    <div className="importer-actions">
+      {'share' in navigator && <Button variant="primary" className="importer-big" onClick={() => void navigator.share({ url: link }).catch((e: unknown) => { if ((e as Error)?.name !== 'AbortError') copy(link); })}><Share size={17}/>Send this link to my Mac</Button>}
+      <Button variant={'share' in navigator ? 'secondary' : 'primary'} className="importer-big" onClick={() => copy(link)}><Copy size={16}/>{copied === link ? 'Copied' : 'Copy link'}</Button>
+    </div>
   </> : <>
+    <p className="importer-eyebrow">FINAL CUT → SHAREDCUT</p>
     <Title focus={focus}>Your browser needs an update</Title>
-    <p className="importer-lede">This page needs Safari 17.4 or newer, or Chrome. Open Apple menu › System Settings › General › Software Update, or use Chrome.</p>
+    <p className="importer-lede">This page needs Safari 17.4 or newer, or Chrome.</p>
+    <ol className="importer-steps still"><li>Open the <strong>Apple menu › System Settings</strong>.</li><li>Choose <strong>General › Software Update</strong> and install the update.</li><li>Open this page again.</li></ol>
+    <div className="importer-actions"><a className="button button-secondary importer-big" href="https://www.google.com/chrome/" target="_blank" rel="noopener noreferrer">Get Chrome</a></div>
   </>;
 
   const screens: Record<Step, () => ReactNode> = { blocked: blockedStep, you, export: exportStep, decide, fonts, footage: footageStep, check, upload, ready, done };
-  const firstOpen = placeList.find(p => p.ids.some(id => stateOf(id) !== 'ok')) ?? placeList[0];
+  // The first place still missing a clip: the Finder scene and the open row. None once every place is done.
+  const firstOpen = placeList.find(p => p.ids.some(id => stateOf(id) !== 'ok'));
+  const fontsLeft = (job?.fonts ?? []).filter(f => !added.has(f)), titled = job?.fonts.find(f => titles[f]) ?? job?.fonts[0] ?? 'Futura PT';
   // Paused or waiting, no lane is sending: the tracks show the unfinished files instead, as far as they got.
   const unsent = items.current.filter(i => (progress?.received[i.assetId] ?? 0) < i.file.size && !progress?.failed.some(f => f.id === i.assetId)).sort((x, y) => (progress?.received[y.assetId] ?? 0) - (progress?.received[x.assetId] ?? 0));
   const laneIds = progress?.sending.some(Boolean) ? progress.sending : unsent.map(i => i.assetId);
   const laneList: Lane[] = Array.from({ length: Math.max(1, Math.min(4, progress?.lanes ?? 1)) }, (_, i) => { const id = laneIds[i], item = id ? items.current.find(x => x.assetId === id) : undefined; return item && progress ? { id: item.assetId, name: item.file.name, share: (progress.received[item.assetId] ?? 0) / item.file.size } : undefined; });
   const sentList = items.current.filter(i => progress?.received[i.assetId] === i.file.size).map(i => ({ id: i.assetId, name: i.file.name, size: i.file.size }));
-  const prepared = (polled?.media ?? []).filter(m => m.uploaded || items.current.some(i => i.assetId === m.id)).map(m => ({ id: m.id, ready: m.status === 'ready', failed: m.status === 'failed', thumbnail: m.thumbnail }));
-  const [scene, replayable]: [ReactNode, boolean] = step === 'blocked' ? [blocked === 'phone' ? <DeviceSwap/> : <Handoff/>, true]
+  const prepared = (polled?.media ?? []).filter(m => m.uploaded || items.current.some(i => i.assetId === m.id)).map(m => ({ id: m.id, name: m.name, ready: m.status === 'ready', failed: m.status === 'failed', thumbnail: m.thumbnail }));
+  // A finished step shows its result, not the how-to: the export's clips on SharedCut's tracks, the title in its font, every clip found.
+  const [scene, replayable]: [ReactNode, boolean] = step === 'blocked' ? [blocked === 'phone' ? <DeviceSwap/> : <BrowserUpdate/>, true]
     : step === 'you' ? [!user && name.trim() ? <NameTag name={name.trim()} color={color}/> : <Handoff/>, !!user || !name.trim()]
-    : step === 'export' ? [<ExportScene/>, true] : step === 'decide' ? [<Handoff/>, true]
-    : step === 'fonts' ? [<FontScene family={(job?.fonts ?? []).find(f => !added.has(f)) ?? job?.fonts[0] ?? 'Futura PT'}/>, true]
-    : step === 'footage' ? [firstOpen ? <FinderScene key={firstOpen.path} sidebar={firstOpen.sidebar} item={firstOpen.item} kind={firstOpen.kind} drive={firstOpen.crumbs[0] !== 'Macintosh HD'}/> : <Handoff/>, true]
+    : step === 'export' ? [dry && !dry.limit ? <Received key={dry.projectId} clips={dry.media.length}/> : <ExportScene/>, true] : step === 'decide' ? [<Handoff/>, true]
+    : step === 'fonts' ? [fontsLeft.length ? <FontScene family={fontsLeft[0]}/> : <FontDone key="done" family={titled} text={titles[titled] ?? job?.name ?? 'Your title'}/>, true]
+    : step === 'footage' ? [remaining.length && planned.length === remaining.length ? <FoundScene key="found" names={planned.map(s => foot.found[s.id].file.name)} total={remaining.length}/> : firstOpen ? <FinderScene key={firstOpen.path} sidebar={firstOpen.sidebar} item={firstOpen.item} kind={firstOpen.kind} drive={firstOpen.crumbs[0] !== 'Macintosh HD'}/> : <Handoff/>, true]
     : step === 'check' ? [<Gauge bytesPerSecond={speed?.parallel ?? sample} settled={!!speed && !probing} failed={!!speed && !speed.measured}/>, false]
-    : step === 'upload' ? [<Lanes lanes={laneList} done={sentList} total={items.current.reduce((a, i) => a + i.file.size, 0)} state={progress?.waiting === 'offline' ? 'offline' : status !== 'running' || progress?.waiting ? 'dim' : ''}/>, false]
+    : step === 'upload' ? [<Lanes lanes={laneList} done={sentList} total={items.current.reduce((a, i) => a + i.file.size, 0)} state={status === 'running' && progress?.waiting ? progress.waiting : status !== 'running' ? 'dim' : ''}/>, false]
     : step === 'ready' ? [<Preparing clips={prepared}/>, false] : [<Arrived name={job?.name ?? 'Your project'}/>, true];
   const at = RAIL_AT[step];
 
   return <MotionConfig reducedMotion="user"><main className="importer" aria-labelledby="importer-title">
     <header className="importer-top">
       <span className="importer-brand"><Brand/><span className="importer-beta">BETA</span></span>
-      {step !== 'blocked' && <ol className="importer-rail" aria-label="Import steps">{RAIL.map((r, i) => <li key={r} aria-current={i === at ? 'step' : undefined} className={i < at ? 'past' : ''}>
+      {step !== 'blocked' && <ol className="importer-rail" aria-label="Import steps">{RAIL.map((r, i) => <li key={r} aria-current={i === at ? 'step' : undefined} className={i < at ? 'past' : i === at && step === 'ready' ? 'busy' : ''}>
         {i === at && <motion.span layoutId="importer-rail" className="importer-rail-pill" transition={{ type: 'spring', stiffness: 380, damping: 34 }}/>}
-        <span className="importer-rail-dot">{i < at && <Check size={10} strokeWidth={3}/>}</span><span className="importer-rail-name">{r}</span></li>)}</ol>}
+        <span className="importer-rail-dot">{i < at ? <Check size={10} strokeWidth={3}/> : i > 0 && i < 4 && step !== 'ready' && i}</span><span className="importer-rail-name">{r}</span></li>)}</ol>}
+      {/* A phone-width window: one line and three segments instead of the rail. */}
+      {step !== 'blocked' && <div className="importer-mini"><p>{at === 0 ? 'Getting started' : at === 4 ? 'Done' : `Step ${at} of 3 · ${RAIL[at]}`}</p><span aria-hidden="true">{[1, 2, 3].map(n => <i key={n} className={n <= at ? 'on' : ''}/>)}</span></div>}
       {user ? <span className="importer-who"><Avatar user={user} size={26}/><span>{user.name}</span></span> : <span className="importer-who"/>}
     </header>
     <div className="importer-body">
@@ -737,7 +810,7 @@ function Importer() {
       <section className={`importer-stage${step === 'you' || step === 'blocked' ? ' photo' : ''}`}>
         {/* No initial={false} here: it would also start every scene on its last frame. */}
         <AnimatePresence mode="wait"><motion.div key={`${step}-${replay}`} className="importer-scene" aria-hidden="true" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} transition={{ duration: .22 }}>{scene}</motion.div></AnimatePresence>
-        {replayable && <button className="importer-replay" aria-label="Replay the animation" onClick={() => setReplay(n => n + 1)}><RotateCcw size={13}/>Replay</button>}
+        {replayable && <button className="importer-replay" aria-label="Replay the animation" title="Replay" onClick={() => setReplay(n => n + 1)}><RotateCcw size={17}/></button>}
       </section>
       <section className="importer-copy">
         <AnimatePresence mode="wait" initial={false}>

@@ -109,7 +109,7 @@ export function places(missing: Source[]): Place[] {
   });
 }
 
-/** ok, or why a matched file is left out (tooBig) or needs a second look; `seconds` is a different clip's own length. */
+/** ok, or why a matched file is left out (tooBig) or needs a second look; `seconds` is the file's own length, when it was measured. */
 export type Check = { state: 'ok' | 'unreadable' | 'tooBig' | 'different'; seconds?: number };
 /**
  * Before Start: the file opens (a broken link or unplugged drive fails here), fits under `maxBytes`, and video or audio
@@ -120,7 +120,7 @@ export async function checkFile(file: File, kind: string | undefined, duration: 
   if (file.size > maxBytes) return { state: 'tooBig' };
   if ((kind !== 'video' && kind !== 'audio') || !duration || duration <= 0) return { state: 'ok' };
   const seconds = await measure(file, kind);
-  return seconds !== undefined && Math.abs(seconds - duration) > Math.max(.5, duration * .01) ? { state: 'different', seconds } : { state: 'ok' };
+  return seconds === undefined ? { state: 'ok' } : { state: Math.abs(seconds - duration) > Math.max(.5, duration * .01) ? 'different' : 'ok', seconds };
 }
 /** The file's own length as this browser reads it; undefined for codecs it cannot read (MXF, ProRes RAW) or after 5 s. */
 function mediaDuration(file: File, kind: string) {

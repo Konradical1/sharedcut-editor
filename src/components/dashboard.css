@@ -460,6 +460,9 @@ input.dash-switch[type=checkbox] { appearance: none; padding: 0; cursor: pointer
 .drive-project-meta { display: flex; justify-content: space-between; padding: 13px 14px; font-size: 10px; color: #a3b1a8; gap: 8px; }
 .drive-options { position: absolute; top: 11px; right: 9px; width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; border: 0; background: none; color: #b4c0b7; }
 .drive-options:hover { background: #ffffff15; }
+/* A Final Cut import with no picture yet: clip bars, the cover the importer's own card preview shows. */
+.drive-thumbnail:has(> .drive-import):not(:has(> img)) { background: linear-gradient(160deg, #1f2c27, #121619); }
+.drive-thumbnail:has(> .drive-import):not(:has(> img))::before { content: ""; position: absolute; left: 12px; right: 12px; top: 14px; height: 30px; background: repeating-linear-gradient(90deg, #78AAEF66 0 36px, transparent 36px 38px) top/100% 11px no-repeat, repeating-linear-gradient(90deg, #B298F555 0 24px, transparent 24px 54px) center/100% 6px no-repeat, repeating-linear-gradient(90deg, #87C9AC55 0 54px, transparent 54px 56px) bottom/100% 8px no-repeat; }
 .drive-import { position: absolute; inset: auto 0 0; padding: 26px 10px 9px; background: linear-gradient(#11131500, #111315e6 42%); color: #b4bbc0; font-size: 10px; line-height: 1.45; text-shadow: 0 1px 2px #000a; }
 .drive-import > b { display: block; font-size: 11px; font-weight: 450; color: #e1e6df; }
 .drive-import strong { font-weight: 600; }

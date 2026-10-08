@@ -107,8 +107,8 @@ test('checkFile: unreadable, too big, a different clip, and lengths it cannot ju
   assert.deepEqual(await checkFile(file('A.mov', 200), 'video', 48, 100), { state: 'tooBig' });
   const length = (seconds?: number) => async () => seconds;
   assert.deepEqual(await checkFile(file('C0001.MP4'), 'video', 48, 100, length(12)), { state: 'different', seconds: 12 });
-  assert.deepEqual(await checkFile(file('C0001.MP4'), 'video', 100, 100, length(100.9)), { state: 'ok' }, 'within 1%');
-  assert.deepEqual(await checkFile(file('C0001.MP4'), 'audio', 20, 100, length(20.4)), { state: 'ok' }, 'within half a second');
+  assert.deepEqual(await checkFile(file('C0001.MP4'), 'video', 100, 100, length(100.9)), { state: 'ok', seconds: 100.9 }, 'within 1%');
+  assert.deepEqual(await checkFile(file('C0001.MP4'), 'audio', 20, 100, length(20.4)), { state: 'ok', seconds: 20.4 }, 'within half a second');
   assert.deepEqual(await checkFile(file('C0001.MXF'), 'video', 48, 100, length(undefined)), { state: 'ok' }, 'a codec the browser cannot read');
   assert.deepEqual(await checkFile(file('still.png'), 'image', 0, 100, length(3)), { state: 'ok' });
 });

@@ -7,30 +7,38 @@
 .importer-who{justify-self:end;display:inline-flex;align-items:center;gap:9px;font-size:13px;color:#b4bbc0;min-width:0}
 .importer-who>span:last-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 
-/* Step rail: You · Export · Footage · Upload · Done, the active one a mint pill that slides between steps. */
+/* Step rail: You · Export · Footage · Upload · Done, the active one a mint pill that slides between steps. Export, Footage
+   and Upload carry their step numbers; Upload's dot spins while SharedCut gets the project ready. */
 .importer-rail{display:flex;gap:2px;margin:0;padding:4px;list-style:none;border:1px solid #ffffff0f;border-radius:999px;background:#15181a}
 .importer-rail li{position:relative;isolation:isolate;display:flex;align-items:center;gap:7px;padding:6px 14px 6px 9px;border-radius:999px;font-size:12.5px;font-weight:550;color:#90979c;white-space:nowrap}
 .importer-rail-pill{position:absolute;inset:0;z-index:-1;border-radius:999px;background:var(--accent)}
-.importer-rail-dot{display:grid;place-items:center;width:15px;height:15px;border-radius:50%;border:1.5px solid #485c4d}
+.importer-rail-dot{display:grid;place-items:center;width:18px;height:18px;border-radius:50%;border:1.5px solid #485c4d;font-size:10.5px;font-weight:650;line-height:1;font-variant-numeric:tabular-nums}
 .importer-rail li.past{color:#b4bbc0}
 .importer-rail li.past .importer-rail-dot{background:#223c2d;border-color:#485c4d;color:var(--accent)}
 .importer-rail li[aria-current]{color:#1a2a1f}
-.importer-rail li[aria-current] .importer-rail-dot{border-color:#1a2a1f;background:#1a2a1f;box-shadow:inset 0 0 0 3px var(--accent)}
+.importer-rail li[aria-current] .importer-rail-dot{border-color:#1a2a1f;background:#1a2a1f;color:var(--accent)}
+.importer-rail li[aria-current] .importer-rail-dot:empty{box-shadow:inset 0 0 0 3px var(--accent)}
+.importer-rail li.busy[aria-current] .importer-rail-dot{background:transparent;border:2px solid #1a2a1f40;border-top-color:#1a2a1f;box-shadow:none;animation:spin .9s linear infinite}
+.importer-mini{display:none}
 
 /* Stage (55%) beside the copy (45%). */
 .importer-body{display:grid;grid-template-columns:minmax(0,55fr) minmax(0,45fr);gap:clamp(28px,4vw,64px);align-items:start;max-width:1440px;margin:0 auto;padding:4px 28px 48px}
-.importer-stage{position:sticky;top:16px;height:min(680px,calc(100dvh - 104px));min-height:380px;overflow:hidden;container-type:size;border-radius:20px;border:1px solid #ffffff0a;background:radial-gradient(ellipse 70% 60% at 50% 45%,#bce8c712,transparent 70%),#151a18}
-.importer-stage.photo{background:linear-gradient(180deg,#061116a6,#081311 45%,#04140ff2 100%),url(/brand/close-up-timeline.png) center/cover}
+/* Sized to the art: the 3:2 scenes fill a 4:3 stage instead of floating in a square one. */
+.importer-stage{position:sticky;top:16px;aspect-ratio:4/3;max-height:calc(100dvh - 104px);overflow:hidden;container-type:size;border-radius:20px;border:1px solid #ffffff0a;background:radial-gradient(ellipse 70% 60% at 50% 45%,#bce8c712,transparent 70%),#151a18}
+/* AuthScreen's overlay, so the timeline photo shows, and a soft dim behind the illustration only. */
+.importer-stage.photo{background:radial-gradient(ellipse 58% 48% at 50% 50%,#0a1311c4,#0a131100 72%),linear-gradient(180deg,#06111688,#0813111f 28%,#04140fdd 100%),url(/brand/close-up-timeline.png) center/cover}
 .importer-scene{position:absolute;inset:0;display:grid;place-items:center}
-.importer-replay{position:absolute;right:10px;bottom:8px;display:inline-flex;align-items:center;gap:6px;min-height:44px;padding:0 14px;border-radius:999px;font-size:12.5px;color:#90979c;background:#111315b3;border:1px solid #ffffff12}
+.importer-replay{position:absolute;right:10px;top:10px;z-index:1;display:grid;place-items:center;width:44px;height:44px;border-radius:50%;color:#90979c;background:#111315b3;border:1px solid #ffffff12}
 .importer-replay:hover{color:#e1e6df}
 .importer-copy{max-width:540px;padding:clamp(8px,4vh,48px) 0 24px}
-.importer-copy h1{margin:0 0 14px;font-size:32px;line-height:1.18;font-weight:600;letter-spacing:-.6px;color:#e1e6df;outline:none}
+/* SharedCut's own heading weight (AuthScreen: 450, -1 px). */
+.importer-copy h1{margin:0 0 14px;font-size:32px;line-height:1.18;font-weight:450;letter-spacing:-1px;color:#e1e6df;outline:none}
 /* The step heading takes focus on every step change (for screen readers); it is not a control, so no ring. */
 .importer-copy h1:focus-visible{outline:none}
-.importer-copy h1 strong{font-weight:700}
+.importer-copy h1 strong{font-weight:600}
 .importer-copy strong{font-weight:600;color:#e1e6df}
-.importer-eyebrow{margin:0 0 12px;font-size:11px;font-weight:600;letter-spacing:1.5px;color:#90979c}
+.importer-eyebrow{display:flex;align-items:center;gap:8px;margin:0 0 12px;font-size:11px;font-weight:600;letter-spacing:1.5px;color:#90979c}
+.importer-eyebrow::before{content:"";flex-shrink:0;width:4px;height:4px;border-radius:50%;background:#a7b9ab}
 .importer-lede{margin:0 0 20px;font-size:16px}
 .importer-foot{margin:14px 0 0;font-size:13.5px;color:#90979c}
 .importer-copy p{overflow-wrap:anywhere}
@@ -58,9 +66,10 @@
 .importer-password button{position:absolute;right:3px;top:50%;transform:translateY(-50%);display:grid;place-items:center;width:40px;height:40px;border-radius:6px;color:#90979c}
 
 /* Welcome */
-.importer-chips{display:flex;flex-wrap:wrap;gap:8px;margin:0;padding:0;list-style:none}
-.importer-chips li{display:inline-flex;align-items:center;gap:7px;padding:7px 12px;border-radius:999px;background:#181b1e;border:1px solid #252a2c;font-size:13px}
-.importer-chips svg{color:var(--accent)}
+/* How it works: numbered like the rail, and plain text, since none of it is a control. */
+.importer-how{display:flex;flex-wrap:wrap;gap:8px 22px;margin:0;padding:0;list-style:none;font-size:14.5px;color:#b4bbc0}
+.importer-how li{display:inline-flex;align-items:center;gap:8px}
+.importer-how b{display:grid;place-items:center;width:20px;height:20px;border-radius:50%;background:#223c2d;color:var(--accent);font-size:11px;font-weight:650}
 .importer-who-block{display:flex;flex-direction:column;align-items:flex-start;gap:16px;margin-top:26px}
 .importer-who-block>p{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:0;font-size:16px}
 .importer-card{display:flex;flex-direction:column;gap:12px;width:100%;margin:18px 0 0;padding:16px 18px;border-radius:12px;background:#181b1e;border:1px solid #303438;text-align:left;font-size:15px}
@@ -79,7 +88,9 @@
 .importer-alert .button{display:flex;width:fit-content;margin-top:12px}
 .importer-note,.importer-problems>li{margin:12px 0 0;padding:11px 14px;border-radius:10px;background:#2a2617;border:1px solid #5a4d2a;color:#f0e2bd;font-size:14.5px}
 .importer-note strong,.importer-problems strong{color:#fff3d6}
-.importer-problems .importer-link{color:var(--importer-warn);text-decoration-color:#e8cf8f80;margin-left:4px}
+.importer-note .importer-link{min-height:0;margin-left:8px;color:var(--importer-warn);text-decoration-color:#e8cf8f80}
+.importer-note-action{display:flex;margin-top:10px}
+.importer .importer-note-action .button,.importer-choose>.button{min-height:34px;padding:6px 12px;font-size:13px}
 
 /* Export: numbered steps, each marked in time with the illustration (8 s, 3 times, then all three). */
 .importer-steps{margin:22px 0 26px;padding:0;list-style:none;counter-reset:step;display:flex;flex-direction:column;gap:14px}
@@ -90,6 +101,9 @@
 @keyframes ix-step1{0%,19%{opacity:1}21%,93%{opacity:.12}100%{opacity:1}}
 @keyframes ix-step2{0%,19%{opacity:.12}21%,47%{opacity:1}49%,93%{opacity:.12}100%{opacity:1}}
 @keyframes ix-step3{0%,47%{opacity:.12}49%,100%{opacity:1}}
+/* done: the export arrived, so every step is ticked; still: numbered steps with no illustration to follow. */
+.importer-steps:is(.done,.still) li::before{animation:none;opacity:0}
+.importer-steps.done li::after{content:"✓";content:"✓" / "";background:var(--accent);color:#1a2a1f;font-size:14px}
 .importer-drop{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;width:100%;height:160px;border:2px dashed #485c4d;border-radius:14px;background:#15181a;color:#e1e6df;font-size:16px;font-weight:550;transition:background .2s,border-color .2s;animation:importer-breathe 3s ease-in-out 3 both}
 .importer-drop>*{pointer-events:none}
 .importer-drop>svg{color:var(--accent);transition:transform .2s}
@@ -124,6 +138,13 @@
 .importer-places{display:flex;flex-direction:column;gap:10px;margin:4px 0 0;padding:0;list-style:none}
 .importer-places>li{border-radius:12px;background:#181b1e;border:1px solid #252a2c;transition:border-color .25s,background .25s}
 .importer-places>li.done{border-color:#485c4d;background:#182320}
+/* A row still missing clips is a drop target, like Export's drop card. */
+.importer-places>li.open{border:2px dashed #485c4d}
+.importer-places>li.over{border-style:solid;border-color:var(--accent);background:#223c2d55}
+.importer-drop-hint{flex-shrink:0;padding:4px 11px;border-radius:999px;border:1px dashed #485c4d;font-size:12.5px;font-weight:550;color:#a7b9ab;white-space:nowrap}
+.importer-places>li.over .importer-drop-hint{border-style:solid;border-color:var(--accent);color:var(--accent)}
+.importer-places .importer-problems{padding:0 16px 4px 50px}
+.importer-or{margin:8px 0 0;font-size:14.5px;color:#90979c}
 .importer-place-row{display:flex;align-items:center;gap:14px;padding:14px 16px}
 .importer-place-row>svg{flex-shrink:0;color:var(--accent)}
 .importer-place-row>div{flex:1;min-width:0}
@@ -159,13 +180,20 @@
 .importer-choose label>span{display:flex;flex-direction:column;min-width:0}
 .importer-choose b{font-weight:500;color:#e1e6df;overflow-wrap:anywhere}
 .importer-choose small{color:#90979c}
+.importer-choose>.button{margin-top:12px}
+.importer-tag{flex-shrink:0;margin-left:auto;padding:2px 9px;border-radius:999px;background:#223c2d;color:var(--accent);font-size:12px;font-style:normal;font-weight:600}
 .importer-footer{margin-top:22px;padding-top:18px;border-top:1px solid #ffffff0d}
 .importer-footer>p:first-child{margin:0;font-size:16px}
 .importer-missing{display:flex;flex-direction:column;gap:7px;margin:10px 0 0;padding:0;list-style:none;font-size:14px}
 .importer-missing b{display:block;font-weight:500;color:#e1e6df}
 .importer-missing small{display:block;color:#90979c;overflow-wrap:anywhere}
 
-/* Check */
+/* Check: the time is the big line; size, clips and speed under it. */
+.importer-hero{margin:0 0 4px}
+.importer-time{margin:0;font-size:32px;line-height:1.2;font-weight:500;letter-spacing:-.8px;color:#e1e6df;font-variant-numeric:tabular-nums}
+.importer-time.waiting{color:#90979c}
+.importer-sub{margin:6px 0 0;font-size:15px;color:#90979c;font-variant-numeric:tabular-nums}
+.importer-hero+.importer-sr+.importer-lede,.importer-hero~.importer-note{margin-top:14px}
 .importer-stats{margin:0 0 10px;font-size:16px;font-variant-numeric:tabular-nums}
 .importer-stats strong{font-size:22px}
 .importer-check{display:flex;align-items:center;gap:10px;min-height:36px;margin:18px 0 0;font-size:15px;color:#e1e6df;cursor:pointer}
@@ -176,7 +204,8 @@
 .importer-tips svg{color:var(--accent)}
 
 /* Upload */
-.importer-percent{margin:6px 0 10px;font-size:64px;line-height:1;font-weight:600;letter-spacing:-2px;color:#e1e6df;font-variant-numeric:tabular-nums}
+.importer-percent{margin:6px 0 10px;font-size:64px;line-height:1;font-weight:600;letter-spacing:-2px;color:#e1e6df;font-variant-numeric:tabular-nums;transition:color .3s}
+.importer-percent.muted{color:#90979c}
 .importer-progress{appearance:none;display:block;width:100%;height:6px;margin:0 0 12px;border:0;border-radius:6px;background:#ffffff0f;overflow:hidden}
 .importer-progress::-webkit-progress-bar{background:#ffffff0f;border-radius:6px}
 .importer-progress::-webkit-progress-value{background:var(--accent);border-radius:6px;transition:width .6s}
@@ -190,7 +219,13 @@
 .importer-clips li{display:flex;justify-content:space-between;gap:12px;padding:9px 14px;border-bottom:1px solid #ffffff08;font-size:14px}
 .importer-clips li>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#e1e6df}
 .importer-clips small{display:inline-flex;align-items:center;gap:5px;white-space:nowrap;color:#90979c;font-variant-numeric:tabular-nums}
-.importer-copy .importer-bar{height:6px;margin:4px 0 18px}
+/* Getting it ready: the bar's stripes move from the start, so 0 of 2 reads as working, not empty. */
+.importer-copy .importer-bar{position:relative;height:6px;margin:4px 0 18px;background:#ffffff14}
+.importer-bar::after{content:"";position:absolute;inset:0 0 0 -12px;background:repeating-linear-gradient(-45deg,#ffffff1f 0 6px,transparent 6px 12px);animation:clip-preparing-stripes 1s linear infinite}
+.importer-h1-check{display:inline-grid;place-items:center;width:28px;height:28px;margin-right:12px;border-radius:50%;background:var(--accent);color:#1a2a1f;vertical-align:-2px}
+.importer-sub-heading{margin:28px 0 0;font-size:16px;font-weight:550;color:#e1e6df}
+.importer-sub-heading+.importer-claim{margin-top:10px}
+.importer-url{display:inline-block;margin:0;padding:8px 14px;border-radius:999px;background:#181b1e;border:1px solid #303438;color:#e1e6df;user-select:all;overflow-wrap:anywhere}
 .importer-claim{display:flex;flex-direction:column;gap:14px;width:100%;margin-top:18px;padding:18px;border-radius:12px;background:#181b1e;border:1px solid #303438}
 .importer-claim small{margin-top:-6px}
 .importer-claim .button{align-self:flex-start}
@@ -209,13 +244,18 @@
   .importer-top{grid-template-columns:auto minmax(0,1fr);padding:12px 16px;gap:12px}
   .importer-rail{grid-column:1/-1;grid-row:2;justify-content:space-between}
   .importer-body{grid-template-columns:minmax(0,1fr);gap:22px;padding:0 16px 40px}
-  .importer-stage{position:relative;top:0;height:28vh;min-height:160px}
+  .importer-stage{position:relative;top:0;max-height:none}
   .importer-copy{max-width:none;padding-top:0}
   .importer-copy h1{font-size:27px}
 }
 @media (max-width:600px){
-  .importer-rail li{padding:6px 9px}
-  .importer-rail li:not([aria-current]) .importer-rail-name{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+  /* The rail becomes one line and three segments. */
+  .importer-rail{display:none}
+  .importer-mini{grid-column:1/-1;grid-row:2;display:flex;flex-direction:column;gap:8px}
+  .importer-mini p{margin:0;font-size:13px;font-weight:550;color:#e1e6df}
+  .importer-mini>span{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}
+  .importer-mini i{height:4px;border-radius:2px;background:#ffffff14}
+  .importer-mini i.on{background:var(--accent)}
   /* The name form's card, larger in the frame: its name has to be readable on a narrow stage. */
   .ia-nametag .ia-card{left:3em;top:2.5em;width:54em}
   .ia-nametag .ia-card-cover{height:24em}
@@ -223,12 +263,12 @@
   .ia-nametag .ia-card-meta{font-size:1.9em}
   .ia-nametag .ia-remote{display:none}
   .importer-percent{font-size:52px}
-  .importer-places details{padding-left:16px}
+  .importer-places :is(details,.importer-problems){padding-left:16px}
   .importer-card.quiet{align-items:flex-start}
 }
 
 /* ---- Illustrations (ImporterArt.tsx): a 60 × 40 em canvas that fits the stage ---------------------------------- */
-.ia-frame{position:relative;flex-shrink:0;width:min(92cqw,138cqh);aspect-ratio:3/2;font-size:calc(min(92cqw,138cqh) / 60);line-height:1.3;color:#b4bbc0;user-select:none;pointer-events:none}
+.ia-frame{position:relative;flex-shrink:0;width:min(96cqw,150cqh);aspect-ratio:3/2;font-size:calc(min(96cqw,150cqh) / 60);line-height:1.3;color:#b4bbc0;user-select:none;pointer-events:none}
 .ia-frame>svg:not(.ia-cursor){position:absolute;inset:0;width:100%;height:100%;overflow:visible}
 .ia-frame :is(.ia-win,.ia-browser,.ia-menubar,.ia-desktop,.ia-x-menu,.ia-x-sheet,.ia-f-menu,.ia-k-ghost,.ia-arrow,.ia-mark,.ia-doc){position:absolute}
 .ia-win,.ia-browser{overflow:hidden;border-radius:.8em;background:#1b1e21;border:1px solid #ffffff14;box-shadow:0 1.4em 3em #0008}
@@ -251,6 +291,8 @@
 .ia-mark{display:none;place-items:center;z-index:6;width:1.8em;height:1.8em;border-radius:50%;background:var(--accent);color:#1a2a1f;font-weight:700;box-shadow:0 0 0 .25em #151a18}
 @media (prefers-reduced-motion:reduce){.ia-mark{display:grid}}
 .ia-shell{fill:#16191b;stroke:#3a4044;stroke-width:2}
+.ia-shell.lit{stroke:#485c4d}
+.ia-url{fill:#90979c;font-size:9px;text-anchor:middle}
 .ia-wordmark{fill:#e6e8e9;font-size:15px;font-weight:630;letter-spacing:-.5px}
 .ia-track-name{fill:#90979c;font-size:9px;font-weight:550}
 /* CSS scenes: 8 s, 3 times, resting on the last frame. */
@@ -398,39 +440,51 @@
 .ia-gauge-end{fill:#90979c;font-size:15px;text-anchor:middle}
 .ia-gauge-note{fill:#b4bbc0;font-size:22px;text-anchor:middle}
 
-/* A7: lanes, styled as SharedCut timeline tracks */
-.ia-l-tracks{position:absolute;left:3em;right:3em;top:5em;display:flex;flex-direction:column;gap:1.4em;transition:opacity .3s}
-.ia-l-track{display:flex;align-items:center;gap:1.2em}
-.ia-l-track b{width:2em;font-size:1.3em;font-weight:500;text-align:center;color:#90979c}
-.ia-l-body{position:relative;flex:1;height:4.6em;border-radius:.6em;background:#202428;transition:background .3s}
-.ia-l-clip{position:absolute;inset:.55em;overflow:hidden;border-radius:.45em;background:#252a2c;border:1px solid #485c4d;animation:ia-arrive .3s ease-out both}
-.ia-l-clip span{position:absolute;inset:0;display:flex;align-items:center;padding:0 1em;font-size:1.25em;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#e1e6df}
+/* A7: lanes, styled as SharedCut timeline tracks (V1–V4), above the timeline the sent files snap onto */
+.ia-l-tracks{position:absolute;left:3em;right:3em;top:2em;height:17.5em;display:flex;flex-direction:column;justify-content:center;gap:1em;transition:opacity .3s}
+.ia-l-track{display:flex;align-items:center;gap:1em}
+.ia-l-track b{width:2.4em;font-size:1.2em;font-weight:600;text-align:center;color:#90979c}
+.ia-l-body{position:relative;flex:1;height:3.8em;border-radius:.6em;background:#202428}
+.ia-l-clip{position:absolute;inset:.45em;overflow:hidden;border-radius:.45em;background:#78AAEF33;border:1px solid #78AAEF;animation:ia-arrive .3s ease-out both}
+.ia-l-clip span{position:absolute;inset:0;display:flex;align-items:center;padding:0 1em;font-size:1.2em;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#e1e6df}
 .ia-l-clip i{position:absolute;inset:0;background:var(--accent);transition:clip-path 1s linear}
 .ia-l-clip i span{color:#1a2a1f}
-.ia-lanes.offline .ia-l-body{background:#2a2617}
-.ia-lanes.offline .ia-l-clip{border-color:#e8cf8f80}
-.ia-lanes.offline .ia-l-clip i{background:var(--importer-warn)}
-.ia-lanes:is(.offline,.dim) .ia-l-tracks{opacity:.55}
-.ia-l-done{position:absolute;left:3em;right:3em;bottom:4.5em}
-.ia-l-done small{display:block;margin:0 0 .6em 3.8em;font-size:1.1em;color:#90979c}
-.ia-l-strip{display:flex;gap:.25em;height:2.6em;margin-left:3.8em;padding:.35em;overflow:hidden;border-radius:.6em;background:#181b1e;border:1px solid #252a2c}
-.ia-l-strip span{flex:none;min-width:.5em;border-radius:.3em;background:#87C9AC;animation:ia-drop .35s ease-out both}
+.ia-frame>svg.ia-l-sent{inset:auto;left:17em;top:20.5em;width:26em;height:auto;transition:opacity .3s}
+.ia-lanes.dim .ia-l-tracks{opacity:.55}
+.ia-lanes.waiting :is(.ia-l-tracks,.ia-l-sent){opacity:.22}
 @keyframes ia-arrive{from{opacity:0;transform:translateX(-1em)}}
-@keyframes ia-drop{from{opacity:0;transform:translateY(-1.2em)}}
+/* Waiting on the Wi-Fi or on SharedCut: the Mac, a pulsing amber line to SharedCut, and what it waits for. */
+.ia-l-wait{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2em;background:radial-gradient(ellipse 46% 40% at 50% 50%,#151a18f2 40%,#151a1800 100%)}
+.ia-l-link{display:flex;align-items:center;gap:1.4em}
+.ia-l-link svg{width:4.6em;height:4.6em;color:#b4bbc0;stroke-width:1.5}
+.ia-l-link i{width:12em;border-top:.3em dashed var(--importer-warn);animation:ia-pulse 1.6s ease-in-out infinite}
+.ia-l-link img{width:4em;height:4em}
+.ia-l-pill{display:inline-flex;align-items:center;gap:.6em;padding:.6em 1.3em;border-radius:99em;background:#2a2617;border:1px solid #5a4d2a;color:#f0e2bd;font-size:1.5em;font-weight:600;white-space:nowrap}
+.ia-l-pill svg{width:1.2em;height:1.2em;color:var(--importer-warn)}
+@keyframes ia-pulse{50%{opacity:.3}}
 
-/* A8: clips being prepared */
-.ia-p-grid{position:absolute;inset:4em;display:flex;flex-wrap:wrap;justify-content:center;align-content:center;gap:.8em}
-.ia-p-grid span{position:relative;width:min(32%,calc((100% - 4em) / var(--n,6)));aspect-ratio:16/9;overflow:hidden;border-radius:.5em;background:#202428;transition:background .3s}
-.ia-p-grid span::after{content:"";position:absolute;inset:0 0 0 -12px;background:repeating-linear-gradient(-45deg,#ffffff12 0 6px,transparent 6px 12px);animation:clip-preparing-stripes 1s linear infinite}
-.ia-p-grid span.ready{background:var(--accent)}
-.ia-p-grid span.failed{background:#3a3322}
-.ia-p-grid span:is(.ready,.failed)::after{display:none}
+/* A8: clips being prepared, each named, with a spinner that turns into a check */
+.ia-p-grid{position:absolute;inset:4em;display:flex;flex-wrap:wrap;justify-content:center;align-content:center;gap:1.4em .8em}
+.ia-p-grid figure{min-width:0;width:min(32%,calc((100% - 4em) / var(--n,6)));margin:0}
+.ia-p-grid figure>span{position:relative;display:block;aspect-ratio:16/9;overflow:hidden;border-radius:.5em;background:#202428;transition:background .3s}
+.ia-p-grid figure>span::after{content:"";position:absolute;inset:0 0 0 -12px;background:repeating-linear-gradient(-45deg,#ffffff12 0 6px,transparent 6px 12px);animation:clip-preparing-stripes 1s linear infinite}
+.ia-p-grid .ready>span{background:var(--accent)}
+.ia-p-grid .failed>span{background:#3a3322}
+.ia-p-grid :is(.ready,.failed)>span::after{display:none}
 .ia-p-grid img{width:100%;height:100%;object-fit:cover;animation:ia-thumb .4s ease-out both}
+.ia-p-grid figcaption{display:flex;align-items:center;gap:.5em;margin-top:.6em;font-size:1.25em;color:#b4bbc0}
+.ia-p-grid figcaption>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ia-p-spin{flex-shrink:0;width:.9em;height:.9em;border-radius:50%;border:.16em solid #485c4d;border-top-color:var(--accent);animation:spin .8s linear infinite}
+.ia-p-done,.ia-p-failed{width:1em;height:1em}
+.ia-p-done{color:var(--accent);stroke-width:3}
+.ia-p-failed{color:var(--importer-warn)}
 @keyframes ia-thumb{from{opacity:0;transform:scale(.96)}}
 
 /* A9: arrived */
 .ia-a-grid{position:absolute;inset:6em 8em;display:grid;grid-template-columns:repeat(3,1fr);grid-template-rows:repeat(2,1fr);gap:1.4em}
-.ia-a-other{border-radius:.8em;background:#181b1e;border:1px solid #252a2c}
+/* The class's other projects, muted, so the new one reads as arriving in Projects. */
+.ia-a-other{display:flex;flex-direction:column;border-radius:.8em;background:#181b1e;border:1px solid #252a2c;opacity:.5;filter:grayscale(.65)}
+.ia-a-other>b{padding:.6em .8em;font-size:1.05em;font-weight:500;color:#b4bbc0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ia-a-new{position:relative;display:flex;flex-direction:column;border-radius:.8em;background:#1b211e;border:1px solid var(--accent);box-shadow:0 0 0 .3em #bce8c71f,0 0 3em #bce8c733}
 .ia-a-cover{flex:1;display:grid;place-items:center;border-radius:.8em .8em 0 0;background:#14191a}
 .ia-a-cover svg{width:65%}
@@ -445,6 +499,28 @@
 .ia-s-phone{animation:ia-s-phone 6s ease 3 both}.ia-s-mac{animation:ia-s-mac 6s ease 3 both}
 @keyframes ia-s-phone{0%,30%{opacity:1}45%,100%{opacity:0}}
 @keyframes ia-s-mac{0%,45%{opacity:0;transform:scale(.96)}60%,100%{opacity:1;transform:none}}
+
+/* Blocked on an old browser: a browser window with an update badge */
+.ia-u-browser{left:13em;top:6em;width:34em;height:26em}
+.ia-u-badge{position:absolute;left:50%;top:44%;display:grid;place-items:center;width:7em;height:7em;margin:-3.5em;border-radius:50%;background:var(--accent);color:#1a2a1f;animation:ia-ring 2s ease-out 3 both}
+.ia-u-badge svg{width:3.6em;height:3.6em;stroke-width:2.5}
+.ia-u-label{position:absolute;left:0;right:0;top:66%;text-align:center;font-size:1.6em;font-weight:600;color:#e1e6df}
+@keyframes ia-ring{from{box-shadow:0 0 0 0 #bce8c780}to{box-shadow:0 0 0 1.6em #bce8c700}}
+
+/* A3, A4 and A5 finished: the export's clips on SharedCut's tracks, the title in its new font, every clip found */
+.ia-fd-screen{position:absolute;left:7em;top:7em;width:46em;height:25.9em;display:grid;place-items:center;border-radius:.8em;background:#0b0d0e;border:1px solid #303438;box-shadow:0 2em 4em #0009,0 0 3em #bce8c71a}
+.ia-fd-screen>i{position:absolute;inset:10%;border:1px dashed #ffffff26;border-radius:.3em}
+.ia-fd-screen>b{max-width:80%;font-size:5.4em;font-weight:400;line-height:1.1;color:#fff;text-align:center;overflow-wrap:anywhere}
+.ia-fd-screen>small{position:absolute;left:1.2em;bottom:.9em;font-size:1.2em;color:#90979c}
+.ia-fd-check{display:grid;place-items:center;width:3.4em;height:3.4em;border-radius:50%;background:var(--accent);color:#1a2a1f;box-shadow:0 0 0 .4em #bce8c733}
+.ia-fd-check svg{width:60%;height:60%;stroke-width:3}
+.ia-fd-screen>.ia-fd-check{position:absolute;right:-1.4em;top:-1.4em}
+.ia-found-browser{left:20em;top:7em;width:26em;height:24em}
+.ia-found-count{position:absolute;inset:2.4em 0 0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:.7em}
+.ia-found-count b{font-size:3.6em;font-weight:600;line-height:1;letter-spacing:-.04em;color:#e1e6df}
+.ia-found-count small{font-size:1.4em;color:#90979c}
+.ia-chip{position:absolute;left:1.6em;z-index:3;max-width:15em;padding:.35em .9em;border-radius:99em;background:var(--accent);color:#1a2a1f;font-size:1.2em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;animation:ia-chip .9s ease-in both}
+@keyframes ia-chip{0%{opacity:0;transform:none}25%{opacity:1;transform:translateX(1em)}100%{opacity:0;transform:translateX(20em) scale(.6)}}
 
 /* Reading the export, and the check it turns into */
 .ia-reading{display:inline-flex;align-items:center;gap:3px;height:12px}

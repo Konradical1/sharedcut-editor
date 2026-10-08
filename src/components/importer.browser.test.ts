@@ -163,6 +163,8 @@ test('export: a video is not the export; the exported XML is read', async () => 
   await shot(a, 'export-not-the-export');
   await chooseExport(a, 'My Film.fcpxml');
   await a.getByText(/Got it: My Film · 3 clips/).waitFor();
+  await a.locator('.ia-received').waitFor();   // the stage shows the clips arriving, not the how-to
+  await a.waitForTimeout(2200);   // the picture at rest: every clip on its track, and the check
   await shot(a, 'export-got-it');
   clean();
 });
@@ -174,6 +176,8 @@ test('fonts: the missing family is dropped in and added', async () => {
   await shot(a, 'fonts-needed');
   await a.locator('.importer-fonts').drop({ files: join(root, 'public', 'fonts', 'BarlowCondensed-Bold.ttf') });
   await a.getByText('Barlow Condensed · added').waitFor();
+  await a.locator('.ia-fontdone').getByText('Game day').waitFor();   // the edit's own title, in the font just added
+  await a.waitForTimeout(800);
   await shot(a, 'fonts-added');
   clean();
 });
@@ -184,6 +188,8 @@ test('footage: places, a different clip with the same name, the right one droppe
   assert.equal(await a.locator('.importer-places > li').count(), 2, 'the library and the SD card');
   assert.match(await a.locator('.importer-places > li').first().innerText(), /Your Final Cut library School Library/);
   assert.match(await a.locator('.importer-stage').innerText(), /Movies/, 'the Finder scene opens Movies');
+  assert.equal(await a.getByText(/Continue without/).count(), 0, 'leaving clips out waits until something is found');
+  await a.getByText('Macintosh HD › Users › maya › Movies › School Library').waitFor();   // the first place is open
   await shot(a, 'footage');
   const card = a.locator('.importer-places > li').filter({ hasText: 'SD CARD' });
   await folder(a).setInputFiles(at('Desktop', 'Footage'));
@@ -198,11 +204,11 @@ test('footage: places, a different clip with the same name, the right one droppe
   // A folder with two other A001.mp4 files, neither of them in a library: which one?
   await folder(a).setInputFiles(at('Desktop', 'Cards'));
   await a.getByText(/Two files are called A001\.mp4\. Which one is from this project\?/).waitFor();
+  if (video) await a.locator('.importer-choose').getByText('Matches').waitFor();   // Card 1's is as long as the edit's
   await shot(a, 'footage-which-one');
   await folder(a).setInputFiles(at('Movies'));
   await a.locator('.importer-footer').getByText(/2 of 3\s*clips found/).waitFor();
   await a.locator('.importer-choose').waitFor({ state: 'detached' });
-  await a.getByText('Show me where').click();
   await a.getByText('Macintosh HD › Users › maya › Movies › School Library').waitFor();
   await shot(a, 'footage-found');
   clean();
@@ -213,7 +219,7 @@ test('check: the Wi-Fi probe, then the size and the time', async () => {
   await step(a, 'Checking your Wi\u2011Fi…');
   await shot(a, 'check-wifi');
   await step(a, 'Ready to upload');
-  assert.match(await a.locator('.importer-lede').innerText(), /This project is .+\. It might take (about .+|less than a minute) to upload to SharedCut\./);
+  assert.match(await a.locator('.importer-sentence').textContent() ?? '', /This project is .+\. It might take (about .+|less than a minute) to upload to SharedCut\./, 'what a screen reader hears');
   await a.getByText('Left out: 1 clip not found.').waitFor();
   await a.getByText("It'll show up in SharedCut as My Film, shared with your class.").waitFor();
   await shot(a, 'check-ready');
@@ -246,6 +252,7 @@ test('upload: lanes, a classmate sees it coming in, Wi-Fi drops and comes back, 
   chunks.set(() => false);
   for (const route of chunks.held.splice(0)) await route.abort('internetdisconnected').catch(() => {});
   await a.locator('.importer-status').getByText('Wi\u2011Fi dropped. Waiting to reconnect… Your progress is saved.').waitFor({ timeout: 3000 });
+  await step(a, 'Waiting for Wi\u2011Fi');
   await shot(a, 'upload-offline');
   await a.waitForTimeout(2000);
   await aContext.setOffline(false);
@@ -326,7 +333,8 @@ test('a closed tab resumes from what arrived; Pause and Resume; the guest saves 
   await a.locator('.importer-footer').getByText(/1 of 1\s*clips found/).waitFor();
   await button(a, /^Continue$/).click();
   await step(a, 'Ready to upload');
-  await a.getByText(/1 of 2 clips are already in SharedCut\. .+ left: /).waitFor();
+  await a.locator('.importer-sentence').filter({ hasText: /1 of 2 clips are already in SharedCut\. .+ left: / }).waitFor({ state: 'attached' });
+  await a.getByText('1 of 2 already in SharedCut').waitFor();
   await shot(a, 'resume-check');
 
   chunks.set(() => true);
@@ -435,6 +443,8 @@ test('a member: Welcome, every clip found, the class checkbox, SharedCut not ans
     await step(m, "Now let's find your footage");
     await folder(m).setInputFiles(at('Desktop', 'Interview'));
     await m.locator('.importer-footer').getByText(/2 of 2\s*clips found/).waitFor();
+    await m.locator('.ia-found').waitFor();
+    await m.waitForTimeout(1200);
     await shot(m, 'footage-all-found');
     await button(m, /^Continue$/).click();
     await step(m, 'Ready to upload');
@@ -445,11 +455,13 @@ test('a member: Welcome, every clip found, the class checkbox, SharedCut not ans
     await m.route('**/api/health', page); await m.route('**/api/media/*/upload', page);
     await button(m, /Start upload/).click();
     await m.locator('.importer-status').getByText("SharedCut isn't answering right now. We'll keep trying, and nothing is lost.").waitFor();
+    await step(m, 'Waiting for SharedCut');
     await shot(m, 'upload-not-answering');
     // Back, but out of room.
     await m.unroute('**/api/health'); await m.unroute('**/api/media/*/upload');
     await m.route('**/api/media/*/upload', route => route.request().method() === 'POST' ? route.fulfill({ status: 507, json: { error: 'The server is almost out of disk space.' } }) : route.continue());
     await m.locator('.importer-status').getByText(/SharedCut ran out of room\. Nothing is lost\./).waitFor({ timeout: 30_000 });
+    await step(m, 'SharedCut is out of room');
     await shot(m, 'upload-no-room');
     await m.unroute('**/api/media/*/upload');
     await button(m, /Pause/).click(); await button(m, /Resume/).click();

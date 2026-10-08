@@ -5,6 +5,7 @@
 // motion scenes from useLoops. Each lays out on a 60 × 40 em canvas (.ia-frame) that scales with the stage.
 import { useEffect, useState, type CSSProperties, type ReactNode } from 'react';
 import { animate, motion, useReducedMotion } from 'motion/react';
+import { AlertTriangle, ArrowUp, Check, CloudOff, HardDrive, Laptop, WifiOff } from 'lucide-react';
 
 /** Remounts a motion scene (`key`) every `ms`, 3 times, then rests; with reduced motion `still` is true from the start. */
 function useLoops(ms: number, times = 3) {
@@ -29,6 +30,13 @@ const BARS = [
   { color: '#78AAEF', from: [182, 196, 50, 14], to: [498, 184] }, { color: '#B298F5', from: [110, 178, 40, 12], to: [424, 155] },
   { color: '#87C9AC', from: [46, 214, 90, 10], to: [362, 220] }, { color: '#87C9AC', from: [140, 214, 80, 10], to: [454, 220] },
 ];
+const CLIP_COLORS = ['#78AAEF', '#B298F5', '#EBC876', '#F06A70', '#ED99C4', '#87C9AC'];
+/** SharedCut's timeline panel (x 318–580, y 120–300): V2, V1 and A1, with the logo and wordmark at its foot, below where bars land. */
+const Panel = () => <>
+  <rect x="318" y="120" width="262" height="180" rx="16" fill="#181b1e" stroke="#303438"/>
+  {([['V2', 150, 22], ['V1', 180, 22], ['A1', 216, 18]] as const).map(([name, y, h]) => <g key={name}><rect x="334" y={y} width="230" height={h} rx="6" fill="#202428"/><text x="342" y={y + h / 2 + 3.5} className="ia-track-name">{name}</text></g>)}
+  <image href="/brand/sharedcut-logo-colored.png" x="334" y="255" width="22" height="22"/><text x="364" y="271" className="ia-wordmark">SharedCut<tspan fill="#bce8c7">.</tspan></text>
+</>;
 export function Handoff() {
   const { key, still } = useLoops(7000);
   return <Frame className="ia-handoff"><svg viewBox="0 0 600 400">
@@ -38,17 +46,46 @@ export function Handoff() {
     {[0, 1, 2, 3].map(i => <rect key={i} x={174 + i % 2 * 40} y={116 + Math.floor(i / 2) * 25} width="34" height="19" rx="2" fill="#24292d"/>)}
     <rect x="40" y="174" width="220" height="62" rx="3" fill="#15181a"/><line x1="96" y1="174" x2="96" y2="236" stroke="#e1e6df" strokeOpacity=".5"/>
     {BARS.map((b, i) => <rect key={i} x={b.from[0]} y={b.from[1]} width={b.from[2]} height={b.from[3]} rx="3" fill={b.color} opacity=".18"/>)}
-    <path d="M262 170C285 20 345 20 372 150" fill="none" stroke="#bce8c7" strokeOpacity=".4" strokeWidth="2" strokeDasharray="2 7" strokeLinecap="round"/>
-    <rect x="318" y="70" width="262" height="230" rx="16" fill="#181b1e" stroke="#303438"/>
-    <image href="/brand/sharedcut-logo-colored.png" x="334" y="84" width="24" height="24"/><text x="366" y="102" className="ia-wordmark">SharedCut<tspan fill="#bce8c7">.</tspan></text>
-    {[['V2', 150, 22], ['V1', 180, 22], ['A1', 216, 18]].map(([name, y, h]) => <g key={name}><rect x="334" y={y} width="230" height={h} rx="6" fill="#202428"/><text x="342" y={Number(y) + Number(h) / 2 + 3.5} className="ia-track-name">{name}</text></g>)}
+    <Panel/>
+    {/* Over the panel: the arc ends on V1's left edge, where the clips land. */}
+    <path d="M262 170C285 20 326 24 334 191" fill="none" stroke="#bce8c7" strokeOpacity=".45" strokeWidth="2" strokeDasharray="2 7" strokeLinecap="round"/>
     <g key={key}>
       {BARS.map((b, i) => { const dx = b.to[0] - b.from[0], dy = b.to[1] - b.from[1];
         return <motion.g key={i} initial={still ? false : { x: 0, y: 0 }} animate={{ x: [0, dx * .5, dx, dx], y: [0, 36 - b.from[1], dy + 2, dy] }} transition={{ duration: 1.15, delay: .5 + i * .35, times: [0, .5, .86, 1], ease: 'easeInOut' }}>
           <rect x={b.from[0]} y={b.from[1]} width={b.from[2]} height={b.from[3]} rx="3" fill={b.color}/>
         </motion.g>; })}
-      {!still && <motion.circle cx="346" cy="96" fill="none" stroke="#bce8c7" strokeWidth="2" initial={{ r: 12, opacity: 0 }} animate={{ r: [12, 34], opacity: [.9, 0] }} transition={{ duration: .9, delay: 3.45 }}/>}
+      {!still && <motion.circle cx="345" cy="266" fill="none" stroke="#bce8c7" strokeWidth="2" initial={{ r: 12, opacity: 0 }} animate={{ r: [12, 34], opacity: [.9, 0] }} transition={{ duration: .9, delay: 3.45 }}/>}
     </g>
+  </svg></Frame>;
+}
+
+/** A mint check in a circle that pops in (SVG, centred on cx, cy). */
+const Pop = ({ cx, cy, r, delay }: { cx: number; cy: number; r: number; delay: number }) => {
+  const still = !!useReducedMotion();
+  return <motion.g initial={still ? false : { scale: 0, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ type: 'spring', stiffness: 420, damping: 16, delay }}>
+    <circle cx={cx} cy={cy} r={r} fill="#bce8c7"/><path d={`M${cx - r * .42} ${cy + r * .02}l${r * .3} ${r * .3} ${r * .56}-${r * .6}`} fill="none" stroke="#1a2a1f" strokeWidth={r * .2} strokeLinecap="round" strokeLinejoin="round"/>
+  </motion.g>;
+};
+
+/** A3, once the export is read: the file drops into this window and opens into its clips on SharedCut's tracks. */
+export function Received({ clips }: { clips: number }) {
+  const still = !!useReducedMotion(), bars = BARS.slice(0, Math.max(1, Math.min(BARS.length, clips)));
+  // The panel, moved 149 left and 22 down, is this browser window's page. The file lands at (449, 132) in its coordinates.
+  return <Frame className="ia-received"><svg viewBox="0 0 600 400">
+    <rect x="150" y="60" width="300" height="280" rx="14" fill="#1b1e21" stroke="#485c4d" strokeWidth="1.5"/>
+    <path d="M150 74a14 14 0 0 1 14-14h272a14 14 0 0 1 14 14v12H150z" fill="#24282b"/>
+    {['#d9675f', '#d8ae4f', '#62b46f'].map((c, i) => <circle key={c} cx={166 + i * 12} cy="73" r="3.6" fill={c}/>)}
+    <text x="300" y="77" className="ia-url">sharedcut.com/importer</text>
+    <g transform="translate(-149 22)"><Panel/>
+      {bars.map((b, i) => { const w = b.from[2], h = b.from[3];
+        return <motion.g key={i} initial={still ? false : { x: 449 - (b.to[0] + w / 2), y: 132 - b.to[1], opacity: 0 }} animate={{ x: 0, y: 0, opacity: 1 }} transition={{ type: 'spring', stiffness: 260, damping: 20, delay: 1 + i * .12 }}>
+          <rect x={b.to[0]} y={b.to[1]} width={w} height={h} rx="3" fill={b.color}/>
+        </motion.g>; })}
+    </g>
+    {!still && <motion.g initial={{ y: -150, opacity: 0, scale: 1 }} animate={{ y: [-150, 0, 0], opacity: [0, 1, 0], scale: [1, 1, .4] }} transition={{ duration: 1.1, times: [0, .6, 1], ease: 'easeOut' }}>
+      <path d="M285 135h22l8 8v30h-30z" fill="#e6ebe5" stroke="#b4bbc0"/><path d="M307 135v8h8" fill="#c9d0c8" stroke="#b4bbc0"/><rect x="289" y="155" width="22" height="8" rx="2" fill="#B298F5"/>
+    </motion.g>}
+    <Pop cx={436} cy={128} r={15} delay={still ? 0 : 1.9}/>
   </svg></Frame>;
 }
 
@@ -98,6 +135,16 @@ export function FontScene({ family }: { family: string }) {
   </Frame>;
 }
 
+/** A4, once every font is in: the edit's own title, set in the font just added, on a dark title-safe frame. */
+export function FontDone({ family, text }: { family: string; text: string }) {
+  const still = !!useReducedMotion();
+  return <Frame className="ia-fontdone"><div className="ia-fd-screen"><i/>
+    <motion.b style={{ fontFamily: `"${family}", system-ui, sans-serif` }} initial={still ? false : { opacity: 0, y: '.3em' }} animate={{ opacity: 1, y: 0 }} transition={{ duration: .5, delay: .2, ease: [.22, 1, .36, 1] }}>{text}</motion.b>
+    <small>{family}</small>
+    <motion.span className="ia-fd-check" initial={still ? false : { scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', stiffness: 420, damping: 15, delay: .8 }}><Check/></motion.span>
+  </div></Frame>;
+}
+
 // A5 (8 s), from the first place still missing files: Finder's sidebar item, then the item, dragged into this window.
 const FAVORITES = ['Desktop', 'Documents', 'Downloads', 'Movies', 'Music'];
 export function FinderScene({ sidebar, item, kind, drive }: { sidebar: string; item: string; kind: 'library' | 'drive' | 'folder'; drive: boolean }) {
@@ -121,6 +168,16 @@ export function FinderScene({ sidebar, item, kind, drive }: { sidebar: string; i
   </Frame>;
 }
 
+/** A5, once every clip is found: their names fly into this window, then the count with a check. */
+export function Found({ names, total }: { names: string[]; total: number }) {
+  const still = !!useReducedMotion();
+  return <Frame className="ia-found">
+    <Browser className="ia-found-browser"><motion.div className="ia-found-count" initial={still ? false : { opacity: 0, scale: .8 }} animate={{ opacity: 1, scale: 1 }} transition={{ type: 'spring', stiffness: 300, damping: 18, delay: .5 + Math.min(6, names.length) * .14 }}>
+      <span className="ia-fd-check"><Check/></span><b>{total} of {total}</b><small>clips found</small></motion.div></Browser>
+    {!still && names.slice(0, 6).map((n, i) => <span key={n + i} className="ia-chip" style={{ top: `${9 + i * 3.4}em`, animationDelay: `${.1 + i * .14}s` }}>{n}</span>)}
+  </Frame>;
+}
+
 /** A6: how fast this connection sends. The needle follows each sample on a spring; the number counts up once it settles. */
 export function Gauge({ bytesPerSecond, settled, failed }: { bytesPerSecond: number; settled: boolean; failed?: boolean }) {
   const reduced = useReducedMotion(), mbps = bytesPerSecond / 1e6, share = failed ? 0 : Math.min(1, Math.sqrt(Math.max(0, mbps) / 16)), [shown, setShown] = useState(0);
@@ -137,40 +194,56 @@ export function Gauge({ bytesPerSecond, settled, failed }: { bytesPerSecond: num
   </svg></Frame>;
 }
 
-/** A7: one SharedCut track per lane, each filling with the file it sends; finished files drop into the strip below. */
+/** A7: one SharedCut track (V1–V4) per lane that is sending, its clip filling mint; each finished file snaps onto the timeline below. */
 export type Lane = { id: string; name: string; share: number } | undefined;
-export function Lanes({ lanes, done, total, state }: { lanes: Lane[]; done: { id: string; name: string; size: number }[]; total: number; state: '' | 'offline' | 'dim' }) {
-  return <Frame className={`ia-lanes ${state}`}>
-    <div className="ia-l-tracks">{lanes.map((lane, i) => <div key={i} className="ia-l-track"><b>{i + 1}</b><div className="ia-l-body">{lane && <div key={lane.id} className="ia-l-clip"><span>{lane.name}</span><i style={{ clipPath: `inset(0 ${100 - Math.min(100, lane.share * 100)}% 0 0)` }}><span>{lane.name}</span></i></div>}</div></div>)}</div>
-    <div className="ia-l-done"><small>Sent</small><div className="ia-l-strip">{done.map(d => <span key={d.id} style={{ width: `${d.size / (total || 1) * 100}%` }}/>)}</div></div>
+const WAIT = { offline: [WifiOff, 'Waiting for Wi‑Fi'], server: [CloudOff, 'Waiting for SharedCut'], full: [HardDrive, 'SharedCut is out of room'] } as const;
+export function Lanes({ lanes, done, total, state }: { lanes: Lane[]; done: { id: string; name: string; size: number }[]; total: number; state: '' | 'dim' | keyof typeof WAIT }) {
+  const wait = state && state !== 'dim' ? WAIT[state] : undefined, Icon = wait?.[0];
+  let x = 362;
+  return <Frame className={`ia-lanes${state ? ` ${state === 'dim' ? 'dim' : 'waiting'}` : ''}`}>
+    <div className="ia-l-tracks">{lanes.filter(lane => lane !== undefined).map((lane, i) => <div key={lane.id} className="ia-l-track"><b>V{i + 1}</b><div className="ia-l-body"><div key={lane.id} className="ia-l-clip"><span>{lane.name}</span><i style={{ clipPath: `inset(0 ${100 - Math.min(100, lane.share * 100)}% 0 0)` }}><span>{lane.name}</span></i></div></div></div>)}</div>
+    {/* V1 runs from x 362 to 556 in the panel: each sent file takes its share of it, with its sound on A1. */}
+    <svg className="ia-l-sent" viewBox="318 120 262 180"><Panel/>{done.map((d, i) => { const w = d.size / (total || 1) * 194, at = x; x += w;
+      return <motion.g key={d.id} initial={{ y: -36, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ type: 'spring', stiffness: 300, damping: 20 }}><rect x={at} y="184" width={Math.max(3, w - 2)} height="14" rx="3" fill={CLIP_COLORS[i % CLIP_COLORS.length]}/><rect x={at} y="220" width={Math.max(3, w - 2)} height="10" rx="3" fill="#87C9AC" opacity=".75"/></motion.g>; })}</svg>
+    {wait && Icon && <div className="ia-l-wait"><div className="ia-l-link"><Laptop/><i/><img src="/brand/sharedcut-logo-colored.png" alt=""/></div><span className="ia-l-pill"><Icon/>{wait[1]}</span></div>}
   </Frame>;
 }
 
-/** A8: the sent clips, striped while SharedCut prepares them, turning mint with their picture as each is ready. */
-export function Preparing({ clips }: { clips: { id: string; ready: boolean; failed: boolean; thumbnail?: string }[] }) {
+/** A8: the sent clips, striped while SharedCut prepares them, each with its name and a spinner that turns into a check. */
+export function Preparing({ clips }: { clips: { id: string; name: string; ready: boolean; failed: boolean; thumbnail?: string }[] }) {
   // Tiles sized to the clips (up to six a row): two clips read as two clips, not two specks in an empty panel.
-  return <Frame className="ia-prep"><div className="ia-p-grid" style={{ '--n': Math.max(1, Math.min(6, clips.length)) } as CSSProperties}>{clips.slice(0, 24).map((c, i) => <span key={c.id} className={c.failed ? 'failed' : c.ready ? 'ready' : ''} style={{ transitionDelay: `${(i % 6) * .05}s` }}>{c.ready && c.thumbnail && <img src={c.thumbnail} alt=""/>}</span>)}</div></Frame>;
+  return <Frame className="ia-prep"><div className="ia-p-grid" style={{ '--n': Math.max(1, Math.min(6, clips.length)) } as CSSProperties}>{clips.slice(0, 24).map((c, i) => <figure key={c.id} className={c.failed ? 'failed' : c.ready ? 'ready' : ''}>
+    <span style={{ transitionDelay: `${(i % 6) * .05}s` }}>{c.ready && c.thumbnail && <img src={c.thumbnail} alt=""/>}</span>
+    <figcaption>{c.ready ? <Check className="ia-p-done"/> : c.failed ? <AlertTriangle className="ia-p-failed"/> : <i className="ia-p-spin"/>}<span>{c.name}</span></figcaption>
+  </figure>)}</div></Frame>;
 }
 
-/** A9: the project drops into a Projects grid, glows and gets its check; 20 sparks, unless motion is reduced. */
+/** A9: the project drops into the class's Projects grid, glows and gets its check; 20 sparks, unless motion is reduced. */
+const CLASSMATES = ['Soccer Highlights', 'Science Fair', 'Field Trip', 'Drama Club', 'Morning News'];
+const Strip = ({ bars = 4 }: { bars?: number }) => <svg viewBox="0 0 40 24">{[<rect key="a" x="4" y="8" width="14" height="5" rx="1" fill="#78AAEF"/>, <rect key="b" x="4" y="15" width="24" height="4" rx="1" fill="#87C9AC"/>, <rect key="c" x="19" y="8" width="17" height="5" rx="1" fill="#78AAEF"/>, <rect key="d" x="8" y="3" width="10" height="4" rx="1" fill="#B298F5"/>].slice(0, bars)}</svg>;
 export function Arrived({ name }: { name: string }) {
   const still = !!useReducedMotion();
   return <Frame className="ia-arrived">
-    <div className="ia-a-grid">{[0, 1, 2, 3, 4, 5].map(i => i ? <span key={i} className="ia-a-other"/> : <motion.div key={i} className="ia-a-new" initial={still ? false : { y: -90, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ type: 'spring', stiffness: 260, damping: 18, delay: .2 }}>
-      <div className="ia-a-cover"><svg viewBox="0 0 40 24"><rect x="4" y="8" width="14" height="5" rx="1" fill="#78AAEF"/><rect x="19" y="8" width="17" height="5" rx="1" fill="#78AAEF"/><rect x="8" y="3" width="10" height="4" rx="1" fill="#B298F5"/><rect x="4" y="15" width="24" height="4" rx="1" fill="#87C9AC"/></svg></div><b>{name}</b>
+    <div className="ia-a-grid">{[0, 1, 2, 3, 4, 5].map(i => i ? <span key={i} className="ia-a-other"><span className="ia-a-cover"><Strip bars={2 + i % 2}/></span><b>{CLASSMATES[i - 1]}</b></span> : <motion.div key={i} className="ia-a-new" initial={still ? false : { y: -90, opacity: 0 }} animate={{ y: 0, opacity: 1 }} transition={{ type: 'spring', stiffness: 260, damping: 18, delay: .2 }}>
+      <div className="ia-a-cover"><Strip/></div><b>{name}</b>
       <motion.svg className="ia-a-check" viewBox="0 0 24 24" initial={still ? false : { scale: 0 }} animate={{ scale: 1 }} transition={{ type: 'spring', stiffness: 400, damping: 15, delay: .75 }}><circle cx="12" cy="12" r="11"/><path d="M7 12.5l3.2 3.2L17 9"/></motion.svg>
       {!still && Array.from({ length: 20 }, (_, p) => { const a = p / 20 * Math.PI * 2, r = 70 + (p * 37 % 50); return <motion.i key={p} className="ia-a-spark" style={{ background: ['#bce8c7', '#78AAEF', '#B298F5', '#87C9AC', '#EBC876'][p % 5] }} initial={{ x: 0, y: 0, opacity: 0 }} animate={{ x: Math.cos(a) * r, y: Math.sin(a) * r * .7, opacity: [0, 1, 0], scale: [1, 1, .4] }} transition={{ duration: .9, delay: .8, ease: 'easeOut' }}/>; })}
     </motion.div>)}</div>
   </Frame>;
 }
 
-/** Blocked on a phone or tablet: the phone fades out and a MacBook fades in. */
+/** Blocked on a phone or tablet: the phone fades out and a MacBook, SharedCut on its screen, fades in. */
 export function DeviceSwap() {
-  return <Frame className="ia-swap"><svg viewBox="0 0 600 400">
-    <g className="ia-s-phone"><rect x="255" y="90" width="90" height="180" rx="16" className="ia-shell"/><rect x="263" y="104" width="74" height="146" rx="6" fill="#101214"/><rect x="286" y="96" width="28" height="4" rx="2" fill="#303438"/></g>
-    <g className="ia-s-mac"><rect x="150" y="96" width="300" height="190" rx="12" className="ia-shell"/><rect x="161" y="107" width="278" height="166" rx="4" fill="#101214"/><path d="M128 290h344l-16 14H144z" className="ia-shell"/>
+  return <Frame className="ia-swap"><svg viewBox="0 0 600 400"><defs><radialGradient id="ia-glow"><stop offset="0" stopColor="#bce8c7" stopOpacity=".3"/><stop offset="1" stopColor="#bce8c7" stopOpacity="0"/></radialGradient></defs>
+    <g className="ia-s-phone"><rect x="255" y="90" width="90" height="180" rx="16" className="ia-shell lit"/><rect x="263" y="104" width="74" height="146" rx="6" fill="#101214"/><rect x="263" y="104" width="74" height="146" rx="6" fill="url(#ia-glow)"/><rect x="286" y="96" width="28" height="4" rx="2" fill="#303438"/></g>
+    <g className="ia-s-mac"><rect x="150" y="96" width="300" height="190" rx="12" className="ia-shell lit"/><rect x="161" y="107" width="278" height="166" rx="4" fill="#101214"/><rect x="161" y="107" width="278" height="166" rx="4" fill="url(#ia-glow)"/><path d="M128 290h344l-16 14H144z" className="ia-shell lit"/>
       <image href="/brand/sharedcut-logo-colored.png" x="283" y="166" width="34" height="34"/></g>
   </svg></Frame>;
+}
+
+/** Blocked on a browser too old for the page: a browser window with an update badge. */
+export function BrowserUpdate() {
+  return <Frame className="ia-update"><Browser className="ia-u-browser"><span className="ia-u-badge"><ArrowUp/></span><span className="ia-u-label">Software Update</span></Browser></Frame>;
 }
 
 /** "Reading your project…": clip bars assembling into a strip. */
