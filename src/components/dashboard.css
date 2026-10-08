@@ -38,6 +38,7 @@
 .dash-breadcrumb span { color: #485053; }
 .dash-breadcrumb strong { color: #c0c7c4; font-weight: 450; }
 .dash-top-actions { display: flex; align-items: center; gap: 15px; }
+.dash-top-actions a.button { text-decoration: none; }
 .dash-top-avatar { background: none; border: 0; padding: 0; display: grid; place-items: center; }
 .dash-local-badge { display: inline-flex; gap: 6px; align-items: center; font-size: 8px; font-weight: 550; letter-spacing: 1px; color: #888f8b; white-space: nowrap; }
 .dash-local-badge > span { height: 4px; width: 4px; background: #a7b9ab; border-radius: 50%; }
@@ -459,6 +460,22 @@ input.dash-switch[type=checkbox] { appearance: none; padding: 0; cursor: pointer
 .drive-project-meta { display: flex; justify-content: space-between; padding: 13px 14px; font-size: 10px; color: #a3b1a8; gap: 8px; }
 .drive-options { position: absolute; top: 11px; right: 9px; width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; border: 0; background: none; color: #b4c0b7; }
 .drive-options:hover { background: #ffffff15; }
+.drive-import { position: absolute; inset: auto 0 0; padding: 26px 10px 9px; background: linear-gradient(#11131500, #111315e6 42%); color: #b4bbc0; font-size: 10px; line-height: 1.45; text-shadow: 0 1px 2px #000a; }
+.drive-import > b { display: block; font-size: 11px; font-weight: 450; color: #e1e6df; }
+.drive-import strong { font-weight: 600; }
+.drive-import > b > svg { display: inline; vertical-align: -1px; margin-right: 5px; color: #e8cf8f; }
+.drive-import > small { display: block; font-size: 10px; margin-top: 2px; }
+.drive-import .progress-track { position: relative; height: 5px; margin-top: 7px; background: #ffffff14; }
+.drive-import .progress-track i { position: relative; overflow: hidden; transition: width .4s; }
+.drive-import.uploading .progress-track i:after,.drive-import.processing .progress-track:after { content: ""; position: absolute; inset: 0 0 0 -12px; background: repeating-linear-gradient(-45deg,#ffffff38 0 6px,transparent 6px 12px); animation: clip-preparing-stripes 1s linear infinite; }
+.drive-import.paused .progress-track i { background: #90979c; }
+.drive-import.processing .progress-track i { background: linear-gradient(90deg,#3f8f7a,#6fd0b0); }
+.drive-import.processing .progress-track:after { background: repeating-linear-gradient(-45deg,#ffffff18 0 6px,transparent 6px 12px); }
+.drive-import.stopped { color: #90979c; }
+.drive-import.stopped > b { color: #b4bbc0; }
+.drive-import-chips { display: flex; flex-wrap: wrap; gap: 5px; min-width: 0; }
+.drive-import-chip { display: inline-flex; align-items: center; gap: 4px; margin: -2px 0; padding: 2px 7px 2px 5px; border-radius: 9px; background: #223c2d; color: #bce8c7; animation: snapshot-arrive .22s ease-out both; }
+.drive-import-chip.warn { background: #3a3322; color: #e8cf8f; }
 .drive-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 17px; }
 .drive-crumbs { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; min-width: 0; }
 .drive-crumbs > span { display: flex; align-items: center; gap: 3px; min-width: 0; }

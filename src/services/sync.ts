@@ -307,6 +307,8 @@ export async function connectSession() {
     const { user } = await api<{ user: User | null }>('/auth/me');
     if (session !== generation) return;
     if (!user) { useEditorStore.setState({ session: 'signedOut', serverOnline: true }); return; }
+    // A guest (the importer's name-only sign-in) can only import, so it goes back to the importer before asking for /api/state.
+    if (user.guest) { if (window.location.pathname !== '/importer') window.location.replace('/importer'); return; }
     envelope = await api<Envelope & { state: PersistedState }>('/state');
     if (session !== generation) return;
     if (!envelope.state) throw new Error('The server did not return the project.');

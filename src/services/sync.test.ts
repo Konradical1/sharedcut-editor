@@ -9,7 +9,8 @@ test('sync preserves pending edits, resolves only conflicts, and isolates asynch
   const originalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
   const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) } });
-  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { location: { pathname: '/' } }) });
+  const replaced: string[] = [];
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: Object.assign(new EventTarget(), { location: { pathname: '/', replace: (path: string) => replaced.push(path) } }) });
   const { useEditorStore } = await import('../state/store.ts');
   const { connection } = await import('./api.ts');
   const { connectSession, flushChanges, refreshState, resolveSyncConflict, signOut } = await import('./sync.ts');
@@ -143,6 +144,12 @@ test('sync preserves pending edits, resolves only conflicts, and isolates asynch
     assert.equal(useEditorStore.getState().currentUserId, 'carol', 'Late PUT acknowledgements also belong to the original session.');
     assert.equal(JSON.parse(storage.get('frameline.unsaved.alice')!).draft.projects[0].description, 'Alice in flight');
     await signOut();
+
+    // A guest opening / goes to sharedcut.com/importer; it never asks for /api/state (the server would refuse it anyway).
+    currentUser = { ...user('maya'), guest: true }; gets.push(() => { throw new Error('a guest must not load the workspace'); });
+    await connectSession();
+    assert.deepEqual(replaced, ['/importer']); assert.equal(useEditorStore.getState().session, 'loading'); assert.equal(connection.enabled, false);
+    gets.length = 0;
   } finally {
     currentUser = null;
     await connectSession();

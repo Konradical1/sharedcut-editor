@@ -7,7 +7,7 @@ export interface SharingValue { shared: boolean; classRole: 'Editor' | 'Viewer';
 export default function SharingFields({ users, userId, ownerId, value, onChange, disabled = false, inherited = [], allowCommenter = false }: { users: User[]; userId: string; ownerId: string; value: SharingValue; onChange: (value: SharingValue) => void; disabled?: boolean; inherited?: ProjectMember[]; allowCommenter?: boolean }) {
   const [query, setQuery] = useState('');
   const owner = users.find(u => u.id === ownerId);
-  const results = query.trim() ? users.filter(u => u.id !== ownerId && !value.members.some(m => m.userId === u.id) && `${u.name} ${u.email}`.toLowerCase().includes(query.trim().toLowerCase())).slice(0, 5) : [];
+  const results = query.trim() ? users.filter(u => !u.guest && u.id !== ownerId && !value.members.some(m => m.userId === u.id) && `${u.name} ${u.email}`.toLowerCase().includes(query.trim().toLowerCase())).slice(0, 5) : [];
   const add = (id: string) => { onChange({ ...value, members: [...value.members, { userId: id, role: 'Editor' }] }); setQuery(''); };
   const inheritedPeople = inherited.filter(m => m.userId !== ownerId);
   return <div className="sharing-fields">

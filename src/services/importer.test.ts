@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { assignFonts, checkFile, estimateSeconds, friendlyDuration, lanesFor, matchSources, measureSpeed, nameKey, places, walk, type Found } from './importer.ts';
+import { assignFonts, checkFile, estimateSeconds, friendlyDuration, importCard, lanesFor, matchSources, measureSpeed, nameKey, places, walk, type Found } from './importer.ts';
+import type { FcpImport } from '../state/models.ts';
 
 const file = (name: string, size = 10, lastModified = 1) => new File([new Uint8Array(size)], name, { lastModified });
 const found = (path: string, size?: number, lastModified?: number): Found => ({ path, file: file(path.split('/').at(-1)!, size, lastModified) });
@@ -122,4 +123,24 @@ test('measureSpeed: one stream then up to four, warm-ups dropped; a failed probe
   assert.ok(samples.length > 3 && samples.every(s => s > 0));
   t.mock.method(globalThis, 'fetch', async () => { throw new TypeError('Failed to fetch'); });
   assert.deepEqual(await measureSpeed(3), { single: 1.5e6, parallel: 1.5e6, room: undefined, measured: false });
+});
+
+test('importCard: what a Projects card says in each phase, and nothing a day after done', () => {
+  const now = 1e12, base: FcpImport = { by: 'maya', phase: 'uploading', total: 4.8e9, received: 2.0e9, files: 38, uploaded: 10, ready: 0, failed: 0, rate: 5.2e6, startedAt: now - 6e5, updatedAt: now };
+  const at = (patch: Partial<FcpImport>, who = 'Maya Chen') => importCard({ ...base, ...patch }, who, now);
+  assert.deepEqual(at({}), { phase: 'uploading', title: '**Maya Chen** is importing a project from Final Cut', detail: '41% · 2.0 of 4.8 GB · about 9 min left', progress: 41, label: 'Maya Chen is importing a project from Final Cut, 41 percent' });
+  assert.equal(at({ rate: 0, total: 3e8, received: 1.5e8 }, '')!.title, "You're importing a project from Final Cut");
+  assert.equal(at({ rate: 0, total: 3e8, received: 1.5e8 }, '')!.detail, '50% · 150.0 of 300.0 MB', 'no time left without a measured rate');
+  assert.equal(at({ rate: 1e9 })!.detail, '41% · 2.0 of 4.8 GB · less than a minute left');
+  assert.deepEqual(at({ phase: 'paused' }), { phase: 'paused', title: "Paused · waiting for Maya Chen's Mac", detail: '41%', progress: 41, label: "Import paused at 41 percent, waiting for Maya Chen's Mac" });
+  assert.equal(at({ phase: 'paused' }, '')!.title, 'Paused · waiting for your Mac');
+  assert.deepEqual(at({ phase: 'processing', received: 4.8e9, uploaded: 38, ready: 12 }), { phase: 'processing', title: 'Getting it ready', detail: '12 of 38 clips ready', progress: 1200 / 38, label: 'Getting it ready, 12 of 38 clips ready' });
+  assert.deepEqual(at({ phase: 'stopped' }), { phase: 'stopped', title: 'Import stopped at 41%', detail: 'Maya Chen can finish it at sharedcut.com/importer', progress: undefined, label: 'Import stopped at 41 percent' });
+  assert.equal(at({ phase: 'stopped' }, '')!.detail, 'You can finish it at sharedcut.com/importer');
+  assert.deepEqual(at({ phase: 'ready', doneAt: now - 3_600_000, failed: 3 }), { phase: 'ready', title: 'New from Final Cut', detail: '3 clips need attention', progress: undefined, label: 'New from Final Cut, 3 clips need attention' });
+  assert.equal(at({ phase: 'ready', doneAt: now - 3_600_000, failed: 1 })!.detail, '1 clip needs attention');
+  assert.equal(at({ phase: 'ready', doneAt: now - 3_600_000 })!.label, 'New from Final Cut');
+  assert.equal(at({ phase: 'ready', doneAt: now - 86_400_001 }), undefined, 'a day after it finished the card is an ordinary card');
+  assert.equal(at({ phase: 'ready' }), undefined, 'ready without doneAt shows nothing');
+  assert.equal(at({ total: 0, received: 0 })!.progress, 0);
 });

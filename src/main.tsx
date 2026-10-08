@@ -1,6 +1,3 @@
-import './components/captions.css';
-import { loadCaptionFonts } from './services/fonts';
-void loadCaptionFonts();
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';

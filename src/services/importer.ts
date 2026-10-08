@@ -2,6 +2,7 @@
 // Wi-Fi. Pure functions plus a little DOM glue, and no editor store, so the page loads without the editor. The server
 // shares fontKey, so both decide font matches the same way.
 import { api } from './api.ts';
+import type { FcpImport } from '../state/models.ts';
 
 /** A font family or file name as a match key: lowercase letters and digits. "Futura PT" matches FuturaPT-Bold.otf by prefix. */
 export const fontKey = (family: string) => family.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -200,4 +201,23 @@ export function friendlyDuration(seconds: number) {
   if (seconds < 5400) { const minutes = Math.round(seconds / 60); return `about ${minutes} minute${minutes === 1 ? '' : 's'}`; }
   const tens = Math.round(seconds / 600), hours = Math.floor(tens / 6), minutes = tens % 6 * 10;
   return `about ${hours} hour${hours === 1 ? '' : 's'}${minutes ? ` ${minutes} minutes` : ''}`;
+}
+
+/**
+ * What a Projects card says about a Final Cut import (§8.2), or nothing once it has been done a day. `who` is the
+ * importer's name, '' when it is the viewer; a bold name is wrapped in `**`. `ready` has no overlay: `title` is its chip and
+ * `detail` the "needs attention" chip, if any. `label` is the same news for the card's aria-label.
+ */
+export function importCard(i: FcpImport, who: string, now = Date.now()) {
+  if (i.phase === 'ready' && !(now - (i.doneAt ?? 0) < 86_400_000)) return undefined;
+  const percent = i.total ? Math.floor(i.received * 100 / i.total) : 0, unit = i.total >= 1e9 ? 1e9 : 1e6;
+  const left = i.rate > 0 ? ` · ${friendlyDuration((i.total - i.received) / i.rate).replace(/(\d) minutes?/, '$1 min')} left` : '';
+  const card = (title: string, detail: string, progress: number | undefined, label: string) => ({ phase: i.phase, title, detail, progress, label });
+  switch (i.phase) {
+    case 'uploading': { const title = who ? `**${who}** is importing a project from Final Cut` : "You're importing a project from Final Cut"; return card(title, `${percent}% · ${(i.received / unit).toFixed(1)} of ${(i.total / unit).toFixed(1)} ${unit === 1e9 ? 'GB' : 'MB'}${left}`, percent, `${title.replaceAll('**', '')}, ${percent} percent`); }
+    case 'paused': { const mac = who ? `${who}'s Mac` : 'your Mac'; return card(`Paused · waiting for ${mac}`, `${percent}%`, percent, `Import paused at ${percent} percent, waiting for ${mac}`); }
+    case 'processing': return card('Getting it ready', `${i.ready} of ${i.files} clips ready`, i.files ? i.ready * 100 / i.files : 0, `Getting it ready, ${i.ready} of ${i.files} clips ready`);
+    case 'stopped': return card(`Import stopped at ${percent}%`, `${who || 'You'} can finish it at sharedcut.com/importer`, undefined, `Import stopped at ${percent} percent`);
+    default: { const attention = i.failed ? `${i.failed} clip${i.failed === 1 ? ' needs' : 's need'} attention` : ''; return card('New from Final Cut', attention, undefined, `New from Final Cut${attention ? `, ${attention}` : ''}`); }
+  }
 }

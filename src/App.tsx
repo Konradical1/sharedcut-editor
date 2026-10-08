@@ -1,3 +1,5 @@
+import './components/captions.css';
+import { loadCaptionFonts } from './services/fonts';
 import { lazy, useEffect, useRef, useState, type PointerEvent } from 'react';
 import { MotionConfig } from 'motion/react';
 import { ChevronLeft, ChevronDown, PanelLeft, SlidersHorizontal, Scissors, Palette, AudioLines, ArrowUpRight, History, Camera, Users, MessageSquare, Radio, Settings, Check, Cloud, X, MonitorPlay } from 'lucide-react';
@@ -24,6 +26,7 @@ import { connectSession, signOut, resolveSyncConflict } from './services/sync';
 import { startPlaybackReporting } from './services/playbackHealthStart';
 // keep the media panel wide enough for every icon tab to stay visible (see .edit-media in styles.css)
 const MIN_MEDIA_WIDTH=232;
+void loadCaptionFonts();
 
 const workspaceItems: {id:Workspace;name:string;icon:typeof Scissors}[]=[{id:'edit',name:'Edit',icon:Scissors},{id:'color',name:'Color',icon:Palette},{id:'audio',name:'Audio',icon:AudioLines},{id:'deliver',name:'Deliver',icon:ArrowUpRight}];
 function EditorStatus() {
@@ -99,6 +102,8 @@ export default function App() {
   const session=useEditorStore(s=>s.session);
   const [connectionError,setConnectionError]=useState('');
   const [route,setRoute]=useState(window.location.pathname);
+  // The importer's "Sign in" link is /login?next=/importer: once signed in, go back there. Only that exact value, so it is no open redirect.
+  const [next]=useState(()=>new URLSearchParams(window.location.search).get('next')==='/importer');
   const modal=useEditorStore(s=>s.modal);
   const settings=useEditorStore(s=>s.settings);
   const projects=useEditorStore(s=>s.projects);
@@ -108,6 +113,7 @@ export default function App() {
   const navigate=(path:string)=>{window.history.pushState({},'',path);setRoute(path);};
   useEffect(()=>{const change=()=>setRoute(window.location.pathname);window.addEventListener('popstate',change);return()=>window.removeEventListener('popstate',change);},[]);
   useEffect(()=>initializeEditorServices(),[]);
+  useEffect(()=>{if(next&&session==='ready')window.location.assign('/importer');},[next,session]);
   useEffect(()=>{void connectSession().catch(error=>{setConnectionError(error.message);useEditorStore.setState({session:'error'});});},[]);
   useEffect(()=>{if(projectId&&knownProject){useEditorStore.getState().openProject(projectId);useEditorStore.getState().setSettings({lastProjectId:projectId});}},[projectId,knownProject]);
   // Resume the last project once, when the project list first arrives. Later navigation is the editor's own.
@@ -120,7 +126,7 @@ export default function App() {
   const home=()=>{useEditorStore.getState().setPlaying(false);useEditorStore.getState().setLiveMode('independent');navigate('/');};
   const logout=()=>{void signOut().then(()=>navigate('/login')).catch(error=>useEditorStore.getState().notify(error.message,'error'));};
   return <MotionConfig reducedMotion={settings.reducedMotion?'always':'user'}><div className="app-root">
-    <LazySuspense fallback={<div className="workspace-loading page-loading"><Brand/><span>Loading…</span></div>}>{session==='loading'?<div className="workspace-loading page-loading"><Brand/><span>Connecting to server…</span></div>:session==='error'?<div className="workspace-loading page-loading"><Brand/><span>Could not connect to your studio server.</span><p>{connectionError}</p><Button onClick={()=>window.location.reload()}>Retry connection</Button></div>:session==='signedOut'?<AuthScreen onDone={home}/>:isEditor&&knownProject?<Editor onHome={home}/>:<Dashboard onOpenProject={id=>navigate(`/project/${encodeURIComponent(id)}`)} onOpenAuth={logout}/>}</LazySuspense>
+    <LazySuspense fallback={<div className="workspace-loading page-loading"><Brand/><span>Loading…</span></div>}>{session==='loading'||next&&session==='ready'?<div className="workspace-loading page-loading"><Brand/><span>Connecting to server…</span></div>:session==='error'?<div className="workspace-loading page-loading"><Brand/><span>Could not connect to your studio server.</span><p>{connectionError}</p><Button onClick={()=>window.location.reload()}>Retry connection</Button></div>:session==='signedOut'?<AuthScreen onDone={home}/>:isEditor&&knownProject?<Editor onHome={home}/>:<Dashboard onOpenProject={id=>navigate(`/project/${encodeURIComponent(id)}`)} onOpenAuth={logout}/>}</LazySuspense>
     <LazySuspense fallback={null} quiet>{(modal==='settings'||modal==='timeline-settings')&&<SettingsDialog initialCategory={modal==='timeline-settings'?'Timeline':'General'} onClose={()=>useEditorStore.getState().setModal(null)}/>}</LazySuspense><SnapshotDialog/><Notifications/>
   </div></MotionConfig>;
 }
