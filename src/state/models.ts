@@ -1,10 +1,20 @@
 export type Workspace = 'edit' | 'color' | 'audio' | 'deliver';
 export type Role = 'Owner' | 'Editor' | 'Commenter' | 'Viewer';
-export interface User { id: string; name: string; email: string; initials: string; color: string }
+/** `guest`: a name-only sign-in from sharedcut.com/importer. It can import Final Cut projects and nothing else until it saves its account. */
+export interface User { id: string; name: string; email: string; initials: string; color: string; guest?: boolean }
 export interface Group { id: string; name: string; userIds: string[] }
 export interface ProjectMember { userId: string; role: Role }
 /** `bins` is the project's own folder list once an editor changed one; without it the panel shows the fixed set. */
-export interface Project { bins?: Bin[]; classRole?: 'Editor' | 'Viewer'; id: string; name: string; description: string; shared: boolean; thumbnail: string; modifiedAt: number; duration: number; resolution: string; fps: number; status: 'In progress' | 'In review' | 'Complete'; members: ProjectMember[] }
+export interface Project { bins?: Bin[]; classRole?: 'Editor' | 'Viewer'; id: string; name: string; description: string; shared: boolean; thumbnail: string; modifiedAt: number; duration: number; resolution: string; fps: number; status: 'In progress' | 'In review' | 'Complete'; members: ProjectMember[]; fcpImport?: FcpImport }
+/** A Final Cut import in flight. Only the server writes it (plan, chunks, media status); every Projects screen that can see the project reads it. */
+export interface FcpImport {
+  by: string;                                                     // user id of the importer
+  phase: 'uploading' | 'paused' | 'processing' | 'ready' | 'stopped';
+  total: number; received: number;                                // bytes of the planned files
+  files: number; uploaded: number; ready: number; failed: number; // planned files; fully received; ready or failed; failed
+  rate: number;                                                   // server-measured bytes/s, smoothed
+  startedAt: number; updatedAt: number; doneAt?: number;          // updatedAt moves only when bytes arrive
+}
 export type MediaStatus = 'downloading' | 'uploading' | 'processing' | 'proxy' | 'waveform' | 'thumbnails' | 'ready' | 'failed';
 export interface MediaAsset { preparationStage?: string; importLink?: { url: string; mode: 'video' | 'audio'; quality: 720 | 1080 | 2160 }; matchedSourceUrl?: string; matchedSourceTitle?: string; id: string; projectId: string; name: string; kind: 'video' | 'audio' | 'image'; binId: string; thumbnail: string; duration: number; resolution: string; fps: number; size: string; status: MediaStatus; progress: number; camera?: string; inputProfile?: string; inputGamut?: string; colorRange?: string; colorMatrix?: string; colorTransfer?: string; probeVersion?: number; colorEvidence?: string; cameraMetadataVersion?: number; frameRate?: string; sourcePath?: string; sourceUrl?: string; colorProxyUrl?: string; proxyUrl?: string; proxyVariants?: Record<string, string>; audioProxyUrl?: string; filmstrip?: string; filmstripFrames?: number; filmstripVersion?: number; waveform?: number[]; waveformVersion?: number; hasAudio?: boolean; hasAlpha?: boolean; error?: string }
 export interface Bin { id: string; name: string }

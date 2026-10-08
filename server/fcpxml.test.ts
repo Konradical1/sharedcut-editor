@@ -7,7 +7,8 @@ import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { fcpProjectId, fcpTime, fileUrlPath, importFcpxml, locateSource, parseXml, readFcpBundle } from './fcpxml.ts';
+import { fcpProjectId, fcpTime, fileUrlPath, importFcpxml, importStatus, locateSource, parseXml, readFcpBundle } from './fcpxml.ts';
+import type { FcpImport } from '../src/state/models.ts';
 import { createFrameLineServer } from './index.ts';
 import { evaluateClip } from '../src/services/animation.ts';
 import { getText, validateText } from '../src/services/text.ts';
@@ -525,4 +526,36 @@ test('POST /api/fcp/import: one project per Final Cut project and importer, dele
     app = createFrameLineServer({ dataDir: dir }); await start();
     assert.ok(existsSync(marker), 'the purge left the live media alone');
   } finally { await app.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('fonts a title needs that the library lacks are named, once each; a library font matches by prefix', () => {
+  assert.deepEqual(importFcpxml(sample, 'fcp-t', 'o').missingFonts, ['Futura']);
+  assert.deepEqual(importFcpxml(sample, 'fcp-t', 'o', [{ id: 'FL-1', name: 'Futura PT Bold' }]).missingFonts, []);
+  const twice = fcp(`<title ref="rT" offset="0s" duration="1s">${text('a', 'One', 'font="Barlow" fontSize="80"')}</title><title ref="rT" offset="1s" duration="1s">${text('b', 'Two', 'font="Barlow" fontSize="80"')}</title><title ref="rT" offset="2s" duration="1s">${text('c', 'Three')}</title>`);
+  assert.deepEqual(importFcpxml(twice, 'fcp-t', 'o').missingFonts, ['Barlow'], 'Helvetica stands in for itself');
+});
+
+test('import card: uploading, then processing, then ready; failures counted; paused held until bytes move; a smoothed rate', () => {
+  const plan = { by: 'maya', files: [{ id: 'a', size: 100 }, { id: 'b', size: 50 }] };
+  const tick = (got: Record<string, number>, status: Record<string, string>, previous: FcpImport | undefined, now: number) => importStatus(plan, id => status[id], id => got[id] ?? 0, previous, now);
+  const start = tick({ a: 10 }, {}, undefined, 1000);
+  assert.deepEqual(start, { by: 'maya', phase: 'uploading', total: 150, received: 10, files: 2, uploaded: 0, ready: 0, failed: 0, rate: 0, startedAt: 1000, updatedAt: 1000 });
+  const soon = tick({ a: 30 }, {}, start, 3000);
+  assert.deepEqual([soon.received, soon.updatedAt, soon.rate], [30, 3000, 0], 'under 5 s since the last bytes: no rate sample');
+  const first = tick({ a: 80 }, {}, soon, 8000);
+  assert.equal(first.rate, 10, 'the first sample is taken whole: 50 bytes in 5 s');
+  const second = tick({ a: 100, b: 20 }, { a: 'processing' }, first, 13000);
+  assert.deepEqual([second.rate, second.uploaded, second.received], [9, 1, 120], '0.7 × 10 + 0.3 × 8, rounded');
+  const quiet = tick({ a: 100, b: 20 }, { a: 'processing' }, second, 60000);
+  assert.deepEqual([quiet.updatedAt, quiet.rate], [13000, 9], 'no bytes: nothing moves');
+  const paused = { ...second, phase: 'paused' as const }, stopped = { ...second, phase: 'stopped' as const };
+  assert.equal(tick({ a: 100, b: 20 }, {}, paused, 70000).phase, 'paused');
+  assert.equal(tick({ a: 100, b: 20 }, {}, stopped, 70000).phase, 'stopped');
+  assert.equal(tick({ a: 100, b: 21 }, {}, paused, 70000).phase, 'uploading', 'bytes arrived');
+  assert.equal(tick({ a: 100, b: 10 }, {}, stopped, 70000).phase, 'stopped', 'a discarded partial file is not an arrival');
+  const processing = tick({ a: Infinity, b: Infinity }, { a: 'ready', b: 'processing' }, second, 80000);
+  assert.deepEqual([processing.phase, processing.received, processing.uploaded, processing.ready, processing.doneAt], ['processing', 150, 2, 1, undefined], 'a complete file counts its planned size');
+  const ready = tick({ a: 100, b: 50 }, { a: 'ready', b: 'failed' }, processing, 90000);
+  assert.deepEqual([ready.phase, ready.ready, ready.failed, ready.doneAt, ready.startedAt], ['ready', 2, 1, 90000, 1000]);
+  assert.equal(tick({ a: 100, b: 50 }, { a: 'ready', b: 'failed' }, ready, 99000).doneAt, 90000, 'done once');
 });

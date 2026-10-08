@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import type { Clip, Effect, GradeNode, Keyframe, Marker, MediaAsset, Project, Timeline, Track } from '../src/state/models.ts';
+import type { Clip, Effect, FcpImport, GradeNode, Keyframe, Marker, MediaAsset, Project, Timeline, Track } from '../src/state/models.ts';
 import { boundedAnimationValue } from '../src/services/animation.ts';
 import { blendModeNames } from '../src/services/blendModes.ts';
+import { fontKey } from '../src/services/importer.ts';
 import { defaultTextEffects, defaultTextStyle, type TextDocument, type TextRun, type TextStyle } from '../src/services/text.ts';
 import { transitionDefinitions } from '../src/services/transitions.ts';
 
@@ -134,7 +135,6 @@ const NTSC: Record<string, number> = { '23.98': 24000 / 1001, '29.97': 30000 / 1
 const TEXT_LIMIT = 10_000;      // characters in one SharedCut text box
 // Final Cut video effect → SharedCut effect, with Final Cut's Amount steps (Low, Moderate, High, Max) as percent.
 const EFFECTS: Record<string, { name: string; amount: (value: number) => number }> = { 'Noise Reduction': { name: 'Noise Reduction', amount: v => [25, 50, 75, 100][Math.round(v)] ?? 50 } };
-const fontKey = (family: string) => family.toLowerCase().replace(/[^a-z0-9]/g, '');
 const at = (f: Frame, local: number) => f.origin + (local - f.start) * f.rate;
 const round = (value: number) => Math.round(value * 1e6) / 1e6;
 const child = (node: XmlNode | undefined, name: string) => node?.children.find(c => c.name === name);
@@ -180,11 +180,11 @@ export function importFcpxml(xml: string, projectId: string, userId: string, fon
   const projectFps = firstFormat.fps || 30, projectWidth = firstFormat.width || 1920, projectHeight = firstFormat.height || 1080;
 
   const library = fonts.map(f => ({ id: f.id, key: fontKey(f.name) }));
-  const resolved = new Map<string, string>();
+  const resolved = new Map<string, string>(), missingFonts: string[] = [];
   const fontFor = (family: string) => {
     if (resolved.has(family)) return resolved.get(family)!;
     const key = fontKey(family), match = library.find(f => f.key === key) ?? library.find(f => key && f.key.startsWith(key));
-    if (!match && !/^(helvetica|helvetica neue|arial)$/i.test(family)) gap(`Font "${family}" is not in SharedCut's font library; its titles use a stand-in until the font is added and the project is imported again with rebuild`);
+    if (!match && !/^(helvetica|helvetica neue|arial)$/i.test(family)) { missingFonts.push(family); gap(`Font "${family}" is not in SharedCut's font library; its titles use a stand-in until the font is added and the project is imported again with rebuild`); }
     resolved.set(family, match?.id ?? family);
     return resolved.get(family)!;
   };
@@ -893,5 +893,26 @@ export function importFcpxml(xml: string, projectId: string, userId: string, fon
   const project: Project = { id: projectId, name: nameOf(/^Untitled Project( \d+)?$/i.test(projects[0].attrs.name?.trim() ?? '') ? fallbackName : undefined, projects[0].attrs.name, fallbackName, 'Final Cut project').slice(0, 255), description: 'Imported from Final Cut Pro.', shared: false, thumbnail: '', modifiedAt: Date.now(),
     duration: main.duration, resolution: `${projectWidth} × ${projectHeight}`, fps: projectFps, status: 'In progress', members: [{ userId, role: 'Owner' }] };
   Object.assign(project, { fcpImportHash: createHash('sha256').update(xml).digest('hex'), fcpWarnings: warnings.slice(0, 500) });
-  return { project, media: [...media.values()], timelines, tracks, clips, nodes, warnings };
+  return { project, media: [...media.values()], timelines, tracks, clips, nodes, warnings, missingFonts };
+}
+
+/**
+ * A Final Cut import's card, from its upload plan and what the server holds now. `receivedOf` is a file's bytes on
+ * the server (more than its size once complete). An import paused or stopped stays so until bytes arrive; `rate`
+ * is an average of the bytes/s between arrivals at least 5 s apart, weighted 0.7 to the old value.
+ */
+export function importStatus(plan: { by: string; files: { id: string; size: number }[] }, statusOf: (id: string) => string | undefined, receivedOf: (id: string) => number, previous: FcpImport | undefined, now: number): FcpImport {
+  let total = 0, received = 0, uploaded = 0, ready = 0, failed = 0;
+  for (const file of plan.files) {
+    const got = Math.min(file.size, receivedOf(file.id)); total += file.size; received += got;
+    if (got < file.size) continue;
+    uploaded++; const status = statusOf(file.id);
+    if (status === 'ready' || status === 'failed') { ready++; if (status === 'failed') failed++; }
+  }
+  const files = plan.files.length, arrived = !previous || received > previous.received, waited = previous ? now - previous.updatedAt : 0;
+  const phase = uploaded < files ? (!arrived && (previous!.phase === 'paused' || previous!.phase === 'stopped') ? previous!.phase : 'uploading') : ready < files ? 'processing' : 'ready';
+  const sample = previous && arrived && waited >= 5000 ? (received - previous.received) / waited * 1000 : undefined;
+  const rate = sample === undefined ? previous?.rate ?? 0 : previous!.rate ? .7 * previous!.rate + .3 * sample : sample;
+  return { by: plan.by, phase, total, received, files, uploaded, ready, failed, rate: Math.round(rate), startedAt: previous?.startedAt ?? now, updatedAt: arrived ? now : previous!.updatedAt,
+    ...(phase === 'ready' ? { doneAt: previous?.doneAt ?? now } : {}) };
 }

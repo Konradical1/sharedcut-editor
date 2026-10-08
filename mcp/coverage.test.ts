@@ -23,6 +23,8 @@ export const ROUTES: Record<string, string> = {
   '/api/auth/me': 'session',
   '/api/auth/login': 'session',
   '/api/auth/signup': 'no: accounts are made by people in the browser',
+  '/api/auth/guest': 'no: guests are people typing their name at sharedcut.com/importer; the MCP runs as a signed-in account',
+  '/api/uploads/probe': 'no: the importer page times its own Wi-Fi before an upload; the MCP reports its real upload rate',
   '/api/auth/logout': 'no: it would revoke the session the MCP runs on; the api tool refuses it',
   '/api/auth/profile': 'store:setUserProfile',
   '/api/state': 'session',
@@ -80,6 +82,7 @@ export const ROUTES: Record<string, string> = {
   '/api/resolve/bridge': 'job:resolve',
   '/api/resolve/import': 'job:resolve',
   '/api/fcp/import': 'job:fcp',
+  '/api/fcp/import/(fcp-[a-zA-Z0-9_-]{1,60})': 'job:fcp',
   // Shared libraries
   '/api/sfx': 'job:sfx', // GET search; POST (save a clip) is job sfx-save
   '/api/sfx/(sfx-[a-zA-Z0-9-]+)/(preview|import)': 'job:sfx-add',

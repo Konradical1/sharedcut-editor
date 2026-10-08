@@ -39,9 +39,9 @@ import { createGzip } from 'node:zlib';
 import { Readable, Transform } from 'node:stream';
 import { promisify, isDeepStrictEqual } from 'node:util';
 import { LOCK_TTL, MOVEMENT_FIELDS, lockConflict, type PersistedState } from '../src/services/index.ts';
-import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock } from '../src/state/models.ts';
+import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock, FcpImport } from '../src/state/models.ts';
 import { exportResolveTimeline, importResolve } from './resolve.ts';
-import { fcpProjectId, importFcpxml } from './fcpxml.ts';
+import { fcpProjectId, importFcpxml, importStatus } from './fcpxml.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
 import { depthCapabilities, depthService } from './depth.ts';
@@ -62,6 +62,8 @@ type Entry = Record<string, any>;
 const emptyState = (): PersistedState => ({ projects: [], media: [], timelines: [], clips: [], tracks: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], users: [], currentUserId: '', settings: { ...DEFAULT_SETTINGS } });
 const idIsValid = (id: unknown): id is string => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id);
 const BIN_ID = /^[A-Za-z0-9 _-]{1,64}$/;
+// What a guest (the importer's name-only sign-in) may call, as "METHOD /path": import Final Cut projects and send their footage.
+const GUEST = /^(?:(?:GET|POST) \/api\/fcp\/import|(?:GET|PUT) \/api\/fcp\/import\/fcp-[\w-]{1,60}|(?:GET|POST|PUT) \/api\/media\/[\w-]+\/upload|PUT \/api\/media\/[\w-]+\/thumbnail|GET \/api\/media\/[\w-]+\/files\/\S+|POST \/api\/fonts|POST \/api\/uploads\/probe)$/;
 const mediaKind = (name: string): MediaAsset['kind'] => /\.(wav|mp3|aac|aiff?|flac|m4a|ogg)$/i.test(name) ? 'audio' : /\.(png|jpe?g|webp|gif|tiff?|bmp|heic)$/i.test(name) ? 'image' : 'video';
 const jsonValue = (value: unknown) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 // Structural first: saved entities are shared by reference, so a 10 MB media list compares in
@@ -133,6 +135,8 @@ async function jsonBody(req: IncomingMessage, max = 20 * 1024 * 1024) {
   object(body); safeJson(body); return body;
 }
 async function binaryBody(req: IncomingMessage, max: number, onProgress?: (bytes: number) => void) {
+  // Refused before reading: the sender then gets the 413 instead of a reset connection.
+  if(Number(req.headers['content-length'])>max)fail(413,'File or chunk exceeds the size limit.');
   const chunks:Buffer[]=[];let length=0;
   for await(const chunk of req){length+=chunk.length;if(length>max)fail(413,'File or chunk exceeds the size limit.');chunks.push(chunk);onProgress?.(length);}
   if(!length)fail(400,'Empty upload.');return Buffer.concat(chunks);
@@ -343,10 +347,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     };
     const timelines = pick('timelines', state.timelines, item => ids.has(item.projectId)), timelineIds = new Set(timelines.map(item => item.id));
     // Email addresses only for the viewer and people who share a project with them. Everyone else keeps a
-    // name and avatar, which is all the people picker in SharingFields needs to add them.
+    // name and avatar, which is all the people picker in SharingFields needs to add them. A guest's is made up, so never.
     const known = [...new Set([userId, ...projects.flatMap(project => project.members.map(member => member.userId))])].sort().join('\n');
     let shown = memo!.lists.get('users');
-    if (shown?.source !== allUsers || shown.dependency !== known) { const keep = new Set(known.split('\n')); memo!.lists.set('users', shown = { source: allUsers, dependency: known, list: allUsers.map(user => keep.has(user.id) ? user : { ...user, email: '' }) }); }
+    if (shown?.source !== allUsers || shown.dependency !== known) { const keep = new Set(known.split('\n')); memo!.lists.set('users', shown = { source: allUsers, dependency: known, list: allUsers.map(user => keep.has(user.id) && !user.guest ? user : { ...user, email: '' }) }); }
     return { revision, lockRevision, serverStartedAt, state: { ...state, projects, timelines, tracks: pick('tracks', state.tracks, item => timelineIds.has(item.timelineId), timelines), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, pick(key, state[key as Collection] as Entry[], item => ids.has(item.projectId))])), users: shown.list as User[], currentUserId: userId, settings: account.settings }, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
   };
   // ponytail: sixteen recent views per account, 32 accounts; older clients recover with a full snapshot.
@@ -449,7 +453,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const transaction = (work: () => void) => { try { store.transaction(work); } catch (error) { accountCache = undefined; throw error; } };
   const sounds = soundLibrary(dataDir); sounds.recover();
   const library = projectLibrary(db, () => state.projects, users, () => revision, write => transaction(() => { write(); persist(); }));
-  const roleFor = library.projectRole;
+  // Guests get no class or folder role: a class-shared project is never theirs to rebuild or upload into.
+  const isGuest = (userId: string) => (accountCache ?? accountMap()).byId.get(userId)?.user.guest === true;
+  const roleFor = (project: Project, userId: string) => isGuest(userId) ? project.members.find(m => m.userId === userId)?.role : library.projectRole(project, userId);
   const visibleTo = (project: Project, userId: string) => Boolean(roleFor(project, userId));
   const uploadLocks = new Set<string>();
   // Last time an asset's transient progress was written. Each write once serialised the whole
@@ -465,6 +471,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const PROJECT_RECOVERY_MS = 7 * 86400_000;
   const minFreeGb = Number(process.env.FRAME_LINE_MIN_FREE_GB ?? 5), minFreeBytes = (Number.isFinite(minFreeGb) && minFreeGb >= 0 ? minFreeGb : 5) * 1024 ** 3;
   const freeBytes = () => { const disk = statfsSync(dataDir); return disk.bavail * disk.bsize; };
+  const guestGb = Number(process.env.FRAME_LINE_GUEST_MAX_GB ?? 100), guestMaxGb = Number.isFinite(guestGb) && guestGb >= 0 ? guestGb : 100;
   const requireSpace = (bytes: number) => { const free = freeBytes(); if (free < bytes + minFreeBytes) fail(507, `The server is almost out of disk space (${(free / 1e9).toFixed(1)} GB free, ${(minFreeBytes / 1e9).toFixed(0)} GB kept in reserve). Free space on the server before uploading.`); };
   // Which project asked for each Smart Mask frame preview; the file name alone authorizes nothing.
   const maskPreviews = new Set<string>();
@@ -493,6 +500,34 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       db.prepare('DELETE FROM deleted_projects WHERE id=?').run(row.id);
     } catch (error) { console.error(`Purging deleted project ${row.id} failed:`, error); }
   };
+  // Final Cut imports from sharedcut.com/importer: each one's upload plan (data/fcp/<id>/plan.json, off the project row so
+  // deltas stay small) and its card, project.fcpImport, which only the server writes; every Projects screen reads it.
+  type Plan = { by: string; files: { id: string; size: number; fingerprint: string }[] };
+  const plans = new Map<string, Plan>(), importTicks = new Map<string, number>();
+  const planOf = (projectId: string) => { if (!plans.has(projectId)) try { plans.set(projectId, JSON.parse(readFileSync(join(fcpDir(projectId), 'plan.json'), 'utf8'))); } catch { return undefined; } return plans.get(projectId); };
+  const partBytes = (id: string) => { try { return statSync(join(mediaDir(id), 'upload.part')).size; } catch { return 0; } };
+  const originalBytes = (id: string) => { try { return statSync(originalPath(id)).size; } catch { return undefined; } };
+  /** A Final Cut source as the importer page sees it: whether the server holds it and how many of its bytes. */
+  const sourceRow = (m: MediaAsset, held = true) => { const size = held ? originalBytes(m.id) : undefined; return { id: m.id, name: m.name, kind: m.kind, duration: m.duration, sourcePath: m.sourcePath, uploaded: size !== undefined, received: size ?? (held ? partBytes(m.id) : 0) }; };
+  const importing = (p: Project) => p.fcpImport?.phase === 'uploading' || p.fcpImport?.phase === 'paused';
+  // ponytail: × 1.25 leaves room for the previews made from the footage; measure full-v3 + stream sizes against originals and tune.
+  const outstanding = (except?: string) => state.projects.reduce((sum, p) => p.id !== except && importing(p) ? sum + (p.fcpImport!.total - p.fcpImport!.received) * 1.25 : sum, 0);
+  /** Bytes an import may still use: free disk less the reserve and what other imports have yet to send. */
+  const room = (except?: string) => freeBytes() - minFreeBytes - outstanding(except);
+  const setImport = (projectId: string, fcpImport: FcpImport) => { const previous = state.projects; state.projects = state.projects.map(p => p.id === projectId ? { ...p, fcpImport } : p); try { persist(); } catch (error) { state.projects = previous; throw error; } };
+  // A complete file counts as its planned size (Infinity, capped by importStatus) even when another copy arrived first.
+  const importNow = (projectId: string, plan: Plan, previous?: FcpImport) => {
+    const statuses = new Map(state.media.filter(m => m.projectId === projectId).map(m => [m.id, m.status]));
+    return importStatus(plan, id => statuses.get(id), id => existsSync(originalPath(id)) ? Infinity : partBytes(id), previous, Date.now());
+  };
+  /** Brings a project's import card up to date: chunks at most every 5 s; a file that completed or changed status at once. */
+  const importTick = (projectId: string, force = false) => {
+    const project = state.projects.find(p => p.id === projectId), previous = project?.fcpImport, plan = planOf(projectId), now = Date.now();
+    if (!previous || !plan || (previous.phase === 'stopped' && !force) || (!force && now - (importTicks.get(projectId) ?? 0) < 5000)) return;
+    if (!force) importTicks.set(projectId, now);
+    // The card is a by-product: failing to save it never fails the chunk or status change that moved it.
+    try { const next = importNow(projectId, plan, previous); if (!same(next, previous)) setImport(projectId, next); } catch (error) { console.error('Import status save failed:', error); }
+  };
   // Every revision wakes every client into fetching state, so progress alone saves at most once a second
   // per asset; the latest value lands when the second is up, or sooner with any other change.
   const progressSaves = new Map<string, { at: number; patch?: Partial<Asset>; timer?: ReturnType<typeof setTimeout> }>();
@@ -508,6 +543,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const merged = { ...saved.patch, ...patch }; saved.patch = undefined; if ('progress' in merged) saved.at = Date.now();
     const previous = state.media; state.media = state.media.map(asset => asset.id === id ? { ...asset, ...merged } : asset);
     try { persist(); } catch (error) { state.media = previous; throw error; }
+    if ('status' in merged) importTick(state.media.find(asset => asset.id === id)!.projectId, true);
   };
   const flushProgress = () => { for (const [id, saved] of progressSaves) if (saved.patch) updateAsset(id, {}); };
   const updateJob = (id: string, patch: Partial<RenderJob>, save = true) => { if (!state.renderJobs.some(job => job.id === id)) return; const previous = state.renderJobs; state.renderJobs = state.renderJobs.map(job => job.id === id ? { ...job, ...patch } : job); try { if (save) persist(); else touch(); } catch (error) { state.renderJobs = previous; throw error; } };
@@ -757,7 +793,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     if (!same(incoming.media, currentView.media) || !same(incoming.renderJobs, currentView.renderJobs)) fail(400, 'Use the media and render endpoints to change files and jobs.');
     object(incoming.settings); for (const value of Object.values(incoming.settings)) if (!['string', 'number', 'boolean'].includes(typeof value)) fail(400, 'Invalid setting.');
     const existing = new Map(state.projects.map(project => [project.id, project])); const allowed = new Set(currentView.projects.map(project => project.id)); const nextProjectIds = new Set(incoming.projects.map(project => project.id));
-    const projects = incoming.projects.map(project => {
+    const projects = incoming.projects.map(sent => {
+      // The import card is the server's. A client's copy, stale or forged, is dropped before any role or lock comparison.
+      const { fcpImport: _, ...rest } = sent, card = existing.get(sent.id)?.fcpImport, project: Project = card ? { ...rest, fcpImport: card } : rest;
       const old = existing.get(project.id);
       if (!old && library.hasLocation(project.id)) fail(400, 'This project ID is reserved by a deleted project. Create a new project instead.');
       if (old && !allowed.has(project.id)) fail(403, 'Project is inaccessible.');
@@ -839,6 +877,21 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     return true;
   }
 
+  // Sign-in rate limits: at most `max` calls per `ms` for one key.
+  const limit = (key: string, max: number, ms: number, message: string) => {
+    const now = Date.now(); let attempts = authAttempts.get(key);
+    if (!attempts || attempts.reset < now) authAttempts.set(key, attempts = { count: 0, reset: now + ms });
+    if (++attempts.count > max) fail(429, message);
+  };
+  // The installation access code (FRAME_LINE_SIGNUP_CODE), when one is set.
+  const codeOk = (value: unknown) => { const code = process.env.FRAME_LINE_SIGNUP_CODE; return !code || (typeof value === 'string' && timingSafeEqual(createHash('sha256').update(value).digest(), createHash('sha256').update(code).digest())); };
+  const openSession = (req: IncomingMessage, res: ServerResponse, account: Account, status: number) => {
+    const now = Date.now(); db.prepare('DELETE FROM sessions WHERE expiresAt<=?').run(now);
+    const token = randomBytes(32).toString('base64url'); db.prepare('INSERT INTO sessions(token,userId,expiresAt) VALUES(?,?,?)').run(createHash('sha256').update(token).digest('hex'), account.user.id, now + 30 * 86400_000);
+    const secure = !!(req.socket as unknown as { encrypted?: boolean }).encrypted || (process.env.FRAME_LINE_TRUST_PROXY === '1' && req.headers['x-forwarded-proto'] === 'https');
+    res.setHeader('Set-Cookie', `frameline_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000${secure ? '; Secure' : ''}`); send(res, status, { user: account.user });
+  };
+
   const server = createServer(async (req, res) => {
     res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'same-origin'); res.setHeader('X-Frame-Options', 'DENY');
     try {
@@ -855,23 +908,37 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       }
       if (path === '/api/uploads/info' && method === 'GET') { requireAccount(req); const address = server.address(); send(res, 200, { localUrl: `http://localhost:${typeof address === 'object' && address ? address.port : 4310}`, maxUploadBytes }); return; }
       if (path === '/api/auth/me' && method === 'GET') { send(res, 200, { user: authenticated(req)?.user ?? null, registrationRequiresCode: Boolean(process.env.FRAME_LINE_SIGNUP_CODE) }); return; }
+      if (path === '/api/auth/guest' && method === 'POST') {
+        // The importer's name-only sign-in: an ordinary account that may only import (GUEST) and holds no class role (roleFor).
+        const body = await jsonBody(req, 4096), address = clientAddress(req);
+        // A whole class sits behind one school address.
+        limit(`network:${address}`, 120, 60_000, 'Too many sign-in requests. Try again in a minute.'); limit(`guest:${address}`, 60, 3_600_000, 'Too many tries from this network. Wait a few minutes, then try again.');
+        if (!codeOk(body.inviteCode)) fail(403, 'Enter the class code to import.');
+        const current = authenticated(req); if (current) { send(res, 200, { user: current.user }); return; }
+        const name = textField(body.name ?? '', 80).trim() || fail(400, 'Enter your name.'), id = `user-${randomUUID()}`, salt = randomBytes(16).toString('hex');
+        const color = typeof body.color === 'string' && /^#[0-9a-f]{6}$/i.test(body.color) ? body.color : '#F06A70';
+        // No password anyone knows: a guest lives in this browser's cookie, and "Save my account" upgrades it in place.
+        // .invalid is reserved (RFC 2606), so the email never collides with a real one.
+        const account: Account = { user: { id, name, email: `${id}@guest.invalid`, initials: initials(name), color, guest: true },
+          salt, hash: (await scrypt(randomBytes(32), salt, 64) as Buffer).toString('hex'), settings: { ...DEFAULT_SETTINGS } };
+        saveAccount(account); persist(); openSession(req, res, account, 201); return;
+      }
       if (['/api/auth/signup', '/api/auth/login'].includes(path) && method === 'POST') {
         const body = await jsonBody(req, 16 * 1024); const email = textField(body.email, 254, true).trim().toLowerCase(); const password = textField(body.password, 1024, true);
         // Keyed by the real client and the email: a stranger hammering an account only locks themselves out.
-        const address = clientAddress(req); const now = Date.now(); const networkKey = `network:${address}`; let networkAttempts = authAttempts.get(networkKey);
-        if (!networkAttempts || networkAttempts.reset < now) { networkAttempts = { count: 0, reset: now + 60_000 }; authAttempts.set(networkKey, networkAttempts); }
-        if (++networkAttempts.count > 120) fail(429, 'Too many sign-in requests. Try again in a minute.');
-        const attemptKey = `account:${address}:${email}`; let attempts = authAttempts.get(attemptKey);
-        if (!attempts || attempts.reset < now) { attempts = { count: 0, reset: now + 15 * 60_000 }; authAttempts.set(attemptKey, attempts); }
-        if (++attempts.count > 20) fail(429, 'Too many sign-in attempts. Try again in 15 minutes.');
+        const address = clientAddress(req), attemptKey = `account:${address}:${email}`;
+        limit(`network:${address}`, 120, 60_000, 'Too many sign-in requests. Try again in a minute.'); limit(attemptKey, 20, 15 * 60_000, 'Too many sign-in attempts. Try again in 15 minutes.');
         let account: Account;
         if (path.endsWith('/signup')) {
-          const signupCode = process.env.FRAME_LINE_SIGNUP_CODE;
-          if (signupCode && (typeof body.inviteCode !== 'string' || !timingSafeEqual(createHash('sha256').update(body.inviteCode).digest(), createHash('sha256').update(signupCode).digest()))) fail(403, 'Enter the installation access code to create an account.');
+          // "Save my account" from the importer: the guest becomes a full account under the same id, so its projects stay its own.
+          // Without upgradeGuest a signup is a new account, so a classmate on a shared Mac never takes over someone's guest.
+          const guest = body.upgradeGuest === true ? authenticated(req) : undefined;
+          if (guest && !guest.user.guest) fail(409, "You're already signed in.");
+          if (!guest && !codeOk(body.inviteCode)) fail(403, 'Enter the installation access code to create an account.');
           if (password.length < 8) fail(400, 'Use a password with at least 8 characters.');
           const fields = profile(body); if (db.prepare('SELECT id FROM accounts WHERE email=?').get(fields.email)) fail(409, 'An account already uses that email.');
           const salt = randomBytes(16).toString('hex'); const hash = (await scrypt(password, salt, 64) as Buffer).toString('hex');
-          account = { user: { id: `user-${randomUUID()}`, ...fields, color: '#F06A70' }, salt, hash, settings: { ...DEFAULT_SETTINGS } };
+          account = guest ? { ...guest, user: { ...(({ guest: _, ...user }) => user)(guest.user), ...fields }, salt, hash } : { user: { id: `user-${randomUUID()}`, ...fields, color: '#F06A70' }, salt, hash, settings: { ...DEFAULT_SETTINGS } };
           try { saveAccount(account); } catch (error) { if (String(error).includes('UNIQUE')) fail(409, 'An account already uses that email.'); throw error; }
           persist();
         } else {
@@ -879,10 +946,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const hash = await scrypt(password, candidate?.salt ?? 'frameline-missing-user-salt', 64) as Buffer;
           if (!candidate || !timingSafeEqual(Buffer.from(candidate.hash, 'hex'), hash)) fail(401, 'Email or password is incorrect.'); account = candidate!;
         }
-        authAttempts.delete(attemptKey); db.prepare('DELETE FROM sessions WHERE expiresAt<=?').run(now);
-        const token = randomBytes(32).toString('base64url'); db.prepare('INSERT INTO sessions(token,userId,expiresAt) VALUES(?,?,?)').run(createHash('sha256').update(token).digest('hex'), account.user.id, now + 30 * 86400_000);
-        const secure = !!(req.socket as unknown as { encrypted?: boolean }).encrypted || (process.env.FRAME_LINE_TRUST_PROXY === '1' && req.headers['x-forwarded-proto'] === 'https');
-        res.setHeader('Set-Cookie', `frameline_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000${secure ? '; Secure' : ''}`); send(res, path.endsWith('/signup') ? 201 : 200, { user: account.user }); return;
+        authAttempts.delete(attemptKey); openSession(req, res, account, path.endsWith('/signup') ? 201 : 200); return;
       }
       if (path === '/api/auth/logout' && method === 'POST') {
         const hash = sessionHash(req); const account = authenticated(req); db.prepare('DELETE FROM sessions WHERE token=?').run(hash);
@@ -892,6 +956,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       }
       if (path.startsWith('/api/')) {
         const account = requireAccount(req); const userId = account.user.id;
+        // A guest brings Final Cut projects in and nothing else; saving the account lifts this.
+        if (account.user.guest && !GUEST.test(`${method} ${path}`)) fail(403, 'Save your account to do that.');
         if (path === '/api/sfx' && method === 'GET') {
           const query = textField(url.searchParams.get('q') ?? '', 200), category = textField(url.searchParams.get('category') ?? '', 50);
           send(res, 200, await sounds.search(query, category)); return;
@@ -941,6 +1007,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const name = textField(new URL(req.url!, 'http://localhost').searchParams.get('name'), 100, true).trim();
           const data = await binaryBody(req, 15 * 1024 * 1024);
           if (fonts.list().length >= 1000) fail(409, 'The shared font library is full.');
+          if (account.user.guest && fonts.countBy(userId) >= 20) fail(403, 'Guests can add up to 20 fonts.');
           try { send(res, 201, { font: fonts.add(data, name, userId) }); } catch (error) { fail(400, (error as Error).message); } return;
         }
         const fontRoute = /^\/api\/fonts\/(FL-[a-f0-9]{32})$/.exec(path);
@@ -1176,12 +1243,18 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const previous=state;state=next;try{persist();}catch(error){state=previous;throw error;}
           send(res,201,{projectId:id,files:imported!.files,warnings:imported!.warnings,media:imported!.media});return;
         }
+        if (path === '/api/fcp/import' && method === 'GET') {
+          // The caller's own imports that still have bytes to send: the importer page offers to continue them.
+          const imports = state.projects.filter(p => p.fcpImport && ['uploading', 'paused', 'stopped'].includes(p.fcpImport.phase) && p.members.some(m => m.userId === userId && m.role === 'Owner'));
+          send(res, 200, { imports: imports.sort((a, b) => b.fcpImport!.updatedAt - a.fcpImport!.updatedAt).slice(0, 20).map(p => ({ projectId: p.id, name: p.name, fcpImport: p.fcpImport })) }); return;
+        }
         if (path === '/api/fcp/import' && method === 'POST') {
           // The body is the raw FCPXML (JSON would escape a 50 MB XML). Without a projectId the server picks it: one per
           // Final Cut project and importer (fcpProjectId), so a rerun resumes its uploads and a re-export rebuilds it
           // (rebuild=1 re-converts the edit, keeping its uploaded media); fresh=1 imports a new copy. A project imported
-          // before ids were per importer keeps its id, the hash of its XML.
-          const rebuild = url.searchParams.get('rebuild') === '1', xml = (await binaryBody(req, 128 * 1024 * 1024)).toString('utf8');
+          // before ids were per importer keeps its id, the hash of its XML. dry=1 says what an import would do and writes
+          // nothing; class=1 shares a new project with the class, as every guest import is.
+          const rebuild = url.searchParams.get('rebuild') === '1', dry = url.searchParams.get('dry') === '1', xml = (await binaryBody(req, 128 * 1024 * 1024)).toString('utf8');
           const legacy = 'fcp-' + createHash('sha256').update(xml).digest('hex').slice(0, 32), mine = (projectId: string) => state.projects.some(p => p.id === projectId && roleFor(p, userId));
           const id = url.searchParams.get('projectId') || (url.searchParams.get('fresh') === '1' ? `fcp-${randomUUID().replace(/-/g, '')}` : mine(legacy) ? legacy : fcpProjectId(xml, userId));
           if (!idIsValid(id) || !id.startsWith('fcp-') || id.length > 64) fail(400, 'Invalid import project ID.');
@@ -1191,6 +1264,15 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const existing = state.projects.find(p => p.id === id) as (Project & { fcpImportHash?: string }) | undefined;
           const { fcpImportHash, fcpWarnings } = imported!.project as Project & { fcpImportHash: string; fcpWarnings: string[] };
           if (!existing && rebuild) fail(404, 'There is no imported project to rebuild for this Final Cut project. Import it without rebuild, or name the project to rebuild.');
+          // A guest may own 5 Final Cut projects; rebuilding or resuming one of them is not a new one.
+          const atLimit = () => account.user.guest === true && state.projects.filter(p => p.id.startsWith('fcp-') && p.members.some(m => m.userId === userId && m.role === 'Owner')).length >= 5;
+          if (dry) {
+            if (existing) { requireProject(id, userId, true); if (!existing.fcpImportHash) fail(409, 'That project was not imported from Final Cut.'); }
+            // A deleted project's files are its backup's, never this import's.
+            const deleted = !existing && reserved(id);
+            send(res, 200, { projectId: id, name: existing?.name ?? imported!.project.name, duration: imported!.project.duration, state: existing ? existing.fcpImportHash === fcpImportHash ? 'resume' : 'changed' : deleted ? 'deleted' : 'new',
+              media: imported!.media.map(m => sourceRow(m, !deleted)), missingFonts: imported!.missingFonts, warnings: imported!.warnings, limit: !existing && !deleted && atLimit() }); return;
+          }
           // The deleted copy's media ids would come back, and purging it later would take the new project's footage.
           if (!existing && reserved(id)) fail(409, 'This Final Cut project was deleted and can still be restored. Restore it from the deleted projects, or import a fresh copy.');
           if (existing) {
@@ -1198,9 +1280,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             if (!existing.fcpImportHash) fail(409, 'That project was not imported from Final Cut.');
             if (!rebuild) {
               if (existing.fcpImportHash !== fcpImportHash) fail(409, 'That project already exists with a different Final Cut XML. Import it with rebuild to replace its edit.');
-              send(res, 200, { projectId: id, warnings: imported!.warnings, media: state.media.filter(m => m.projectId === id) }); return;
+              send(res, 200, { projectId: id, warnings: imported!.warnings, missingFonts: imported!.missingFonts, media: state.media.filter(m => m.projectId === id) }); return;
             }
           }
+          if (!existing && atLimit()) fail(403, 'Guests can import up to 5 projects. Save your account to import more.');
           let next: PersistedState;
           if (existing) {
             // The edit it replaces stays restorable as a snapshot; comments on clips that no longer exist move to the timeline.
@@ -1212,13 +1295,58 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
               media: [...state.media, ...imported!.media.filter(m => !known.has(m.id))], timelines: [...others(state.timelines), ...imported!.timelines],
               tracks: [...state.tracks.filter(t => !oldTimelines.has(t.timelineId)), ...imported!.tracks], clips: [...others(state.clips), ...imported!.clips], nodes: [...others(state.nodes), ...imported!.nodes],
               comments: state.comments.map(c => c.projectId === id && c.clipId && !clipIds.has(c.clipId) ? (({ clipId: _, ...rest }) => rest)(c) : c), snapshots: [...state.snapshots, snapshot] } as PersistedState;
-          } else next = { ...state, projects: [...state.projects, imported!.project], ...Object.fromEntries(['media', 'timelines', 'tracks', 'clips', 'nodes'].map(k => [k, [...(state as any)[k], ...(imported as any)[k]]])) } as PersistedState;
+          } else {
+            const project = account.user.guest || url.searchParams.get('class') === '1' ? { ...imported!.project, shared: true, classRole: 'Editor' as const } : imported!.project;
+            next = { ...state, projects: [...state.projects, project], ...Object.fromEntries(['media', 'timelines', 'tracks', 'clips', 'nodes'].map(k => [k, [...(state as any)[k], ...(imported as any)[k]]])) } as PersistedState;
+          }
           for (const key of ['projects', 'timelines', 'tracks', 'clips', 'nodes', 'comments', 'snapshots']) validateCollection((next as any)[key], key, holds(key));
           validateRelations(next);
           mkdirSync(fcpDir(id), { recursive: true, mode: 0o700 }); writeFileSync(join(fcpDir(id), 'project.fcpxml'), xml, { mode: 0o600 });
           const previous = state; state = next; try { persist(); } catch (error) { state = previous; throw error; }
-          send(res, existing ? 200 : 201, { projectId: id, warnings: imported!.warnings, media: state.media.filter(m => m.projectId === id) }); return;
+          send(res, existing ? 200 : 201, { projectId: id, warnings: imported!.warnings, missingFonts: imported!.missingFonts, media: state.media.filter(m => m.projectId === id) }); return;
         }
+        const importRoute = /^\/api\/fcp\/import\/(fcp-[a-zA-Z0-9_-]{1,60})$/.exec(path);
+        // Getting it ready and Done poll this; Continue upload reads every source from it instead of the XML.
+        if (importRoute && method === 'GET') {
+          const project = requireProject(importRoute[1], userId);
+          const media = state.media.filter(m => m.projectId === project.id && m.sourcePath).map(m => ({ ...sourceRow(m), status: m.status, progress: m.progress, ...((m as Asset).error && { error: (m as Asset).error }), ...(m.thumbnail && { thumbnail: m.thumbnail }) }));
+          send(res, 200, { projectId: project.id, name: project.name, fcpImport: project.fcpImport ?? null, media }); return;
+        }
+        // The plan: which files the importer is about to send. It checks room before a byte moves and starts the card.
+        if (importRoute && method === 'PUT') {
+          const project = requireProject(importRoute[1], userId, true) as Project & { fcpImportHash?: string };
+          if (!project.fcpImportHash) fail(409, 'That project was not imported from Final Cut.');
+          const body = await jsonBody(req, 4 * 1024 * 1024);
+          if (!Array.isArray(body.files) || !body.files.length || body.files.length > 5000) fail(400, 'Plan between 1 and 5,000 files.');
+          const media = new Set(state.media.filter(m => m.projectId === project.id).map(m => m.id)), seen = new Set<string>();
+          const files = (body.files as unknown[]).map(file => {
+            object(file); const id = textField(file.id, 160, true);
+            if (!media.has(id) || seen.has(id)) fail(400, 'Every planned file must be media of this project, once.'); seen.add(id);
+            if (!Number.isSafeInteger(file.size) || file.size < 1) fail(400, 'Invalid file size.');
+            if (file.size > maxUploadBytes) fail(413, `Files must be smaller than ${Math.floor(maxUploadBytes / 1024 ** 3)} GB.`);
+            return { id, size: file.size as number, fingerprint: textField(file.fingerprint, 300, true) };
+          });
+          if (account.user.guest) {
+            // What the guest's imports hold or plan to: a new plan never frees a file that already arrived.
+            const own = new Set(state.projects.filter(p => p.members.some(m => m.userId === userId && m.role === 'Owner')).map(p => p.id));
+            const planned = new Map([...own].flatMap(id => id === project.id ? files : planOf(id)?.files ?? []).map(f => [f.id, f.size]));
+            if (state.media.reduce((sum, m) => own.has(m.projectId) ? sum + (originalBytes(m.id) ?? planned.get(m.id) ?? 0) : sum, 0) > guestMaxGb * 1024 ** 3) fail(403, `Guests can upload up to ${guestMaxGb} GB. Save your account to upload more.`);
+          }
+          // A different copy of a file restarts cleanly instead of being refused as "differs from the unfinished upload".
+          const differs = (f: Plan['files'][number]) => { try { return !same(JSON.parse(readFileSync(join(mediaDir(f.id), 'upload.json'), 'utf8')), { size: f.size, fingerprint: f.fingerprint }); } catch { return false; } };
+          const dropped = new Set(files.filter(f => !existsSync(originalPath(f.id)) && !uploadLocks.has(f.id) && differs(f)).map(f => f.id));
+          const need = files.reduce((sum, f) => sum + (existsSync(originalPath(f.id)) ? 0 : Math.max(0, f.size - (dropped.has(f.id) ? 0 : partBytes(f.id)))), 0) * 1.25, free = room(project.id);
+          if (need > 0 && need > free) { send(res, 507, { error: `SharedCut needs about ${(need / 1e9).toFixed(1)} GB for this import and has ${(Math.max(0, free) / 1e9).toFixed(1)} GB free.`, needed: Math.ceil(need), room: Math.floor(free) }); return; }
+          for (const id of dropped) for (const name of ['upload.part', 'upload.json']) rmSync(join(mediaDir(id), name), { force: true });
+          const plan = { by: userId, files };
+          mkdirSync(fcpDir(project.id), { recursive: true, mode: 0o700 }); writeFileSync(join(fcpDir(project.id), 'plan.json'), JSON.stringify(plan), { mode: 0o600 }); plans.set(project.id, plan);
+          // Re-planning an import that is still going keeps its start; anything else starts over.
+          const previous = project.fcpImport, fcpImport = importNow(project.id, plan, previous && importing(project) ? { ...previous, phase: 'uploading', updatedAt: Date.now() } : undefined);
+          setImport(project.id, fcpImport);
+          send(res, 200, { fcpImport, files: files.map(f => { const size = originalBytes(f.id); return { id: f.id, received: size ?? partBytes(f.id), complete: size !== undefined }; }) }); return;
+        }
+        // The importer times its Wi-Fi with these before an upload; the bytes are dropped. `project` leaves that import out of `room`.
+        if (path === '/api/uploads/probe' && method === 'POST') { const bytes = (await binaryBody(req, 8 * 1024 * 1024)).length; send(res, 200, { bytes, room: Math.floor(room(url.searchParams.get('project') ?? undefined)) }); return; }
         const exchange=/^\/api\/projects\/([a-zA-Z0-9_-]+)\/resolve-export$/.exec(path);
         if(exchange&&method==='GET') {
           const project=requireProject(exchange[1],userId),timeline=state.timelines.find(t=>t.projectId===project.id&&t.id===url.searchParams.get('timelineId'));
@@ -1317,6 +1445,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
               // Said plainly: an import script names the file and goes on with the rest.
               if(body.size===0)fail(400,'The file is empty.');if(typeof body.size==='number'&&body.size>maxUploadBytes)fail(413,`Files must be smaller than ${Math.floor(maxUploadBytes/1024**3)} GB.`);
               numberField(body.size,1,maxUploadBytes);if(!Number.isSafeInteger(body.size))fail(400,'Invalid file size.');textField(body.fingerprint,300,true);
+              // A guest sends only what its import planned: that is what makes the guest byte cap real.
+              if(account.user.guest&&!planOf(asset.projectId)?.files.some(f=>f.id===id&&f.size===body.size))fail(403,'Start this upload from sharedcut.com/importer.');
               if(!staging&&existsSync(originalPath(id))){send(res,200,{complete:true});return;}
               if(staging&&body.size!==JSON.parse(readFileSync(replacement,'utf8')).size)fail(409,'The selected file differs from the replacement. Choose Replace Media again.');
               if(uploadLocks.has(id))fail(409,'Upload is busy.');
@@ -1360,6 +1490,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
                   progressAt.set(id, Date.now());
                   updateAsset(id, { progress: Math.min(99, Math.floor((offset + chunk.length) / metadata.size * 100)) });
                 }
+                importTick(asset.projectId, complete);
                 send(res,complete?202:200,{offset:offset+chunk.length,complete});return;
               } finally {uploadLocks.delete(id);}
             }
@@ -1792,7 +1923,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   });
   // cloudflared pools idle origin connections for 90 s. Node's 5 s default closed them under it and reset requests.
   server.requestTimeout = 60 * 60_000; server.keepAliveTimeout = 120_000; server.headersTimeout = 121_000;
-  const housekeeping = setInterval(() => { expired(); purgeExpiredProjects(); timelinePreviews.sweep(); const now = Date.now(); reportsTick(now); for (const [key, value] of authAttempts) if (value.reset < now) authAttempts.delete(key); for (const [res, subscriber] of subscribers) { if (!db.prepare('SELECT token FROM sessions WHERE token=? AND expiresAt>?').get(subscriber.session, now)) { res.end(); subscribers.delete(res); } else res.write(': heartbeat\n\n'); } }, 10_000); housekeeping.unref();
+  // An import whose bytes stopped for 90 s reads paused on its card; its next chunk makes it uploading again.
+  const pauseImports = () => { const now = Date.now(); for (const p of state.projects) if (p.fcpImport?.phase === 'uploading' && now - p.fcpImport.updatedAt > 90_000) setImport(p.id, { ...p.fcpImport, phase: 'paused' }); };
+  const housekeeping = setInterval(() => { try { pauseImports(); } catch (error) { console.error('Pausing idle imports failed:', error); } expired(); purgeExpiredProjects(); timelinePreviews.sweep(); const now = Date.now(); reportsTick(now); for (const [key, value] of authAttempts) if (value.reset < now) authAttempts.delete(key); for (const [res, subscriber] of subscribers) { if (!db.prepare('SELECT token FROM sessions WHERE token=? AND expiresAt>?').get(subscriber.session, now)) { res.end(); subscribers.delete(res); } else res.write(': heartbeat\n\n'); } }, 10_000); housekeeping.unref();
   purgeExpiredProjects();
   // Settle what the restart interrupted. Saved entities are frozen, so every change is a new object,
   // and a list is replaced only when something in it changed.
@@ -1813,13 +1946,16 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   if (media.some((asset, i) => asset !== state.media[i])) state.media = media;
   if (store.dirty(state)) persist();
   // An upload nobody has sent a chunk to for a day is abandoned: it stops holding a queue slot and its partial file goes.
+  // A Final Cut import's files wait a week for its importer's Mac to come back; after that the import stops and they go too.
   const expireUploads = () => {
-    const cutoff = Date.now() - 86400_000, staged = ['replacement.json', 'replacement.upload.json', 'replacement.part'];
+    const now = Date.now(), cutoff = now - 86400_000, staged = ['replacement.json', 'replacement.upload.json', 'replacement.part'];
+    for (const p of state.projects) if (importing(p) && now - p.fcpImport!.updatedAt > 7 * 86400_000) setImport(p.id, { ...p.fcpImport!, phase: 'stopped' });
+    const kept = new Set(state.projects.filter(importing).map(p => p.id));
     const lastTouched = (id: string, names: string[]) => Math.max(0, ...names.map(name => { try { return statSync(join(mediaDir(id), name)).mtimeMs; } catch { return 0; } }));
     for (const asset of state.media) if (!uploadLocks.has(asset.id)) {
       // An abandoned Replace Media drops only its staged file: the media keeps its original and its state.
       if (existsSync(join(mediaDir(asset.id), 'replacement.json')) && lastTouched(asset.id, staged) < cutoff) for (const name of staged) rmSync(join(mediaDir(asset.id), name), { force: true });
-      if (asset.status !== 'uploading' || lastTouched(asset.id, ['upload.part', 'upload.json', '']) >= cutoff) continue;
+      if (asset.status !== 'uploading' || lastTouched(asset.id, ['upload.part', 'upload.json', '']) >= (kept.has(asset.projectId) ? now - 7 * 86400_000 : cutoff)) continue;
       rmSync(join(mediaDir(asset.id), 'upload.part'), { force: true }); rmSync(join(mediaDir(asset.id), 'upload.json'), { force: true });
       updateAsset(asset.id, { status: 'failed', progress: 0, error: 'This upload stopped for a day and was discarded. Upload the file again.' });
     }
@@ -1829,6 +1965,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const sweepPrepared = () => { try { const swept = sweepPreparedTemp(join(dataDir, 'media')); if (swept) console.log(`Removed ${swept} interrupted preview folder(s).`); } catch (error) { console.error('Interrupted preview cleanup failed:', error); } };
   const sweepUploads = () => { try { expireUploads(); } catch (error) { console.error('Abandoned upload cleanup failed:', error); } sweepPrepared(); };
   sweepUploads(); const uploadSweep = setInterval(sweepUploads, 3600_000); uploadSweep.unref();
+  // Import cards settle too: media the restart interrupted changed status, and an importer's Mac may have gone quiet meanwhile.
+  for (const p of state.projects) if (p.fcpImport) importTick(p.id, true);
+  try { pauseImports(); } catch (error) { console.error('Pausing idle imports failed:', error); }
   // A fresh install gets its legacy row now, so `project-bundle.mjs import` has one to merge into;
   // after a migration or a crash the row is brought up to date before anything reads it.
   if (!store.legacyCurrent()) store.writeLegacy();

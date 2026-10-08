@@ -9,6 +9,7 @@ export function fontLibrary(db: DatabaseSync) {
   return {
     list: () => (db.prepare('SELECT id,name,createdAt FROM fonts ORDER BY name COLLATE NOCASE').all() as {id: string; name: string; createdAt: number}[]).map(describe),
     get: (id: string) => db.prepare('SELECT data FROM fonts WHERE id=?').get(id) as { data: Uint8Array } | undefined,
+    countBy: (uploader: string) => Number((db.prepare('SELECT COUNT(*) AS n FROM fonts WHERE uploader=?').get(uploader) as { n: number }).n),
     add(data: Buffer, name: string, uploader: string) {
       if (data.length < 12 || data.length > 15 * 1024 * 1024 || !['00010000', '4f54544f', '774f4646', '774f4632', '74746366'].includes(data.subarray(0, 4).toString('hex'))) throw new Error('Choose a valid TTF, OTF, TTC, WOFF, or WOFF2 font under 15 MB.');
       const id = `FL-${createHash('sha256').update(data).digest('hex').slice(0, 32)}`;
