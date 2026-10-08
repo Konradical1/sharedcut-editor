@@ -64,7 +64,8 @@ for (const file of bundle.fonts) {
   await call(`/api/fonts?name=${encodeURIComponent(name)}`, { method: 'POST', body: await readFile(file) }).then(() => console.log(`Font ${name} added`), error => console.log(`Font ${name} not added: ${error.message}`));
 }
 // The server picks the project: the same Final Cut project (re-exported or not) is the same SharedCut project.
-const query = new URLSearchParams({ ...(project && { projectId: project }), ...(rebuild && { rebuild: '1' }), ...(fresh && { fresh: '1' }) });
+// Final Cut's default "Untitled Project" becomes the name the bundle was given.
+const query = new URLSearchParams({ ...(bundle.name && { name: bundle.name }), ...(project && { projectId: project }), ...(rebuild && { rebuild: '1' }), ...(fresh && { fresh: '1' }) });
 const imported = await call(`/api/fcp/import?${query}`, { method: 'POST', headers: { 'content-type': 'application/xml' }, body: bundle.xml });
 console.log(`${rebuild ? 'Rebuilt' : 'Imported'} the edit (project ${imported.projectId}).`);
 if (imported.warnings.length) { console.log('\nNot carried over from Final Cut:'); for (const warning of imported.warnings) console.log(' - ' + warning); }

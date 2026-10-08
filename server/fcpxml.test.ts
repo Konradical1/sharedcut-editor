@@ -5,7 +5,7 @@ import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fcpProjectId, fcpTime, fileUrlPath, importFcpxml, locateSource, parseXml, readFcpBundle } from './fcpxml.ts';
 import { createFrameLineServer } from './index.ts';
@@ -235,6 +235,9 @@ test('bundle reading maps original paths to the copied files', async () => {
     await writeFile(join(dir, 'sources.tsv'), '/Volumes/Shoot/Day 1/A&B.mov\tmedia/A&B.mov\n');
     const bundle = readFcpBundle(dir);
     assert.equal(bundle.xml, sample);
+    assert.equal(bundle.name, basename(dir), 'the bundle folder names the project when Final Cut left it untitled');
+    assert.equal(importFcpxml(sample.replace('name="Edit"', 'name="Untitled Project"'), 'fcp-u', 'u', [], undefined, 'BoySoccer').project.name, 'BoySoccer');
+    assert.equal(importFcpxml(sample, 'fcp-u', 'u', [], undefined, 'BoySoccer').project.name, 'Edit', 'a name the editor chose is kept');
     assert.equal(locateSource({ name: 'A&B.mov', sourcePath: '/Volumes/Shoot/Day 1/A&B.mov' }, bundle.sources), join(dir, 'media', 'A&B.mov'));
     assert.equal(locateSource({ name: 'song.wav', sourcePath: '/nowhere/song.wav' }, bundle.sources, ['/x/song.wav']), '/x/song.wav');
     assert.equal(locateSource({ name: 'song.wav', sourcePath: '/nowhere/song.wav' }, bundle.sources, ['/x/song.wav', '/y/song.wav']), undefined, 'two candidates: ambiguous');

@@ -1187,7 +1187,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (!idIsValid(id) || !id.startsWith('fcp-') || id.length > 64) fail(400, 'Invalid import project ID.');
           // Titles are measured with the fonts and canvas the export renders them with, so they can be shrunk to fit.
           const ruler = createCanvas(8, 8).getContext('2d'), measure = (text: string, style: TextStyle) => { ruler.font = canvasFont(style); return style.letterSpacing ? [...new Intl.Segmenter().segment(text)].reduce((sum, g) => sum + ruler.measureText(g.segment).width + style.letterSpacing, 0) : ruler.measureText(text).width; };
-          let imported: ReturnType<typeof importFcpxml>; try { imported = importFcpxml(xml, id, userId, fonts.list(), measure); } catch (error) { fail(400, (error as Error).message); }
+          let imported: ReturnType<typeof importFcpxml>; try { imported = importFcpxml(xml, id, userId, fonts.list(), measure, url.searchParams.get('name')?.slice(0, 255) || undefined); } catch (error) { fail(400, (error as Error).message); }
           const existing = state.projects.find(p => p.id === id) as (Project & { fcpImportHash?: string }) | undefined;
           const { fcpImportHash, fcpWarnings } = imported!.project as Project & { fcpImportHash: string; fcpWarnings: string[] };
           if (!existing && rebuild) fail(404, 'There is no imported project to rebuild for this Final Cut project. Import it without rebuild, or name the project to rebuild.');

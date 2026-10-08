@@ -89,7 +89,9 @@ export function readFcpBundle(path: string) {
   // Title fonts public/fcp.sh found on the editor's Mac; the import adds them to SharedCut's font library first.
   const fontDir = join(folder, 'fonts');
   const fonts = existsSync(fontDir) ? readdirSync(fontDir).filter(name => /\.(ttf|otf|ttc|woff2?)$/i.test(name) && !name.startsWith('._')).map(name => join(fontDir, name)) : [];
-  return { xml: readFileSync(file, 'utf8'), sources, fonts };
+  // What the editor called it: the bundle folder fcp.sh made ("SharedCut - <name>"), else the XML's own file name.
+  const name = basename(file === path ? file : path).replace(/\.fcpxmld?$/i, '').replace(/^SharedCut - /, '').trim();
+  return { xml: readFileSync(file, 'utf8'), sources, fonts, name: name === 'Info' ? '' : name };
 }
 
 /** Bundle sources.tsv first, then the original path, then the one same-named file found under the media folders. */
@@ -154,7 +156,7 @@ const hex = (rgba: string | undefined, fallback: string) => {
  * `fonts` is SharedCut's font library: title fonts resolve to its entries by name. `measure` gives a text's width in
  * project pixels as the renderer sets it, so titles can be shrunk to fit as Final Cut's Auto-Shrink does.
  */
-export function importFcpxml(xml: string, projectId: string, userId: string, fonts: { id: string; name: string }[] = [], measure?: (text: string, style: TextStyle) => number) {
+export function importFcpxml(xml: string, projectId: string, userId: string, fonts: { id: string; name: string }[] = [], measure?: (text: string, style: TextStyle) => number, fallbackName?: string) {
   const document = parseXml(xml.replace(/^\uFEFF/, '')).children.find(n => n.name === 'fcpxml');
   if (!document) throw new Error('That file is not Final Cut XML. In Final Cut choose File > Export XML….');
   const projects = findAll(document, 'project');
@@ -888,7 +890,7 @@ export function importFcpxml(xml: string, projectId: string, userId: string, fon
   timelines.sort((a, b) => Number(!!a.composition) - Number(!!b.composition));
 
   const warnings = [...gaps].map(([what, count]) => count > 1 ? `${what} (×${count})` : what).sort();
-  const project: Project = { id: projectId, name: nameOf(projects[0].attrs.name, 'Final Cut project').slice(0, 255), description: 'Imported from Final Cut Pro.', shared: false, thumbnail: '', modifiedAt: Date.now(),
+  const project: Project = { id: projectId, name: nameOf(/^Untitled Project( \d+)?$/i.test(projects[0].attrs.name?.trim() ?? '') ? fallbackName : undefined, projects[0].attrs.name, fallbackName, 'Final Cut project').slice(0, 255), description: 'Imported from Final Cut Pro.', shared: false, thumbnail: '', modifiedAt: Date.now(),
     duration: main.duration, resolution: `${projectWidth} × ${projectHeight}`, fps: projectFps, status: 'In progress', members: [{ userId, role: 'Owner' }] };
   Object.assign(project, { fcpImportHash: createHash('sha256').update(xml).digest('hex'), fcpWarnings: warnings.slice(0, 500) });
   return { project, media: [...media.values()], timelines, tracks, clips, nodes, warnings };

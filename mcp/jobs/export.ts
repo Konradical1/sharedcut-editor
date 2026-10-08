@@ -265,7 +265,7 @@ function importFinalCut(p: Record<string, any>) {
     // Fonts first: the import resolves title fonts against the library by name.
     for (const file of bundle.fonts) await call(`/fonts?name=${encodeURIComponent(basename(file).replace(/\.[^.]+$/, ''))}`, { method: 'POST', body: await readFile(file) }).catch(() => undefined);
     // The server picks the project (the same Final Cut project, re-exported or not, is the same SharedCut project).
-    const query = new URLSearchParams({ ...(p.project && { projectId: String(p.project) }), ...(p.rebuild && { rebuild: '1' }), ...(p.fresh && { fresh: '1' }) });
+    const query = new URLSearchParams({ ...(bundle.name && { name: bundle.name }), ...(p.project && { projectId: String(p.project) }), ...(p.rebuild && { rebuild: '1' }), ...(p.fresh && { fresh: '1' }) });
     const imported = await call<{ projectId: string; warnings: string[]; media: MediaAsset[] }>(`/fcp/import?${query}`, { method: 'POST', body: bundle.xml }), projectId = imported.projectId;
     const found = folders.length ? (await Promise.all(folders.map(async (f: string) => (await readdir(f, { recursive: true })).map(n => join(f, n))))).flat() : [];
     const sources = imported.media.filter(a => !a.sourceUrl), missing: string[] = [];
