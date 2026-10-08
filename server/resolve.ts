@@ -64,8 +64,8 @@ export function importResolve(manifest:RecordValue,projectId:string,userId:strin
         const mapping:Record<string,string>={Pan:'x',Tilt:'y',RotationAngle:'rotation',AnchorPointX:'anchorX',AnchorPointY:'anchorY',CropLeft:'cropLeft',CropRight:'cropRight',CropTop:'cropTop',CropBottom:'cropBottom',Opacity:'opacity'};
         for(const [from,to] of Object.entries(mapping))if(p[from]!=null)properties[to]=number(p[from])*(from==='Tilt'?-1:1);
         const zoomX=number(p.ZoomX??1),zoomY=p.ZoomY!=null?number(p.ZoomY):zoomX;
-        properties.zoom=zoomX*100;
-        if(Math.abs(zoomY-zoomX)>.00001){if(zoomX)properties.scaleY=Math.min(800,Math.max(1,Math.abs(zoomY/zoomX)*100));else warnings.add(`${item.name}: nonuniform scaling needs a Resolve render.`);}
+        if(Math.abs(zoomY-zoomX)<=.00001)properties.zoom=zoomX*100;
+        else for(const [key,v] of [['scaleX',zoomX],['scaleY',zoomY]] as const){const s=Math.abs(v)*100;properties[key]=Math.min(800,Math.max(1,s));if(s<1||s>800)warnings.add(`${item.name}: Zoom beyond 1–800% is clamped.`);}
         for(const k of ['FlipX','FlipY','Pitch','Yaw','CropSoftness','CompositeMode'])if(p[k])warnings.add(`${item.name}: ${k} is retained in the archive, not reproduced.`);
         const clip:Clip={id:id('clip',item.id),projectId,timelineId:timeline.id,trackId:track.id,mediaId:asset.id,name:text(item.name),start:(position-start)/fps,duration:duration/fps,sourceIn:inFrame/sourceFps,color:tr.kind==='video'?'#668b9e':'#699781',disabled:item.enabled===false,properties,effects:[]};
         Object.assign(clip,{resolveId:item.id,resolveStartFrame:position,resolveSourceFrame:inFrame});

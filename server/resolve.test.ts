@@ -83,12 +83,15 @@ test('SharedCut export branding preserves imports from both studio names',()=>{
 });
 
 
-test('Resolve Zoom X/Y import as Zoom and Scale Y; a stretch exports as SharedCut metadata with a warning',()=>{
+test('Resolve Zoom X/Y import as Scale X/Y; a stretch exports as SharedCut metadata with a warning',()=>{
  const m=structuredClone(manifest);m.timelines[0].tracks[0].items[0].properties={ZoomX:1.25,ZoomY:1};
  const imported=importResolve(m,'resolve-stretch','owner',otios),clip=imported.clips[0];
- assert.deepEqual([clip.properties.zoom,clip.properties.scaleY],[125,80]);assert.ok(!imported.warnings.some(w=>/nonuniform/.test(w)));
+ assert.deepEqual([clip.properties.zoom,clip.properties.scaleX,clip.properties.scaleY],[undefined,125,100]);assert.ok(!imported.warnings.some(w=>/nonuniform|clamped/.test(w)));
+ m.timelines[0].tracks[0].items[0].properties={ZoomX:.1,ZoomY:10};
+ const extreme=importResolve(m,'resolve-extreme','owner',otios);
+ assert.deepEqual([extreme.clips[0].properties.scaleX,extreme.clips[0].properties.scaleY],[10,800]);assert.ok(extreme.warnings.some(w=>/clamped/.test(w)));
  const stretch=/Scale X\/Y stretch/,{otio,warnings}=exportResolveTimeline(imported.project,imported.timelines[0],imported.tracks,imported.clips,imported.media);
- assert.ok(warnings.some(w=>stretch.test(w)));assert.equal(otio.tracks.children[0].children[0].metadata.SharedCut.properties.scaleY,80);
+ assert.ok(warnings.some(w=>stretch.test(w)));assert.equal(otio.tracks.children[0].children[0].metadata.SharedCut.properties.scaleX,125);
  const plain=importResolve(manifest,'resolve-plain','owner',otios);
  assert.ok(!exportResolveTimeline(plain.project,plain.timelines[0],plain.tracks,plain.clips,plain.media).warnings.some(w=>stretch.test(w)),'no warning without a stretch');
 });
