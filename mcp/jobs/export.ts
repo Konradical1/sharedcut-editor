@@ -11,7 +11,8 @@ import { pipeline } from 'node:stream/promises';
 import { call, ApiFailure, refresh, handle, need, clip, project, timeline, store, done, sleep, type JobDef, type Poller, type Step } from './kit.ts';
 import { flush, config } from '../session.ts';
 import { timecode } from '../../src/services/timecode.ts';
-import { uploadSource } from '../../src/services/upload.ts';
+import { bytes, uploadImport, uploadSource, type ImportProgress } from '../../src/services/upload.ts';
+import { friendlyDuration } from '../../src/services/importer.ts';
 import { ApiError } from '../../src/services/api.ts';
 import { locateSource, readFcpBundle } from '../../server/fcpxml.ts';
 import type { EditorStore } from '../../src/state/store.ts';
@@ -265,24 +266,28 @@ function importFinalCut(p: Record<string, any>) {
     // Fonts first: the import resolves title fonts against the library by name.
     for (const file of bundle.fonts) await call(`/fonts?name=${encodeURIComponent(basename(file).replace(/\.[^.]+$/, ''))}`, { method: 'POST', body: await readFile(file) }).catch(() => undefined);
     // The server picks the project (the same Final Cut project, re-exported or not, is the same SharedCut project).
-    const query = new URLSearchParams({ ...(bundle.name && { name: bundle.name }), ...(p.project && { projectId: String(p.project) }), ...(p.rebuild && { rebuild: '1' }), ...(p.fresh && { fresh: '1' }) });
+    const query = new URLSearchParams({ ...(bundle.name && { name: bundle.name }), ...(p.project && { projectId: String(p.project) }), ...(p.rebuild && { rebuild: '1' }), ...(p.fresh && { fresh: '1' }), ...(p.class && { class: '1' }) });
     const imported = await call<{ projectId: string; warnings: string[]; media: MediaAsset[] }>(`/fcp/import?${query}`, { method: 'POST', body: bundle.xml }), projectId = imported.projectId;
     const found = folders.length ? (await Promise.all(folders.map(async (f: string) => (await readdir(f, { recursive: true })).map(n => join(f, n))))).flat() : [];
-    const sources = imported.media.filter(a => !a.sourceUrl), missing: string[] = [];
-    let uploaded = 0;
-    for (const [i, asset] of sources.entries()) {
-      signal.throwIfAborted();
+    const { maxUploadBytes } = await call<{ maxUploadBytes: number }>('/uploads/info');
+    const sources = imported.media.filter(a => !a.sourceUrl), missing: string[] = [], items: { assetId: string; file: File }[] = [];
+    for (const asset of sources) {
       const source = locateSource(asset, bundle.sources, found);
       if (!source) { missing.push(asset.name); continue; }
       const info = await stat(source);
-      // One file the server refuses (too large, empty) must not stop the files after it.
-      try { await uploadSource(asset.id, new File([await openAsBlob(source)], basename(source), { lastModified: Math.trunc(info.mtimeMs) }), percent => report(`uploading ${asset.name} ${percent}% (${i + 1}/${sources.length})`), signal); uploaded++; }
-      catch (error) { if (signal.aborted || !(error instanceof ApiError) || error.status >= 500) throw error; missing.push(`${asset.name} (${error.message})`); }
+      if (info.size > maxUploadBytes) { missing.push(`${asset.name} (over ${Math.floor(maxUploadBytes / 1024 ** 3)} GB)`); continue; }
+      // Named and dated like the browser's File, so a browser upload of the same file resumes this one.
+      items.push({ assetId: asset.id, file: new File([await openAsBlob(source)], basename(source), { lastModified: Math.trunc(info.mtimeMs) }) });
     }
+    // The plan puts the import on everyone's Projects screen and checks the server has room before a byte moves.
+    const waiting = { offline: 'waiting for the network', server: 'SharedCut is not answering, retrying', full: 'SharedCut is out of room, retrying every minute' };
+    const line = (u: ImportProgress) => `uploading ${u.sent}/${u.files} files, ${u.lanes} at a time · ${Math.floor(u.bytes / u.total * 100)}% of ${bytes(u.total)} · ${bytes(u.rate)}/s${u.eta ? ` · ${friendlyDuration(u.eta)} left` : ''}${u.waiting ? ` · ${waiting[u.waiting]}` : ''}`;
+    const result = await uploadImport(projectId, items, { signal, onProgress: u => report(line(u)) });
+    for (const f of result.failed) missing.push(`${items.find(i => i.assetId === f.id)!.file.name} (${f.reason === 'unreadable' ? 'could not be read' : f.reason})`);
     await refresh();
     const name = store.getState().projects.find(x => x.id === projectId)?.name ?? 'Final Cut project';
     const list = (items: string[]) => `${items.slice(0, 5).join(', ')}${items.length > 5 ? '…' : ''}`;
-    return [`project ${handle(projectId)} "${name}" · ${imported.media.length} sources (${imported.media.length - sources.length + uploaded} uploaded${missing.length ? `, ${missing.length} not uploaded: ${list(missing)}` : ''})`,
+    return [`project ${handle(projectId)} "${name}" · ${imported.media.length} sources (${imported.media.length - sources.length + result.sent} uploaded${missing.length ? `, ${missing.length} not uploaded: ${list(missing)}` : ''})`,
       `${imported.warnings.length} not carried over${imported.warnings.length ? `: ${imported.warnings.slice(0, 4).join(' | ')}` : ''}`,
       `open it: projects{open:"${handle(projectId)}"}${missing.length ? '. Run again with media:[folders] to upload the missing files.' : ''}`].join('\n');
   });
@@ -329,7 +334,7 @@ export const jobs: Record<string, JobDef> = {
     },
   },
   fcp: {
-    doc: '{path: bundle folder from sharedcut.com/fcp.sh | .fcpxml, media?:[folders], rebuild?, project?:@h, fresh?} imports a Final Cut Pro project and uploads its footage',
+    doc: '{path: bundle folder from sharedcut.com/fcp.sh | .fcpxml, media?:[folders], rebuild?, project?:@h, fresh?, class?} imports a Final Cut Pro project, uploads its footage 4 files at a time; Projects shows it importing',
     async start(p) { return importFinalCut(p); },
   },
   resolve: {
@@ -372,7 +377,8 @@ export const topics: Record<string, string> = {
     'exports{job, cancel:true} stops a waiting or rendering export; exports{job, delete:true} deletes a complete export\'s file (the record stays, as failed/Cancelled). retry queues the same settings against the CURRENT edit. job{kind:"cancel"} on a running export job stops the render, or only the download once it is complete.',
     'Resolve → SharedCut: 1) job resolve{do:"bridge", path} saves resolve-export.lua. 2) In Resolve\'s Lua console run the dofile line it prints, with an empty folder. 3) job resolve{do:"import", path:"<that folder>", media:["<footage folders>"]}.',
     'import: originals upload from the paths Resolve recorded, else by file name under media folders. Running it again resumes the same project (same bundle = same id); fresh:true makes a new project. A .drp alone cannot be imported.',
-    'Final Cut → SharedCut: on the editor\'s Mac, File > Export XML…, then zsh -c "$(curl -fsSL https://sharedcut.com/fcp.sh)" copies the XML and footage to a drive. job fcp{path:"<that folder>"} imports it (same Final Cut project = same SharedCut project, so a rerun resumes uploads; after a re-export rebuild:true re-converts the edit, keeping uploads, old edit saved as a snapshot; project:@h names the project to resume or rebuild; fresh:true imports a new copy, also after deleting one). Its warnings list what did not carry over.',
+    'Final Cut → SharedCut: on the editor\'s Mac, File > Export XML…, then zsh -c "$(curl -fsSL https://sharedcut.com/fcp.sh)" copies the XML and footage to a drive. job fcp{path:"<that folder>"} imports it (same Final Cut project = same SharedCut project, so a rerun resumes uploads; after a re-export rebuild:true re-converts the edit, keeping uploads, old edit saved as a snapshot; project:@h names the project to resume or rebuild; fresh:true imports a new copy, also after deleting one; class:true shares a new import with the class as Editor). Its warnings list what did not carry over.',
+    'No terminal needed: people can use sharedcut.com/importer in a browser (name and class code).',
     'SharedCut → Resolve: job resolve{do:"otio", path, timeline?} writes an OTIO timeline for Resolve (File > Import > Timeline). Refused: overlapping clips on one track, and clips with no media file (titles, shapes, captions, compositions, adjustment clips).',
   ].join('\n'),
 };

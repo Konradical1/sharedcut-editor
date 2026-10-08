@@ -121,3 +121,17 @@ test('Resolve: bridge script, OTIO refusal on a title, and a bundle imported wit
   assert.match(await job('resolve', { do: 'otio', path: `${out}/` }), /SharedCut-timeline\.otio · \d+ warnings/);
   assert.equal(JSON.parse(await readFile(join(out, 'SharedCut-timeline.otio'), 'utf8')).OTIO_SCHEMA, 'Timeline.1');
 });
+
+test('Final Cut: the plan puts the import on Projects screens, class:true shares it, a clip not found is listed', async () => {
+  const bundle = join(dataDir, 'fcp'), footage = join(dataDir, 'fcp-footage');
+  await mkdir(bundle, { recursive: true }); await mkdir(footage, { recursive: true });
+  execFileSync(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=s=160x90:r=25:d=2', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', join(footage, 'A001.mp4')]);
+  const asset = (id: string, path: string) => `<asset id="${id}" start="0s" duration="2s" hasVideo="1" format="r1"><media-rep kind="original-media" src="file://${path}"/></asset>`;
+  await writeFile(join(bundle, 'Info.fcpxml'), `<fcpxml version="1.11"><resources><format id="r1" frameDuration="100/2500s" width="160" height="90"/>${asset('a', '/Volumes/Card/A001.mp4')}${asset('b', '/Volumes/Card/B002.mp4')}</resources>
+<library><event name="E"><project name="Class Film" uid="MCP-1"><sequence format="r1" duration="4s" tcStart="0s"><spine><asset-clip ref="a" offset="0s" start="0s" duration="2s"/><asset-clip ref="b" offset="2s" start="0s" duration="2s"/></spine></sequence></project></event></library></fcpxml>`);
+  assert.match(await job('fcp', { path: bundle, media: [footage], class: true }), /^project @\w+ "Class Film" · 2 sources \(1 uploaded, 1 not uploaded: B002\.mp4\)/);
+  const project = store.getState().projects.find(p => p.name === 'Class Film')!;
+  assert.deepEqual([project.shared, project.classRole], [true, 'Editor']);
+  assert.deepEqual([project.fcpImport?.files, project.fcpImport?.uploaded, project.fcpImport?.received], [1, 1, (await readFile(join(footage, 'A001.mp4'))).length]);
+  assert.match(project.fcpImport!.phase, /^(processing|ready)$/);
+});

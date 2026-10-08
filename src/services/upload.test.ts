@@ -94,3 +94,114 @@ test('the queue shows all files, bounds concurrency, pauses a stalled file, and 
     assert.ok(uploadQueue.getState().jobs.every(job => !job.file), 'completed jobs release file handles');
   } finally { resetUploads(); }
 });
+
+// uploadImport against a fake server: `script` may answer a request itself (a status, a thrown error, a delay) before
+// the fake's own resumable-upload rules do.
+type Hook = (method: string, id: string, init: RequestInit) => Promise<Response | void> | Response | void;
+function fakeImport(t: import('node:test').TestContext, sizes: Record<string, number>, { complete = [] as string[], offsets = {} as Record<string, number>, script = (() => {}) as Hook } = {}) {
+  const log: string[] = [], offset = new Map(Object.entries(sizes).map(([id, size]) => [id, complete.includes(id) ? size : offsets[id] ?? 0]));
+  let inFlight = 0, most = 0, plan: any;
+  t.mock.method(globalThis, 'fetch', async (url: string, init: RequestInit = {}) => {
+    const method = init.method ?? 'GET', id = url.split('/')[3];
+    log.push(`${method} ${url.replace('/api', '')}`);
+    if (url === '/api/health') return new Response('{}');
+    if (url.startsWith('/api/fcp/import/')) { plan = JSON.parse(String(init.body)); return Response.json({ files: plan.files.map((f: any) => ({ id: f.id, received: offset.get(f.id), complete: offset.get(f.id) === sizes[f.id] })) }); }
+    if (method === 'PUT') { most = Math.max(most, ++inFlight); }
+    try {
+      const scripted = await script(method, id, init);
+      if (scripted) return scripted;
+      if (method === 'PUT') {
+        assert.equal(Number((init.headers as Record<string, string>)['Upload-Offset']), offset.get(id));
+        offset.set(id, offset.get(id)! + (init.body as ArrayBuffer).byteLength);
+      }
+      return Response.json({ offset: offset.get(id), complete: offset.get(id) === sizes[id] });
+    } finally { if (method === 'PUT') inFlight--; }
+  });
+  return { log, offset, plan: () => plan, most: () => most };
+}
+const blob = (name: string, size: number) => new File([new Uint8Array(size)], name, { lastModified: 7 });
+const settle = async () => { for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve)); };
+/** Runs `work` on mocked timers, moving the clock a second at a time whenever nothing else is left to do. */
+async function onClock<T>(t: import('node:test').TestContext, work: () => Promise<T>) {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  let finished = false;
+  const running = work().finally(() => { finished = true; });
+  running.catch(() => {});
+  for (let i = 0; !finished && i < 5000; i++) { await settle(); if (!finished) t.mock.timers.tick(1000); }
+  return running;
+}
+
+test('uploadImport plans first, sends the largest files first, never more than `lanes` at once, and skips what arrived', async t => {
+  const { uploadImport } = await import('./upload.ts');
+  const sizes = { a: 10, b: 60, c: 30, d: 50, e: 20 };
+  const server = fakeImport(t, sizes, { complete: ['d'], offsets: { a: 4 }, script: async method => { if (method === 'PUT') await new Promise(resolve => setTimeout(resolve, 5)); } });
+  const items = Object.entries(sizes).map(([id, size]) => ({ assetId: id, file: blob(`${id}.bin`, size) })), seen: number[] = [];
+  const done = await uploadImport('fcp-1', [...items, { assetId: 'empty', file: blob('empty.bin', 0) }], { lanes: 2, onProgress: p => seen.push(p.bytes) });
+  assert.equal(server.log[0], 'PUT /fcp/import/fcp-1');
+  assert.deepEqual(server.plan().files, items.map(i => ({ id: i.assetId, size: i.file.size, fingerprint: `${i.assetId}.bin:${i.file.size}:7` })), 'the empty file is left out of the plan');
+  assert.deepEqual(server.log.filter(l => l.startsWith('POST')).map(l => l.split('/')[2]), ['b', 'c', 'e', 'a'], 'largest first; the finished file is not sent');
+  assert.ok(server.most() <= 2, `${server.most()} PUTs at once`);
+  assert.deepEqual({ ...done, rate: 0, eta: undefined }, { bytes: 170, total: 170, rate: 0, eta: undefined, files: 5, sent: 5, lanes: 2, waiting: undefined, failed: [{ id: 'empty', reason: 'The file is empty.' }], sending: [undefined, undefined], received: { a: 10, b: 60, c: 30, d: 50, e: 20 } });
+  assert.equal(seen[0], 54, 'progress starts from what the server already has');
+});
+
+test('uploadImport retries a dropped connection and a moved offset, and leaves out only the file the server refuses', async t => {
+  const { uploadImport } = await import('./upload.ts');
+  let posts = 0, puts = 0;
+  const server = fakeImport(t, { a: 30, b: 20, c: 10 }, { script: (method, id) => {
+    if (id === 'a' && method === 'POST' && ++posts === 1) throw new TypeError('Failed to fetch');
+    // The chunk landed but its answer was lost: the next PUT is refused and the server's offset moves on.
+    if (id === 'b' && method === 'PUT' && ++puts === 1) { server.offset.set('b', 20); return Response.json({ error: 'Upload offset changed. Resume from the server offset.' }, { status: 409 }); }
+    if (id === 'c' && method === 'POST') return Response.json({ error: 'Files must be smaller than 10 GB.' }, { status: 413 });
+  } });
+  const done = await onClock(t, () => uploadImport('fcp-1', [['a', 30], ['b', 20], ['c', 10]].map(([id, size]) => ({ assetId: id as string, file: blob(`${id}.bin`, size as number) }))));
+  assert.deepEqual([done.sent, done.failed], [2, [{ id: 'c', reason: 'Files must be smaller than 10 GB.' }]]);
+  assert.ok(server.log.includes('GET /health'), 'it waited for the server before trying again');
+  assert.equal(server.log.filter(l => l === 'PUT /media/b/upload').length, 1, 'the moved offset finished b without sending it again');
+});
+
+test('uploadImport holds every lane while the server is out of room, and stops everything when signed out', async t => {
+  const { uploadImport } = await import('./upload.ts');
+  let full = true;
+  const server = fakeImport(t, { a: 10, b: 10 }, { script: method => { if (full && method === 'POST') return Response.json({ error: 'The server is almost out of disk space.' }, { status: 507 }); } });
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const progress: string[] = [];
+  const running = uploadImport('fcp-1', [{ assetId: 'a', file: blob('a.bin', 10) }, { assetId: 'b', file: blob('b.bin', 10) }], { onProgress: p => progress.push(p.waiting ?? '') });
+  const posts = () => server.log.filter(l => l.startsWith('POST')).length;
+  await settle();
+  assert.equal(posts(), 2);
+  t.mock.timers.tick(59_000); await settle();
+  assert.equal(posts(), 2, 'nobody asks again within the minute');
+  t.mock.timers.tick(1000); await settle();
+  assert.equal(posts(), 3, 'one lane asks for everyone');
+  assert.ok(progress.includes('full'));
+  full = false;
+  t.mock.timers.tick(60_000); await settle();
+  const done = await running;
+  assert.deepEqual([done.sent, done.failed], [2, []]);
+  t.mock.timers.reset();
+
+  const held: AbortSignal[] = [];
+  const signedOut = fakeImport(t, { a: 10, b: 10 }, { script: (method, id, init) => {
+    if (method !== 'PUT') return;
+    if (id === 'a') return Response.json({ error: 'Sign in' }, { status: 401 });
+    held.push(init.signal!);
+    return new Promise((_, reject) => { init.signal!.addEventListener('abort', () => reject(init.signal!.reason)); if (init.signal!.aborted) reject(init.signal!.reason); });
+  } });
+  await assert.rejects(uploadImport('fcp-1', [{ assetId: 'a', file: blob('a.bin', 10) }, { assetId: 'b', file: blob('b.bin', 10) }]), { status: 401 });
+  assert.equal(held.length, 1); assert.equal(held[0].aborted, true, 'the other lane stopped too');
+  assert.equal(signedOut.log.filter(l => l === 'PUT /media/a/upload').length, 1);
+});
+
+test('uploadImport counts a resumed offset in its bytes but never in its rate', async t => {
+  const { uploadImport } = await import('./upload.ts');
+  const size = 4e9, resumed = size - 16;
+  // A 4 GB file whose first 4 GB already arrived: only its last 16 bytes travel, over two seconds.
+  const big = { name: 'big.bin', size, lastModified: 7, type: '', slice: (from: number, to: number) => new Blob([new Uint8Array(Math.min(to, size) - from)]) } as unknown as File;
+  fakeImport(t, { big: size }, { offsets: { big: resumed }, script: async method => { if (method === 'PUT') await new Promise(resolve => setTimeout(resolve, 2000)); } });
+  const rates: number[] = [];
+  const done = await onClock(t, () => uploadImport('fcp-1', [{ assetId: 'big', file: big }], { onProgress: p => rates.push(p.rate) }));
+  assert.deepEqual([done.bytes, done.total, done.sent], [size, size, 1]);
+  assert.ok(rates.every(rate => rate <= 16), `rates ${rates}`);
+  assert.ok(rates.at(-1)! > 0);
+});

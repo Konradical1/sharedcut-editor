@@ -70,10 +70,11 @@ const imported = await call(`/api/fcp/import?${query}`, { method: 'POST', header
 console.log(`${rebuild ? 'Rebuilt' : 'Imported'} the edit (project ${imported.projectId}).`);
 if (imported.warnings.length) { console.log('\nNot carried over from Final Cut:'); for (const warning of imported.warnings) console.log(' - ' + warning); }
 
+// Named and dated as the browser's File is, so a browser or MCP upload of the same file resumes this one.
+const fingerprintOf = (file, info) => `${basename(file)}:${info.size}:${Math.trunc(info.mtimeMs)}`;
 /** The editor's resumable protocol: POST size + fingerprint, then PUT checksummed chunks at the server's offset. */
 async function upload(asset, file, label) {
-  // Named and dated as the browser's File is, so a browser or MCP upload of the same file resumes this one.
-  const info = await stat(file), fingerprint = `${basename(file)}:${info.size}:${Math.trunc(info.mtimeMs)}`;
+  const info = await stat(file), fingerprint = fingerprintOf(file, info);
   const begin = () => call(`/api/media/${asset.id}/upload`, { method: 'POST', json: { size: info.size, fingerprint } });
   let state = await begin();
   if (state.complete) return 'already uploaded';
@@ -102,10 +103,14 @@ async function upload(asset, file, label) {
 }
 
 const found = folders.length ? (await Promise.all(folders.map(async folder => (await readdir(folder, { recursive: true })).map(name => join(folder, name))))).flat() : [];
-const missing = [], failed = [], sources = imported.media.filter(asset => !asset.sourceUrl);
+const missing = [], failed = [], sources = imported.media.filter(asset => !asset.sourceUrl), located = sources.map(asset => locateSource(asset, bundle.sources, found));
 console.log(`\n${imported.media.length} source files · ${imported.media.length - sources.length} already on the server`);
+// The plan puts the import on everyone's Projects screen and checks the server has room before a byte moves.
+const { maxUploadBytes } = await call('/api/uploads/info');
+const planned = (await Promise.all(sources.map(async (asset, i) => located[i] && { id: asset.id, info: await stat(located[i]), file: located[i] }))).filter(f => f && f.info.size >= 1 && f.info.size <= maxUploadBytes);
+if (planned.length) await call(`/api/fcp/import/${imported.projectId}`, { method: 'PUT', json: { files: planned.map(f => ({ id: f.id, size: f.info.size, fingerprint: fingerprintOf(f.file, f.info) })) } });
 for (const [index, asset] of sources.entries()) {
-  const label = `${index + 1}/${sources.length} ${asset.name}`, file = locateSource(asset, bundle.sources, found);
+  const label = `${index + 1}/${sources.length} ${asset.name}`, file = located[index];
   if (!file) { missing.push(asset.name); console.log(`${label}: not found`); continue; }
   // One file the server refuses (too large, empty) must not stop the files after it.
   try { console.log(`\r${label}: ${await upload(asset, file, label)}   `); }

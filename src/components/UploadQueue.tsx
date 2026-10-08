@@ -1,10 +1,9 @@
 import { useState } from 'react';
 import { useStore } from 'zustand';
 import { api, connection } from '../services/api';
-import { dismissUpload, pauseUpload, resumeUpload, uploadQueue } from '../services/upload';
+import { bytes, dismissUpload, pauseUpload, resumeUpload, uploadQueue } from '../services/upload';
 import type { MediaAsset } from '../state/models';
 
-const bytes = (value: number) => value >= 1e9 ? `${(value / 1e9).toFixed(2)} GB` : `${(value / 1e6).toFixed(1)} MB`;
 const duration = (seconds: number) => seconds >= 60 ? `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s` : `${Math.round(seconds)}s`;
 export default function UploadQueue({ projectId, media, onSelectFiles }: { projectId: string; media: MediaAsset[]; onSelectFiles: () => void }) {
   const jobs = useStore(uploadQueue, state => state.jobs).filter(job => job.projectId === projectId);
