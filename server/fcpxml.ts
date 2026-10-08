@@ -403,9 +403,9 @@ export function importFcpxml(xml: string, projectId: string, userId: string, fon
       parameters['offset' + c] = bounded(offset[i] / s); parameters['gamma' + c] = bounded(-Math.log2(p)); parameters['gain' + c] = bounded(s ** p - 1);
     });
     const saturation = (key: string) => { const v = Number(param(filter, key)?.attrs.value); return Number.isFinite(v) ? 1 + (v - .5) * 2 : 1; };
-    const ranges = ['Saturation Shadows', 'Saturation Midtones', 'Saturation Highlights'].map(saturation);
-    if (ranges.some(v => Math.abs(v - 1) > 1e-3)) gap(`Shadow, midtone and highlight saturation import as one overall saturation (${label})`);
-    parameters.saturation = round(Math.min(400, Math.max(0, 100 * saturation('Saturation Global') * (ranges[0] + ranges[1] + ranges[2]) / 3)));
+    const percent = (key: string) => round(Math.min(400, Math.max(0, 100 * saturation(key))));
+    parameters.saturation = percent('Saturation Global');
+    for (const range of ['Shadows', 'Midtones', 'Highlights']) { const v = percent(`Saturation ${range}`); if (v !== 100) parameters[`saturation${range}`] = v; }
     if (filter.children.some(p => p.name === 'param' && keyNodes(p).length)) gap(`Animated color corrections import as their first value (${label})`);
     return { name: name.slice(0, 80), kind: 'balance', enabled, parameters };
   }

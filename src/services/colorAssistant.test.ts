@@ -158,7 +158,7 @@ test('values map onto node parameters and curves and back without loss', () => {
   assert.deepEqual({ contrast: q.contrast, pivot: q.pivot, saturation: q.saturation, lift: q.lift, gamma: q.gamma, gain: q.gain, offset: q.offset, liftRgb: rgbOf(q, 'lift'), gammaRgb: rgbOf(q, 'gamma'), gainRgb: rgbOf(q, 'gain'), offsetRgb: rgbOf(q, 'offset'), curves: { rgb: curve('RGB'), r: curve('R'), g: curve('G'), b: curve('B') } }, l);
   assert.deepEqual(Object.keys(patch.curves!).sort(), ['B', 'RGB']); assert.equal(patch.curves!.RGB!.mode, 'smooth'); assert.deepEqual(patch.curves!.RGB!.points.map(p => p.id), ['pt1', 'pt2', 'pt3']);
   assert.deepEqual(lookNodePatch(neutralLook(), () => 'x').curves, {});
-  assert.deepEqual(balanceParameters(neutralBalance()), { exposure: 0, temperature: 0, tint: 0, contrast: 1, pivot: .336043, saturation: 100, lift: 0, gamma: 0, gain: 1, offset: 0, liftR: 0, liftG: 0, liftB: 0, gammaR: 0, gammaG: 0, gammaB: 0, gainR: 0, gainG: 0, gainB: 0, offsetR: 0, offsetG: 0, offsetB: 0 });
+  assert.deepEqual(balanceParameters(neutralBalance()), { exposure: 0, temperature: 0, tint: 0, contrast: 1, pivot: .336043, saturation: 100, lift: 0, gamma: 0, gain: 1, offset: 0, saturationShadows: 100, saturationMidtones: 100, saturationHighlights: 100, liftR: 0, liftG: 0, liftB: 0, gammaR: 0, gammaG: 0, gammaB: 0, gainR: 0, gainG: 0, gainB: 0, offsetR: 0, offsetG: 0, offsetB: 0 });
 });
 
 test('proposed nodes render through the engine, land between Look and ACES output, replace earlier extras and never touch CST nodes', () => {

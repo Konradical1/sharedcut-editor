@@ -32,7 +32,7 @@ const fxText = (e: ColorEffect) => e.type === 'cst'
 function nodeLine(node: GradeNode, c: Clip, managed: boolean) {
   const keyed = (field: string) => c.keyframes?.[`nodes.${node.id}.${field}`]?.length ? '~' : '';
   const defaults: Record<string, number> = { ...primaryDefaults, pivot: managed ? primaryDefaults.pivot : .5, curve25: .25, curve50: .5, curve75: .75 };
-  const params = Object.entries(node.parameters).filter(([k, v]) => v !== (defaults[k.toLowerCase()] ?? 0) || keyed(`parameters.${k}`)).map(([k, v]) => `${k}=${num(v)}${keyed(`parameters.${k}`)}`);
+  const params = Object.entries(node.parameters).filter(([k, v]) => v !== (defaults[k] ?? defaults[k.toLowerCase()] ?? 0) || keyed(`parameters.${k}`)).map(([k, v]) => `${k}=${num(v)}${keyed(`parameters.${k}`)}`);
   const m = node.mask, mask = !m ? '' : `mask ${isDepthKey(m) ? `depth ${m.near}-${m.far} soft ${m.softness}` : `smart ${handle(m.id)}`}${m.invert ? ' inverted' : ''}${m.amount !== 100 ? ` ${m.amount}%` : ''}${m.enabled ? '' : ' off'}`;
   const curves = node.curves && Object.keys(node.curves).length ? `curves ${Object.entries(node.curves).map(([ch, cv]) => `${ch}${cv!.points.length}`).join(',')}${keyed('curves')}` : '';
   return [`${handle(node.id)} ${quote(node.name, 30)}${node.enabled ? '' : ' (off)'}${keyed('enabled')}`, ...params, curves, ...(node.effects ?? []).map(fxText), mask].filter(Boolean).join(' ');
@@ -229,6 +229,7 @@ function colorTopic() {
       'Pipelines: a clip starts legacy (nodes work in Gamma 2.4/Rec.709). act initializeColorGrade(clip) makes it nodes-v2: Input CST (source → DaVinci Intermediate/DaVinci Wide Gamut) · Balance · Look · Output CST (→ Gamma 2.4/Rec.709; aces2 for log sources, none for Rec.709). It replaces every node (a snapshot keeps the old grade). Grade between the two CSTs.',
       'Parameters (key default (UI range; per-node render limit)), set with updateNode(node,{parameters:{key:value}}) (keys merge, others stay):',
       ...primaryTable(),
+      'saturationShadows saturationMidtones saturationHighlights 100 (0..400, 100 = unchanged): saturation by luma after saturation; shadows fade out by luma .5, highlights fade in from .5.',
       'lift 0 · gamma 0 · offset 0 (−1..1); gain 1 (0..2); per channel liftR liftG liftB, gammaR…, gainR…, offsetR… 0 (−1..1, added to the master; render ±2). Any other key, or hue≠0, fails at render.',
       'Curves: updateNode(node,{curves:{RGB?,R?,G?,B?}}) replaces all curves ({} clears). Each {mode:"smooth"|"linear", points:[{id,x,y,slope?}]}: 2–64 points, unique ids, x ascending (gap ≥.0001), first x=0, last x=1, x/y 0..1, slope −20..20. RGB runs first, then the channel. S-curve: {RGB:{mode:"smooth",points:[{id:"a",x:0,y:0},{id:"b",x:.25,y:.2},{id:"c",x:.75,y:.8},{id:"d",x:1,y:1}]}}',
       'Effects: updateNode(node,{effects:[…]}) replaces the node\'s whole list (≤16); read it first with get{id:"@node",path:"effects"}. A node holding a LUT: change its list through job color-lut{node, effects} instead (act cannot carry LUT data).',

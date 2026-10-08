@@ -53,6 +53,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
   }
   vec3 lutValue(int i){return texelFetch(lutAtlas,ivec2(i%512,i/512),0).rgb;}
   vec4 param(int x,int n){return texelFetch(parameters,ivec2(x,n),0);}
+  vec3 rangeSaturation(vec3 rgb,vec3 w,vec3 r){if(r==vec3(0))return rgb;float y=dot(rgb,w),ws=1.-smoothstep(0.,.5,y),wh=smoothstep(.5,1.,y);return y+(rgb-y)*(1.+dot(vec3(ws,1.-ws-wh,wh),r));}
   float curve(float v,vec3 p){float x=clamp(v,0.,1.)*4.;return x<1.?mix(0.,p.x,x):x<2.?mix(p.x,p.y,x-1.):x<3.?mix(p.y,p.z,x-2.):mix(p.z,1.,x-3.);}
   vec3 maskNode(vec3 rgb,vec3 before,vec4 mask,vec2 coord){
     if(mask.w<2.||mask.x<0.)return rgb;
@@ -93,11 +94,11 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
         if(a.x!=0.||c.w!=0.||d.w!=0.)rgb=encodeRGB(decodeRGB(rgb,int(kind.y))*exp2(a.x)*vec3(1.+c.w,1.-d.w,1.-c.w),int(kind.y));
         vec3 v=rgb,x=(v-a.z)*a.y+a.z+b.w+e.xyz;
         rgb=sign(x)*pow(abs(x),vec3(1.)/exp2(b.y+c.xyz))*(b.z+d.xyz)+(b.x+f.xyz)*(1.-v);
-        float y=dot(rgb,param(11,n).xyz);rgb=y+(rgb-y)*a.w;
+        float y=dot(rgb,param(11,n).xyz);rgb=rangeSaturation(y+(rgb-y)*a.w,param(11,n).xyz,param(8,n).xyz);
       }else{
         vec3 v=max(vec3(0),rgb*exp2(a.x));
         rgb=pow(max(vec3(0),(v-a.z)*a.y+a.z+b.w+e.xyz),vec3(1.)/exp2(b.y+c.xyz))*(b.z+d.xyz)+(b.x+f.xyz)*(1.-min(vec3(1),v));
-        float y=dot(rgb,vec3(.2126,.7152,.0722));rgb=(y+(rgb-y)*a.w)*vec3(1.+c.w,1.-d.w,1.-c.w);
+        float y=dot(rgb,vec3(.2126,.7152,.0722));rgb=rangeSaturation(y+(rgb-y)*a.w,vec3(.2126,.7152,.0722),param(8,n).xyz)*vec3(1.+c.w,1.-d.w,1.-c.w);
       }
       if(h.w==2.){rgb=vec3(customCurve(rgb.r,n*4),customCurve(rgb.g,n*4),customCurve(rgb.b,n*4));rgb=vec3(customCurve(rgb.r,n*4+1),customCurve(rgb.g,n*4+2),customCurve(rgb.b,n*4+3));}
       else if(h.w==1.)rgb=vec3(curve(rgb.r,h.xyz),curve(rgb.g,h.xyz),curve(rgb.b,h.xyz));
@@ -210,22 +211,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
       if(controls!==previous){
         const interpreted={...clip,properties:{...clip.properties,inputProfile:profile,inputGamut:gamut}};
         const stages=processingStages(interpreted,nodes),height=Math.max(1,stages.length);if(height*4>gl.getParameter(gl.MAX_TEXTURE_SIZE))throw new Error('Too many correction stages for this GPU.');
-        const data=new Float32Array(height*52),curveData=new Float32Array(1024*height*4);
-        let lutOffset=0;const lutEffects:Extract<ReturnType<typeof processingStages>[number],{type:'lut'}>[]=[];
-        stages.forEach((stage,i)=>{
-          const row=i*52,mask=stage.node.mask;data.set([mask?.enabled?maskIds.indexOf(nodeMaskId(stage.node)!):-1,(mask?.amount??100)/100,mask?.invert?1:0,(stage.nodeStart?1:0)+(stage.nodeEnd?2:0)],row+48);
-          if(stage.type==='cst'){
-            const e=stage.effect;data.set([1,profiles.indexOf(e.inputGamma as typeof profiles[number]),profiles.indexOf(e.outputGamma as typeof profiles[number]),e.toneMapping==='aces2'?2:e.toneMapping==='shoulder'?1:0],row+28);
-            stage.matrix.forEach((r,j)=>data.set([...r,j===0&&e.gamutMapping==='compress'?1:0],row+32+j*4));data.set(luminanceWeights(e.outputGamut),row+44);
-          }else if(stage.type==='lut'){
-            const e=stage.effect;data.set([lutOffset,e.cube.size,e.amount,0,...e.cube.min,0,...e.cube.max,0],row);data[row+28]=2;lutOffset+=e.cube.size**3;lutEffects.push(stage);
-          }else{
-            const {g,extra:p,node}=stage;
-            data.set([g.exposure,g.contrast,g.pivot,g.saturation,g.lift,g.gamma,g.gain,g.offset,p.gammaR??0,p.gammaG??0,p.gammaB??0,clip.properties.colorPipeline==='nodes-v2'?g.temperature/10000:Math.max(-.5,Math.min(.5,g.temperature/10000)),p.gainR??0,p.gainG??0,p.gainB??0,clip.properties.colorPipeline==='nodes-v2'?g.tint/200:Math.max(-.5,Math.min(.5,g.tint/200)),p.offsetR??0,p.offsetG??0,p.offsetB??0,0,p.liftR??0,p.liftG??0,p.liftB??0,0,p.curve25??.25,p.curve50??.5,p.curve75??.75,node.curves?2:Object.keys(p).some(k=>k.startsWith('curve'))?1:0,0,profiles.indexOf(stage.gamma as typeof profiles[number]),0,0],row);
-            data.set(luminanceWeights(stage.gamut),row+44);
-            if(node.curves)for(const [c,key]of ['RGB','R','G','B'].entries()){const curve=node.curves[key as 'RGB']??identityCurve();for(let x=0;x<1024;x++)curveData[(i*4+c)*1024+x]=sampleCurve(x/1023,curve);}
-          }
-        });
+        const {data,curveData,lutOffset,lutEffects}=packStages(clip,stages,maskIds);
         gl.activeTexture(gl.TEXTURE6);gl.bindTexture(gl.TEXTURE_2D,curveTexture);settings(gl.TEXTURE_2D,gl.NEAREST);gl.texImage2D(gl.TEXTURE_2D,0,gl.R32F,1024,height*4,0,gl.RED,gl.FLOAT,curveData);
         const lutKey=JSON.stringify(lutEffects.map(s=>cubeId(s.effect.cube)));
         if(lutKey!==previousLuts){
@@ -281,6 +267,28 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     },
     dispose(){worker.terminate();gl.deleteTexture(neutral.texture);for(const look of looks.values())if(look&&!(look instanceof Error))gl.deleteTexture(look.texture);gl.deleteTexture(picture);gl.deleteTexture(parameters);gl.deleteTexture(maskTexture);gl.deleteTexture(curveTexture);gl.deleteTexture(lutTexture);planes.forEach(t=>gl.deleteTexture(t));acesTables.forEach(t=>gl.deleteTexture(t));gl.deleteProgram(program);gl.getExtension('WEBGL_lose_context')?.loseContext();looks.clear();},
   };
+}
+
+/** Each stage as one 52-float row (13 RGBA texels) of the shader's parameter texture, plus its 4 curve rows. Correction texel 8 holds range saturation as factor − 1. */
+export function packStages(clip:Clip,stages:ReturnType<typeof processingStages>,maskIds:string[]){
+  const height=Math.max(1,stages.length),data=new Float32Array(height*52),curveData=new Float32Array(1024*height*4);
+  let lutOffset=0;const lutEffects:Extract<ReturnType<typeof processingStages>[number],{type:'lut'}>[]=[];
+  stages.forEach((stage,i)=>{
+    const row=i*52,mask=stage.node.mask;data.set([mask?.enabled?maskIds.indexOf(nodeMaskId(stage.node)!):-1,(mask?.amount??100)/100,mask?.invert?1:0,(stage.nodeStart?1:0)+(stage.nodeEnd?2:0)],row+48);
+    if(stage.type==='cst'){
+      const e=stage.effect;data.set([1,profiles.indexOf(e.inputGamma as typeof profiles[number]),profiles.indexOf(e.outputGamma as typeof profiles[number]),e.toneMapping==='aces2'?2:e.toneMapping==='shoulder'?1:0],row+28);
+      stage.matrix.forEach((r,j)=>data.set([...r,j===0&&e.gamutMapping==='compress'?1:0],row+32+j*4));data.set(luminanceWeights(e.outputGamut),row+44);
+    }else if(stage.type==='lut'){
+      const e=stage.effect;data.set([lutOffset,e.cube.size,e.amount,0,...e.cube.min,0,...e.cube.max,0],row);data[row+28]=2;lutOffset+=e.cube.size**3;lutEffects.push(stage);
+    }else{
+      const {g,extra:p,node}=stage;
+      data.set([(p.saturationShadows??100)/100-1,(p.saturationMidtones??100)/100-1,(p.saturationHighlights??100)/100-1],row+32);
+      data.set([g.exposure,g.contrast,g.pivot,g.saturation,g.lift,g.gamma,g.gain,g.offset,p.gammaR??0,p.gammaG??0,p.gammaB??0,clip.properties.colorPipeline==='nodes-v2'?g.temperature/10000:Math.max(-.5,Math.min(.5,g.temperature/10000)),p.gainR??0,p.gainG??0,p.gainB??0,clip.properties.colorPipeline==='nodes-v2'?g.tint/200:Math.max(-.5,Math.min(.5,g.tint/200)),p.offsetR??0,p.offsetG??0,p.offsetB??0,0,p.liftR??0,p.liftG??0,p.liftB??0,0,p.curve25??.25,p.curve50??.5,p.curve75??.75,node.curves?2:Object.keys(p).some(k=>k.startsWith('curve'))?1:0,0,profiles.indexOf(stage.gamma as typeof profiles[number]),0,0],row);
+      data.set(luminanceWeights(stage.gamut),row+44);
+      if(node.curves)for(const [c,key]of ['RGB','R','G','B'].entries()){const curve=node.curves[key as 'RGB']??identityCurve();for(let x=0;x<1024;x++)curveData[(i*4+c)*1024+x]=sampleCurve(x/1023,curve);}
+    }
+  });
+  return {data,curveData,lutOffset,lutEffects};
 }
 
 /** Last-resort path for devices where WebGL 2 is unavailable. Uses the same color math as export. */

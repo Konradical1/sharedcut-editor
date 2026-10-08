@@ -58,6 +58,16 @@ def lut(rgb,e):
                 w=np.prod(np.where(np.array([r,g,b]),f,1-f),axis=-1,keepdims=True);at=lo+[r,g,b];result+=table[at[...,2],at[...,1],at[...,0]]*w
     return rgb+(result-rgb)*e['amount']
 
+def smoothstep(a,b,x):
+    t=np.clip((x-a)/(b-a),0,1); return t*t*(3-2*t)
+
+def range_saturation(rgb,w,p):
+    """rangeSaturation in color.ts: saturationShadows/Midtones/Highlights (percent) by luma, after the node's saturation."""
+    s,m,h=(p.get('saturation'+k,100)/100-1 for k in ('Shadows','Midtones','Highlights'))
+    if not (s or m or h): return rgb
+    y=(rgb@np.array(w))[...,None];ws=1-smoothstep(0,.5,y);wh=smoothstep(.5,1,y)
+    return y+(rgb-y)*(1+ws*s+(1-ws-wh)*m+wh*h)
+
 def grade(rgb,stages,masks=None,managed=True):
     def blend(result,before,stage):
         binding=stage.get('node',{}).get('mask')
@@ -90,11 +100,11 @@ def grade(rgb,stages,masks=None,managed=True):
                 if g['exposure'] or g['temperature'] or g['tint']: rgb=encode(decode(rgb,gamma)*2**g['exposure']*np.array([1+g['temperature']/10000,1-g['tint']/200,1-g['temperature']/10000]),gamma)
                 v=rgb;x=(v-g['pivot'])*g['contrast']+g['pivot']+g['offset']+np.array([p.get('offset'+c,0) for c in channels])
                 rgb=np.sign(x)*np.abs(x)**(1/2**(g['gamma']+np.array([p.get('gamma'+c,0) for c in channels])))*(g['gain']+np.array([p.get('gain'+c,0) for c in channels]))+(g['lift']+np.array([p.get('lift'+c,0) for c in channels]))*(1-v)
-                y=(rgb@np.array(s['weights']))[...,None];rgb=y+(rgb-y)*g['saturation']
+                y=(rgb@np.array(s['weights']))[...,None];rgb=range_saturation(y+(rgb-y)*g['saturation'],s['weights'],p)
             else:
                 v=np.maximum(0,rgb*2**g['exposure']);x=(v-g['pivot'])*g['contrast']+g['pivot']+g['offset']+np.array([p.get('offset'+c,0) for c in channels])
                 rgb=np.maximum(0,x)**(1/2**(g['gamma']+np.array([p.get('gamma'+c,0) for c in channels])))*(g['gain']+np.array([p.get('gain'+c,0) for c in channels]))+(g['lift']+np.array([p.get('lift'+c,0) for c in channels]))*(1-np.minimum(1,v))
-                y=(rgb@np.array([.2126,.7152,.0722]))[...,None];rgb=(y+(rgb-y)*g['saturation'])*np.array([1+np.clip(g['temperature']/10000,-.5,.5),1-np.clip(g['tint']/200,-.5,.5),1-np.clip(g['temperature']/10000,-.5,.5)])
+                y=(rgb@np.array([.2126,.7152,.0722]))[...,None];rgb=range_saturation(y+(rgb-y)*g['saturation'],[.2126,.7152,.0722],p)*np.array([1+np.clip(g['temperature']/10000,-.5,.5),1-np.clip(g['tint']/200,-.5,.5),1-np.clip(g['temperature']/10000,-.5,.5)])
             curves=s['node'].get('curves')
             if curves is not None:
                 if 'RGB' in curves: rgb=curve(rgb,curves['RGB'])
