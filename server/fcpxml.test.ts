@@ -178,18 +178,23 @@ test('a real Final Cut export: audition timing, sample-accurate sound, split edi
   near(lithe.start, 10.5 + (24459373200 / 720000 - 81531444 / 2400)); near(lithe.duration, 20370000 / 720000, 'the split edit runs to audioDuration, past the picture');
   const beep = r.clips.find(c => c.name === 'Beep.wav')!;
   near(beep.start, 9996389011 / 35280000 - 658900 / 2400, 'sound alone is cut to the sample, not the frame'); near(beep.sourceIn, 260546094466 / 35280000 - 7385);
-  const title = r.clips.find(c => c.mediaId === 'frameline-title')!, doc = JSON.parse(String(title.properties.textDocument));
-  assert.equal(doc.runs[0].style.fontFamily, 'FL-bebas', 'title fonts resolve to the font library'); assert.equal(doc.align, 'left');
-  near(doc.y + doc.height, .5 + 290.8225 / 1080, 'bottom-aligned text ends at the lowest text box');
+  // One title per text object, stacked in order and linked: the renderer sets each line at least as tall as a title's first run.
+  const docs = (clips: typeof r.clips) => clips.filter(c => c.mediaId === 'frameline-title').map(c => ({ clip: c, doc: JSON.parse(String(c.properties.textDocument)) }));
+  const [name, subtitle] = docs(r.clips);
+  assert.deepEqual([name.doc.runs[0].text, subtitle.doc.runs[0].text], ['Jack matthews #15', 'Mens soccer']);
+  assert.equal(name.doc.runs[0].style.fontFamily, 'FL-bebas', 'title fonts resolve to the font library'); assert.equal(name.doc.align, 'left');
+  assert.ok(name.clip.properties.linkGroup && name.clip.properties.linkGroup === subtitle.clip.properties.linkGroup, 'the parts of one title move together');
+  near(name.doc.y + name.doc.height, subtitle.doc.y, 'the subtitle sits right under the name');
+  near(subtitle.doc.y + subtitle.doc.height, .5 + 290.8225 / 1080, 'bottom-aligned text ends at the lowest text box');
   assert.ok(!r.warnings.some(w => /Bebas/.test(w)), 'a font found in the library is not reported');
 
   // A line wider than its box shrinks the whole title (Final Cut's Auto-Shrink) instead of wrapping; tracking is % of size.
   const measure = (text: string, style: { fontSize: number; letterSpacing: number }) => [...text].length * (style.fontSize * .5 + style.letterSpacing);
-  const fitted = JSON.parse(String(importFcpxml(fieldExport, 'fcp-field', 'owner', [], measure).clips.find(c => c.mediaId === 'frameline-title')!.properties.textDocument));
-  const big = fitted.runs[0], small = fitted.runs.find((r: { text: string }) => r.text === 'Mens soccer'), widest = measure('Jack matthews #15', big.style);
-  assert.ok(widest <= fitted.width * 1920 + 1e-6 && widest > .95 * fitted.width * 1920, `the widest line fills its box: ${widest} of ${fitted.width * 1920}`);
+  const [fittedName, fittedSubtitle] = docs(importFcpxml(fieldExport, 'fcp-field', 'owner', [], measure).clips).map(d => d.doc);
+  const big = fittedName.runs[0], small = fittedSubtitle.runs[0], widest = measure('Jack matthews #15', big.style);
+  assert.ok(widest <= fittedName.width * 1920 + 1e-6 && widest > .95 * fittedName.width * 1920, `the widest line fills its box: ${widest} of ${fittedName.width * 1920}`);
   near(big.style.fontSize / small.style.fontSize, 278.9 / 91.9, 'every run shrinks by the same factor');
-  near(JSON.parse(String(r.clips.find(c => c.mediaId === 'frameline-title')!.properties.textDocument)).runs[0].style.letterSpacing, 0, 'no tracking, no spacing');
+  near(name.doc.runs[0].style.letterSpacing, 0, 'no tracking, no spacing');
 });
 
 test('a non-uniform Final Cut scale imports per axis as Scale X / Scale Y, static and keyed', () => {

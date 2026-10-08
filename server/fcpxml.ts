@@ -589,43 +589,50 @@ export function importFcpxml(xml: string, projectId: string, userId: string, fon
     const begin = at(parent, fcpTime(node.attrs.offset)), own: Frame = { origin: begin, start: fcpTime(node.attrs.start), rate: parent.rate };
     const span = visible(ctx, begin, fcpTime(node.attrs.duration) * parent.rate, win), out: Placed[] = [];
     const styles = new Map(node.children.filter(c => c.name === 'text-style-def').map(d => [d.attrs.id, child(d, 'text-style')]));
-    const runs: TextRun[] = [];
-    let tight = false;
-    for (const [i, text] of node.children.filter(c => c.name === 'text').entries()) {
-      if (i && runs.length) runs.push({ text: '\n', style: runs[runs.length - 1].style });
-      for (const r of text.children.filter(c => c.name === 'text-style')) {
-        const s = styles.get(r.attrs.ref), face = s?.attrs.fontFace ?? '', family = (s?.attrs.font ?? '').replace(/[\x00-\x1f"\\]/g, '').trim().slice(0, 160);
+    // Each <text> is one of the template's text objects; each becomes its own SharedCut title, as SharedCut sets every
+    // line of a title at least as tall as its first run (a big name line would push small lines below it out of the box).
+    const blocks = node.children.filter(c => c.name === 'text').map(text => {
+      let tight = false;
+      const runs: TextRun[] = text.children.filter(c => c.name === 'text-style').map(r => {
+        const s = styles.get(r.attrs.ref), face = s?.attrs.fontFace ?? '', family = (s?.attrs.font ?? '').replace(/[\x00-\x1f"\\]/g, '').trim().slice(0, 160), size = Number(s?.attrs.fontSize) || 63;
         if (Number(s?.attrs.lineSpacing) < 0) tight = true;
-        runs.push({ text: r.text, style: { fontFamily: family ? fontFor(family) : defaultTextStyle.fontFamily, fontSize: Math.min(600, Math.max(4, Number(s?.attrs.fontSize) || 63)),
+        return { text: r.text, style: { fontFamily: family ? fontFor(family) : defaultTextStyle.fontFamily, fontSize: Math.min(600, Math.max(4, size)),
           fontWeight: s?.attrs.bold === '1' || /bold|black|heavy/i.test(face) ? 700 : /light|thin/i.test(face) ? 300 : /medium/i.test(face) ? 500 : 400,
           // Final Cut's tracking is a percent of the font size; SharedCut's letter spacing is pixels.
-          italic: s?.attrs.italic === '1' || /italic|oblique/i.test(face), underline: s?.attrs.underline === '1', letterSpacing: round(Math.min(100, Math.max(-10, (Number(s?.attrs.kerning) || 0) / 100 * (Number(s?.attrs.fontSize) || 63)))), color: hex(s?.attrs.fontColor, '#ffffff') } });
-      }
-    }
-    const content = runs.map(r => r.text).join('');
-    if (!content.trim()) gap(`Titles with no text are skipped (${template})`);
+          italic: s?.attrs.italic === '1' || /italic|oblique/i.test(face), underline: s?.attrs.underline === '1', letterSpacing: round(Math.min(100, Math.max(-10, (Number(s?.attrs.kerning) || 0) / 100 * size))), color: hex(s?.attrs.fontColor, '#ffffff') } };
+      });
+      return { runs, tight };
+    }).filter(b => b.runs.some(r => r.text.trim()));
+    if (!blocks.length) gap(`Titles with no text are skipped (${template})`);
     else if (span) {
       gap(`Title "${template}" imports as text with its fonts and layout; the template's graphics and animation are not reproduced`);
-      const clamp = (lo: number, hi: number, v: number) => Math.min(hi, Math.max(lo, v));
+      const clamp = (lo: number, hi: number, v: number) => Math.min(hi, Math.max(lo, v)), runs = blocks.flatMap(b => b.runs);
       const placement = param(node, 'Alignment')?.attrs.value ?? '', styled = [...styles.values()][0]?.attrs.alignment;
       const align = /Right/.test(placement) ? 'right' : /Left/.test(placement) ? 'left' : /Center/.test(placement) ? 'center' : styled === 'left' || styled === 'right' ? styled : 'center';
       const positions = node.children.filter(c => c.name === 'param' && c.attrs.name === 'Position').map(c => pair(c.attrs.value));
       const x = align === 'left' && positions.length ? clamp(.03, .6, .5 + Math.min(...positions.map(p => p[0])) / ctx.width) : .05, width = align === 'left' ? Math.min(.94, .97 - x) : .9;
       // Final Cut breaks lines only where the text does (Auto-Shrink fits them to the margins); SharedCut would wrap
       // at its box instead, so a line wider than the box shrinks the whole title, as Auto-Shrink does.
-      const widths = [0];
-      if (measure) for (const r of runs) for (const [k, part] of r.text.split('\n').entries()) { if (k) widths.push(0); widths[widths.length - 1] += part ? measure(part, r.style) : 0; }
+      const widths: number[] = [];
+      if (measure) for (const b of blocks) { widths.push(0); for (const r of b.runs) for (const [k, part] of r.text.split('\n').entries()) { if (k) widths.push(0); widths[widths.length - 1] += part ? measure(part, r.style) : 0; } }
       const fit = Math.min(1, .98 * width * ctx.width / Math.max(1, ...widths));
       if (fit < 1) for (const r of runs) r.style = { ...r.style, fontSize: Math.max(4, round(r.style.fontSize * fit)), letterSpacing: round(r.style.letterSpacing * fit) };
-      const lineHeight = tight ? 1 : 1.14, lines: number[] = [0];
-      for (const r of runs) for (const [k, part] of r.text.split('\n').entries()) { if (k) lines.push(0); if (part) lines[lines.length - 1] = Math.max(lines[lines.length - 1], r.style.fontSize); }
-      const height = clamp(.01, 1, lines.reduce((sum, size) => sum + (size || runs[0].style.fontSize) * lineHeight, 0) / ctx.height);
+      // Heights as the renderer sets them: each line as tall as its largest run, and never shorter than the first run.
+      const heights = blocks.map(b => {
+        const lineHeight = b.tight ? 1 : 1.14, lines: number[] = [0];
+        for (const r of b.runs) for (const [k, part] of r.text.split('\n').entries()) { if (k) lines.push(0); if (part) lines[lines.length - 1] = Math.max(lines[lines.length - 1], r.style.fontSize); }
+        return { lineHeight, height: lines.reduce((sum, size) => sum + Math.max(size, b.runs[0].style.fontSize) * lineHeight, 0) / ctx.height };
+      });
+      const total = heights.reduce((sum, h) => sum + h.height, 0);
       const bottoms = node.children.filter(c => c.name === 'param' && c.attrs.name === 'Bottom Margin').map((c, i) => (positions[i]?.[1] ?? 0) + Number(c.attrs.value));
-      const y = /Bottom/.test(placement) && bottoms.length ? .5 - Math.min(...bottoms) / ctx.height - height : .5 - (positions[0]?.[1] ?? 0) / ctx.height - height / 2;
-      const doc: TextDocument = { ...defaultTextEffects, runs: runs.slice(0, 1000), x, y: clamp(-4, 4, y), width, height, align, lineHeight, opacity: 100 };
-      const look = picture(ctx, node, own, span, label);
-      out.push(place(ctx, 'video', lane, { mediaId: 'frameline-title', name: content.replace(/\s+/g, ' ').trim().slice(0, 80), start: span.lo, duration: span.hi - span.lo, sourceIn: 0, color: '#8e75ba',
-        disabled: node.attrs.enabled === '0', properties: { animationPresetDuration: span.hi - span.lo, textDocument: JSON.stringify(doc), ...look.properties }, keyframes: look.keyframes }, look));
+      let y = /Bottom/.test(placement) && bottoms.length ? .5 - Math.min(...bottoms) / ctx.height - total : .5 - (positions[0]?.[1] ?? 0) / ctx.height - total / 2;
+      const look = picture(ctx, node, own, span, label), link = blocks.length > 1 ? id('link', `${ctx.timeline.id}/${ctx.count}`) : undefined;
+      for (const [i, b] of blocks.entries()) {
+        const doc: TextDocument = { ...defaultTextEffects, runs: b.runs.slice(0, 1000), x, y: clamp(-4, 4, y), width, height: clamp(.01, 1, heights[i].height), align, lineHeight: heights[i].lineHeight, opacity: 100 };
+        y += heights[i].height;
+        out.push(place(ctx, 'video', lane, { mediaId: 'frameline-title', name: b.runs.map(r => r.text).join(' ').replace(/\s+/g, ' ').trim().slice(0, 80), start: span.lo, duration: span.hi - span.lo, sourceIn: 0, color: '#8e75ba',
+          disabled: node.attrs.enabled === '0', properties: { animationPresetDuration: span.hi - span.lo, textDocument: JSON.stringify(doc), ...(link ? { linkGroup: link } : {}), ...look.properties }, keyframes: structuredClone(look.keyframes) }, look));
+      }
     }
     connected(ctx, node, own, win, lane);
     markers(ctx, node, own, span);
