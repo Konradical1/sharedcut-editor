@@ -41,7 +41,7 @@ import { promisify, isDeepStrictEqual } from 'node:util';
 import { LOCK_TTL, MOVEMENT_FIELDS, lockConflict, type PersistedState } from '../src/services/index.ts';
 import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock } from '../src/state/models.ts';
 import { exportResolveTimeline, importResolve } from './resolve.ts';
-import { importFcpxml } from './fcpxml.ts';
+import { fcpProjectId, importFcpxml } from './fcpxml.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
 import { depthCapabilities, depthService } from './depth.ts';
@@ -477,15 +477,19 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     state = { ...state, projects: state.projects.filter(item => item.id !== projectId), timelines: state.timelines.filter(item => item.projectId !== projectId), tracks: state.tracks.filter(item => !timelineIds.has(item.timelineId)), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, (state[key as Collection] as Entry[]).filter(item => item.projectId !== projectId)])) };
   };
   const backupProject = (id: string, ownerId: string, expiresAt: number, backup: Record<Collection, Entry[]>) => db.prepare('INSERT INTO deleted_projects(id,ownerId,expiresAt,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET ownerId=excluded.ownerId,expiresAt=excluded.expiresAt,data=excluded.data').run(id, ownerId, expiresAt, JSON.stringify(backup));
+  /** An id a deleted project still holds: reusing it would bring the deleted copy's media ids back. */
+  const reserved = (id: string) => Boolean(db.prepare('SELECT 1 FROM deleted_projects WHERE id=?').get(id)) || library.hasLocation(id);
   const purgeExpiredProjects = () => {
     const rows = db.prepare('SELECT id,data FROM deleted_projects WHERE expiresAt<=?').all(Date.now()) as { id: string; data: string }[];
     // A file Windows holds open (antivirus, an indexer) must not crash the housekeeping timer or block startup; the row stays and is retried.
     for (const row of rows) try {
       const bundle = JSON.parse(row.data) as Record<Collection, Entry[]>;
-      for (const asset of bundle.media ?? []) rmSync(mediaDir(asset.id), { recursive: true, force: true });
+      // Whatever a live project uses under the same id stays: an import made while the deleted copy waited may share it.
+      const live = new Set(state.media.map(asset => asset.id)), reused = state.projects.some(project => project.id === row.id);
+      for (const asset of bundle.media ?? []) if (!live.has(asset.id)) rmSync(mediaDir(asset.id), { recursive: true, force: true });
       for (const job of bundle.renderJobs ?? []) for (const extension of ['.mp4', '.mov']) rmSync(join(dataDir, 'renders', `${job.id}${extension}`), { force: true });
-      db.prepare('DELETE FROM caption_jobs WHERE projectId=?').run(row.id);
-      try { colorAssistant.purge(row.id); } catch { /* A still being served; its folder outlives the purge. */ }
+      if (!reused) db.prepare('DELETE FROM caption_jobs WHERE projectId=?').run(row.id);
+      if (!reused) try { colorAssistant.purge(row.id); } catch { /* A still being served; its folder outlives the purge. */ }
       db.prepare('DELETE FROM deleted_projects WHERE id=?').run(row.id);
     } catch (error) { console.error(`Purging deleted project ${row.id} failed:`, error); }
   };
@@ -1159,6 +1163,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if(!idIsValid(id)||id.length>64)fail(400,'Invalid import project ID.');
           object(body.manifest);
           let imported: ReturnType<typeof importResolve>;try{imported=importResolve(body.manifest,id,userId,body.otios);}catch(error){fail(400,(error as Error).message);}
+          if(!state.projects.some(p=>p.id===id)&&reserved(id))fail(409,'This Resolve project was deleted and can still be restored. Restore it from the deleted projects, or import it fresh.');
           if(state.projects.some(p=>p.id===id)) {
             const existing=requireProject(id,userId,true) as Project & {resolveImportHash?:string};
             if(existing.resolveImportHash!==(imported!.project as Project & {resolveImportHash?:string}).resolveImportHash)fail(409,'That project ID already exists with different content.');
@@ -1172,16 +1177,22 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           send(res,201,{projectId:id,files:imported!.files,warnings:imported!.warnings,media:imported!.media});return;
         }
         if (path === '/api/fcp/import' && method === 'POST') {
-          // The body is the raw FCPXML (JSON would escape a 50 MB XML). The same XML maps to the same project id, so a
-          // rerun resumes its uploads; rebuild=1 re-converts an imported project's edit, keeping its uploaded media.
-          const id = url.searchParams.get('projectId') ?? '', rebuild = url.searchParams.get('rebuild') === '1';
+          // The body is the raw FCPXML (JSON would escape a 50 MB XML). Without a projectId the server picks it: one per
+          // Final Cut project and importer (fcpProjectId), so a rerun resumes its uploads and a re-export rebuilds it
+          // (rebuild=1 re-converts the edit, keeping its uploaded media); fresh=1 imports a new copy. A project imported
+          // before ids were per importer keeps its id, the hash of its XML.
+          const rebuild = url.searchParams.get('rebuild') === '1', xml = (await binaryBody(req, 128 * 1024 * 1024)).toString('utf8');
+          const legacy = 'fcp-' + createHash('sha256').update(xml).digest('hex').slice(0, 32), mine = (projectId: string) => state.projects.some(p => p.id === projectId && roleFor(p, userId));
+          const id = url.searchParams.get('projectId') || (url.searchParams.get('fresh') === '1' ? `fcp-${randomUUID().replace(/-/g, '')}` : mine(legacy) ? legacy : fcpProjectId(xml, userId));
           if (!idIsValid(id) || !id.startsWith('fcp-') || id.length > 64) fail(400, 'Invalid import project ID.');
-          const xml = (await binaryBody(req, 128 * 1024 * 1024)).toString('utf8');
           // Titles are measured with the fonts and canvas the export renders them with, so they can be shrunk to fit.
           const ruler = createCanvas(8, 8).getContext('2d'), measure = (text: string, style: TextStyle) => { ruler.font = canvasFont(style); return style.letterSpacing ? [...new Intl.Segmenter().segment(text)].reduce((sum, g) => sum + ruler.measureText(g.segment).width + style.letterSpacing, 0) : ruler.measureText(text).width; };
           let imported: ReturnType<typeof importFcpxml>; try { imported = importFcpxml(xml, id, userId, fonts.list(), measure); } catch (error) { fail(400, (error as Error).message); }
           const existing = state.projects.find(p => p.id === id) as (Project & { fcpImportHash?: string }) | undefined;
           const { fcpImportHash, fcpWarnings } = imported!.project as Project & { fcpImportHash: string; fcpWarnings: string[] };
+          if (!existing && rebuild) fail(404, 'There is no imported project to rebuild for this Final Cut project. Import it without rebuild, or name the project to rebuild.');
+          // The deleted copy's media ids would come back, and purging it later would take the new project's footage.
+          if (!existing && reserved(id)) fail(409, 'This Final Cut project was deleted and can still be restored. Restore it from the deleted projects, or import a fresh copy.');
           if (existing) {
             requireProject(id, userId, true);
             if (!existing.fcpImportHash) fail(409, 'That project was not imported from Final Cut.');
@@ -1302,7 +1313,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             const partial=join(mediaDir(id),staging?'replacement.part':'upload.part'), metadataPath=join(mediaDir(id),staging?'replacement.upload.json':'upload.json');
             if(method==='GET'){send(res,200,{offset:existsSync(partial)?statSync(partial).size:0,complete:!staging&&existsSync(originalPath(id)),metadata:existsSync(metadataPath)?JSON.parse(readFileSync(metadataPath,'utf8')):null});return;}
             if(method==='POST') {
-              const body=await jsonBody(req);numberField(body.size,1,maxUploadBytes);if(!Number.isSafeInteger(body.size))fail(400,'Invalid file size.');textField(body.fingerprint,300,true);
+              const body=await jsonBody(req);
+              // Said plainly: an import script names the file and goes on with the rest.
+              if(body.size===0)fail(400,'The file is empty.');if(typeof body.size==='number'&&body.size>maxUploadBytes)fail(413,`Files must be smaller than ${Math.floor(maxUploadBytes/1024**3)} GB.`);
+              numberField(body.size,1,maxUploadBytes);if(!Number.isSafeInteger(body.size))fail(400,'Invalid file size.');textField(body.fingerprint,300,true);
               if(!staging&&existsSync(originalPath(id))){send(res,200,{complete:true});return;}
               if(staging&&body.size!==JSON.parse(readFileSync(replacement,'utf8')).size)fail(409,'The selected file differs from the replacement. Choose Replace Media again.');
               if(uploadLocks.has(id))fail(409,'Upload is busy.');

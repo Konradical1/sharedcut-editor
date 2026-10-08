@@ -2,24 +2,27 @@
 //
 //   node scripts/import-fcp.mjs "/media/konradfischer/SD/SharedCut - Edit"
 //   node scripts/import-fcp.mjs Edit.fcpxml --media ~/Footage --server https://sharedcut.com
-//   node scripts/import-fcp.mjs "<bundle>" --rebuild        re-convert an imported project's edit (the old edit is kept as a snapshot)
+//   node scripts/import-fcp.mjs "<bundle>" --rebuild        re-convert the edit after a re-export (the old edit is kept as a snapshot)
+//   node scripts/import-fcp.mjs "<bundle>" --project fcp-…  the project to resume or rebuild, when it is not found by itself
+//   node scripts/import-fcp.mjs "<bundle>" --fresh          import a new copy, beside (or after deleting) an earlier one
 //
 // Run it on the SharedCut host with the drive plugged in, so footage moves over loopback instead of the tunnel.
-// Safe to stop and run again: the same XML maps to the same project, finished files are skipped and a half-sent
-// one continues from the server's offset. FRAME_LINE_COOKIE skips the sign-in prompt.
+// Safe to stop and run again: the same Final Cut project maps to the same SharedCut project, finished files are skipped
+// and a half-sent one continues from the server's offset. FRAME_LINE_COOKIE skips the sign-in prompt.
 import { createHash } from 'node:crypto';
 import { open, readFile, readdir, stat } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
-import { fcpProjectId, locateSource, readFcpBundle } from '../server/fcpxml.ts';
+import { locateSource, readFcpBundle } from '../server/fcpxml.ts';
 import { agentCookie } from './state-patch.mjs';
 
 for (const event of ['uncaughtException', 'unhandledRejection']) process.on(event, error => { console.error('\n' + (error?.message ?? error)); process.exit(1); });
 
 const args = process.argv.slice(2);
 const flag = name => { const i = args.indexOf(name); return i < 0 ? undefined : args.splice(i, 2)[1]; };
+const toggle = name => { const i = args.indexOf(name); if (i >= 0) args.splice(i, 1); return i >= 0; };
 const server = (flag('--server') ?? process.env.FRAME_LINE_URL ?? 'http://127.0.0.1:4310').replace(/\/$/, '');
 const folders = []; for (let folder; (folder = flag('--media'));) folders.push(resolve(folder));
-const rebuild = args.includes('--rebuild'); if (rebuild) args.splice(args.indexOf('--rebuild'), 1);
+const project = flag('--project'), rebuild = toggle('--rebuild'), fresh = toggle('--fresh');
 if (!args[0]) throw new Error('Pass the folder sharedcut.com/fcp.sh made (or an .fcpxml file).');
 const CHUNK = 8 * 1024 * 1024, ATTEMPTS = 6;
 
@@ -60,9 +63,10 @@ for (const file of bundle.fonts) {
   const name = basename(file).replace(/\.[^.]+$/, '');
   await call(`/api/fonts?name=${encodeURIComponent(name)}`, { method: 'POST', body: await readFile(file) }).then(() => console.log(`Font ${name} added`), error => console.log(`Font ${name} not added: ${error.message}`));
 }
-const projectId = fcpProjectId(bundle.xml);
-const imported = await call(`/api/fcp/import?projectId=${projectId}${rebuild ? '&rebuild=1' : ''}`, { method: 'POST', headers: { 'content-type': 'application/xml' }, body: bundle.xml });
-console.log(`${rebuild ? 'Rebuilt' : 'Imported'} the edit (project ${projectId}).`);
+// The server picks the project: the same Final Cut project (re-exported or not) is the same SharedCut project.
+const query = new URLSearchParams({ ...(project && { projectId: project }), ...(rebuild && { rebuild: '1' }), ...(fresh && { fresh: '1' }) });
+const imported = await call(`/api/fcp/import?${query}`, { method: 'POST', headers: { 'content-type': 'application/xml' }, body: bundle.xml });
+console.log(`${rebuild ? 'Rebuilt' : 'Imported'} the edit (project ${imported.projectId}).`);
 if (imported.warnings.length) { console.log('\nNot carried over from Final Cut:'); for (const warning of imported.warnings) console.log(' - ' + warning); }
 
 /** The editor's resumable protocol: POST size + fingerprint, then PUT checksummed chunks at the server's offset. */
@@ -97,12 +101,16 @@ async function upload(asset, file, label) {
 }
 
 const found = folders.length ? (await Promise.all(folders.map(async folder => (await readdir(folder, { recursive: true })).map(name => join(folder, name))))).flat() : [];
-const missing = [], sources = imported.media.filter(asset => !asset.sourceUrl);
+const missing = [], failed = [], sources = imported.media.filter(asset => !asset.sourceUrl);
 console.log(`\n${imported.media.length} source files · ${imported.media.length - sources.length} already on the server`);
 for (const [index, asset] of sources.entries()) {
   const label = `${index + 1}/${sources.length} ${asset.name}`, file = locateSource(asset, bundle.sources, found);
   if (!file) { missing.push(asset.name); console.log(`${label}: not found`); continue; }
-  console.log(`\r${label}: ${await upload(asset, file, label)}   `);
+  // One file the server refuses (too large, empty) must not stop the files after it.
+  try { console.log(`\r${label}: ${await upload(asset, file, label)}   `); }
+  catch (error) { failed.push(asset.name); console.log(`\r${label}: not uploaded. ${error.message.replace(/^.*→ \d+: /, '')}   `); }
 }
-if (missing.length) console.log(`\n${missing.length} files were not found: ${missing.slice(0, 8).join(', ')}${missing.length > 8 ? '…' : ''}. Run again with --media <folder> to upload them.`);
+const list = names => `${names.slice(0, 8).join(', ')}${names.length > 8 ? '…' : ''}`;
+if (missing.length) console.log(`\n${missing.length} files were not found: ${list(missing)}. Run again with --media <folder> to upload them.`);
+if (failed.length) console.log(`\n${failed.length} files were not uploaded: ${list(failed)}. The reasons are listed above.`);
 console.log(`\nDone. Open ${server} — the project is on your Projects screen. Previews finish preparing on the server.`);

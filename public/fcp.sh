@@ -58,12 +58,16 @@ if [[ $pick == <1-> && -n ${vols[pick]} ]]; then root=$vols[pick]; else root=$pi
 [[ -d $root && -w $root ]] || die "Can't write to $root"
 dest=$root/"SharedCut - $name"
 
-# Same name from different folders: keep both as "name (2).ext". Fixed by XML order, so a rerun maps identically.
+# Names the SharedCut host (Windows) can open: no < > : " / \ | ? * or control characters, no trailing dot or space,
+# no reserved device name. Same name from different folders, in any case (drives ignore case): keep both as
+# "name (2).ext". Fixed by XML order, so a rerun maps identically.
 typeset -A taken; names=()
 for f in $found; do
-  n=${f:t} stem=${f:t:r} ext=${f:t:e} i=1
-  while [[ -n ${taken[$n]} ]]; do (( i++ )); n="$stem ($i)${ext:+.$ext}"; done
-  taken[$n]=1; names+=($n)
+  n=${${f:t}//[<>:\"\\\\|?*[:cntrl:]]/_}; n=${n%%[. ]##}; n=${n:-_}
+  [[ ${(U)n:r} == (CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]) ]] && n="_$n"
+  stem=${n:r} ext=${n:e} i=1
+  while [[ -n ${taken[${(L)n}]} ]]; do (( i++ )); n="$stem ($i)${ext:+.$ext}"; done
+  taken[${(L)n}]=1; names+=($n)
 done
 
 needed=0
@@ -73,7 +77,8 @@ for i in {1..${#found}}; do
 done
 free=$(( $(df -k $root | awk 'NR==2{print $4}') * 1024 ))
 (( needed < free )) || die "Not enough space on ${root:t}: needs $(human $needed), has $(human $free)."
-if mount | grep -qF " on $root (msdos"; then
+# The file system of the folder itself, wherever it sits on the drive (df -T exits 0 only for that type).
+if df -T msdos -- $root >/dev/null 2>&1; then
   for s in $sizes; do (( s < 4294967296 )) || die "${root:t} is formatted FAT32, which can't hold files over 4 GB. Use an exFAT or APFS drive."; done
 fi
 
