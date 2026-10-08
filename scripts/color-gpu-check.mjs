@@ -27,7 +27,7 @@ try{
    const renderer=createColorPreview();HTMLCanvasElement.prototype.getContext=nativeContext;
    try{for(const profile of profiles){
    const clip={id:'color',properties:{inputProfile:profile,inputGamut:profile==='S-Log3'?'S-Gamut3.Cine':profile.startsWith('Canon')?'Cinema Gamut':'Rec.709',inputExposure:.3,inputTemperature:170}},asset={inputProfile:profile};
-   const nodes=[{clipId:clip.id,enabled:true,name:'Curves',order:2,parameters:{curve25:.19,curve50:.47,curve75:.83,liftR:.01,gammaG:.03,gainB:.02,offsetR:.015}},{clipId:clip.id,enabled:true,name:'Primaries',order:1,parameters:{exposure:.1,contrast:1.08,pivot:.43,saturation:93,temperature:220,tint:7,lift:.01,gamma:.04,gain:1.01,offset:.003}}];
+   const nodes=[{clipId:clip.id,enabled:true,name:'Curves',order:2,parameters:{curve25:.19,curve50:.47,curve75:.83,liftR:.01,gammaG:.03,gainB:.02,offsetR:.015}},{clipId:clip.id,enabled:true,name:'Primaries',order:1,parameters:{exposure:.1,contrast:1.08,pivot:.43,saturation:93,saturationShadows:60,saturationMidtones:130,saturationHighlights:80,temperature:220,tint:7,lift:.01,gamma:.04,gain:1.01,offset:.003}}];
    let rendered;for(let attempt=0;attempt<1000;attempt++){try{rendered=renderer.draw(source,clip,asset,nodes,['gpu','software'].includes(mode)?undefined:video);break;}catch(e){if(!(e instanceof ColorPending))throw e;await new Promise(r=>setTimeout(r,10));}}
    if(!rendered)throw Error('Color preparation timed out');if(mode.includes('gpu')&&!rendered.getContext('webgl2'))throw Error('GPU check fell back to CPU');out.drawImage(rendered,0,0);const actual=out.getImageData(0,0,64,1).data,transform=colorTransform(clip,asset,nodes);let total=0,max=0;
    for(let i=0;i<64;i++){const expected=transform(Array.from(image.data.slice(i*4,i*4+3)).map(x=>x/255));for(let c=0;c<3;c++){const error=Math.abs(actual[i*4+c]-Math.round(expected[c]*255));total+=error;max=Math.max(max,error);}}
@@ -39,7 +39,7 @@ try{
     const renderer=createColorPreview();HTMLCanvasElement.prototype.getContext=nativeContext;
     try{for(const profile of profiles){
       let id=0;const clip={id:'managed',projectId:'test',properties:{colorPipeline:'nodes-v2',inputProfile:profile,inputGamut:profile.startsWith('S-Log')?'S-Gamut3.Cine':profile.startsWith('Canon')?'Cinema Gamut':'Rec.709'}},asset={inputProfile:profile},nodes=starterGrade(clip,asset,()=>String(++id));
-      nodes[1].parameters={exposure:-.4,temperature:profile==='Linear'?6000:120,tint:profile==='Linear'?150:3,contrast:1.08,pivot:.336043,saturation:94,lift:.002,gamma:.01,gain:.99,offset:.006};
+      nodes[1].parameters={exposure:-.4,temperature:profile==='Linear'?6000:120,tint:profile==='Linear'?150:3,contrast:1.08,pivot:.336043,saturation:94,saturationShadows:140,saturationMidtones:70,saturationHighlights:120,lift:.002,gamma:.01,gain:.99,offset:.006};
       nodes[1].curves={RGB:{mode:'smooth',points:[{id:'a',x:0,y:.01},{id:'b',x:.3,y:.27},{id:'c',x:.65,y:.7,slope:.8},{id:'d',x:1,y:1}]},R:{mode:'linear',points:[{id:'a',x:0,y:0},{id:'b',x:.4,y:.41},{id:'d',x:1,y:1}]}};
       const cube=makeCube(rgb=>[rgb[0]*.98,rgb[1],rgb[2]*1.01],5);nodes[2].effects=[{id:'lut',type:'lut',name:'Test',enabled:true,amount:.5,inputGamma:'DaVinci Intermediate',inputGamut:'DaVinci Wide Gamut',cube:{...cube,data:Array.from(cube.data)}}];
       const rendered=renderer.draw(source,clip,asset,nodes);if(mode.includes('gpu')&&!rendered.getContext('webgl2'))throw Error('GPU check fell back to CPU');out.drawImage(rendered,0,0);const actual=out.getImageData(0,0,64,1).data,transform=colorTransform(clip,asset,nodes);let total=0,max=0;
@@ -103,5 +103,5 @@ try{
   return results;
  });
  for(const result of results){console.log(result);assert.ok(result.meanError<1.5&&result.maxError<6,'GPU must match validated CPU camera and correction math.');}
- console.log('PASS Sony/Canon GPU color parity, ordered nodes, channel wheels, curves and camera exposure.');
+ console.log('PASS Sony/Canon GPU color parity, ordered nodes, channel wheels, range saturation, curves and camera exposure.');
 }finally{await browser.close();await server.close();}

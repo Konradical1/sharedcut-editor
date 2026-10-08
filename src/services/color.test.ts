@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { colorTransform, decodeLog, makeCube, cubeText, parseCube, sampleCube } from './color.ts';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { colorTransform, decodeLog, makeCube, cubeText, parseCube, sampleCube, processingStages, rangeDefaults, starterGrade } from './color.ts';
+import { venvPython } from '../../server/platform.ts';
 import { timecode } from './timecode.ts';
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 
@@ -85,4 +91,58 @@ test('ungraded log footage is shown as recorded; only a grade or an imported loo
     const transform=colorTransform(clip,{inputProfile,inputGamut} as unknown as MediaAsset,[]);
     for(const rgb of [[128/1023,128/1023,128/1023],[.3,.5,.7],[.9,.2,.4]])assert.deepEqual(transform(rgb),rgb,`${inputProfile} must pass through untouched`);
   }
+});
+
+test('range saturation: identity when absent or 100, smoothstep luma weights, legacy and nodes-v2 alike, preview packing matches',async()=>{
+  const {rangeSaturation,colorStages,luminanceWeights,processingStages}=await import('./color.ts'),{packStages}=await import('./colorPreview.ts');
+  const node=(parameters:Record<string,number>)=>({id:'n',clipId:'r',enabled:true,order:1,name:'Range',parameters} as GradeNode);
+  const legacy={id:'r',properties:{}} as Clip,managed={id:'r',properties:{colorPipeline:'nodes-v2',inputProfile:'Linear',inputGamut:'Rec.2020'}} as unknown as Clip;
+  const colors=[[.02,.05,.01],[.3,.5,.2],[.6,.4,.7],[.95,.9,.6]],near=(a:number,b:number,m:string,e=1e-12)=>assert.ok(Math.abs(a-b)<e,`${m}: ${a} vs ${b}`);
+  const range={saturationShadows:150,saturationMidtones:50,saturationHighlights:300},base={exposure:.2,saturation:120,temperature:300,tint:5,gainR:.05},w=[.2126,.7152,.0722];
+  for(const clip of [legacy,managed]){
+    const plain=colorTransform(clip,undefined,[node(base)]),unity=colorTransform(clip,undefined,[node({...base,saturationShadows:100,saturationMidtones:100,saturationHighlights:100})]);
+    for(const rgb of colors)assert.deepEqual(unity(rgb),plain(rgb),'100 everywhere is bit-identical to no keys');
+  }
+  const grey=[.3,.5,.2];assert.equal(rangeSaturation(grey,w,{}),grey,'absent keys skip the math');
+  for(const n of starterGrade(managed,undefined,()=>'s'))assert.ok(!Object.keys(n.parameters).some(k=>k in rangeDefaults),'new grades store no range keys, so builds without them still render them');
+  // (ws,wm,wh) = (1,0,0) (.5,.5,0) (0,1,0) (0,.5,.5) (0,0,1) at luma 0 .25 .5 .75 1; beyond 0..1 the weights clamp and the pivot does not.
+  for(const [y,ws,wm,wh] of [[0,1,0,0],[.25,.5,.5,0],[.5,0,1,0],[.75,0,.5,.5],[1,0,0,1],[1.3,0,0,1],[-.1,1,0,0]]){
+    const chroma=[.1,-.1*w[0]/w[1],0],out=rangeSaturation(chroma.map(c=>y+c),w,range),f=1+ws*.5-wm*.5+wh*2;
+    out.forEach((v,c)=>near(v,y+chroma[c]*f,`luma ${y} channel ${c}`));near(w[0]*out[0]+w[1]*out[1]+w[2]*out[2],y,`luma ${y} kept`);
+  }
+  const expect=(rgb:number[],weights:number[],ranges=[.5,-.5,2])=>{
+    const y=weights[0]*rgb[0]+weights[1]*rgb[1]+weights[2]*rgb[2],t=(a:number,b:number)=>{const x=Math.max(0,Math.min(1,(y-a)/(b-a)));return x*x*(3-2*x);},ws=1-t(0,.5),wh=t(.5,1),f=1+ws*ranges[0]+(1-ws-wh)*ranges[1]+wh*ranges[2];
+    return rgb.map(v=>Math.max(0,Math.min(1,y+(v-y)*f)));
+  };
+  for(const rgb of colors){
+    // Legacy pivots on Rec.709 luma, before warm/tint; nodes-v2 on the stage gamut's luma (Rec.2020 here).
+    colorTransform(legacy,undefined,[node(range)])(rgb).forEach((v,c)=>near(v,expect(rgb,w)[c],'legacy'));
+    colorTransform(legacy,undefined,[node({...range,temperature:2000})])(rgb).forEach((v,c)=>near(v,Math.min(1,expect(rgb,w)[c]*[1.2,1,.8][c]),'legacy warm after range'));
+    colorTransform(managed,undefined,[node(range)])(rgb).forEach((v,c)=>near(v,expect(rgb,luminanceWeights('Rec.2020'))[c],'nodes-v2',1e-9));
+  }
+  for(const v of [-1,401,NaN])assert.throws(()=>colorStages(legacy,[node({saturationMidtones:v})]),/saturationMidtones is outside/);
+  assert.doesNotThrow(()=>colorStages(legacy,[node({saturationShadows:0,saturationHighlights:400})]));
+  // The shader reads texel 8 of a correction row as factor − 1 (0 = identity) and runs the same formula on it.
+  for(const clip of [legacy,managed]){
+    const stages=processingStages(clip,[node(range),{...node(base),id:'m',order:2}]),{data}=packStages(clip,stages,[]);
+    assert.deepEqual([...data.slice(32,35)],[.5,-.5,2]);assert.deepEqual([...data.slice(52+32,52+35)],[0,0,0],'a node without the keys packs identity');
+    const weights=clip===legacy?w:[...data.slice(44,47)];
+    for(const rgb of colors)expect(rgb,weights,[...data.slice(32,35)]).forEach((v,c)=>near(v,colorTransform(clip,undefined,[node(range)])(rgb)[c],'packed row drives the same pixels',1e-6));
+  }
+});
+
+const colorPython=process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color');
+test('the export worker (color-render.py) grades range saturation like colorTransform, legacy and nodes-v2',{skip:!existsSync(colorPython)&&'the colour worker (npm run setup:color) is not installed'},()=>{
+  const dir=mkdtempSync(join(tmpdir(),'frameline-range-saturation-')),job=join(dir,'job.json'),colors=Array.from({length:64},(_,i)=>[i/63,(i*37%64)/63,(i*11%64)/63]);
+  // Planar G,B,R floats in and out, as the export decoder feeds the worker.
+  const planar=new Float32Array(colors.length*3);colors.forEach((rgb,i)=>[1,2,0].forEach((c,p)=>{planar[p*colors.length+i]=rgb[c];}));
+  try{
+    for(const clip of [{id:'r',properties:{}},{id:'r',properties:{colorPipeline:'nodes-v2',inputProfile:'Linear',inputGamut:'Rec.2020'}}] as unknown as Clip[]){
+      const nodes=[{id:'n',projectId:'p',kind:'serial',clipId:'r',enabled:true,order:1,name:'Range',parameters:{saturation:110,temperature:300,saturationShadows:60,saturationMidtones:130,saturationHighlights:80}} as GradeNode];
+      writeFileSync(job,JSON.stringify({width:colors.length,height:1,stages:processingStages(clip,nodes),managed:clip.properties.colorPipeline==='nodes-v2'}));
+      const out=execFileSync(colorPython,[fileURLToPath(new URL('../../scripts/color-render.py',import.meta.url)),job,'--stream'],{input:Buffer.from(planar.buffer),stdio:['pipe','pipe','ignore']});
+      const data=new Float32Array(out.buffer,out.byteOffset,out.byteLength/4),cpu=colorTransform(clip,undefined,nodes);
+      colors.forEach((rgb,i)=>cpu(rgb).forEach((v,c)=>{const py=Math.min(1,Math.max(0,data[[2,0,1][c]*colors.length+i]));assert.ok(Math.abs(v-py)<1e-5,`${clip.properties.colorPipeline??'legacy'} ${rgb} channel ${c}: ${v} vs ${py}`);}));
+    }
+  }finally{rmSync(dir,{recursive:true,force:true});}
 });

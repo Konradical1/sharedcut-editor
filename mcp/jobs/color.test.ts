@@ -142,6 +142,7 @@ test('the help topic carries the app\'s slider ranges, render limits and color s
   assert.match(topics.color, /^Color grading/);
   assert.match(topics.color, /exposure 0 \(-6\.\.6, stops; render ±16\)/);
   assert.match(topics.color, /saturation 100 \(0\.\.200, 100 = unchanged; render ≤400\)/);
+  assert.match(topics.color, /saturationShadows saturationMidtones saturationHighlights 100 \(0\.\.400/);
   assert.match(topics.color, /gammas: Rec\.709, S-Log3, .*Gamma 2\.4/);
   for (const line of Object.values(jobs).map(j => j.doc)) assert.ok(!line.includes('\n') && line.length < 200, line);
 });

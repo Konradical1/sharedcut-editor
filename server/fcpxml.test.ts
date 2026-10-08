@@ -147,6 +147,9 @@ const fieldExport = `<fcpxml version="1.13"><resources>
       <filter-video ref="r14" name="Color Correction">
         <!-- info-asc-cdl: slope="1.1527 1.1527 1.1527" offset="-0.0627263 -0.0623002 -0.0638536" power="1.02651 0.993983 0.936511" -->
         <param name="Saturation Global" key="2004" value="0.852376"/>
+        <param name="Saturation Shadows" key="2005" value="0.75"/>
+        <param name="Saturation Midtones" key="2006" value="0.5"/>
+        <param name="Saturation Highlights" key="2007" value="0.6"/>
       </filter-video>
       <filter-video ref="r14" name="Color Correction" enabled="0"><!-- info-asc-cdl: slope="2 2 2" offset="0 0 0" power="1 1 1" --></filter-video>
     </asset-clip>
@@ -168,6 +171,8 @@ test('a real Final Cut export: audition timing, sample-accurate sound, split edi
   const p = grades[0].parameters, slope = 1.1527, offset = [-0.0627263, -0.0623002, -0.0638536], power = [1.02651, 0.993983, 0.936511];
   for (const v of [.1, .45, .9]) for (const [i, c] of [...'RGB'].entries()) near(Math.max(0, v + p['offset' + c]) ** (1 / 2 ** p['gamma' + c]) * (1 + p['gain' + c]), (slope * v + offset[i]) ** power[i], `CDL ${c} at ${v}`);
   near(p.saturation, 170.4752, 'color board saturation 0.5 = unchanged, ±0.5 = ±100%');
+  assert.deepEqual([p.saturationShadows, p.saturationMidtones, p.saturationHighlights], [150, undefined, 120], 'range pucks import as range saturation, unchanged ones stay out');
+  assert.ok(!r.warnings.some(w => /saturation/i.test(w)), 'range saturation imports exactly');
   const lithe = r.clips.find(c => c.name === 'Lithe.mp3')!;
   near(lithe.start, 10.5 + (24459373200 / 720000 - 81531444 / 2400)); near(lithe.duration, 20370000 / 720000, 'the split edit runs to audioDuration, past the picture');
   const beep = r.clips.find(c => c.name === 'Beep.wav')!;

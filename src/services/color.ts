@@ -98,14 +98,22 @@ export function curveValue(v: number, p: Record<string,number>) {
   const x=clamp(v)*4, i=Math.min(3,Math.floor(x)), points=[0,p.curve25??.25,p.curve50??.5,p.curve75??.75,1];
   return points[i]+(points[i+1]-points[i])*(x-i);
 }
+const smoothstep=(a:number,b:number,x:number)=>{const t=clamp((x-a)/(b-a));return t*t*(3-2*t);};
+/** Saturation by luma range (saturationShadows/Midtones/Highlights, percent, 100 = unchanged) after a node's saturation. Shadows fade out by luma .5, highlights fade in from .5; it pivots on the unclamped luma, as saturation does. */
+export function rangeSaturation(rgb:number[],weights:number[],p:Record<string,number>){
+  const s=(p.saturationShadows??100)/100-1,m=(p.saturationMidtones??100)/100-1,h=(p.saturationHighlights??100)/100-1;
+  if(!s&&!m&&!h)return rgb;
+  const y=weights[0]*rgb[0]+weights[1]*rgb[1]+weights[2]*rgb[2],ws=1-smoothstep(0,.5,y),wh=smoothstep(.5,1,y),f=1+ws*s+(1-ws-wh)*m+wh*h;
+  return rgb.map(v=>y+(v-y)*f);
+}
 export function colorStages(clip: Clip, nodes: GradeNode[]) {
   const enabled=nodes.filter(n=>n.enabled && n.clipId===clip.id).sort((a,b)=>(a.order??0)-(b.order??0));
   return enabled.map(node=>{
-    const extra=Object.fromEntries(Object.entries(node.parameters).filter(([k])=>/^(lift|gamma|gain|offset)[RGB]$|^curve(25|50|75)$/.test(k)));
+    const extra=Object.fromEntries(Object.entries(node.parameters).filter(([k])=>/^(lift|gamma|gain|offset)[RGB]$|^curve(25|50|75)$|^saturation(Shadows|Midtones|Highlights)$/.test(k)));
     const g=gradeValues([{...node,parameters:Object.fromEntries(Object.entries(node.parameters).filter(([k])=>!(k in extra)))}]);
     const limits:Record<string,number>={exposure:16,contrast:8,pivot:2,saturation:4,temperature:10000,tint:200,lift:4,gamma:8,gain:8,offset:4};
     for(const [k,v] of Object.entries(g))if(!Number.isFinite(v)||Math.abs(v)>limits[k])throw new Error(`${node.name}: ${k} is outside the supported range.`);
-    for(const [k,v] of Object.entries(extra))if(!Number.isFinite(v)||Math.abs(v)>(k.startsWith('curve')?1:2)||k.startsWith('curve')&&v<0)throw new Error(`${node.name}: ${k} is outside the supported range.`);
+    for(const [k,v] of Object.entries(extra)){const [min,max]=k.startsWith('curve')?[0,1]:k.startsWith('saturation')?[0,400]:[-2,2];if(!Number.isFinite(v)||v<min||v>max)throw new Error(`${node.name}: ${k} is outside the supported range.`);}
     return {g,extra,node};
   });
 }
@@ -131,7 +139,7 @@ export function colorTransform(clip: Clip, asset: MediaAsset | undefined, nodes:
         return Math.max(0,(v-g.pivot)*g.contrast+g.pivot+g.offset+(p['offset'+channel]??0))**(1/2**(g.gamma+(p['gamma'+channel]??0)))*(g.gain+(p['gain'+channel]??0))+(g.lift+(p['lift'+channel]??0))*(1-Math.min(1,v));
       });
       const y=.2126*rgb[0]+.7152*rgb[1]+.0722*rgb[2], warm=clamp(g.temperature/10000,-.5,.5), tint=clamp(g.tint/200,-.5,.5);
-      rgb=rgb.map((v,c)=>(y+(v-y)*g.saturation)*[1+warm,1-tint,1-warm][c]);
+      rgb=rangeSaturation(rgb.map(v=>y+(v-y)*g.saturation),[.2126,.7152,.0722],p).map((v,c)=>v*[1+warm,1-tint,1-warm][c]);
       if(node.curves)rgb=applyCurves(rgb,node);
       else if(Object.keys(p).some(k=>k.startsWith('curve'))) rgb=rgb.map(v=>curveValue(v,p));
       rgb=blendNode(rgb,nodeInput,stage,maskAt);
@@ -175,6 +183,8 @@ export function hdrToSdr(transfer: string, npl = 100) {
 
 export const transferFunctions = profiles.filter(p=>p!=='Rec.709');
 export const primaryDefaults:Record<string,number>={exposure:0,temperature:0,tint:0,contrast:1,pivot:.336043,saturation:100,lift:0,gamma:0,gain:1,offset:0};
+// Kept out of primaryDefaults so only nodes that use them store them: absent = identity, and builds before range saturation refuse to render a node carrying them.
+export const rangeDefaults:Record<string,number>={saturationShadows:100,saturationMidtones:100,saturationHighlights:100};
 export function gamutMatrix(input:string,output:string){const source=rgbToXYZ(input),target=inverse(rgbToXYZ(output));return target.map(row=>[0,1,2].map(c=>row.reduce((v,x,i)=>v+x*source[i][c],0)));}
 // OCIO camera transforms include their reference chromatic adaptation to ACES D60.
 // Legacy D65-only CSTs retain their original matrix for existing saved grades.
@@ -302,7 +312,7 @@ function managedColorTransform(clip:Clip,asset:MediaAsset|undefined,nodes:GradeN
       const {g,extra:p,node,gamma,gamut}=stage;
       if(g.exposure||g.temperature||g.tint)rgb=rgb.map((v,c)=>encodeLog(decodeLog(v,gamma)*2**g.exposure*[1+g.temperature/10000,1-g.tint/200,1-g.temperature/10000][c],gamma));
       rgb=rgb.map((v,c)=>{const ch='RGB'[c],x=(v-g.pivot)*g.contrast+g.pivot+g.offset+(p['offset'+ch]??0);return Math.sign(x)*Math.abs(x)**(1/2**(g.gamma+(p['gamma'+ch]??0)))*(g.gain+(p['gain'+ch]??0))+(g.lift+(p['lift'+ch]??0))*(1-v);});
-      const y=multiply([stage.weights],rgb)[0];rgb=rgb.map(v=>y+(v-y)*g.saturation);
+      const y=multiply([stage.weights],rgb)[0];rgb=rangeSaturation(rgb.map(v=>y+(v-y)*g.saturation),stage.weights,p);
       if(node.curves)rgb=applyCurves(rgb,node);
       else if(Object.keys(p).some(k=>k.startsWith('curve')))rgb=rgb.map(v=>curveValue(v,p));
       rgb=blendNode(rgb,nodeInput,stage,maskAt);
