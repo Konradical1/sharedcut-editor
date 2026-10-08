@@ -44,6 +44,7 @@
     "setup:depth": "node scripts/setup-venv.mjs .venv-mask scripts/mask-requirements.txt scripts/setup-depth.py",
     "test:depth": "node scripts/venv-run.mjs .venv-mask scripts/depth.py --selftest && node --experimental-strip-types --test src/services/depth.test.ts src/services/depthFx.test.ts src/services/depthPreview.test.ts server/depth.test.ts",
     "test:depth:browser": "node --experimental-strip-types --test src/components/depth.browser.test.ts",
+    "test:importer": "node --experimental-strip-types --test src/components/importer.browser.test.ts",
     "test:depth:parity": "node scripts/depth-fx-check.mjs",
     "test:depth:inference": "node --experimental-strip-types scripts/depth-inference-check.mjs",
     "test:masks:browser": "node --experimental-strip-types scripts/smart-mask-browser-check.mjs",
