@@ -71,13 +71,16 @@ function Title({ focus, children }: { focus: boolean; children: ReactNode }) {
 }
 const Alert = ({ children }: { children: ReactNode }) => <div className="importer-alert" role="alert"><AlertTriangle size={18}/><div>{children}</div></div>;
 
-/** "Save my account": the guest becomes a full account under the same id, so everything it imported stays its own. */
-function Claim({ user, projectId, onSaved }: { user: User; projectId?: string; onSaved: (user: User) => void }) {
-  const [email, setEmail] = useState(''), [password, setPassword] = useState(''), [show, setShow] = useState(false), [busy, setBusy] = useState(false), [error, setError] = useState(''), [saved, setSaved] = useState('');
-  if (saved) return <div className="importer-claim saved"><p role="status"><Check size={18}/>All set. Next time, sign in at sharedcut.com with <strong>{saved}</strong>.</p><a className="button button-primary importer-big" href={projectId ? `/project/${encodeURIComponent(projectId)}` : '/'}>Open in SharedCut</a></div>;
+/**
+ * "Save my account": the guest becomes a full account under the same id, so everything it imported stays its own. `saved`,
+ * the email it was saved with, lives in the page: saving makes her a member, which redraws the screen around this form.
+ */
+function Claim({ user, projectId, saved, onSaved }: { user: User; projectId?: string; saved: string; onSaved: (user: User) => void }) {
+  const [email, setEmail] = useState(''), [password, setPassword] = useState(''), [show, setShow] = useState(false), [busy, setBusy] = useState(false), [error, setError] = useState('');
+  if (saved) return <div className="importer-claim saved"><p role="status"><Check size={18}/><span>All set. Next time, sign in at sharedcut.com with <strong>{saved}</strong>.</span></p><a className="button button-primary importer-big" href={projectId ? `/project/${encodeURIComponent(projectId)}` : '/'}>Open in SharedCut</a></div>;
   return <form className="importer-claim" onSubmit={async event => {
     event.preventDefault(); if (busy) return; setBusy(true); setError('');
-    try { const r = await api<{ user: User }>('/auth/signup', { method: 'POST', body: JSON.stringify({ name: user.name, email: email.trim(), password, upgradeGuest: true }) }); setSaved(r.user.email); onSaved(r.user); }
+    try { const r = await api<{ user: User }>('/auth/signup', { method: 'POST', body: JSON.stringify({ name: user.name, email: email.trim(), password, upgradeGuest: true }) }); onSaved(r.user); }
     catch (e) { setError(e instanceof ApiError && e.status === 409 ? 'That email already has a SharedCut account. Sign in with it; your class project is already there for you to edit.' : message(e)); }
     finally { setBusy(false); }
   }}>
@@ -95,7 +98,7 @@ function Importer() {
   const [me, setMe] = useState<Me>(), [newGuest, setNewGuest] = useState(false), [imports, setImports] = useState<{ projectId: string; name: string; fcpImport: FcpImport }[]>([]);
   const [maxBytes, setMaxBytes] = useState(10 * 1024 ** 3), [replay, setReplay] = useState(0), [said, setSaid] = useState(''), [toast, setToast] = useState(''), [dragging, setDragging] = useState(false);
   const [name, setName] = useState(''), [code, setCode] = useState(''), [color] = useState(() => COLORS[Math.floor(Math.random() * COLORS.length)]);
-  const [youError, setYouError] = useState<{ text: string; code?: boolean }>(), [busy, setBusy] = useState(false), [shake, setShake] = useState(0), [claim, setClaim] = useState(false);
+  const [youError, setYouError] = useState<{ text: string; code?: boolean }>(), [busy, setBusy] = useState(false), [shake, setShake] = useState(0), [claim, setClaim] = useState(false), [savedAs, setSavedAs] = useState('');
   const [reading, setReading] = useState(false), [over, setOver] = useState(false), [xml, setXml] = useState<{ file: File; name?: string; fresh?: boolean }>(), [dry, setDry] = useState<Dry>(), [exportError, setExportError] = useState<{ text: ReactNode; fresh?: boolean; claim?: boolean }>();
   const [job, setJobState] = useState<Job>(), [added, setAdded] = useState<Set<string>>(new Set()), [fontErrors, setFontErrors] = useState<Record<string, string>>({});
   const [placeList, setPlaceList] = useState<Place[]>([]), [walking, setWalking] = useState<{ name: string; count: number }>(), [checking, setChecking] = useState<{ done: number; total: number }>(), [notes, setNotes] = useState<string[]>([]);
@@ -115,6 +118,8 @@ function Importer() {
   stepRef.current = step;
   const statusRef = useRef(status); statusRef.current = status;
   const user = me?.user ?? undefined, guest = user?.guest === true;
+  // Who sees "Save my account" and its "All set": a guest, and for the rest of this import the guest who just saved it.
+  const claimant = guest || !!savedAs;
   const setJob = (next: Job | undefined) => { jobRef.current = next; setJobState(next); };
   const say = (text: string) => setSaid(current => current === text ? `${text} ` : text);
   const note = (text: string) => { setToast(text); say(text); };
@@ -146,7 +151,7 @@ function Importer() {
   // Let's start: the export step, reading a project file dropped before the person said who they are.
   const begin = () => { go('export'); const x = held.current.xml; held.current.xml = undefined; if (x) void readExport(x); };
   const reset = () => {
-    control.current?.abort('pause'); setDry(undefined); setXml(undefined); setExportError(undefined); setJob(undefined); setAdded(new Set()); setFontErrors({}); setPlaceList([]); setNotes([]);
+    control.current?.abort('pause'); setSavedAs(''); setDry(undefined); setXml(undefined); setExportError(undefined); setJob(undefined); setAdded(new Set()); setFontErrors({}); setPlaceList([]); setNotes([]);
     foot.pool.clear(); foot.found = {}; foot.checks = {}; foot.use.clear(); foot.ambig = {}; foot.lost.clear(); announced.current.clear();
     setSpeed(undefined); setProgress(undefined); setFailed([]); setPolled(undefined); setStartError(undefined); setNoRoom(undefined); setStatus('running'); setNudge(false); setShowClips(false);
     imported.current = ''; ids.current.clear(); items.current = []; decile.current = 0; etaShown.current = { at: 0 };
@@ -261,8 +266,12 @@ function Importer() {
     if (!current) return changed;
     for (const m of matchSources(current.sources, [...foot.pool.values()])) {
       if (!needs(m.id)) continue;
-      if (m.state === 'found' && foot.found[m.id]?.file !== m.found!.file) { foot.found[m.id] = m.found!; delete foot.ambig[m.id]; delete foot.checks[m.id]; foot.lost.delete(m.id); changed.push(m.id); }
-      else if (m.state === 'ambiguous' && !m.candidates!.some(c => c.file === foot.found[m.id]?.file)) { foot.ambig[m.id] = m.candidates!; delete foot.found[m.id]; delete foot.checks[m.id]; }
+      // A file this source already has here failed its check (a different clip, or one that won't open), so it is not the
+      // answer to a tie: the only other candidate is, and several others go to the chooser.
+      const tried = foot.found[m.id]?.file, others = m.state === 'ambiguous' ? m.candidates!.filter(c => c.file !== tried) : [];
+      const pick = m.state === 'found' ? m.found! : others.length === 1 ? others[0] : undefined;
+      if (pick && pick.file !== tried) { foot.found[m.id] = pick; delete foot.ambig[m.id]; delete foot.checks[m.id]; foot.lost.delete(m.id); changed.push(m.id); }
+      else if (others.length > 1) { foot.ambig[m.id] = others; delete foot.found[m.id]; delete foot.checks[m.id]; foot.lost.delete(m.id); }
     }
     render(); return changed;
   };
@@ -478,7 +487,7 @@ function Importer() {
 
   // ---- Screens ---------------------------------------------------------------------------------------------------
   const focus = moved.current;
-  const savedAccount = (next: User) => setMe(current => current && { ...current, user: next });
+  const savedAccount = (next: User) => { setSavedAs(next.email); setMe(current => current && { ...current, user: next }); };
   const doneFrom = (source: Source) => { const id = real(source.id); return progress?.received[id] !== undefined && items.current.find(i => i.assetId === id)?.file.size === progress.received[id]; };
   const leftOut = remaining.filter(s => !planned.includes(s) || failed.some(f => f.id === real(s.id)));
   const reasonOf = (s: Source) => { const f = failed.find(x => x.id === real(s.id)); return f ? f.reason === 'unreadable' ? "couldn't be read" : f.reason : stateOf(s.id) === 'tooBig' ? 'too big' : 'not found'; };
@@ -497,7 +506,7 @@ function Importer() {
     {user ? <div className="importer-who-block">
       <p>{guest ? <span>Welcome back, <strong>{user.name.split(' ')[0]}</strong>.</span> : <><Avatar user={user} size={30}/><span>Importing as <strong>{user.name}</strong></span></>}
         <button className="importer-link" onClick={async () => { if (guest) { await signOut(); setMe(current => current && { ...current, user: null }); setImports([]); reset(); } else if (confirm('This signs you out of SharedCut on this Mac.')) { await signOut(); location.reload(); } }}>{guest ? `Not ${user.name.split(' ')[0]}? Start fresh` : 'Not you?'}</button></p>
-      {guest && !newGuest && (claim ? <Claim user={user} onSaved={savedAccount}/> : <button className="importer-card quiet" onClick={() => setClaim(true)}>Save your account so you can open your projects from any computer.<ArrowRight size={15}/></button>)}
+      {claimant && !newGuest && (claim || savedAs ? <Claim user={user} saved={savedAs} onSaved={savedAccount}/> : <button className="importer-card quiet" onClick={() => setClaim(true)}>Save your account so you can open your projects from any computer.<ArrowRight size={15}/></button>)}
       <Button variant={imports.length ? 'secondary' : 'primary'} className="importer-big" onClick={() => { reset(); begin(); }}>{imports.length ? 'Start a different project' : "Let's start"}{!imports.length && <ArrowRight size={17}/>}</Button>
     </div> : me && !me.offline && <form className="importer-form" onSubmit={e => { e.preventDefault(); void startGuest(); }}>
       <div><label className="form-field"><span>Your name</span><input className="input" autoFocus autoComplete="name" maxLength={80} placeholder="First and last name" value={name} onChange={e => setName(e.target.value)} aria-describedby="name-hint"/></label><small id="name-hint">Your class sees this name next to the project.</small></div>
@@ -518,7 +527,7 @@ function Importer() {
       : dry && !dry.limit ? <div className="importer-got"><GotIt/><p>Got it: <strong>{dry.name}</strong> · {plural(dry.media.length, 'clip')} · {clock(dry.duration)}</p></div>
       : <button className={`importer-drop${over ? ' over' : ''}`} onClick={() => xmlInput.current?.click()} onDragOver={() => setOver(true)} onDragLeave={() => setOver(false)}><FileText size={30}/><span>Drag the exported file here</span><span className="importer-link">or choose it…</span></button>}
     {exportError && <Alert>{exportError.text}{exportError.fresh && xml && <Button variant="primary" onClick={() => void readXml(xml.file, xml.name, true)}>Import a separate copy</Button>}</Alert>}
-    {exportError?.claim && user && <Claim user={user} onSaved={next => { savedAccount(next); if (xml) void readXml(xml.file, xml.name, xml.fresh); }}/>}
+    {exportError?.claim && user && <Claim user={user} saved={savedAs} onSaved={next => { savedAccount(next); if (xml) void readXml(xml.file, xml.name, xml.fresh); }}/>}
     {dry && !dry.limit && <div className="importer-actions"><Button variant="primary" className="importer-big" autoFocus onClick={afterExport}>Continue<ArrowRight size={17}/></Button><button className="importer-link" onClick={() => { setDry(undefined); setXml(undefined); }}>Use a different file</button></div>}
     <details className="importer-help"><summary>It won't drop?</summary><p>Right-click the file on your Desktop, choose <strong>Show Package Contents</strong>, and drag <strong>Info.fcpxml</strong> onto this window instead.</p></details>
   </>;
@@ -604,7 +613,7 @@ function Importer() {
       </>}
       {short && <Alert>SharedCut doesn't have room for this right now. It needs about {bytes(short.needed)} and has {bytes(Math.max(0, short.room))} free. Your files are safe on your Mac. Tell your teacher, then press <strong>Check again</strong>.</Alert>}
       {startError && <Alert>{startError}</Alert>}
-      {claim && guest && user && <Claim user={user} projectId={imported.current || undefined} onSaved={savedAccount}/>}
+      {claim && claimant && user && <Claim user={user} saved={savedAs} projectId={imported.current || undefined} onSaved={savedAccount}/>}
       {guest ? <p className="importer-lands">It'll show up in SharedCut as <strong>{job?.name}</strong>, shared with your class.</p> : <>
         {(job?.mode === 'new' || job?.mode === 'fresh') && !imported.current && <label className="importer-check"><input type="checkbox" checked={share} onChange={e => setShare(e.target.checked)}/>Let my class see it on their Projects screen</label>}
         <p className="importer-lands">It'll show up in your Projects as <strong>{job?.name}</strong>.</p></>}
@@ -622,7 +631,8 @@ function Importer() {
     <Title focus={focus}>Uploading <strong>{job?.name}</strong></Title>
     <p className="importer-percent" aria-hidden="true">{percent}%</p>
     <progress className="importer-progress" max={100} value={percent} aria-label="Upload progress" aria-valuetext={`${percent} percent${eta ? `, ${friendlyDuration(eta)} left` : ''}`}/>
-    <p className="importer-stats">{progress && progress.bytes > 0 ? <>{bytes(progress.bytes)} of {bytes(progress.total)} · {(progress.rate / 1e6).toFixed(1)} MB/s · {eta ? `${friendlyDuration(eta)} left` : 'Starting…'}</> : 'Starting…'}</p>
+    {/* Speed and time only while bytes can move: paused or offline, they would read 0.0 MB/s and "Starting…". */}
+    <p className="importer-stats">{!progress ? 'Starting…' : <>{bytes(progress.bytes)} of {bytes(progress.total)}{status === 'running' && !progress.waiting && <> · {(progress.rate / 1e6).toFixed(1)} MB/s · {eta ? `${friendlyDuration(eta)} left` : 'Starting…'}</>}</>}</p>
     <p className="importer-foot">{progress ? `${progress.sent} of ${plural(progress.files, 'clip')} sent` : ''}</p>
     {statusText && <div className={`importer-status ${progress?.waiting || status === 'locked' || unreadableNow.length ? 'warn' : ''}`}>{status === 'paused' ? <Pause size={16}/> : <AlertTriangle size={16}/>}<span>{statusText}</span>
       {status === 'paused' && <Button variant="primary" onClick={resume}><Play size={14}/>Resume</Button>}
@@ -637,7 +647,7 @@ function Importer() {
     {showClips && <ul className="importer-clips">{remaining.map(s => { const id = real(s.id), on = progress?.sending.includes(id), got = progress?.received[id], size = foot.found[s.id]?.file.size;
       const out = leftOut.includes(s) && (failed.some(f => f.id === id) || !planned.includes(s)) || progress?.failed.some(f => f.id === id);
       return <li key={s.id}><span>{s.name}</span><small>{out ? `left out · ${reasonOf(s)}` : doneFrom(s) ? <><Check size={13}/>sent</> : on && size ? `sending ${Math.floor((got ?? 0) * 100 / size)}%` : 'queued'}</small></li>; })}</ul>}
-    {nudge && guest && user && (claim ? <Claim user={user} projectId={imported.current} onSaved={savedAccount}/> : <button className="importer-card quiet" onClick={() => setClaim(true)}>Want to open this from another computer later? Save your account now. It takes 20 seconds.<ArrowRight size={15}/></button>)}
+    {nudge && claimant && user && (claim || savedAs ? <Claim user={user} saved={savedAs} projectId={imported.current} onSaved={savedAccount}/> : <button className="importer-card quiet" onClick={() => setClaim(true)}>Want to open this from another computer later? Save your account now. It takes 20 seconds.<ArrowRight size={15}/></button>)}
   </>;
 
   const ready = () => { const i = polled?.fcpImport; return <>
@@ -649,9 +659,9 @@ function Importer() {
 
   const done = () => { const prepFailed = polled?.media.filter(m => m.uploaded && m.status === 'failed') ?? [], warnings = job?.warnings ?? []; return <>
     <Title focus={focus}><strong>{job?.name ?? 'Your project'}</strong> is in SharedCut</Title>
-    {guest ? <>
+    {claimant ? <>
       <p className="importer-lede">Everyone in your class can find it in Projects. Want to edit it yourself from any computer?</p>
-      {user && <Claim user={user} projectId={imported.current} onSaved={savedAccount}/>}
+      {user && <Claim user={user} saved={savedAs} projectId={imported.current} onSaved={savedAccount}/>}
       <div className="importer-actions"><Button className="importer-big" onClick={() => { reset(); go('you'); void loadSession(); }}>I'm done</Button></div>
     </> : <>
       <p className="importer-lede">It's in your Projects.</p>
@@ -688,9 +698,9 @@ function Importer() {
   return <MotionConfig reducedMotion="user"><main className="importer" aria-labelledby="importer-title">
     <header className="importer-top">
       <span className="importer-brand"><Brand/><span className="importer-beta">BETA</span></span>
-      <ol className="importer-rail" aria-label="Import steps">{RAIL.map((r, i) => <li key={r} aria-current={i === at ? 'step' : undefined} className={i < at ? 'past' : ''}>
+      {step !== 'blocked' && <ol className="importer-rail" aria-label="Import steps">{RAIL.map((r, i) => <li key={r} aria-current={i === at ? 'step' : undefined} className={i < at ? 'past' : ''}>
         {i === at && <motion.span layoutId="importer-rail" className="importer-rail-pill" transition={{ type: 'spring', stiffness: 380, damping: 34 }}/>}
-        <span className="importer-rail-dot">{i < at && <Check size={10} strokeWidth={3}/>}</span><span className="importer-rail-name">{r}</span></li>)}</ol>
+        <span className="importer-rail-dot">{i < at && <Check size={10} strokeWidth={3}/>}</span><span className="importer-rail-name">{r}</span></li>)}</ol>}
       {user ? <span className="importer-who"><Avatar user={user} size={26}/><span>{user.name}</span></span> : <span className="importer-who"/>}
     </header>
     <div className="importer-body">

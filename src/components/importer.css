@@ -26,6 +26,8 @@
 .importer-replay:hover{color:#e1e6df}
 .importer-copy{max-width:540px;padding:clamp(8px,4vh,48px) 0 24px}
 .importer-copy h1{margin:0 0 14px;font-size:32px;line-height:1.18;font-weight:600;letter-spacing:-.6px;color:#e1e6df;outline:none}
+/* The step heading takes focus on every step change (for screen readers); it is not a control, so no ring. */
+.importer-copy h1:focus-visible{outline:none}
 .importer-copy h1 strong{font-weight:700}
 .importer-copy strong{font-weight:600;color:#e1e6df}
 .importer-eyebrow{margin:0 0 12px;font-size:11px;font-weight:600;letter-spacing:1.5px;color:#90979c}
@@ -403,8 +405,8 @@
 @keyframes ia-drop{from{opacity:0;transform:translateY(-1.2em)}}
 
 /* A8: clips being prepared */
-.ia-p-grid{position:absolute;inset:4em;display:grid;grid-template-columns:repeat(6,1fr);align-content:center;gap:.8em}
-.ia-p-grid span{position:relative;aspect-ratio:16/9;overflow:hidden;border-radius:.5em;background:#202428;transition:background .3s}
+.ia-p-grid{position:absolute;inset:4em;display:flex;flex-wrap:wrap;justify-content:center;align-content:center;gap:.8em}
+.ia-p-grid span{position:relative;width:calc((100% - 4em) / 6);aspect-ratio:16/9;overflow:hidden;border-radius:.5em;background:#202428;transition:background .3s}
 .ia-p-grid span::after{content:"";position:absolute;inset:0 0 0 -12px;background:repeating-linear-gradient(-45deg,#ffffff12 0 6px,transparent 6px 12px);animation:clip-preparing-stripes 1s linear infinite}
 .ia-p-grid span.ready{background:var(--accent)}
 .ia-p-grid span.failed{background:#3a3322}

@@ -111,7 +111,7 @@ export async function uploadSource(assetId: string, file: File, onProgress: (per
 }
 
 
-export const bytes = (value: number) => value >= 1e9 ? `${(value / 1e9).toFixed(1)} GB` : `${(value / 1e6).toFixed(1)} MB`;
+export const bytes = (value: number) => value >= 1e9 ? `${(value / 1e9).toFixed(1)} GB` : value >= 1e6 ? `${(value / 1e6).toFixed(1)} MB` : `${Math.ceil(value / 1e3)} KB`;
 
 export type TransferProgress = { resumedBytes?: number; bytes: number; total: number; speed: number; elapsed: number; remaining?: number; message: string };
 export type UploadJob = { key: string; projectId: string; name: string; file?: File; assetId?: string; status: 'queued' | 'uploading' | 'paused' | 'failed' | 'uploaded'; progress: TransferProgress; error?: string; candidates: MediaAsset[] };
@@ -230,8 +230,9 @@ export async function uploadImport(projectId: string, items: { assetId: string; 
     const first = samples[0], span = first ? (samples.at(-1)!.at - first.at) / 1000 : 0;
     const rate = span > 0 ? (sum(fresh) - sum(first.fresh)) / span : 0, single = span > 0 ? Math.max(...fresh.map((f, i) => (f - first.fresh[i]) / span)) : 0;
     const left = files.filter(i => !failed.some(f => f.id === i.assetId)).map(i => i.file.size - received.get(i.assetId)!);
+    // waiting: the browser knows the Wi-Fi is gone before a chunk's own retries give up, so that shows at once.
     return { bytes: sum(received.values()), total: sum(files.map(i => i.file.size)), rate, eta: rate > 0 ? estimateSeconds(left, single || rate, rate, width) : undefined, files: files.length,
-      sent: files.filter(i => received.get(i.assetId) === i.file.size).length, lanes: width, waiting: offline ?? (full ? 'full' : undefined), failed: [...failed], sending: [...sending], received: Object.fromEntries(received) };
+      sent: files.filter(i => received.get(i.assetId) === i.file.size).length, lanes: width, waiting: offline ?? (globalThis.navigator?.onLine === false ? 'offline' : full ? 'full' : undefined), failed: [...failed], sending: [...sending], received: Object.fromEntries(received) };
   };
   if (!files.length) return progress();
 
