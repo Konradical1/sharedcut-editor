@@ -176,6 +176,14 @@ test('a real Final Cut export: audition timing, sample-accurate sound, split edi
   assert.equal(doc.runs[0].style.fontFamily, 'FL-bebas', 'title fonts resolve to the font library'); assert.equal(doc.align, 'left');
   near(doc.y + doc.height, .5 + 290.8225 / 1080, 'bottom-aligned text ends at the lowest text box');
   assert.ok(!r.warnings.some(w => /Bebas/.test(w)), 'a font found in the library is not reported');
+
+  // A line wider than its box shrinks the whole title (Final Cut's Auto-Shrink) instead of wrapping; tracking is % of size.
+  const measure = (text: string, style: { fontSize: number; letterSpacing: number }) => [...text].length * (style.fontSize * .5 + style.letterSpacing);
+  const fitted = JSON.parse(String(importFcpxml(fieldExport, 'fcp-field', 'owner', [], measure).clips.find(c => c.mediaId === 'frameline-title')!.properties.textDocument));
+  const big = fitted.runs[0], small = fitted.runs.find((r: { text: string }) => r.text === 'Mens soccer'), widest = measure('Jack matthews #15', big.style);
+  assert.ok(widest <= fitted.width * 1920 + 1e-6 && widest > .95 * fitted.width * 1920, `the widest line fills its box: ${widest} of ${fitted.width * 1920}`);
+  near(big.style.fontSize / small.style.fontSize, 278.9 / 91.9, 'every run shrinks by the same factor');
+  near(JSON.parse(String(r.clips.find(c => c.mediaId === 'frameline-title')!.properties.textDocument)).runs[0].style.letterSpacing, 0, 'no tracking, no spacing');
 });
 
 test('bundle reading maps original paths to the copied files', async () => {

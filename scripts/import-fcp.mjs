@@ -47,7 +47,7 @@ const call = async (path, { json, ...init } = {}) => {
   return text ? JSON.parse(text) : {};
 };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const size = bytes => bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${(bytes / 1e6).toFixed(0)} MB`;
+const size = bytes => bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : bytes >= 1e6 ? `${(bytes / 1e6).toFixed(0)} MB` : `${Math.ceil(bytes / 1e3)} KB`;
 
 const bundle = readFcpBundle(resolve(args[0]));
 if (!cookie || await call('/api/auth/me').then(() => false, () => true)) {

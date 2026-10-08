@@ -26,7 +26,8 @@ import { presenceCursor } from '../src/services/presence.ts';
 import { fontLibrary } from './fonts.ts';
 import { transitionLibrary } from './transitions.ts';
 import { transitionPresetId, timelineTransitions, transitionDefinitions, isLeakMedia, leakIdOf, validateTransition } from '../src/services/transitions.ts';
-import { isTitle, getText, validateText } from '../src/services/text.ts';
+import { canvasFont, isTitle, getText, validateText, type TextStyle } from '../src/services/text.ts';
+import { createCanvas } from '@napi-rs/canvas';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
@@ -1176,7 +1177,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const id = url.searchParams.get('projectId') ?? '', rebuild = url.searchParams.get('rebuild') === '1';
           if (!idIsValid(id) || !id.startsWith('fcp-') || id.length > 64) fail(400, 'Invalid import project ID.');
           const xml = (await binaryBody(req, 128 * 1024 * 1024)).toString('utf8');
-          let imported: ReturnType<typeof importFcpxml>; try { imported = importFcpxml(xml, id, userId, fonts.list()); } catch (error) { fail(400, (error as Error).message); }
+          // Titles are measured with the fonts and canvas the export renders them with, so they can be shrunk to fit.
+          const ruler = createCanvas(8, 8).getContext('2d'), measure = (text: string, style: TextStyle) => { ruler.font = canvasFont(style); return style.letterSpacing ? [...new Intl.Segmenter().segment(text)].reduce((sum, g) => sum + ruler.measureText(g.segment).width + style.letterSpacing, 0) : ruler.measureText(text).width; };
+          let imported: ReturnType<typeof importFcpxml>; try { imported = importFcpxml(xml, id, userId, fonts.list(), measure); } catch (error) { fail(400, (error as Error).message); }
           const existing = state.projects.find(p => p.id === id) as (Project & { fcpImportHash?: string }) | undefined;
           const { fcpImportHash, fcpWarnings } = imported!.project as Project & { fcpImportHash: string; fcpWarnings: string[] };
           if (existing) {

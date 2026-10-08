@@ -4,7 +4,7 @@ import { basename, dirname, join } from 'node:path';
 import type { Clip, Effect, GradeNode, Keyframe, Marker, MediaAsset, Project, Timeline, Track } from '../src/state/models.ts';
 import { boundedAnimationValue } from '../src/services/animation.ts';
 import { blendModeNames } from '../src/services/blendModes.ts';
-import { defaultTextEffects, defaultTextStyle, type TextDocument, type TextRun } from '../src/services/text.ts';
+import { defaultTextEffects, defaultTextStyle, type TextDocument, type TextRun, type TextStyle } from '../src/services/text.ts';
 import { transitionDefinitions } from '../src/services/transitions.ts';
 
 /**
@@ -131,8 +131,11 @@ const hex = (rgba: string | undefined, fallback: string) => {
   return parts.length >= 3 && parts.slice(0, 3).every(Number.isFinite) ? '#' + parts.slice(0, 3).map(v => Math.round(Math.min(1, Math.max(0, v)) * 255).toString(16).padStart(2, '0')).join('') : fallback;
 };
 
-/** `fonts` is SharedCut's font library: title fonts resolve to its entries by name. */
-export function importFcpxml(xml: string, projectId: string, userId: string, fonts: { id: string; name: string }[] = []) {
+/**
+ * `fonts` is SharedCut's font library: title fonts resolve to its entries by name. `measure` gives a text's width in
+ * project pixels as the renderer sets it, so titles can be shrunk to fit as Final Cut's Auto-Shrink does.
+ */
+export function importFcpxml(xml: string, projectId: string, userId: string, fonts: { id: string; name: string }[] = [], measure?: (text: string, style: TextStyle) => number) {
   const document = parseXml(xml.replace(/^\uFEFF/, '')).children.find(n => n.name === 'fcpxml');
   if (!document) throw new Error('That file is not Final Cut XML. In Final Cut choose File > Export XML….');
   const projects = findAll(document, 'project');
@@ -592,7 +595,8 @@ export function importFcpxml(xml: string, projectId: string, userId: string, fon
         if (Number(s?.attrs.lineSpacing) < 0) tight = true;
         runs.push({ text: r.text, style: { fontFamily: family ? fontFor(family) : defaultTextStyle.fontFamily, fontSize: Math.min(600, Math.max(4, Number(s?.attrs.fontSize) || 63)),
           fontWeight: s?.attrs.bold === '1' || /bold|black|heavy/i.test(face) ? 700 : /light|thin/i.test(face) ? 300 : /medium/i.test(face) ? 500 : 400,
-          italic: s?.attrs.italic === '1' || /italic|oblique/i.test(face), underline: s?.attrs.underline === '1', letterSpacing: Math.min(100, Math.max(-10, Number(s?.attrs.kerning) || 0)), color: hex(s?.attrs.fontColor, '#ffffff') } });
+          // Final Cut's tracking is a percent of the font size; SharedCut's letter spacing is pixels.
+          italic: s?.attrs.italic === '1' || /italic|oblique/i.test(face), underline: s?.attrs.underline === '1', letterSpacing: round(Math.min(100, Math.max(-10, (Number(s?.attrs.kerning) || 0) / 100 * (Number(s?.attrs.fontSize) || 63)))), color: hex(s?.attrs.fontColor, '#ffffff') } });
       }
     }
     const content = runs.map(r => r.text).join('');
@@ -602,14 +606,20 @@ export function importFcpxml(xml: string, projectId: string, userId: string, fon
       const clamp = (lo: number, hi: number, v: number) => Math.min(hi, Math.max(lo, v));
       const placement = param(node, 'Alignment')?.attrs.value ?? '', styled = [...styles.values()][0]?.attrs.alignment;
       const align = /Right/.test(placement) ? 'right' : /Left/.test(placement) ? 'left' : /Center/.test(placement) ? 'center' : styled === 'left' || styled === 'right' ? styled : 'center';
+      const positions = node.children.filter(c => c.name === 'param' && c.attrs.name === 'Position').map(c => pair(c.attrs.value));
+      const x = align === 'left' && positions.length ? clamp(.03, .6, .5 + Math.min(...positions.map(p => p[0])) / ctx.width) : .05, width = align === 'left' ? Math.min(.94, .97 - x) : .9;
+      // Final Cut breaks lines only where the text does (Auto-Shrink fits them to the margins); SharedCut would wrap
+      // at its box instead, so a line wider than the box shrinks the whole title, as Auto-Shrink does.
+      const widths = [0];
+      if (measure) for (const r of runs) for (const [k, part] of r.text.split('\n').entries()) { if (k) widths.push(0); widths[widths.length - 1] += part ? measure(part, r.style) : 0; }
+      const fit = Math.min(1, .98 * width * ctx.width / Math.max(1, ...widths));
+      if (fit < 1) for (const r of runs) r.style = { ...r.style, fontSize: Math.max(4, round(r.style.fontSize * fit)), letterSpacing: round(r.style.letterSpacing * fit) };
       const lineHeight = tight ? 1 : 1.14, lines: number[] = [0];
       for (const r of runs) for (const [k, part] of r.text.split('\n').entries()) { if (k) lines.push(0); if (part) lines[lines.length - 1] = Math.max(lines[lines.length - 1], r.style.fontSize); }
       const height = clamp(.01, 1, lines.reduce((sum, size) => sum + (size || runs[0].style.fontSize) * lineHeight, 0) / ctx.height);
-      const positions = node.children.filter(c => c.name === 'param' && c.attrs.name === 'Position').map(c => pair(c.attrs.value));
       const bottoms = node.children.filter(c => c.name === 'param' && c.attrs.name === 'Bottom Margin').map((c, i) => (positions[i]?.[1] ?? 0) + Number(c.attrs.value));
       const y = /Bottom/.test(placement) && bottoms.length ? .5 - Math.min(...bottoms) / ctx.height - height : .5 - (positions[0]?.[1] ?? 0) / ctx.height - height / 2;
-      const x = align === 'left' && positions.length ? clamp(.03, .6, .5 + Math.min(...positions.map(p => p[0])) / ctx.width) : .05;
-      const doc: TextDocument = { ...defaultTextEffects, runs: runs.slice(0, 1000), x, y: clamp(-4, 4, y), width: align === 'left' ? Math.min(.94, .97 - x) : .9, height, align, lineHeight, opacity: 100 };
+      const doc: TextDocument = { ...defaultTextEffects, runs: runs.slice(0, 1000), x, y: clamp(-4, 4, y), width, height, align, lineHeight, opacity: 100 };
       const look = picture(ctx, node, own, span, label);
       out.push(place(ctx, 'video', lane, { mediaId: 'frameline-title', name: content.replace(/\s+/g, ' ').trim().slice(0, 80), start: span.lo, duration: span.hi - span.lo, sourceIn: 0, color: '#8e75ba',
         disabled: node.attrs.enabled === '0', properties: { animationPresetDuration: span.hi - span.lo, textDocument: JSON.stringify(doc), ...look.properties }, keyframes: look.keyframes }, look));
