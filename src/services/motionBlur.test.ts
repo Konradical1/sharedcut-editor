@@ -40,3 +40,18 @@ test('additive shutter preserves opaque interiors, coloured transparent edges an
  }
 
 });
+test('Scale X/Y stretch in the clip axes before rotation, about the anchor; an unstretched pose is unchanged',()=>{
+ const still=(properties:Clip['properties'])=>transformMotion({...base,keyframes:undefined,properties},0,24,1920,1080)[0];
+ const pose=still({x:10,y:20,zoom:150,scaleX:200,scaleY:50,rotation:90,anchorX:100,anchorY:40});
+ const near=(a:number,b:number)=>Math.abs(a-b)<1e-9;
+ assert.ok(near(pose.x,140)&&near(pose.y,-240)&&pose.scaleX===3&&pose.scaleY===.75,JSON.stringify(pose));
+ // The anchor point (100, 40 from the centre) stays put at position + anchor.
+ const c=Math.cos(pose.rotation),s=Math.sin(pose.rotation);
+ assert.ok(near(pose.x+c*pose.scaleX*100-s*pose.scaleY*40,110)&&near(pose.y+s*pose.scaleX*100+c*pose.scaleY*40,60));
+ // Bit for bit what the pose was before Scale X/Y existed: C + X + A + zoom·R·(−A).
+ const p={x:-37,y:12.5,zoom:137,rotation:21,anchorX:300,anchorY:-40},r=21*Math.PI/180,z=1.37;
+ const old={x:-37+300+z*(Math.cos(r)*-300-Math.sin(r)*40),y:12.5-40+z*(Math.sin(r)*-300+Math.cos(r)*40),scaleX:z,scaleY:z,rotation:r};
+ assert.deepEqual(still(p),old);assert.deepEqual(still({...p,scaleX:100,scaleY:100}),old);
+ const keyed={...base,keyframes:{'properties.scaleX':keys(100,300)}};
+ assert.ok(sample(keyed).length>1&&sample(keyed).every(q=>q.scaleY===1),'a keyed stretch gets shutter samples on its own axis');
+});

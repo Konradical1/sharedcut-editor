@@ -4,6 +4,7 @@ import type { Clip } from '../state/models';
 import { evaluateClip } from '../services/animation';
 import { projectSize } from '../services/playback';
 import { defaultShape, fitPenPoints, getShape, isShape, shapePath, type ShapeDocument, type ShapePoint } from '../services/shapes';
+import { scales } from '../services/text';
 import { lockedAxis, overlayBoxes, shapeBox, snapBox, SNAP_PIXELS, type SnapBox, type SnapGuide } from '../services/snapping';
 import './shapes.css';
 
@@ -24,10 +25,10 @@ function ShapeOverlay(){
   const visible=clips.filter(c=>c.timelineId===timelineId&&isShape(c)&&!c.disabled&&c.start<=playhead&&c.start+c.duration>playhead&&!tracks.find(t=>t.id===c.trackId)?.hidden).sort((a,b)=>(tracks.find(t=>t.id===b.trackId)?.number??0)-(tracks.find(t=>t.id===a.trackId)?.number??0));
   const framePoint=(e:{clientX:number;clientY:number}):XY=>{const p=root.current!.createSVGPoint();p.x=e.clientX;p.y=e.clientY;const q=p.matrixTransform(root.current!.getScreenCTM()!.inverse());return{x:q.x/width,y:q.y/height};};
   const pivot=(clip:Clip,doc:ShapeDocument)=>({x:(doc.x+doc.width/2)*width+Number(clip.properties.anchorX??0),y:(doc.y+doc.height/2)*height+Number(clip.properties.anchorY??0)});
-  const transform=(clip:Clip,doc:ShapeDocument)=>{const p=pivot(clip,doc);return `translate(${p.x+Number(clip.properties.x??0)} ${p.y+Number(clip.properties.y??0)}) rotate(${Number(clip.properties.rotation??0)}) scale(${Math.max(.01,Number(clip.properties.zoom??100)/100)}) translate(${-p.x} ${-p.y})`;};
+  const transform=(clip:Clip,doc:ShapeDocument)=>{const p=pivot(clip,doc);return `translate(${p.x+Number(clip.properties.x??0)} ${p.y+Number(clip.properties.y??0)}) rotate(${Number(clip.properties.rotation??0)}) scale(${scales(clip).join(' ')}) translate(${-p.x} ${-p.y})`;};
   const localPoint=(e:{clientX:number;clientY:number},clip:Clip,doc:ShapeDocument):XY=>{
-    const pt=framePoint(e),p=pivot(clip,doc),r=-Number(clip.properties.rotation??0)*Math.PI/180,z=Math.max(.01,Number(clip.properties.zoom??100)/100),dx=pt.x*width-p.x-Number(clip.properties.x??0),dy=pt.y*height-p.y-Number(clip.properties.y??0);
-    return {x:((dx*Math.cos(r)-dy*Math.sin(r))/z+p.x)/width,y:((dx*Math.sin(r)+dy*Math.cos(r))/z+p.y)/height};
+    const pt=framePoint(e),p=pivot(clip,doc),r=-Number(clip.properties.rotation??0)*Math.PI/180,[zx,zy]=scales(clip),dx=pt.x*width-p.x-Number(clip.properties.x??0),dy=pt.y*height-p.y-Number(clip.properties.y??0);
+    return {x:((dx*Math.cos(r)-dy*Math.sin(r))/zx+p.x)/width,y:((dx*Math.sin(r)+dy*Math.cos(r))/zy+p.y)/height};
   };
   const setPenPoints=(points:ShapePoint[])=>{penRef.current=points;setPen(points);};
   const finishPen=(closed:boolean)=>{
@@ -118,8 +119,8 @@ function ShapeOverlay(){
       if(d.mode.includes('w')){doc.x=clamp(x+dx,-4,x+w-.001);doc.width=clamp(x+w-doc.x,.001,8);}
       if(d.mode.includes('n')){doc.y=clamp(y+dy,-4,y+h-.001);doc.height=clamp(y+h-doc.y,.001,8);}
       if(e.shiftKey){const ratio=w/h;if(d.mode==='n'||d.mode==='s')doc.width=clamp(doc.height*ratio,.001,8);else doc.height=clamp(doc.width/ratio,.001,8);}
-      const cx=(doc.x+doc.width/2-x-w/2)*width,cy=(doc.y+doc.height/2-y-h/2)*height,r=d.rotation*Math.PI/180,z=Math.max(.01,Number(d.clip!.properties.zoom??100)/100);
-      doc.x=clamp(doc.x+(z*(cx*Math.cos(r)-cy*Math.sin(r))-cx)/width,-4,4);doc.y=clamp(doc.y+(z*(cx*Math.sin(r)+cy*Math.cos(r))-cy)/height,-4,4);
+      const cx=(doc.x+doc.width/2-x-w/2)*width,cy=(doc.y+doc.height/2-y-h/2)*height,r=d.rotation*Math.PI/180,[zx,zy]=scales(d.clip!);
+      doc.x=clamp(doc.x+(zx*cx*Math.cos(r)-zy*cy*Math.sin(r)-cx)/width,-4,4);doc.y=clamp(doc.y+(zx*cx*Math.sin(r)+zy*cy*Math.cos(r)-cy)/height,-4,4);
     }
     d.next=doc;useEditorStore.setState({clipPreview:{...d.clip!,keyframes:undefined,properties:{...d.clip!.properties,shapeDocument:JSON.stringify(doc)}}});
   };

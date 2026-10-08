@@ -1232,8 +1232,9 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       // The fit to the canvas came after the grade, so a 4K source ran its table and float conversion on four times the
       // pixels the export keeps. Fitting first is what the preview does (it grades the smaller proxy), and it cut the
       // Newspaper composite from 152 s to 116 s. Pixel effects keep the old order: their radii are source pixels.
-      const zoom = property('zoom', 100, 1, 800) / 100;
-      const scaledWidth = Math.max(2, Math.round(width * zoom / 2) * 2), scaledHeight = Math.max(2, Math.round(height * zoom / 2) * 2);
+      // Scale X/Y stretch in the clip's own axes, before rotation, about the same anchor as Zoom.
+      const zoom = property('zoom', 100, 1, 800) / 100, scaleX = property('scaleX', 100, 1, 800), scaleY = property('scaleY', 100, 1, 800);
+      const scaledWidth = Math.max(2, Math.round(width * (zoom * (scaleX / 100)) / 2) * 2), scaledHeight = Math.max(2, Math.round(height * (zoom * (scaleY / 100)) / 2) * 2);
       if (scaledWidth * scaledHeight > 64_000_000) throw new Error(`${clip.name}: zoom requires too much memory at this resolution. Reduce Zoom.`);
       const poses=request.transformSamples?.[clip.id];
       const motion=poses&&poses.length>1;
@@ -1244,12 +1245,12 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         ? Array.from({ length: Math.ceil(length * fps - 1e-6) + 1 }, (_, frame) => {
           const at = evaluateClip(clip, geo.start + localStart + frame / fps, fps).properties;
           const value = (key: string, fallback: number, min: number, max: number) => finite(at[key] ?? fallback, `${clip.name} ${key}`, min, max);
-          return placement({ x: value('x', 0, -100000, 100000), y: value('y', 0, -100000, 100000), zoom: value('zoom', 100, 1, 800), rotation: value('rotation', 0, -360, 360), anchorX: value('anchorX', 0, -100000, 100000), anchorY: value('anchorY', 0, -100000, 100000) }, width, height, projectWidth, projectHeight, anchorShift);
+          return placement({ x: value('x', 0, -100000, 100000), y: value('y', 0, -100000, 100000), zoom: value('zoom', 100, 1, 800), scaleX: value('scaleX', 100, 1, 800), scaleY: value('scaleY', 100, 1, 800), rotation: value('rotation', 0, -360, 360), anchorX: value('anchorX', 0, -100000, 100000), anchorY: value('anchorY', 0, -100000, 100000) }, width, height, projectWidth, projectHeight, anchorShift);
         }) : undefined;
       // The clip is graded, cropped and padded on a canvas only as large as it ends up on the output, never larger
       // than the project canvas: a 4K project exported at 1080p used to grade, convert and pad every 4K frame and
       // only then shrink it. Crop stays measured in project pixels, scaled onto that canvas.
-      const largest = motion ? Math.max(...poses.map(pose => Math.max(pose.scaleX, pose.scaleY))) * width : streamed ? Math.max(...streamed.map(frame => frame.zoom)) * width : scaledWidth;
+      const largest = motion ? Math.max(...poses.map(pose => Math.max(pose.scaleX, pose.scaleY))) * width : streamed ? Math.max(...streamed.map(frame => Math.max(frame.zoom, frame.zoomY))) * width : Math.max(scaledWidth, Math.round(width * (zoom * (scaleY / 100)) / 2) * 2);
       const canvas = Math.min(1, largest / projectWidth), canvasWidth = Math.max(2, Math.round(projectWidth * canvas)), canvasHeight = Math.max(2, Math.round(projectHeight * canvas));
       const fit = `w=${canvasWidth}:h=${canvasHeight}:force_original_aspect_ratio=decrease`;
       const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && !['EQ', 'Compressor', 'Limiter', 'Stabilize', 'Depth'].includes(e.name));
@@ -1262,7 +1263,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       if (left + right >= projectWidth || top + bottom >= projectHeight) throw new Error(`${clip.name}: crop removes the entire frame.`);
       const [cropLeft, cropRight, cropTop, cropBottom] = [left, right, top, bottom].map(value => Math.round(value * canvas));
       if (left || right || top || bottom) video.push(`crop=${Math.max(1, canvasWidth - cropLeft - cropRight)}:${Math.max(1, canvasHeight - cropTop - cropBottom)}:${cropLeft}:${cropTop}`, `pad=${canvasWidth}:${canvasHeight}:${cropLeft}:${cropTop}:color=black@0`);
-      const still = placement({ x: property('x', 0, -100000, 100000), y: property('y', 0, -100000, 100000), zoom: zoom * 100, rotation: property('rotation', 0, -360, 360), anchorX: property('anchorX', 0, -100000, 100000), anchorY: property('anchorY', 0, -100000, 100000) }, width, height, projectWidth, projectHeight, anchorShift);
+      const still = placement({ x: property('x', 0, -100000, 100000), y: property('y', 0, -100000, 100000), zoom: zoom * 100, scaleX, scaleY, rotation: property('rotation', 0, -360, 360), anchorX: property('anchorX', 0, -100000, 100000), anchorY: property('anchorY', 0, -100000, 100000) }, width, height, projectWidth, projectHeight, anchorShift);
       const rotation = still.rotation;
       if (streamed) video.push(...transformFilters(streamed, width, height, Math.min(2, Math.max(1, largest / width))));
       else if(!motion)video.push(`scale=${scaledWidth}:${scaledHeight}`);
@@ -1756,7 +1757,7 @@ async function renderDepthTimeline(request: RenderRequest) {
         return [m[0], m[1] * sx / sy, m[2] * sx, m[3] * sy / sx, m[4], m[5] * sy];
       });
       const duration = frames / sourceFps, job = path.join(directory, `${index}.json`);
-      const neutral = { speed: 100, reverse: false, freeze: false, zoom: 100, x: 0, y: 0, anchorX: 0, anchorY: 0, rotation: 0, opacity: 100, cropLeft: 0, cropRight: 0, cropTop: 0, cropBottom: 0, fadeIn: 0, fadeOut: 0, flipH: false, blendMode: 'Normal', transitionOut: '' };
+      const neutral = { speed: 100, reverse: false, freeze: false, zoom: 100, scaleX: 100, scaleY: 100, x: 0, y: 0, anchorX: 0, anchorY: 0, rotation: 0, opacity: 100, cropLeft: 0, cropRight: 0, cropTop: 0, cropBottom: 0, fadeIn: 0, fadeOut: 0, flipH: false, blendMode: 'Normal', transitionOut: '' };
       // Half a frame early: the decoder keeps the first frame at or after the seek, so float noise cannot skip `origin`.
       const alone: Clip = { ...clip, start: 0, duration, sourceIn: image ? clip.sourceIn : Math.max(0, origin - .5 / sourceFps), transition: '', effects: before, keyframes: {}, properties: { ...clip.properties, ...neutral } };
       request.onStage?.(`Baking depth · ${clip.name}`);
@@ -1812,11 +1813,12 @@ function outsideRange(request: RenderRequest, clip: Clip, records: TransitionRec
 }
 
 /** The most pixels the clip's picture covers in this export: the output frame at the clip's largest zoom. A bake
- *  needs no more than this (a 4K source in a 1080p export at 150 % needs 2880 wide, not the 4K project canvas). */
+ *  needs no more than this (a 4K source in a 1080p export at 150 % needs 2880 wide, not the 4K project canvas).
+ *  A stretch counts its larger axis on both, so the box keeps the project's shape (compositions render at it). */
 function pictureBox(request: RenderRequest, clip: Clip): [number, number] {
   const [width, height] = dimensions(request.settings.resolution || request.project.resolution);
-  const zooms = [clip.properties.zoom ?? 100, ...(clip.keyframes?.['properties.zoom'] ?? []).map(key => key.value)].map(Number).filter(Number.isFinite);
-  const zoom = Math.max(100, ...zooms) / 100;
+  const most = (key: string) => Math.max(100, ...[clip.properties[key] ?? 100, ...(clip.keyframes?.[`properties.${key}`] ?? []).map(k => k.value)].map(Number).filter(Number.isFinite)) / 100;
+  const zoom = most('zoom') * Math.max(most('scaleX'), most('scaleY'));
   return [Math.ceil(width * zoom / 2) * 2, Math.ceil(height * zoom / 2) * 2];
 }
 

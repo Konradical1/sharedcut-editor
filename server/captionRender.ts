@@ -50,7 +50,7 @@ export async function renderCaptionTimeline(request: RenderRequest) {
         const c=evaluateClip(original,time,fps),p=c.properties;
         ctx.save();ctx.globalAlpha=Number(p.opacity??100)/100*fadeLevel(c,time);
         const ax=width/2+Number(p.anchorX??0)*width/pw,ay=height/2+Number(p.anchorY??0)*height/ph;
-        ctx.translate(ax+Number(p.x??0)*width/pw,ay+Number(p.y??0)*height/ph);ctx.rotate(Number(p.rotation??0)*Math.PI/180);ctx.scale(Number(p.zoom??100)/100,Number(p.zoom??100)/100);ctx.translate(-ax,-ay);
+        ctx.translate(ax+Number(p.x??0)*width/pw,ay+Number(p.y??0)*height/ph);ctx.rotate(Number(p.rotation??0)*Math.PI/180);ctx.scale(Number(p.zoom??100)/100*(Number(p.scaleX??100)/100),Number(p.zoom??100)/100*(Number(p.scaleY??100)/100));ctx.translate(-ax,-ay);
         drawText(ctx,getText(c),width,height,pw,ph,sourceTime(original,time,fps));ctx.restore();
       }
       if(!child.stdin.write(Buffer.from(ctx.getImageData(0,0,width,height).data)))await Promise.race([once(child.stdin,'drain'),done.then(()=>{throw new Error('Caption encoder closed early');})]);

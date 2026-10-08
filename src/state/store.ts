@@ -879,7 +879,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
           next = clamp(value, 0, resolution[key === 'cropTop' || key === 'cropBottom' ? 1 : 0] ?? 3840);
         }
         if (key === 'speed') next = clamp(value, 1, 800);
-        if (key === 'zoom') next = clamp(value, 1, 800);
+        if (key === 'zoom' || key === 'scaleX' || key === 'scaleY') next = clamp(value, 1, 800);
         if (key === 'gain') next = clamp(value, -60, 24);
         if (key === 'pan') next = clamp(value, -100, 100);
       }

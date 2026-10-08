@@ -4,7 +4,7 @@ import { getShape, isShape } from './shapes.ts';
 import { getText, isTitle } from './text.ts';
 
 export type MotionPose = { x: number; y: number; scaleX: number; scaleY: number; rotation: number };
-const paths = ['properties.x','properties.y','properties.zoom','text.x','text.y','shape.x','shape.y','shape.width','shape.height'];
+const paths = ['properties.x','properties.y','properties.zoom','properties.scaleX','properties.scaleY','text.x','text.y','shape.x','shape.y','shape.width','shape.height'];
 const bounded = (value: unknown, fallback: number, min: number, max: number) => typeof value === 'number' && Number.isFinite(value) ? Math.max(min,Math.min(max,value)) : fallback;
 export function validateMotionBlur(clip: Clip) {
   const p=clip.properties;
@@ -18,7 +18,7 @@ export function transformMotion(clip: Clip, time: number, fps: number, width: nu
   const local=time-clip.start,rotation=Number(p.rotation??0)*Math.PI/180,c=Math.cos(rotation),s=Math.sin(rotation);
   const value=(path:string,t:number,fallback:number)=>{const keys=clip.keyframes?.[path];return keys?.length?Number(boundedAnimationValue(path,sampleKeyframes(keys,t))):fallback;};
   const pose=(t:number,centred=false):MotionPose=>{
-    const zoom=value('properties.zoom',t,Number(p.zoom??100))/100;
+    const zoom=value('properties.zoom',t,Number(p.zoom??100))/100,kx=value('properties.scaleX',t,Number(p.scaleX??100))/100,ky=value('properties.scaleY',t,Number(p.scaleY??100))/100;
     const sx=shape?value('shape.width',t,shape.width)/shape.width:1,sy=shape?value('shape.height',t,shape.height)/shape.height:1;
     const doc=shape??text,prefix=shape?'shape':'text';
     const bx=doc?(centred&&doc.width<=1?(1-doc.width)/2:doc.x):0,by=doc?(centred&&doc.height<=1?(1-doc.height)/2:doc.y):0;
@@ -26,7 +26,7 @@ export function transformMotion(clip: Clip, time: number, fps: number, width: nu
     const ax=Number(p.anchorX??0)+(shape?(value('shape.x',t,shape.x)+value('shape.width',t,shape.width)/2-.5)*width:0);
     const ay=Number(p.anchorY??0)+(shape?(value('shape.y',t,shape.y)+value('shape.height',t,shape.height)/2-.5)*height:0);
     const lx=((sx-1)/2+dx)*width-ax,ly=((sy-1)/2+dy)*height-ay;
-    return {x:value('properties.x',t,Number(p.x??0))+ax+zoom*(c*lx-s*ly),y:value('properties.y',t,Number(p.y??0))+ay+zoom*(s*lx+c*ly),scaleX:zoom*sx,scaleY:zoom*sy,rotation};
+    return {x:value('properties.x',t,Number(p.x??0))+ax+zoom*(c*kx*lx-s*ky*ly),y:value('properties.y',t,Number(p.y??0))+ay+zoom*(s*kx*lx+c*ky*ly),scaleX:zoom*kx*sx,scaleY:zoom*ky*sy,rotation};
   };
   const current=pose(local),strength=bounded(p.motionBlurStrength,50,0,100);
   if(p.motionBlur!==true||!strength||!paths.some(path=>clip.keyframes?.[path]?.length))return [current];

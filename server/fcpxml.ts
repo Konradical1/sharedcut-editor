@@ -343,14 +343,17 @@ export function importFcpxml(xml: string, projectId: string, userId: string, fon
       if (keyNodes(param(transform, 'anchor')).length) gap(`Animated anchor points import as their first value (${label})`);
       // Final Cut puts the anchor at `position`; SharedCut turns about the anchor but places by x, so x = position - anchor.
       animate(out, transform, 'position', [['x', v => (pair(v)[0] - anchor[0]) * H, 0], ['y', v => -(pair(v)[1] - anchor[1]) * H, 0]], relative);
-      animate(out, transform, 'scale', [['zoom', v => Math.abs(pair(v)[0]) * 100, 100]], relative);
+      // A uniform scale is Zoom; an uneven one keys Scale X and Scale Y per axis, so each eases exactly as Final Cut's does.
+      const uneven = [transform.attrs.scale ?? param(transform, 'scale')?.attrs.value, ...keyNodes(param(transform, 'scale')).map(k => k.attrs.value)]
+        .some(v => { const [a, b] = pair(v); return v !== undefined && Math.abs(Math.abs(a) - Math.abs(b)) > 1e-4; });
+      const axis = (i: 0 | 1) => (v: string) => { const s = Math.abs(pair(v)[i]) * 100; if (s < 1 || s > 800) gap(`Scale beyond 1–800% is clamped (${label})`); return s; };
+      animate(out, transform, 'scale', uneven ? [['scaleX', axis(0), 100], ['scaleY', axis(1), 100]] : [['zoom', axis(0), 100]], relative);
       animate(out, transform, 'rotation', [['rotation', v => -Number(v), 0]], relative);
       if (anchor[0]) out.properties.anchorX = round(anchor[0] * H);
       if (anchor[1]) out.properties.anchorY = round(-anchor[1] * H);
       const [sx, sy] = pair(transform.attrs.scale ?? param(transform, 'scale')?.attrs.value ?? '1 1');
       if (sx < 0) out.properties.flipH = true;
       if (sy < 0) gap(`Vertical flips are not imported (${label})`);
-      if (Math.abs(Math.abs(sx) - Math.abs(sy)) > 1e-4) gap(`Non-uniform scale imports as uniform (${label})`);
     }
     const crop = child(node, 'adjust-crop');
     if (crop) {

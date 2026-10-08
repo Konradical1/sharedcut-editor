@@ -261,14 +261,17 @@ export function pivotOffset(clip: Clip, project: Size): Vec {
   return { x: Number(clip.properties.anchorX ?? 0) + (shape ? (shape.x + shape.width / 2 - .5) * project[0] : 0), y: Number(clip.properties.anchorY ?? 0) + (shape ? (shape.y + shape.height / 2 - .5) * project[1] : 0) };
 }
 
-/** Layer point `layer` (project pixels, before the transform) on the canvas: C + position + A + zoom·R·(layer − C − A),
- *  exactly the pose playback (motionBlur.transformMotion) and export (media.ts overlay placement) apply. `clip` must
+/** Layer point `layer` (project pixels, before the transform) on the canvas: C + position + A + zoom·R·S·(layer − C − A)
+ *  with S the Scale X/Y stretch, exactly the pose playback (motionBlur.transformMotion) and export (media.ts overlay placement) apply. `clip` must
  *  already be evaluated at the time in question. */
 export function poseLayerPoint(clip: Clip, layer: Vec, project: Size): Vec {
-  const p = clip.properties, pivot = pivotOffset(clip, project), zoom = Number(p.zoom ?? 100) / 100, angle = Number(p.rotation ?? 0) * Math.PI / 180;
-  const cx = project[0] / 2 + pivot.x, cy = project[1] / 2 + pivot.y, dx = layer.x - cx, dy = layer.y - cy;
+  const p = clip.properties, pivot = pivotOffset(clip, project), zoom = Number(p.zoom ?? 100) / 100, angle = Number(p.rotation ?? 0) * Math.PI / 180, [kx, ky] = stretch(clip);
+  const cx = project[0] / 2 + pivot.x, cy = project[1] / 2 + pivot.y, dx = kx * (layer.x - cx), dy = ky * (layer.y - cy);
   return { x: cx + Number(p.x ?? 0) + zoom * (Math.cos(angle) * dx - Math.sin(angle) * dy), y: cy + Number(p.y ?? 0) + zoom * (Math.sin(angle) * dx + Math.cos(angle) * dy) };
 }
+
+/** Scale X/Y as factors: the stretch in the layer's own axes, applied before rotation. */
+const stretch = (clip: Clip): [number, number] => [Number(clip.properties.scaleX ?? 100) / 100, Number(clip.properties.scaleY ?? 100) / 100];
 
 /** Source point of a tracked clip in project pixels on the fitted canvas, with Stabilize's warp when it has one. */
 export function sourceToLayer(point: Pick<TrackPoint, 'x' | 'y' | 'time'>, source: Size, project: Size, warp?: SourceWarp): Vec {
@@ -435,9 +438,9 @@ export function pictureBounds(clip: Clip, source: Size, project: Size) {
 /**
  * Camera follow: reposition (and zoom) the tracked clip so the tracked point stays put on the canvas.
  *
- * With the clip's pose P = C + X + A + z·R·(L − C − A), putting fitted-picture point L at canvas point G needs
- * X = G − C − A − z·R·(L − C − A). Then canvas corner K shows picture point L + R⁻¹(K − G)/z, so the picture covers
- * the canvas exactly when every corner's R⁻¹(K − G)/z, placed around L, stays inside the picture: each corner and
+ * With the clip's pose P = C + X + A + z·R·S·(L − C − A) (S the Scale X/Y stretch), putting fitted-picture point L at
+ * canvas point G needs X = G − C − A − z·R·S·(L − C − A). Then canvas corner K shows picture point L + S⁻¹R⁻¹(K − G)/z,
+ * so the picture covers the canvas exactly when every corner's S⁻¹R⁻¹(K − G)/z, placed around L, stays inside the picture: each corner and
  * axis gives a least zoom. The zoom curve rides above those needs (held, then blurred), and where even the largest
  * zoom allowed cannot hide an edge the point is let off its mark instead: no frame ever shows a border.
  */
@@ -456,10 +459,12 @@ export function cameraKeyframes(context: ApplyContext, attachTime: number, base:
   const bounds = pictureBounds(clip, context.source, context.project);
   const corners = [{ x: 0, y: 0 }, { x: width, y: 0 }, { x: 0, y: height }, { x: width, y: height }];
   const reach = frames.map((_, i) => corners.map(k => rotate({ x: k.x - goal.x, y: k.y - goal.y }, -angle(i))));
+  const stretched = poses.map(stretch);
   const needed = frames.map((_, i) => {
     let zoom = 0;
+    const [kx, ky] = stretched[i];
     for (const d of reach[i]) {
-      const limits: [number, number][] = [[d.x, d.x > 0 ? bounds.right - lx[i] : lx[i] - bounds.left], [d.y, d.y > 0 ? bounds.bottom - ly[i] : ly[i] - bounds.top]];
+      const limits: [number, number][] = [[d.x / kx, d.x > 0 ? bounds.right - lx[i] : lx[i] - bounds.left], [d.y / ky, d.y > 0 ? bounds.bottom - ly[i] : ly[i] - bounds.top]];
       for (const [distance, room] of limits) if (Math.abs(distance) > 1e-9) zoom = Math.max(zoom, room > 1e-9 ? Math.abs(distance) / room : Infinity);
     }
     return zoom * 100;
@@ -469,16 +474,16 @@ export function cameraKeyframes(context: ApplyContext, attachTime: number, base:
   const zooms = options.zoom === 'off' ? frames.map(() => base.zoom) : options.zoom === 'steady' ? frames.map(() => Math.max(...floor)) : envelope(floor, hold, sigma).map(value => Math.min(value, options.maxZoom));
   const x: number[] = [], y: number[] = [];
   frames.forEach((_, i) => {
-    const z = zooms[i] / 100;
+    const z = zooms[i] / 100, [kx, ky] = stretched[i];
     let px = lx[i], py = ly[i];
     if (options.zoom !== 'off') {
       // Picture points that may sit at the goal without uncovering an edge at this zoom; the point stays inside.
-      const low = { x: bounds.left - Math.min(...reach[i].map(d => d.x)) / z, y: bounds.top - Math.min(...reach[i].map(d => d.y)) / z };
-      const high = { x: bounds.right - Math.max(...reach[i].map(d => d.x)) / z, y: bounds.bottom - Math.max(...reach[i].map(d => d.y)) / z };
+      const low = { x: bounds.left - Math.min(...reach[i].map(d => d.x)) / (z * kx), y: bounds.top - Math.min(...reach[i].map(d => d.y)) / (z * ky) };
+      const high = { x: bounds.right - Math.max(...reach[i].map(d => d.x)) / (z * kx), y: bounds.bottom - Math.max(...reach[i].map(d => d.y)) / (z * ky) };
       px = low.x <= high.x ? clamp(px, low.x, high.x) : (low.x + high.x) / 2;
       py = low.y <= high.y ? clamp(py, low.y, high.y) : (low.y + high.y) / 2;
     }
-    const own = pivotOffset(poses[i], context.project), c = { x: width / 2 + own.x, y: height / 2 + own.y }, arm = rotate({ x: px - c.x, y: py - c.y }, angle(i));
+    const own = pivotOffset(poses[i], context.project), c = { x: width / 2 + own.x, y: height / 2 + own.y }, arm = rotate({ x: kx * (px - c.x), y: ky * (py - c.y) }, angle(i));
     x.push(goal.x - c.x - z * arm.x); y.push(goal.y - c.y - z * arm.y);
   });
   const times = frames.map(frame => frame.time), channels: ChannelKeys = {};

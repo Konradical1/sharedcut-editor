@@ -78,6 +78,8 @@ test('canvas mapping is the pose playback draws, for video, rotated, anchored an
     video(),
     video({ properties: { x: 120, y: -80, zoom: 137, rotation: 21, anchorX: 300, anchorY: -40 } }),
     video({ mediaId: 'frameline-shape', properties: { x: 10, y: 5, zoom: 80, rotation: -33, anchorX: 12, anchorY: 7, shapeDocument: shape } }),
+    video({ properties: { x: -60, y: 40, zoom: 110, scaleX: 130.9, scaleY: 76.7, rotation: 17, anchorX: -200, anchorY: 90 } }),
+    video({ mediaId: 'frameline-shape', properties: { x: 10, y: 5, zoom: 80, scaleX: 50, scaleY: 240, rotation: -33, anchorX: 12, anchorY: 7, shapeDocument: shape } }),
   ];
   for (const clip of cases) for (const point of [{ x: 0, y: 0 }, { x: 700, y: 300 }, { x: 1920, y: 1080 }]) {
     const expected = chain(clip, point), actual = poseLayerPoint(clip, point, project);
@@ -130,6 +132,7 @@ test('camera follow keeps the point on its mark and never shows a border', () =>
     ['steady centred', { ...defaultCameraOptions, zoom: 'steady' as const, framing: 'center' as const, smoothing: 0 }, {}],
     ['rotated, cropped and anchored', { ...defaultCameraOptions, maxZoom: 800, smoothing: 0 }, { properties: { x: 0, y: 0, zoom: 100, rotation: 8, anchorX: 90, anchorY: -30, cropLeft: 40, cropTop: 12 } }],
     ['capped zoom', { ...defaultCameraOptions, maxZoom: 130, framing: 'center' as const }, {}],
+    ['stretched, rotated and anchored', { ...defaultCameraOptions, maxZoom: 800, smoothing: 0 }, { properties: { x: 0, y: 0, zoom: 100, scaleX: 60, scaleY: 140, rotation: 8, anchorX: 90, anchorY: -30 } }],
   ] as const) {
     const tracked = video(clipPatch as Partial<Clip>), source = [3840, 2160] as const;
     const path = trackerPath({ keys: [], source: { mediaId: 'media', fps: 30, width: 3840, height: 2160, duration: 20 } }, samples(range(0, 400), 30, wander));
@@ -141,10 +144,10 @@ test('camera follow keeps the point on its mark and never shows a border', () =>
     for (let n = 0; n < 120; n++) {
       const time = 10 + n / 30, pose = evaluateClip(followed, time, 30), point = poseLayerPoint(pose, sourceToLayer(trackAtTimeline(path, tracked, asset, time, 30)!, source, project), project);
       // Invert the pose at each canvas corner: it must land on picture, not on a bar or the cropped edge.
-      const p = pose.properties, zoom = Number(p.zoom) / 100, angle = -Number(p.rotation) * Math.PI / 180, cx = 960 + Number(p.anchorX ?? 0), cy = 540 + Number(p.anchorY ?? 0);
+      const p = pose.properties, zoom = Number(p.zoom) / 100, kx = Number(p.scaleX ?? 100) / 100, ky = Number(p.scaleY ?? 100) / 100, angle = -Number(p.rotation) * Math.PI / 180, cx = 960 + Number(p.anchorX ?? 0), cy = 540 + Number(p.anchorY ?? 0);
       for (const corner of [{ x: 0, y: 0 }, { x: 1920, y: 0 }, { x: 0, y: 1080 }, { x: 1920, y: 1080 }]) {
         const dx = corner.x - cx - Number(p.x), dy = corner.y - cy - Number(p.y);
-        const lx = cx + (Math.cos(angle) * dx - Math.sin(angle) * dy) / zoom, ly = cy + (Math.sin(angle) * dx + Math.cos(angle) * dy) / zoom;
+        const lx = cx + (Math.cos(angle) * dx - Math.sin(angle) * dy) / zoom / kx, ly = cy + (Math.sin(angle) * dx + Math.cos(angle) * dy) / zoom / ky;
         assert.ok(lx >= bounds.left - .2 && lx <= bounds.right + .2 && ly >= bounds.top - .2 && ly <= bounds.bottom + .2, `${label}: border at ${time.toFixed(3)} corner ${JSON.stringify(corner)}`);
       }
       if (Math.hypot(point.x - goal.x, point.y - goal.y) < .3) onMark++;

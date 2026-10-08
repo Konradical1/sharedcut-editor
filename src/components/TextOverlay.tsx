@@ -4,7 +4,7 @@ import type { Clip } from '../state/models';
 import { evaluateClip } from '../services/animation';
 import { memo, useEffect, useRef, useState, type PointerEvent } from 'react';
 import { useEditorStore, usePausedPlayhead } from '../state/store';
-import { getText, isTitle, defaultTextStyle, textLocalPoint, type TextDocument } from '../services/text';
+import { getText, isTitle, defaultTextStyle, scales, textLocalPoint, type TextDocument } from '../services/text';
 import { lockedAxis, overlayBoxes, snapBox, textBox, SNAP_PIXELS, type SnapBox, type SnapGuide } from '../services/snapping';
 import { TextContentEditor } from './TextInspector';
 
@@ -47,14 +47,14 @@ function TextOverlay() {
     const doc=d.doc!,dx=p.x-d.x,dy=p.y-d.y;let {x,y,width,height}=doc;
     if(d.mode==='move'){
       // Shift locks the drag to its dominant direction; Alt suspends snapping for fine placement.
-      // The pointer delta is already in document space, so a snap measured on screen divides by zoom.
-      const zoom=Math.max(.01,Number(d.clip!.properties.zoom??100)/100),axis=e.shiftKey?lockedAxis(dx*projectWidth,dy*projectHeight):null;
+      // The pointer delta is already in document space, so a snap measured on screen divides by each axis's scale.
+      const [zx,zy]=scales(d.clip!),axis=e.shiftKey?lockedAxis(dx*projectWidth,dy*projectHeight):null;
       let nx=x+(axis==='y'?0:dx),ny=y+(axis==='x'?0:dy);
       if(e.altKey)setGuides([]);
       else {
         const rect=root.current!.getBoundingClientRect();
         const snap=snapBox(textBox(d.clip!,{...doc,x:nx,y:ny},projectWidth,projectHeight),d.targets??[],{x:SNAP_PIXELS/rect.width,y:SNAP_PIXELS/rect.height},{x:axis!=='y',y:axis!=='x'});
-        nx+=snap.dx/zoom;ny+=snap.dy/zoom;setGuides(snap.guides);
+        nx+=snap.dx/zx;ny+=snap.dy/zy;setGuides(snap.guides);
       }
       x=Math.max(-4,Math.min(4,nx));y=Math.max(-4,Math.min(4,ny));
     }
@@ -62,7 +62,7 @@ function TextOverlay() {
     d.next={...doc,x,y,width,height};const clip=d.clip!;useEditorStore.setState({textPreview:[{...clip,keyframes:undefined,properties:{...clip.properties,textDocument:JSON.stringify(d.next)}}]});
   };
   return <div ref={root} className={`text-overlay ${tool?'drawing-text':''} ${playing?'text-playing':''}`} aria-label="Text canvas" onPointerDown={e=>begin(e)} onPointerMove={move} onPointerUp={()=>finish()} onPointerCancel={()=>finish(true)} onLostPointerCapture={()=>{if(drag.current)finish(true);}}>
-    {!playing&&visible.map(clip=>{const evaluated=preview.find(c=>c.id===clip.id)??evaluateClip(clipPreview?.id===clip.id?clipPreview:clip,playhead),doc=getText(evaluated),p=evaluated.properties,selected=ids.includes(clip.id);return <div key={clip.id} role="button" tabIndex={tool?-1:0} aria-label={`Select text: ${clip.name}`} aria-pressed={selected} className={`text-box ${selected?'selected':''}`} style={{left:`${doc.x*100}%`,top:`${doc.y*100}%`,width:`${doc.width*100}%`,height:`${doc.height*100}%`,transform:`translate(${Number(p.x??0)/projectWidth/doc.width*100}%, ${Number(p.y??0)/projectHeight/doc.height*100}%) rotate(${Number(p.rotation??0)}deg) scale(${Math.max(.01,Number(p.zoom??100)/100)})`,transformOrigin:`${(.5+Number(p.anchorX??0)/projectWidth-doc.x)/doc.width*100}% ${(.5+Number(p.anchorY??0)/projectHeight-doc.y)/doc.height*100}%`,pointerEvents:tool||shapeTool?'none':undefined}} onPointerDown={e=>begin(e,clip.id)} onDoubleClick={e=>{e.stopPropagation();s().selectText(clip.id);if(!isCaption(clip))setEditing(clip.id);}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();s().selectText(clip.id);if(!isCaption(clip))setEditing(clip.id);}}}>
+    {!playing&&visible.map(clip=>{const evaluated=preview.find(c=>c.id===clip.id)??evaluateClip(clipPreview?.id===clip.id?clipPreview:clip,playhead),doc=getText(evaluated),p=evaluated.properties,selected=ids.includes(clip.id);return <div key={clip.id} role="button" tabIndex={tool?-1:0} aria-label={`Select text: ${clip.name}`} aria-pressed={selected} className={`text-box ${selected?'selected':''}`} style={{left:`${doc.x*100}%`,top:`${doc.y*100}%`,width:`${doc.width*100}%`,height:`${doc.height*100}%`,transform:`translate(${Number(p.x??0)/projectWidth/doc.width*100}%, ${Number(p.y??0)/projectHeight/doc.height*100}%) rotate(${Number(p.rotation??0)}deg) scale(${scales(evaluated).join(', ')})`,transformOrigin:`${(.5+Number(p.anchorX??0)/projectWidth-doc.x)/doc.width*100}% ${(.5+Number(p.anchorY??0)/projectHeight-doc.y)/doc.height*100}%`,pointerEvents:tool||shapeTool?'none':undefined}} onPointerDown={e=>begin(e,clip.id)} onDoubleClick={e=>{e.stopPropagation();s().selectText(clip.id);if(!isCaption(clip))setEditing(clip.id);}} onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();s().selectText(clip.id);if(!isCaption(clip))setEditing(clip.id);}}}>
       {selected&&<><span className="text-box-label">T · {clip.name.slice(0,28)}</span>{['nw','n','ne','e','se','s','sw','w'].map(handle=><button key={handle} className={`text-resize text-resize-${handle}`} aria-label={`Resize text ${handle}`} onPointerDown={e=>begin(e,clip.id,handle)} onKeyDown={e=>{if(!['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(e.key))return;e.preventDefault();e.stopPropagation();s().updateText([{id:clip.id,doc:{...doc,width:Math.max(.01,Math.min(1,doc.width+(e.key==='ArrowRight'?.005:e.key==='ArrowLeft'?-.005:0))),height:Math.max(.01,Math.min(1,doc.height+(e.key==='ArrowDown'?.005:e.key==='ArrowUp'?-.005:0)))}}]);}}/>)}</>}
     </div>;})}
     {guides.map((g,i)=><div key={i} className={`snap-guide snap-guide-${g.axis}`} style={g.axis==='x'?{left:`${g.at*100}%`}:{top:`${g.at*100}%`}}/>)}

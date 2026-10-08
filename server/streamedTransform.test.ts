@@ -9,6 +9,7 @@ import { renderTimeline, run, type RenderRequest } from './media.ts';
 import { piecewise, placement, streamsTransform } from './streamedTransform.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
+import { transformMotion } from '../src/services/motionBlur.ts';
 
 const exec = promisify(execFile), ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
 // The expression FFmpeg evaluates, run as JavaScript (`in` is a keyword there).
@@ -32,16 +33,32 @@ test('placement turns zoom and rotation about the anchor', () => {
   assert.deepEqual([anchored.shiftX, anchored.shiftY], [-200, -100]);
 });
 
+test('placement stretches Scale X/Y in the layer axes before turning, keeps the anchor and matches the preview pose', () => {
+  const values = { x: 30, y: -14, zoom: 120, scaleX: 150, scaleY: 60, rotation: 35, anchorX: 400, anchorY: -260 };
+  const at = placement(values, 1920, 1080, 3840, 2160), c = Math.cos(at.rotation), s = Math.sin(at.rotation);
+  assert.ok(Math.abs(at.zoom - 1.8) < 1e-12 && Math.abs(at.zoomY - .72) < 1e-12, `${at.zoom} × ${at.zoomY}`);
+  // The anchor (200, -130 output pixels from the centre) lands on position + anchor.
+  assert.ok(Math.abs(at.shiftX + c * at.zoom * 200 - s * at.zoomY * -130 - (15 + 200)) < 1e-9 && Math.abs(at.shiftY + s * at.zoom * 200 + c * at.zoomY * -130 - (-7 - 130)) < 1e-9);
+  // Export and preview place the layer from the same pose (motionBlur.transformMotion, in project pixels).
+  const pose = transformMotion({ id: 'c', projectId: 'p', timelineId: 't', trackId: 'v', mediaId: 'm', name: 'Shot', start: 0, duration: 1, sourceIn: 0, color: '', disabled: false, effects: [], properties: values }, 0, 24, 3840, 2160)[0];
+  assert.ok(Math.abs(pose.x / 2 - at.shiftX) < 1e-9 && Math.abs(pose.y / 2 - at.shiftY) < 1e-9 && pose.scaleX === at.zoom && Math.abs(pose.scaleY - at.zoomY) < 1e-12, JSON.stringify({ pose, at }));
+  // Unstretched, the numbers are the ones placement gave before Scale X/Y.
+  const plain = { x: 100, y: -50, zoom: 137, rotation: 21, anchorX: 300, anchorY: -40 }, r = 21 * Math.PI / 180;
+  assert.deepEqual(placement({ ...plain, scaleX: 100, scaleY: 100 }, 1920, 1080, 3840, 2160), { zoom: 1.37, zoomY: 1.37, rotation: r, shiftX: 50 + 150 - 1.37 * (150 * Math.cos(r) - -20 * Math.sin(r)), shiftY: -25 + -20 - 1.37 * (150 * Math.sin(r) + -20 * Math.cos(r)) });
+});
+
 test('only position, zoom, rotation and anchor keys stream', () => {
   const clip = (keyframes: Clip['keyframes'], properties = {}): Clip => ({ id: 'c', projectId: 'p', timelineId: 't', trackId: 'v', mediaId: 'm', name: 'Shot', start: 0, duration: 2, sourceIn: 0, color: '', disabled: false, properties: { ...defaultProperties, ...properties }, effects: [], keyframes });
   const key = (value: number) => [{ id: 'k', time: 0, value, interpolation: 'linear' as const }];
   assert.ok(streamsTransform(clip({ 'properties.zoom': key(100), 'properties.gain': key(-3) })));
+  assert.ok(streamsTransform(clip({ 'properties.scaleX': key(130), 'properties.scaleY': key(80) })), 'a keyed stretch streams too');
   assert.ok(!streamsTransform(clip({ 'properties.zoom': key(100), 'properties.opacity': key(50) })), 'opacity keys still render per frame');
   assert.ok(!streamsTransform(clip({ 'properties.zoom': key(100) }, { motionBlur: true })), 'motion blur samples inside each frame');
   assert.ok(!streamsTransform(clip({ 'properties.gain': key(-3) })), 'nothing to stream');
 });
 
-// The streamed pass must draw what the per-frame renders drew: a 1 s Ken Burns zoom with a slide and a tilt.
+// The streamed pass must draw what the per-frame renders drew: a 1 s Ken Burns zoom with a slide and a tilt, and an
+// anchored, turning stretch (Scale X/Y keyed apart, as a Final Cut import can be).
 test('a streamed keyframed transform matches the per-frame render', { timeout: 300000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'frameline-streamed-'));
   try {
@@ -50,23 +67,29 @@ test('a streamed keyframed transform matches the per-frame render', { timeout: 3
     const asset: MediaAsset = { id: 'asset', projectId: 'project', name: 'source.mp4', kind: 'video', binId: 'all', duration: 2, fps: 24, resolution: '640 × 360', size: '1 MB', status: 'ready', progress: 100, thumbnail: '', hasAudio: false };
     const track: Track = { id: 'v1', timelineId: 'timeline', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
     const keys = (from: number, to: number) => [{ id: 'a', time: 0, value: from, interpolation: 'linear' as const }, { id: 'b', time: 1, value: to, interpolation: 'linear' as const }];
-    const clip: Clip = { id: 'clip', projectId: 'project', timelineId: 'timeline', mediaId: 'asset', name: 'Zoom', trackId: 'v1', start: 0, duration: 1, sourceIn: .5, color: 'red', disabled: false,
-      properties: { ...defaultProperties }, effects: [], keyframes: { 'properties.zoom': keys(100, 160), 'properties.x': keys(0, 120), 'properties.rotation': keys(0, 8) } };
-    const request = (streamTransforms: boolean): RenderRequest => ({ project: { id: 'project', resolution: '640 × 360', fps: 24 } as Project, timeline: { id: 'timeline', projectId: 'project', name: 'test', duration: 1 }, tracks: [track], clips: [clip], nodes: [], assets: [{ asset, path: source }],
-      settings: { resolution: '640 × 360', fps: '24', codec: 'H.264', quality: 'Visually lossless', rangeIn: '0', rangeOut: '1', audio: 'Disabled' }, outputPath: path.join(dir, `${streamTransforms}.mp4`), streamTransforms });
-    const started = Date.now();
-    await renderTimeline(request(true));
-    const streamedSeconds = (Date.now() - started) / 1000;
-    await renderTimeline(request(false));
-    const frames = async (file: string) => await run(ffmpeg, ['-v', 'error', '-i', file, '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { binary: true, maxBytes: 64 * 1024 ** 2 });
-    const [streamed, reference] = [await frames(path.join(dir, 'true.mp4')), await frames(path.join(dir, 'false.mp4'))];
-    assert.equal(streamed.length, reference.length, 'same frame count');
-    const size = 640 * 360;
-    for (let frame = 0; frame < streamed.length / size; frame += 4) {
-      let difference = 0;
-      for (let i = frame * size; i < (frame + 1) * size; i++) difference += Math.abs(streamed[i] - reference[i]);
-      assert.ok(difference / size < 4, `frame ${frame}: mean difference ${(difference / size).toFixed(2)} levels`);
+    const cases: [string, Clip['properties'], Clip['keyframes']][] = [
+      ['zoom', {}, { 'properties.zoom': keys(100, 160), 'properties.x': keys(0, 120), 'properties.rotation': keys(0, 8) }],
+      ['stretch', { zoom: 110, anchorX: 80, anchorY: -30 }, { 'properties.scaleX': keys(100, 170), 'properties.scaleY': keys(100, 70), 'properties.rotation': keys(0, 8) }],
+    ];
+    for (const [name, properties, keyframes] of cases) {
+      const clip: Clip = { id: 'clip', projectId: 'project', timelineId: 'timeline', mediaId: 'asset', name: 'Zoom', trackId: 'v1', start: 0, duration: 1, sourceIn: .5, color: 'red', disabled: false,
+        properties: { ...defaultProperties, ...properties }, effects: [], keyframes };
+      const request = (streamTransforms: boolean): RenderRequest => ({ project: { id: 'project', resolution: '640 × 360', fps: 24 } as Project, timeline: { id: 'timeline', projectId: 'project', name: 'test', duration: 1 }, tracks: [track], clips: [clip], nodes: [], assets: [{ asset, path: source }],
+        settings: { resolution: '640 × 360', fps: '24', codec: 'H.264', quality: 'Visually lossless', rangeIn: '0', rangeOut: '1', audio: 'Disabled' }, outputPath: path.join(dir, `${name}-${streamTransforms}.mp4`), streamTransforms });
+      const started = Date.now();
+      await renderTimeline(request(true));
+      const streamedSeconds = (Date.now() - started) / 1000;
+      await renderTimeline(request(false));
+      const frames = async (file: string) => await run(ffmpeg, ['-v', 'error', '-i', file, '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { binary: true, maxBytes: 64 * 1024 ** 2 });
+      const [streamed, reference] = [await frames(path.join(dir, `${name}-true.mp4`)), await frames(path.join(dir, `${name}-false.mp4`))];
+      assert.equal(streamed.length, reference.length, `${name}: same frame count`);
+      const size = 640 * 360;
+      for (let frame = 0; frame < streamed.length / size; frame += 4) {
+        let difference = 0;
+        for (let i = frame * size; i < (frame + 1) * size; i++) difference += Math.abs(streamed[i] - reference[i]);
+        assert.ok(difference / size < 4, `${name} frame ${frame}: mean difference ${(difference / size).toFixed(2)} levels`);
+      }
+      console.log(`${name}: streamed render ${streamedSeconds.toFixed(1)} s`);
     }
-    console.log(`streamed render ${streamedSeconds.toFixed(1)} s`);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

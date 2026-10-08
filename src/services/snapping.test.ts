@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { lockedAxis, overlayBoxes, shapeBox, snapBox, snapTime, textBox } from './snapping.ts';
 import { defaultShape } from './shapes.ts';
-import { presetDocument } from './text.ts';
+import { presetDocument, textLocalPoint } from './text.ts';
+import { poseLayerPoint } from './motionTracker.ts';
 import type { Clip, Track } from '../state/models.ts';
 
 const clip = (id: string, mediaId: string, properties: Clip['properties']): Clip =>
@@ -52,4 +53,16 @@ test('boxes follow the clip transform, and moving the document moves them one fo
   const state = { clips: [shape, title, { ...clip('h', 'frameline-title', title.properties), trackId: 'v9' }], tracks, timelineId: 't', playhead: 1 };
   assert.equal(overlayBoxes(state, 1920, 1080).length, 3);        // every title and shape under the playhead
   assert.equal(overlayBoxes(state, 1920, 1080, 's').length, 2);   // minus the one being dragged
+});
+
+test('Scale X/Y stretch the boxes per axis, and the title handles invert the stretched pose', () => {
+  const doc = defaultShape(), shape = clip('s', 'frameline-shape', { zoom: 50, scaleX: 200, scaleY: 50, shapeDocument: JSON.stringify(doc) }), box = shapeBox(shape, doc, 1920, 1080);
+  assert.ok(Math.abs(box.width - doc.width) < 1e-9 && Math.abs(box.height - doc.height / 4) < 1e-9 && Math.abs(box.x + box.width / 2 - (doc.x + doc.width / 2)) < 1e-9, JSON.stringify(box));
+  const text = presetDocument(0), title = clip('t', 'frameline-title', { zoom: 100, scaleX: 50, scaleY: 300, textDocument: JSON.stringify(text) }), area = textBox(title, text, 1920, 1080);
+  assert.ok(Math.abs(area.width - text.width / 2) < 1e-9 && Math.abs(area.height - text.height * 3) < 1e-9 && Math.abs(area.y - (.5 + 3 * (text.y - .5))) < 1e-9);
+  const turned = { x: 40, y: -25, zoom: 120, scaleX: 130.9, scaleY: 76.7, rotation: 27, anchorX: -150, anchorY: 60 };
+  for (const point of [{ x: 100, y: 200 }, { x: 1700, y: 950 }]) {
+    const screen = poseLayerPoint(clip('t', 'frameline-title', turned), point, [1920, 1080]), back = textLocalPoint({ x: screen.x / 1920, y: screen.y / 1080 }, turned, 1920, 1080);
+    assert.ok(Math.abs(back.x * 1920 - point.x) < 1e-6 && Math.abs(back.y * 1080 - point.y) < 1e-6, JSON.stringify({ point, back }));
+  }
 });

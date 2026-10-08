@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fcpProjectId, fcpTime, fileUrlPath, importFcpxml, locateSource, parseXml, readFcpBundle } from './fcpxml.ts';
 import { createFrameLineServer } from './index.ts';
+import { evaluateClip } from '../src/services/animation.ts';
 
 // A 25 fps edit whose timeline starts at 01:00:00:00, exercising each structure the converter handles.
 export const sample = `<?xml version="1.0" encoding="UTF-8"?>
@@ -189,6 +190,30 @@ test('a real Final Cut export: audition timing, sample-accurate sound, split edi
   assert.ok(widest <= fitted.width * 1920 + 1e-6 && widest > .95 * fitted.width * 1920, `the widest line fills its box: ${widest} of ${fitted.width * 1920}`);
   near(big.style.fontSize / small.style.fontSize, 278.9 / 91.9, 'every run shrinks by the same factor');
   near(JSON.parse(String(r.clips.find(c => c.mediaId === 'frameline-title')!.properties.textDocument)).runs[0].style.letterSpacing, 0, 'no tracking, no spacing');
+});
+
+test('a non-uniform Final Cut scale imports per axis as Scale X / Scale Y, static and keyed', () => {
+  const clip = (name: string, offset: number, transform: string) => `<asset-clip ref="r2" offset="${offset}s" name="${name}" start="0s" duration="2s">${transform}</asset-clip>`;
+  const keyed = (a: string, b: string) => `<adjust-transform><param name="scale"><keyframeAnimation><keyframe time="0s" value="${a}"/><keyframe time="1s" value="${b}"/></keyframeAnimation></param></adjust-transform>`;
+  const xml = `<fcpxml version="1.11"><resources><format id="r1" frameDuration="100/2500s" width="1920" height="1080"/>
+    <asset id="r2" start="0s" duration="60s" hasVideo="1" format="r1"><media-rep kind="original-media" src="file:///M/a.mov"/></asset></resources>
+    <library><event name="E"><project name="Stretch"><sequence format="r1" duration="12s" tcStart="0s"><spine>
+    ${clip('stretched', 0, '<adjust-transform scale="1.309 1.004"/>')}${clip('uniform keys', 2, keyed('1 1', '2 2'))}${clip('stretched keys', 4, keyed('1 1', '1.5 0.75'))}${clip('flipped', 6, '<adjust-transform scale="-2 1"/>')}${clip('widening', 8, keyed('1 1', '2 1'))}${clip('extreme', 10, '<adjust-transform scale="0.1 10"/>')}
+    </spine></sequence></project></event></library></fcpxml>`;
+  const r = importFcpxml(xml, 'fcp-stretch', 'owner'), byName = (name: string) => r.clips.find(c => c.name === name)!;
+  const stretched = byName('stretched'), uniform = byName('uniform keys'), keys = byName('stretched keys'), flipped = byName('flipped');
+  near(stretched.properties.scaleX, 130.9); near(stretched.properties.scaleY, 100.4); assert.equal(stretched.properties.zoom, undefined);
+  assert.deepEqual(uniform.keyframes?.['properties.zoom']?.map(k => k.value), [100, 200]); assert.equal(uniform.keyframes?.['properties.scaleY'], undefined, 'a uniform keyed scale gets no Scale Y channel');
+  assert.deepEqual(keys.keyframes?.['properties.scaleX']?.map(k => k.value), [100, 150]); assert.deepEqual(keys.keyframes?.['properties.scaleY']?.map(k => k.value), [100, 75]); assert.equal(keys.keyframes?.['properties.zoom'], undefined);
+  // Between keys each axis follows Final Cut's own straight line, not a product of two ramps.
+  for (const [name, t, w, h] of [['stretched keys', .5, 1.25, .875], ['stretched keys', .25, 1.125, .9375], ['widening', .5, 1.5, 1]] as const) {
+    const c = byName(name), p = evaluateClip(c, c.start + t).properties, zoom = Number(p.zoom ?? 100) / 100;
+    near(zoom * Number(p.scaleX ?? 100) / 100, w, `${name} width at ${t}s`); near(zoom * Number(p.scaleY ?? 100) / 100, h, `${name} height at ${t}s`);
+  }
+  near(flipped.properties.scaleX, 200); assert.equal(flipped.properties.scaleY, undefined); assert.equal(flipped.properties.flipH, true);
+  assert.deepEqual([byName('extreme').properties.scaleX, byName('extreme').properties.scaleY], [10, 800]);
+  assert.ok(r.warnings.some(w => /Scale beyond 1–800% is clamped \(extreme\)/.test(w)), r.warnings.join('; '));
+  assert.ok(!r.warnings.some(w => /uniform|clamped \((?!extreme)/i.test(w)), r.warnings.join('; '));
 });
 
 test('bundle reading maps original paths to the copied files', async () => {

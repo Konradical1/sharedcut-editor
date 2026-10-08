@@ -13,6 +13,8 @@ import type { RenderRequest } from './media.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
 import { gradeValues } from '../src/services/grade.ts';
+import { createCanvas } from '@napi-rs/canvas';
+import { drawMotionPose, transformMotion } from '../src/services/motionBlur.ts';
 
 const exec = promisify(execFile);
 const ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg';
@@ -409,6 +411,38 @@ test('vertical reels: rotated probes, portrait stills, flips, aspect guard and H
   assert.ok(Math.abs(mapped.luma-raw.luma)>4,`tone mapping changes brightness (${mapped.luma} vs ${raw.luma})`);
   assert.ok(Math.abs(mapped.sat-raw.sat)>4,`and saturation (${mapped.sat} vs ${raw.sat})`);
  } finally {await rm(dir,{recursive:true,force:true});}
+});
+
+test('a stretched, turned, anchored still exports where the preview draws it (Scale X/Y before rotation)', { timeout: 60000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-stretch-'));
+  try {
+    const [W, H] = [160, 90], split = path.join(dir, 'split.png');
+    await ff(['-f', 'lavfi', '-i', 'color=red:s=80x90', '-f', 'lavfi', '-i', 'color=blue:s=80x90', '-filter_complex', '[0][1]hstack,format=rgb24', '-frames:v', '1', split]);
+    const clip = { id: 'c', projectId: 'p', timelineId: 'tl', trackId: 't', mediaId: 'a', name: 'Stretch', start: 0, duration: .25, sourceIn: 0, color: '#fff', disabled: false, effects: [],
+      properties: { ...defaultProperties, x: 12, y: -6, zoom: 90, scaleX: 60, scaleY: 160, rotation: 90, anchorX: 20, anchorY: 10 } } as Clip;
+    const outputPath = path.join(dir, 'stretch.mov');
+    await renderTimeline({ project: { id: 'p', resolution: `${W} × ${H}`, fps: 24 } as Project, timeline: { id: 'tl', projectId: 'p', name: 'Main', duration: .25 }, clips: [clip], nodes: [],
+      tracks: [{ id: 't', timelineId: 'tl', name: 'V1', kind: 'video', number: 1, muted: false, solo: false, locked: false, hidden: false, gain: 0, pan: 0 }],
+      assets: [{ asset: { id: 'a', projectId: 'p', name: 'Split', kind: 'image', duration: 1, status: 'ready', progress: 100, binId: '', thumbnail: '', fps: 0, resolution: `${W} × ${H}`, size: '' }, path: split }],
+      settings: { audio: 'Disabled', codec: 'Apple ProRes 4444', resolution: `${W} × ${H}`, fps: '24' }, outputPath });
+    const exported = (await ff(['-i', outputPath, '-frames:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgba', 'pipe:1'])).stdout;
+    // The preview draws the same picture through the same pose on a canvas.
+    const source = createCanvas(W, H), paint = source.getContext('2d'), preview = createCanvas(W, H).getContext('2d');
+    paint.fillStyle = '#ff0000'; paint.fillRect(0, 0, 80, H); paint.fillStyle = '#0000ff'; paint.fillRect(80, 0, 80, H); preview.fillStyle = '#000000'; preview.fillRect(0, 0, W, H);
+    drawMotionPose(preview as unknown as CanvasRenderingContext2D, source as unknown as CanvasImageSource, transformMotion(clip, 0, 24, W, H)[0], clip, W, H, W, H);
+    const drawn = preview.getImageData(0, 0, W, H).data;
+    const kind = (p: ArrayLike<number>, i: number) => p[i] > 160 && p[i + 2] < 90 ? 'red' : p[i + 2] > 160 && p[i] < 90 ? 'blue' : p[i] < 40 && p[i + 2] < 40 ? 'black' : '';
+    const counts: Record<string, number> = { red: 0, blue: 0, black: 0 }, wrong: number[] = [];
+    // Export places on whole pixels and the canvas on fractions: an edge may sit one pixel over.
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const a = kind(exported, (y * W + x) * 4);
+      if (!a) continue;
+      counts[a]++;
+      if (![-1, 0, 1].some(dy => [-1, 0, 1].some(dx => x + dx >= 0 && x + dx < W && y + dy >= 0 && y + dy < H && kind(drawn, ((y + dy) * W + x + dx) * 4) === a))) wrong.push(x, y);
+    }
+    // 160×90 at 54 % × 144 %, turned a quarter: about 130 × 86 on screen, red above blue.
+    assert.ok(!wrong.length && counts.red > 3000 && counts.blue > 3000 && counts.black > 1500, JSON.stringify({ wrong, counts }));
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('gain keys stay in the static pass and a keyed graphic no longer chops the sound',{timeout:120000},async()=>{
