@@ -79,6 +79,16 @@ fi
 
 mkdir -p -- $dest/media || die "Can't create $dest"
 cp -X -- $xml "$dest/$name.fcpxml" || die "Couldn't copy the XML."
+# Title fonts the editor installed (their own copies, from Font Book): SharedCut needs them to set the titles.
+typeset -U fontfiles; unmatched=()
+for family in ${(f)"$(xmllint --xpath "//text-style/@font" $xml 2>/dev/null | grep -o 'font="[^"]*"' | sed 's/^font="//; s/"$//' | sort -u)"}; do
+  key=${${(L)family}//[^a-z0-9]/} hit=0
+  for f in ~/Library/Fonts/*.(#i)(ttf|otf|ttc)(N.) /Library/Fonts/*.(#i)(ttf|otf|ttc)(N.); do
+    [[ ${${(L)${f:t:r}}//[^a-z0-9]/} == ${key}* ]] && { fontfiles+=($f); hit=1 }
+  done
+  (( hit )) || [[ $key == (helvetica|helveticaneue|arial) ]] || unmatched+=($family)
+done
+if (( ${#fontfiles} )); then mkdir -p -- $dest/fonts && cp -X -- $fontfiles $dest/fonts/ || die "Couldn't copy the title fonts."; fi
 : >| $dest/sources.tsv
 for i in {1..${#found}}; do print -r -- "$found[i]	media/$names[i]" >> $dest/sources.tsv; done
 if (( ${#missing} )); then print -rl -- $missing >| $dest/missing.txt; else rm -f -- $dest/missing.txt; fi
@@ -98,4 +108,6 @@ done
 
 print "\nDone: $dest"
 (( ${#missing} )) && print "${#missing} offline files were skipped (listed in missing.txt)."
+(( ${#fontfiles} )) && print "${#fontfiles} title font files copied."
+(( ${#unmatched} )) && print "Fonts to add in SharedCut by hand (built into macOS or Final Cut): ${(j:, :)unmatched}"
 print "Eject ${root:t}, then bring it to the SharedCut host to import."

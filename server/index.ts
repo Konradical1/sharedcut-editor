@@ -40,6 +40,7 @@ import { promisify, isDeepStrictEqual } from 'node:util';
 import { LOCK_TTL, MOVEMENT_FIELDS, lockConflict, type PersistedState } from '../src/services/index.ts';
 import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock } from '../src/state/models.ts';
 import { exportResolveTimeline, importResolve } from './resolve.ts';
+import { importFcpxml } from './fcpxml.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
 import { depthCapabilities, depthService } from './depth.ts';
@@ -455,6 +456,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   // still sends every client to fetch state, so these callers keep their own five-second ration.
   const progressAt = new Map<string, number>();
   const resolveDir = (id:string) => join(dataDir,'resolve',id);
+  const fcpDir = (id: string) => join(dataDir, 'fcp', id);
   const mediaDir = (id: string) => join(dataDir, 'media', id);
   const originalPath = (id: string) => join(mediaDir(id), 'original');
   const replacedVersion = (id: string) => { try { return readFileSync(join(mediaDir(id), 'replaced'), 'utf8'); } catch { return ''; } };
@@ -1167,6 +1169,41 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           mkdirSync(resolveDir(id),{recursive:true,mode:0o700});writeFileSync(join(resolveDir(id),'project.frameline.json'),JSON.stringify(body.manifest),{mode:0o600});
           const previous=state;state=next;try{persist();}catch(error){state=previous;throw error;}
           send(res,201,{projectId:id,files:imported!.files,warnings:imported!.warnings,media:imported!.media});return;
+        }
+        if (path === '/api/fcp/import' && method === 'POST') {
+          // The body is the raw FCPXML (JSON would escape a 50 MB XML). The same XML maps to the same project id, so a
+          // rerun resumes its uploads; rebuild=1 re-converts an imported project's edit, keeping its uploaded media.
+          const id = url.searchParams.get('projectId') ?? '', rebuild = url.searchParams.get('rebuild') === '1';
+          if (!idIsValid(id) || !id.startsWith('fcp-') || id.length > 64) fail(400, 'Invalid import project ID.');
+          const xml = (await binaryBody(req, 128 * 1024 * 1024)).toString('utf8');
+          let imported: ReturnType<typeof importFcpxml>; try { imported = importFcpxml(xml, id, userId, fonts.list()); } catch (error) { fail(400, (error as Error).message); }
+          const existing = state.projects.find(p => p.id === id) as (Project & { fcpImportHash?: string }) | undefined;
+          const { fcpImportHash, fcpWarnings } = imported!.project as Project & { fcpImportHash: string; fcpWarnings: string[] };
+          if (existing) {
+            requireProject(id, userId, true);
+            if (!existing.fcpImportHash) fail(409, 'That project was not imported from Final Cut.');
+            if (!rebuild) {
+              if (existing.fcpImportHash !== fcpImportHash) fail(409, 'That project already exists with a different Final Cut XML. Import it with rebuild to replace its edit.');
+              send(res, 200, { projectId: id, warnings: imported!.warnings, media: state.media.filter(m => m.projectId === id) }); return;
+            }
+          }
+          let next: PersistedState;
+          if (existing) {
+            // The edit it replaces stays restorable as a snapshot; comments on clips that no longer exist move to the timeline.
+            const mine = <T extends { projectId: string }>(items: T[]) => items.filter(item => item.projectId === id), others = <T extends { projectId: string }>(items: T[]) => items.filter(item => item.projectId !== id);
+            const oldTimelines = new Set(mine(state.timelines).map(t => t.id)), known = new Set(state.media.map(m => m.id)), clipIds = new Set(imported!.clips.map(c => c.id));
+            const snapshot = { id: `${id}-rebuild-${Date.now().toString(36)}`, projectId: id, name: 'Before Final Cut rebuild', note: 'The edit as it was before the Final Cut XML was imported again.', userId, timestamp: Date.now(),
+              state: { timelines: mine(state.timelines), clips: mine(state.clips), tracks: state.tracks.filter(t => oldTimelines.has(t.timelineId)), nodes: mine(state.nodes), comments: mine(state.comments) } };
+            next = { ...state, projects: state.projects.map(p => p.id === id ? { ...p, fcpImportHash, fcpWarnings, modifiedAt: Date.now() } : p),
+              media: [...state.media, ...imported!.media.filter(m => !known.has(m.id))], timelines: [...others(state.timelines), ...imported!.timelines],
+              tracks: [...state.tracks.filter(t => !oldTimelines.has(t.timelineId)), ...imported!.tracks], clips: [...others(state.clips), ...imported!.clips], nodes: [...others(state.nodes), ...imported!.nodes],
+              comments: state.comments.map(c => c.projectId === id && c.clipId && !clipIds.has(c.clipId) ? (({ clipId: _, ...rest }) => rest)(c) : c), snapshots: [...state.snapshots, snapshot] } as PersistedState;
+          } else next = { ...state, projects: [...state.projects, imported!.project], ...Object.fromEntries(['media', 'timelines', 'tracks', 'clips', 'nodes'].map(k => [k, [...(state as any)[k], ...(imported as any)[k]]])) } as PersistedState;
+          for (const key of ['projects', 'timelines', 'tracks', 'clips', 'nodes', 'comments', 'snapshots']) validateCollection((next as any)[key], key, holds(key));
+          validateRelations(next);
+          mkdirSync(fcpDir(id), { recursive: true, mode: 0o700 }); writeFileSync(join(fcpDir(id), 'project.fcpxml'), xml, { mode: 0o600 });
+          const previous = state; state = next; try { persist(); } catch (error) { state = previous; throw error; }
+          send(res, existing ? 200 : 201, { projectId: id, warnings: imported!.warnings, media: state.media.filter(m => m.projectId === id) }); return;
         }
         const exchange=/^\/api\/projects\/([a-zA-Z0-9_-]+)\/resolve-export$/.exec(path);
         if(exchange&&method==='GET') {

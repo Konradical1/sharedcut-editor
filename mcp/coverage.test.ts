@@ -79,6 +79,7 @@ export const ROUTES: Record<string, string> = {
   '/api/projects/([a-zA-Z0-9_-]+)/resolve/([a-zA-Z0-9_.-]+)': 'job:resolve',
   '/api/resolve/bridge': 'job:resolve',
   '/api/resolve/import': 'job:resolve',
+  '/api/fcp/import': 'job:fcp',
   // Shared libraries
   '/api/sfx': 'job:sfx', // GET search; POST (save a clip) is job sfx-save
   '/api/sfx/(sfx-[a-zA-Z0-9-]+)/(preview|import)': 'job:sfx-add',

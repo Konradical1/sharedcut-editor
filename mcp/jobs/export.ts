@@ -12,6 +12,7 @@ import { call, ApiFailure, refresh, handle, need, clip, project, timeline, store
 import { flush, config } from '../session.ts';
 import { timecode } from '../../src/services/timecode.ts';
 import { uploadSource } from '../../src/services/upload.ts';
+import { fcpProjectId, locateSource, readFcpBundle } from '../../server/fcpxml.ts';
 import type { EditorStore } from '../../src/state/store.ts';
 import type { MediaAsset, RenderJob } from '../../src/state/models.ts';
 
@@ -253,6 +254,35 @@ function importBundle(p: Record<string, any>) {
   });
 }
 
+/** Import a Final Cut project: the bundle sharedcut.com/fcp.sh made (or a bare .fcpxml), then upload its footage. */
+function importFinalCut(p: Record<string, any>) {
+  const path = expand(need(p, 'path')), folders = (Array.isArray(p.media) ? p.media : p.media ? [p.media] : []).map((f: unknown) => expand(String(f)));
+  return background(`importing ${basename(path)}`, async (report, signal) => {
+    const bundle = readFcpBundle(path), projectId = fcpProjectId(bundle.xml);
+    await flush();
+    // Fonts first: the import resolves title fonts against the library by name.
+    for (const file of bundle.fonts) await call(`/fonts?name=${encodeURIComponent(basename(file).replace(/\.[^.]+$/, ''))}`, { method: 'POST', body: await readFile(file) }).catch(() => undefined);
+    const imported = await call<{ projectId: string; warnings: string[]; media: MediaAsset[] }>(`/fcp/import?projectId=${projectId}${p.rebuild ? '&rebuild=1' : ''}`, { method: 'POST', body: bundle.xml });
+    const found = folders.length ? (await Promise.all(folders.map(async (f: string) => (await readdir(f, { recursive: true })).map(n => join(f, n))))).flat() : [];
+    const sources = imported.media.filter(a => !a.sourceUrl), missing: string[] = [];
+    let uploaded = 0;
+    for (const [i, asset] of sources.entries()) {
+      signal.throwIfAborted();
+      const source = locateSource(asset, bundle.sources, found);
+      if (!source) { missing.push(asset.name); continue; }
+      const info = await stat(source);
+      await uploadSource(asset.id, new File([await openAsBlob(source)], basename(source), { lastModified: Math.trunc(info.mtimeMs) }), percent => report(`uploading ${asset.name} ${percent}% (${i + 1}/${sources.length})`), signal);
+      uploaded++;
+    }
+    await refresh();
+    const name = store.getState().projects.find(x => x.id === projectId)?.name ?? 'Final Cut project';
+    const list = (items: string[]) => `${items.slice(0, 5).join(', ')}${items.length > 5 ? '…' : ''}`;
+    return [`project ${handle(projectId)} "${name}" · ${imported.media.length} sources (${imported.media.length - sources.length + uploaded} uploaded${missing.length ? `, ${missing.length} missing: ${list(missing)}` : ''})`,
+      `${imported.warnings.length} not carried over${imported.warnings.length ? `: ${imported.warnings.slice(0, 4).join(' | ')}` : ''}`,
+      `open it: projects{open:"${handle(projectId)}"}${missing.length ? '. Run again with media:[folders] to upload the missing files.' : ''}`].join('\n');
+  });
+}
+
 export const jobs: Record<string, JobDef> = {
   export: {
     doc: '{timeline?, clip?|in?,out?, preset?, codec?, resolution?, fps?, quality?, audio?, name?, download?:path} renders the saved edit on the server → status, saved file. help export',
@@ -293,6 +323,10 @@ export const jobs: Record<string, JobDef> = {
       return watch(job.id, p.download);
     },
   },
+  fcp: {
+    doc: '{path: bundle folder from sharedcut.com/fcp.sh | .fcpxml, media?:[folders], rebuild?} imports a Final Cut Pro project and uploads its footage',
+    async start(p) { return importFinalCut(p); },
+  },
   resolve: {
     doc: '{do:"otio"|"bridge", path, timeline?} saves the timeline as OTIO / the Resolve bridge script; {do:"import", path:bundle folder, media?:[folders], fresh?} imports a Resolve project',
     async start(p) {
@@ -317,7 +351,7 @@ export const jobs: Record<string, JobDef> = {
 const presetLine = (p: typeof PRESETS[number]) => `${p.name}: ${p.codec} · ${p.resolution} · ${p.quality}`;
 export const topics: Record<string, string> = {
   export: [
-    'export: server exports (Deliver) and the DaVinci Resolve round trip. Jobs: export, exports, resolve.',
+    'export: server exports (Deliver), the DaVinci Resolve round trip and Final Cut import. Jobs: export, exports, resolve, fcp.',
     'export renders the SAVED edit of the open timeline (or params.timeline / the clip\'s timeline) on the server. One export renders at a time server-wide; at most 20 wait. Needs Owner/Editor.',
     `presets (codec · size · quality): ${PRESETS.filter(p => p.name !== 'Custom').map(presetLine).join(' | ')} | Custom = your overrides. No preset = Quick Export at the project's own size (Deliver's default). A preset size of another shape (vertical project) falls back to the project size. Changing codec or size makes it Custom.`,
     `codec: ${CODECS.join(' | ')}. ProRes writes .mov, the rest .mp4 (the name's extension follows). Short forms work: h264, h265, prores, prores4444.`,
@@ -333,6 +367,7 @@ export const topics: Record<string, string> = {
     'exports{job, cancel:true} stops a waiting or rendering export; exports{job, delete:true} deletes a complete export\'s file (the record stays, as failed/Cancelled). retry queues the same settings against the CURRENT edit. job{kind:"cancel"} on a running export job stops the render, or only the download once it is complete.',
     'Resolve → SharedCut: 1) job resolve{do:"bridge", path} saves resolve-export.lua. 2) In Resolve\'s Lua console run the dofile line it prints, with an empty folder. 3) job resolve{do:"import", path:"<that folder>", media:["<footage folders>"]}.',
     'import: originals upload from the paths Resolve recorded, else by file name under media folders. Running it again resumes the same project (same bundle = same id); fresh:true makes a new project. A .drp alone cannot be imported.',
+    'Final Cut → SharedCut: on the editor\'s Mac, File > Export XML…, then zsh -c "$(curl -fsSL https://sharedcut.com/fcp.sh)" copies the XML and footage to a drive. job fcp{path:"<that folder>"} imports it (same XML = same project; rerun resumes uploads; rebuild:true re-converts the edit, keeping uploads, old edit saved as a snapshot). Its warnings list what did not carry over.',
     'SharedCut → Resolve: job resolve{do:"otio", path, timeline?} writes an OTIO timeline for Resolve (File > Import > Timeline). Refused: overlapping clips on one track, and clips with no media file (titles, shapes, captions, compositions, adjustment clips).',
   ].join('\n'),
 };
