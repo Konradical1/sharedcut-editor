@@ -32,7 +32,7 @@ import { existsSync, rmSync, statfsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import type { Clip, Effect, GradeNode, MediaAsset, Project, Timeline, Track } from '../src/state/models.ts';
-import { colorTransform, cubeText, makeCube, parseCube, hasACES, interpretation, processingStages, hdrToSdr, isHdrTransfer, type Cube } from '../src/services/color.ts';
+import { colorTransform, cubeText, makeCube, parseCube, hasACES, interpretation, processingStages, hdrToSdr, isHdrTransfer, rangeDefaults, type Cube } from '../src/services/color.ts';
 import { tmpdir, cpus, setPriority, totalmem } from 'node:os';
 import { renderOpticalFlow, trimFlowCache } from './opticalFlow.ts';
 import { renderStabilized, stabilizeSolve, stabilizeWarpMattes, trimStabilizeCache } from './stabilize.ts';
@@ -1220,7 +1220,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       if (!exactColor) {
         // HDR sources tone-map inside the same table, so the grade sees the SDR picture the preview shows.
         const hdr = hdrTransform(source.asset.colorTransfer);
-        const size = hdr||clip.properties.colorPipeline==='nodes-v2'||request.nodes.some(n=>n.clipId===clip.id&&(n.curves||n.effects?.length))?65:base?.size ?? 33;
+        // Range saturation is a smooth step in luma: at 33³ it drifts several levels from the preview, at 65³ it matches as curves do.
+        const size = hdr||clip.properties.colorPipeline==='nodes-v2'||request.nodes.some(n=>n.clipId===clip.id&&(n.curves||n.effects?.length||Object.keys(rangeDefaults).some(k=>n.parameters[k]!==undefined&&n.parameters[k]!==100)))?65:base?.size ?? 33;
         const table = await cachedLut(['look-v1', size, lookId ?? null, colorInputs(clip, source.asset, request.nodes), hdr ? [source.asset.colorTransfer, hdrNpl()] : null], async file => {
           const grade = colorTransform(clip, source.asset, request.nodes, base);
           const cube = makeCube(hdr ? rgb => grade(hdr(rgb)) : grade, size);
