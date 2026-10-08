@@ -4,7 +4,7 @@ import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { encodeLog, gamutMatrix, interpretation, luminanceWeights, primaryDefaults, processingStages } from '../src/services/color.ts';
+import { encodeLog, gamutMatrix, interpretation, luminanceWeights, primaryDefaults, processingStages, rangeDefaults } from '../src/services/color.ts';
 import { eligibility, findGradeNodes, LIMITS, outputSchema, proposedNodes, validateOutput, type AssistantMode, type BalanceValues, type LookOption, type LooksOutput, type ShotNote } from '../src/services/colorAssistant.ts';
 import type { Clip, GradeNode, MediaAsset } from '../src/state/models.ts';
 import { aiModel, aiProvider, codexCommand, codexShimError, runCodex } from './codexExec.ts';
@@ -98,7 +98,7 @@ const di = (stops: number) => encodeLog(.18 * 2 ** stops, 'DaVinci Intermediate'
 function changed(node?: GradeNode) {
   if (!node) return 'none';
   // Only keys the engine reads (colorStages): a stored key is editor-written text and must not reach the model.
-  const values = Object.entries(node.parameters).filter(([key, value]) => (key in primaryDefaults || /^(lift|gamma|gain|offset)[RGB]$|^curve(25|50|75)$/.test(key)) && value !== (primaryDefaults[key] ?? 0)).map(([key, value]) => `${key} ${round(value, 3)}`), curves = Object.keys(node.curves ?? {});
+  const defaults = { ...primaryDefaults, ...rangeDefaults }, values = Object.entries(node.parameters).filter(([key, value]) => (key in defaults || /^(lift|gamma|gain|offset)[RGB]$|^curve(25|50|75)$/.test(key)) && value !== (defaults[key] ?? 0)).map(([key, value]) => `${key} ${round(value, 3)}`), curves = Object.keys(node.curves ?? {});
   return [...values, ...(curves.length ? [`curves ${curves.join('/')}`] : [])].join(', ') || 'neutral';
 }
 

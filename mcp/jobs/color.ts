@@ -6,7 +6,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { basename, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { edit, handle, need, clip as clipOf, project, store, done, bytes, image, type Content, type JobDef, type Poller, type Step } from './kit.ts';
-import { profiles, gamuts, primaryDefaults, parseCube, processingStages, interpretation, acesOutputUpgrade } from '../../src/services/color.ts';
+import { profiles, gamuts, primaryDefaults, rangeDefaults, parseCube, processingStages, interpretation, acesOutputUpgrade } from '../../src/services/color.ts';
 import { eligibility, neutralLook, type LookValues } from '../../src/services/colorAssistant.ts';
 import { assistantCapabilities, startAssistant, assistantJob, latestAssistantJob, cancelAssistant, type AssistantJob } from '../../src/services/colorAssistantClient.ts';
 import { createId } from '../../src/services/index.ts';
@@ -31,7 +31,7 @@ const fxText = (e: ColorEffect) => e.type === 'cst'
   : `[lut ${quote(e.name, 30)} ${e.cube.size}³ amount ${num(e.amount)} expects ${e.inputGamma}/${e.inputGamut}${e.enabled ? '' : ' off'} ${handle(e.id)}]`;
 function nodeLine(node: GradeNode, c: Clip, managed: boolean) {
   const keyed = (field: string) => c.keyframes?.[`nodes.${node.id}.${field}`]?.length ? '~' : '';
-  const defaults: Record<string, number> = { ...primaryDefaults, pivot: managed ? primaryDefaults.pivot : .5, curve25: .25, curve50: .5, curve75: .75 };
+  const defaults: Record<string, number> = { ...primaryDefaults, ...rangeDefaults, pivot: managed ? primaryDefaults.pivot : .5, curve25: .25, curve50: .5, curve75: .75 };
   const params = Object.entries(node.parameters).filter(([k, v]) => v !== (defaults[k] ?? defaults[k.toLowerCase()] ?? 0) || keyed(`parameters.${k}`)).map(([k, v]) => `${k}=${num(v)}${keyed(`parameters.${k}`)}`);
   const m = node.mask, mask = !m ? '' : `mask ${isDepthKey(m) ? `depth ${m.near}-${m.far} soft ${m.softness}` : `smart ${handle(m.id)}`}${m.invert ? ' inverted' : ''}${m.amount !== 100 ? ` ${m.amount}%` : ''}${m.enabled ? '' : ' off'}`;
   const curves = node.curves && Object.keys(node.curves).length ? `curves ${Object.entries(node.curves).map(([ch, cv]) => `${ch}${cv!.points.length}`).join(',')}${keyed('curves')}` : '';

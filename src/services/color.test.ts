@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { colorTransform, decodeLog, makeCube, cubeText, parseCube, sampleCube } from './color.ts';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { colorTransform, decodeLog, makeCube, cubeText, parseCube, sampleCube, processingStages, rangeDefaults, starterGrade } from './color.ts';
+import { venvPython } from '../../server/platform.ts';
 import { timecode } from './timecode.ts';
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 
@@ -98,6 +104,7 @@ test('range saturation: identity when absent or 100, smoothstep luma weights, le
     for(const rgb of colors)assert.deepEqual(unity(rgb),plain(rgb),'100 everywhere is bit-identical to no keys');
   }
   const grey=[.3,.5,.2];assert.equal(rangeSaturation(grey,w,{}),grey,'absent keys skip the math');
+  for(const n of starterGrade(managed,undefined,()=>'s'))assert.ok(!Object.keys(n.parameters).some(k=>k in rangeDefaults),'new grades store no range keys, so builds without them still render them');
   // (ws,wm,wh) = (1,0,0) (.5,.5,0) (0,1,0) (0,.5,.5) (0,0,1) at luma 0 .25 .5 .75 1; beyond 0..1 the weights clamp and the pivot does not.
   for(const [y,ws,wm,wh] of [[0,1,0,0],[.25,.5,.5,0],[.5,0,1,0],[.75,0,.5,.5],[1,0,0,1],[1.3,0,0,1],[-.1,1,0,0]]){
     const chroma=[.1,-.1*w[0]/w[1],0],out=rangeSaturation(chroma.map(c=>y+c),w,range),f=1+ws*.5-wm*.5+wh*2;
@@ -122,4 +129,20 @@ test('range saturation: identity when absent or 100, smoothstep luma weights, le
     const weights=clip===legacy?w:[...data.slice(44,47)];
     for(const rgb of colors)expect(rgb,weights,[...data.slice(32,35)]).forEach((v,c)=>near(v,colorTransform(clip,undefined,[node(range)])(rgb)[c],'packed row drives the same pixels',1e-6));
   }
+});
+
+const colorPython=process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color');
+test('the export worker (color-render.py) grades range saturation like colorTransform, legacy and nodes-v2',{skip:!existsSync(colorPython)&&'the colour worker (npm run setup:color) is not installed'},()=>{
+  const dir=mkdtempSync(join(tmpdir(),'frameline-range-saturation-')),job=join(dir,'job.json'),colors=Array.from({length:64},(_,i)=>[i/63,(i*37%64)/63,(i*11%64)/63]);
+  // Planar G,B,R floats in and out, as the export decoder feeds the worker.
+  const planar=new Float32Array(colors.length*3);colors.forEach((rgb,i)=>[1,2,0].forEach((c,p)=>{planar[p*colors.length+i]=rgb[c];}));
+  try{
+    for(const clip of [{id:'r',properties:{}},{id:'r',properties:{colorPipeline:'nodes-v2',inputProfile:'Linear',inputGamut:'Rec.2020'}}] as unknown as Clip[]){
+      const nodes=[{id:'n',projectId:'p',kind:'serial',clipId:'r',enabled:true,order:1,name:'Range',parameters:{saturation:110,temperature:300,saturationShadows:60,saturationMidtones:130,saturationHighlights:80}} as GradeNode];
+      writeFileSync(job,JSON.stringify({width:colors.length,height:1,stages:processingStages(clip,nodes),managed:clip.properties.colorPipeline==='nodes-v2'}));
+      const out=execFileSync(colorPython,[fileURLToPath(new URL('../../scripts/color-render.py',import.meta.url)),job,'--stream'],{input:Buffer.from(planar.buffer),stdio:['pipe','pipe','ignore']});
+      const data=new Float32Array(out.buffer,out.byteOffset,out.byteLength/4),cpu=colorTransform(clip,undefined,nodes);
+      colors.forEach((rgb,i)=>cpu(rgb).forEach((v,c)=>{const py=Math.min(1,Math.max(0,data[[2,0,1][c]*colors.length+i]));assert.ok(Math.abs(v-py)<1e-5,`${clip.properties.colorPipeline??'legacy'} ${rgb} channel ${c}: ${v} vs ${py}`);}));
+    }
+  }finally{rmSync(dir,{recursive:true,force:true});}
 });

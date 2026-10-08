@@ -182,7 +182,9 @@ export function hdrToSdr(transfer: string, npl = 100) {
 }
 
 export const transferFunctions = profiles.filter(p=>p!=='Rec.709');
-export const primaryDefaults:Record<string,number>={exposure:0,temperature:0,tint:0,contrast:1,pivot:.336043,saturation:100,lift:0,gamma:0,gain:1,offset:0,saturationShadows:100,saturationMidtones:100,saturationHighlights:100};
+export const primaryDefaults:Record<string,number>={exposure:0,temperature:0,tint:0,contrast:1,pivot:.336043,saturation:100,lift:0,gamma:0,gain:1,offset:0};
+// Kept out of primaryDefaults so only nodes that use them store them: absent = identity, and builds before range saturation refuse to render a node carrying them.
+export const rangeDefaults:Record<string,number>={saturationShadows:100,saturationMidtones:100,saturationHighlights:100};
 export function gamutMatrix(input:string,output:string){const source=rgbToXYZ(input),target=inverse(rgbToXYZ(output));return target.map(row=>[0,1,2].map(c=>row.reduce((v,x,i)=>v+x*source[i][c],0)));}
 // OCIO camera transforms include their reference chromatic adaptation to ACES D60.
 // Legacy D65-only CSTs retain their original matrix for existing saved grades.
