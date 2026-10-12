@@ -301,6 +301,12 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     if (state.tracks.find(track => track.id === clip.trackId)?.locked) { state.notify('Unlock the track to edit this clip', 'info'); return undefined; }
     return clip;
   };
+  // The selection left after undo/redo removed clips. A lost primary passes to the last clip still selected:
+  // a highlighted clip with no primary ignored ⌘B, and clicking it could not re-select it.
+  const survivingSelection=(state:{selectedClipId:string|null;selectedClipIds:string[]},clips:Clip[])=>{
+    const ids=state.selectedClipIds.filter(id=>clips.some(c=>c.id===id)),primary=state.selectedClipId&&clips.some(c=>c.id===state.selectedClipId)?state.selectedClipId:ids.at(-1)??null;
+    return {selectedClipIds:ids,selectedClipId:primary};
+  };
   const linkedClips=(clip:Clip)=>get().settings.linkSelection!==false&&clip.properties.linkGroup?get().clips.filter(c=>c.projectId===clip.projectId&&c.timelineId===clip.timelineId&&c.properties.linkGroup===clip.properties.linkGroup):[clip];
   const editableGroup=(clip:Clip,field='manipulation')=>{const group=linkedClips(clip);return group.every(c=>editableClip(c.id,field))?group:null;};
   let lastGesture: { token: string; operationId: string } | undefined;
@@ -968,10 +974,11 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const state=get(),group=editableGroup(clip);if(!group)return;
       const frame=1/(state.projects.find(p=>p.id===state.projectId)?.fps||24);
       if(group.some(c=>state.playhead-c.start<frame||c.start+c.duration-state.playhead<frame)){state.notify('Place the playhead inside the linked clips to split them','info');return;}
-      const changes:Change[]=[],linkGroup=createId('link');let selected='';
-      for(const c of group){const cut=cutClip(c,state.playhead,group.length>1?linkGroup:undefined);if(c.id===id)selected=cut.right.id;changes.push(...cut.changes);}
+      const changes:Change[]=[],linkGroup=createId('link'),rights:string[]=[];let selected='';
+      for(const c of group){const cut=cutClip(c,state.playhead,group.length>1?linkGroup:undefined);if(c.id===id)selected=cut.right.id;rights.push(cut.right.id);changes.push(...cut.changes);}
       commit('ClipTrimmed',id,`split ${clip.name} at the playhead`,changes);
-      set({selectedClipId:selected,selectedTextIds:isTitle(clip)?[selected]:[],textSelection:null,selectedNodeId:get().nodes.find(n=>n.clipId===selected)?.id??null});
+      // The right halves replace the whole selection; keeping the old ids selected the left half too.
+      set({selectedClipId:selected,selectedClipIds:rights,selectedTextIds:isTitle(clip)?[selected]:[],textSelection:null,selectedNodeId:get().nodes.find(n=>n.clipId===selected)?.id??null});
     },
     cutThrough(time) {
       const state=get();if(!Number.isFinite(time)||!writable())return 0;
@@ -1633,7 +1640,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const undo = collaborationService.createOperation({ ...operation, gestureId: undefined, description: `undid: ${operation.description}`, oldState: [...group].reverse().flatMap(o=>o.newState as Change[]), newState: changes, undone: true });
       const restored = applyChanges(state, changes), ids=new Set(group.map(o=>o.id));
       redoable = [undo, ...redoable];
-      set({ ...restored, selectedClipIds:state.selectedClipIds.filter(id=>restored.clips.some(c=>c.id===id)), textSelection: null, textPreview: [], selectedTextIds: state.selectedTextIds.filter(id => restored.clips.some(c => c.id === id)), projects: updatedProjects(state, restored.clips), operations: [undo, ...state.operations.map(op => ids.has(op.id) ? { ...op, undone: true } : op)], selectedClipId: state.selectedClipId && restored.clips.some(c => c.id === state.selectedClipId) ? state.selectedClipId : null, selectedNodeId: state.selectedNodeId && restored.nodes.some(n => n.id === state.selectedNodeId) ? state.selectedNodeId : null });
+      set({ ...restored, ...survivingSelection(state, restored.clips), textSelection: null, textPreview: [], selectedTextIds: state.selectedTextIds.filter(id => restored.clips.some(c => c.id === id)), projects: updatedProjects(state, restored.clips), operations: [undo, ...state.operations.map(op => ids.has(op.id) ? { ...op, undone: true } : op)], selectedNodeId: state.selectedNodeId && restored.nodes.some(n => n.id === state.selectedNodeId) ? state.selectedNodeId : null });
       if(!get().timelines.some(t=>t.id===state.timelineId)){
         const parent=[...state.compositionTrail].reverse().find(entry=>get().timelines.some(t=>t.id===entry.timelineId));
         const timeline=parent?.timelineId??get().timelines.find(t=>t.projectId===state.projectId&&!t.composition)?.id;
@@ -1655,7 +1662,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       commit(undone.type,undone.targetId,`redid: ${description}`,forward);
       redoable=rest;
       const now=get();
-      set({selectedClipIds:now.selectedClipIds.filter(id=>now.clips.some(c=>c.id===id)),selectedTextIds:now.selectedTextIds.filter(id=>now.clips.some(c=>c.id===id)),selectedClipId:now.selectedClipId&&now.clips.some(c=>c.id===now.selectedClipId)?now.selectedClipId:null,selectedNodeId:now.selectedNodeId&&now.nodes.some(n=>n.id===now.selectedNodeId)?now.selectedNodeId:null});
+      set({...survivingSelection(now,now.clips),selectedTextIds:now.selectedTextIds.filter(id=>now.clips.some(c=>c.id===id)),selectedNodeId:now.selectedNodeId&&now.nodes.some(n=>n.id===now.selectedNodeId)?now.selectedNodeId:null});
       state.notify(`Redone: ${description}`);
     },
     saveSnapshot(name, note) {

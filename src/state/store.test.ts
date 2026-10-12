@@ -237,6 +237,20 @@ test('split preserves media identity and source offsets and undoes atomically', 
   assert.equal(state().nodes.length, originalNodes);
 });
 
+test('split selects only the right half, and after undo the clip splits again', () => {
+  state().selectClip('c3');state().setPlayhead(42);state().splitClip('c3');
+  const right=state().selectedClipId!;
+  assert.deepEqual(state().selectedClipIds,[right]);
+  state().undo();
+  assert.equal(state().selectedClipId,null);assert.deepEqual(state().selectedClipIds,[]);
+  state().selectClip('c3');assert.equal(state().selectedClipId,'c3');
+  state().splitClip(state().selectedClipId!);
+  assert.equal(clip().duration,12);assert.deepEqual(state().selectedClipIds,[state().selectedClipId]);
+  // Undo that removes the primary hands it to a clip still selected, so ⌘B keeps working on what is highlighted.
+  state().selectClips(['c3',state().selectedClipId!]);state().undo();
+  assert.deepEqual(state().selectedClipIds,['c3']);assert.equal(state().selectedClipId,'c3');
+});
+
 test('AI grade inserts editable nodes before the output and undoes as one action', () => {
   const before = structuredClone(state().nodes);
   state().applyGrade([{ name: 'Warm balance', parameters: { temperature: 350 } }, { name: 'Skin protection', parameters: { saturation: -4 } }]);
