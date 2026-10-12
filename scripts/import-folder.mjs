@@ -65,7 +65,15 @@ const ask = (label, hidden) => new Promise(done => {
 
 let cookie = agentCookie();
 async function call(path, init = {}) {
-  const response = await fetch(server + path, { ...init, headers: { ...(typeof init.body === 'string' ? { 'content-type': 'application/json' } : {}), ...(cookie && { cookie }), ...init.headers } });
+  // A Wi-Fi drop or a server restart (the tunnel answers 502/530) is waited out for ~2 minutes instead of ending
+  // a long upload. Every request here is safe to repeat: a chunk sent twice comes back 409 and re-syncs its offset.
+  let response;
+  for (let attempt = 1; ; attempt++) {
+    try { response = await fetch(server + path, { ...init, headers: { ...(typeof init.body === 'string' ? { 'content-type': 'application/json' } : {}), ...(cookie && { cookie }), ...init.headers } }); }
+    catch (error) { if (attempt >= 8) throw error; }
+    if (response && ![502, 503, 504, 530].includes(response.status) || attempt >= 8) break;
+    await new Promise(r => setTimeout(r, Math.min(30000, 1000 * 2 ** attempt)));
+  }
   const set = response.headers.getSetCookie?.()[0]; if (set) cookie = set.split(';')[0];
   const text = response.status === 204 ? '' : await response.text();
   if (!response.ok) { const error = new Error(`${path} -> ${response.status} ${text}`); error.status = response.status; throw error; }
