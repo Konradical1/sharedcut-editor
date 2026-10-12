@@ -27,6 +27,15 @@ def main():
         return addresses
 
     socket.getaddrinfo = public_addresses
+    # Networks that re-sign TLS (the Lenovo's school Wi-Fi runs Securly) need their root on top of certifi.
+    extra_ca = os.environ.get("FRAME_LINE_IMPORT_CA")
+    compat = set()
+    if extra_ca:
+        import certifi
+        bundle = Path(directory) / "ca-bundle.pem"
+        bundle.write_text(Path(certifi.where()).read_text() + "\n" + Path(extra_ca).read_text())
+        os.environ["SSL_CERT_FILE"] = os.environ["REQUESTS_CA_BUNDLE"] = str(bundle)
+        compat = {"no-certifi"}
     from yt_dlp import YoutubeDL
 
     class Logger:
@@ -46,7 +55,8 @@ def main():
         client = Spotdl(client_id="", client_secret="", no_cache=True, headless=True,
                         downloader_settings={"audio_providers": ["youtube"], "lyrics_providers": [],
                                              "threads": 1, "ffmpeg": shutil.which(os.environ.get("FFMPEG_PATH", "ffmpeg")) or "ffmpeg",
-                                             "yt_dlp_args": "--js-runtimes node --socket-timeout 20 --retries 2"})
+                                             "yt_dlp_args": "--js-runtimes node --socket-timeout 20 --retries 2"
+                                                            + (" --compat-options no-certifi" if compat else "")})
         song = client.search([url])[0]
         title, expected_duration = song.display_name, song.duration
         url = client.downloader.search(song)
@@ -80,7 +90,7 @@ def main():
                "outtmpl": str(Path(directory) / "media.%(ext)s"),
                "max_filesize": max_bytes, "progress_hooks": [progress],
                "format": "bestaudio/best" if mode == "audio" else f"bestvideo[height<={height}]+bestaudio/best[height<={height}]",
-               "merge_output_format": "mp4", "windowsfilenames": True}
+               "merge_output_format": "mp4", "windowsfilenames": True, "compat_opts": compat}
     if mode == "audio":
         options["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a"}]
     with YoutubeDL(options) as downloader:
