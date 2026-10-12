@@ -12,6 +12,9 @@
 // Point --server at the LOOPBACK address when the footage is on the machine hosting SharedCut.
 // Going out through the public tunnel and back caps the transfer at the household upload link
 // (measured: 60s for 200MB through the tunnel against 3.1s over loopback).
+//
+// From another machine, go through https://sharedcut.com: --parallel files (default 4) go at once,
+// since one stream through the tunnel tops out well below the link (Lenovo: ~6-9 MB/s for one, ~18 for four).
 import { createHash } from 'node:crypto';
 import { readdir, stat, open } from 'node:fs/promises';
 import { join, relative, basename, extname, resolve as resolvePath } from 'node:path';
@@ -27,6 +30,7 @@ const access = flag('--access') ?? 'private';           // private | people | cl
 const classRole = flag('--class-role') ?? 'Editor';     // Viewer | Editor
 const resolution = flag('--resolution') ?? '1080 × 1920';
 const fps = Number(flag('--fps') ?? 30);
+const lanes = Math.max(1, Number(flag('--parallel') ?? 4) || 1);
 if (!args[0]) throw new Error('Pass the folder holding the footage.');
 if (!['private', 'people', 'class'].includes(access)) throw new Error('--access must be private, people, or class.');
 const root = resolvePath(args[0]);
@@ -128,13 +132,13 @@ console.log('');
 const started = Date.now();
 let sent = 0, done = 0, skipped = 0;
 const rate = () => { const s = (Date.now() - started) / 1000; return s > 0 ? `${(sent / 1024 ** 2 / s).toFixed(0)} MB/s` : '-'; };
+const overall = () => `${gb(sent)}/${gb(total)} overall  ${rate()}`;
+const finished = (name, what) => process.stdout.write(`\r[${String(++done).padStart(3)}/${files.length}] ${name} - ${what}  ${overall()}          \n`);
 
-for (const file of files) {
+async function upload(file) {
   const size = sizes.get(file), name = nameFor(file), mediaId = id('media', `${projectId}:${relative(root, file)}`);   // per project: one folder can feed two reels
   const { mtimeMs } = await stat(file);
   const fingerprint = `${name}:${size}:${Math.floor(mtimeMs)}`;
-  done++;
-  const label = `[${String(done).padStart(3)}/${files.length}] ${name}`;
 
   for (let attempt = 1; ; attempt++) {
     try { await call(`/api/media?${new URLSearchParams({ projectId, id: mediaId, name, placeholder: '1' })}`, { method: 'POST' }); break; }
@@ -146,7 +150,7 @@ for (const file of files) {
   }
 
   const state = await call(`/api/media/${mediaId}/upload`, { method: 'POST', body: JSON.stringify({ size, fingerprint }) });
-  if (state.complete) { skipped++; sent += size; console.log(`${label} - already uploaded`); continue; }
+  if (state.complete) { skipped++; sent += size; finished(name, 'already uploaded'); return; }
 
   const handle = await open(file, 'r');
   try {
@@ -172,11 +176,15 @@ for (const file of files) {
       }
       if (offset === before && ++stalled >= ATTEMPTS) throw new Error(`${name}: upload stalled; the server stopped accepting data.`);
       if (offset !== before) { sent += offset - before; stalled = 0; }
-      process.stdout.write(`\r${label} - ${Math.floor(offset / size * 100)}%  ${gb(sent)}/${gb(total)} overall  ${rate()}   `);
+      process.stdout.write(`\r${done}/${files.length} files  ${overall()}   `);
     }
   } finally { await handle.close(); }
-  process.stdout.write(`\r${label} - done  ${gb(sent)}/${gb(total)} overall  ${rate()}          \n`);
+  finished(name, 'done');
 }
+
+// Largest first, so one giant clip never runs alone at the end. Chunks within a file stay in order.
+const queue = [...files].sort((a, b) => sizes.get(b) - sizes.get(a));
+await Promise.all(Array.from({ length: Math.min(lanes, queue.length) }, async () => { for (let file; (file = queue.shift());) await upload(file); }));
 
 // A server restart mid-preparation leaves assets reading "Processing was interrupted". Their
 // originals are already on disk, so a retry resumes from those instead of re-uploading anything.

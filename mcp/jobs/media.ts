@@ -20,7 +20,7 @@ import { call, refresh, edit, handle, need, media, project, store, done, sleep, 
 // A path the model writes as ~/… means the home folder, as in a shell.
 const expand = (path: string) => resolve(path.replace(/^~(?=$|[\\/])/, homedir()));
 
-/** What a folder upload picks up (scripts/import-folder.mjs:34; that script runs when imported, so the list is copied).
+/** What a folder upload picks up (scripts/import-folder.mjs:38; that script runs when imported, so the list is copied).
  *  A file named directly goes up whatever its extension. */
 export const EXTENSIONS = ['.mp4', '.mov', '.m4v', '.mxf', '.avi', '.mkv', '.webm', '.wav', '.mp3', '.aac', '.aiff', '.aif', '.flac', '.m4a', '.ogg', '.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff', '.heic'];
 const MB = (n: number) => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${(n / 1e6).toFixed(1)} MB`;
