@@ -1,25 +1,34 @@
 import { colorStages, interpretation, primaryDefaults, processingStages, validateGradeNode } from './color.ts';
 import type { Clip, ColorCurve, GradeNode, MediaAsset } from '../state/models.ts';
+import { recipeLook, RECIPES } from './colorLooks.ts';
 
 /** Shared by server and client: the model only proposes these numbers; SharedCut's engine renders and applies them. */
 export type AssistantMode = 'looks' | 'balance' | 'match';
 export type Rgb = { r: number; g: number; b: number };
 export interface BalanceValues { exposure: number; temperature: number; tint: number; lift: Rgb; gamma: Rgb; gain: Rgb; offset: Rgb }
 export interface CurvePoints { x: number; y: number }
-export interface LookValues { contrast: number; pivot: number; saturation: number; lift: number; gamma: number; gain: number; offset: number; liftRgb: Rgb; gammaRgb: Rgb; gainRgb: Rgb; offsetRgb: Rgb; curves: { rgb: CurvePoints[]; r: CurvePoints[]; g: CurvePoints[]; b: CurvePoints[] } }
+/** saturationShadows/Midtones/Highlights: percent, absent = 100 (rangeSaturation in color.ts). */
+export interface LookValues { contrast: number; pivot: number; saturation: number; lift: number; gamma: number; gain: number; offset: number; liftRgb: Rgb; gammaRgb: Rgb; gainRgb: Rgb; offsetRgb: Rgb; curves: { rgb: CurvePoints[]; r: CurvePoints[]; g: CurvePoints[]; b: CurvePoints[] }; saturationShadows?: number; saturationMidtones?: number; saturationHighlights?: number }
 export type WarningCode = 'clipping' | 'lighting-change' | 'low-confidence' | 'large-residual' | 'different-scene' | 'skin' | 'other';
 export interface ShotNote { clipId: string; confidence: number; warnings: { code: WarningCode; text: string }[]; rationale: string }
-export interface LookOption { name: string; intensity: 'natural' | 'bold' | 'extreme'; description: string; look: LookValues; extraNodes: LookValues[]; shots: ShotNote[] }
+export type Intensity = 'natural' | 'bold' | 'extreme';
+/** recipe/strength/warmth: the library look it was built from (absent on results made before the library). */
+export interface LookOption { name: string; intensity: Intensity; description: string; look: LookValues; extraNodes: LookValues[]; shots: ShotNote[]; recipe?: string; strength?: number; warmth?: number }
 export interface LooksOutput { options: LookOption[] }
+/** What the model answers for Three looks: a balance per shot, then three library looks with a strength and a warmth trim. SharedCut turns it into node values. */
+export interface ShotAnswer extends ShotNote { keepBalance: boolean; exposure: number; temperature: number; tint: number }
+export interface OptionAnswer { name: string; intensity: Intensity; description: string; recipe: string; strength: number; warmth: number }
+export interface LooksAnswer { shots: ShotAnswer[]; options: OptionAnswer[] }
 export interface BalanceOutput { shots: (ShotNote & { balance: BalanceValues })[] }
 export type Eligibility = { ok: true } | { ok: false; code: 'legacy-pipeline' | 'unverified-camera' | 'not-aces' | 'missing-nodes' | 'masked-node' | 'keyframed'; text: string };
 
 type Range = readonly [number, number];
 /** Tighter than the engine's own limits (colorStages). */
-export const LIMITS = { exposure: [-3, 3], temperature: [-2000, 2000], tint: [-100, 100], contrast: [.5, 2.5], pivot: [.15, .65], saturation: [0, 200], lift: [-.4, .4], gamma: [-.4, .4], gain: [.6, 1.4], offset: [-.4, .4], rgb: [-.4, .4], confidence: [0, 1], extraNodes: 2, curvePoints: 8, text: 300, name: 60, warnings: 8 } as const;
+export const LIMITS = { exposure: [-3, 3], temperature: [-2000, 2000], tint: [-100, 100], contrast: [.5, 2.5], pivot: [.15, .65], saturation: [0, 200], lift: [-.4, .4], gamma: [-.4, .4], gain: [.6, 1.4], offset: [-.4, .4], rgb: [-.4, .4], confidence: [0, 1], extraNodes: 2, curvePoints: 8, text: 300, name: 60, warnings: 8,
+  trim: [-2, 2], balanceTemperature: [-4000, 4000], strength: [.2, 1], warmth: [-1, 1] } as const;
 const INTENSITIES = ['natural', 'bold', 'extreme'] as const, WARNINGS: WarningCode[] = ['clipping', 'lighting-change', 'low-confidence', 'large-residual', 'different-scene', 'skin', 'other'];
 const RGB = ['r', 'g', 'b'] as const, WHEELS = ['lift', 'gamma', 'gain', 'offset'] as const, CURVES = [['rgb', 'RGB'], ['r', 'R'], ['g', 'G'], ['b', 'B']] as const;
-const LOOK_NUMBERS = ['contrast', 'pivot', 'saturation', 'lift', 'gamma', 'gain', 'offset'] as const, LOOK_RGB = ['liftRgb', 'gammaRgb', 'gainRgb', 'offsetRgb'] as const;
+const RANGES = ['saturationShadows', 'saturationMidtones', 'saturationHighlights'] as const;
 const NOTE_KEYS = ['clipId', 'confidence', 'warnings', 'rationale'];
 
 // JSON Schema for `codex exec --output-schema` (OpenAI strict mode: closed objects, every property required).
@@ -28,17 +37,18 @@ const obj = (properties: Record<string, unknown>) => ({ type: 'object', addition
 const arr = (items: unknown, maxItems: number, minItems?: number, description?: string) => ({ type: 'array', items, maxItems, ...(minItems !== undefined ? { minItems } : {}), ...(description ? { description } : {}) });
 const str = (maxLength: number) => ({ type: 'string', maxLength });
 const rgbSchema = (description: string) => ({ ...obj(Object.fromEntries(RGB.map(c => [c, num(LIMITS.rgb)]))), description });
-const curveSchema = arr(obj({ x: num([0, 1]), y: num([0, 1]) }), LIMITS.curvePoints, undefined, 'DaVinci Intermediate code values. Empty = no curve; otherwise 2-8 points, x strictly ascending, first x=0, last x=1.');
-const lookSchema = obj({
-  contrast: num(LIMITS.contrast, '1 = unchanged'), pivot: num(LIMITS.pivot, 'DaVinci Intermediate code value; 0.336 = 18% grey'), saturation: num(LIMITS.saturation, '100 = unchanged'),
-  lift: num(LIMITS.lift, '0 = unchanged'), gamma: num(LIMITS.gamma, '0 = unchanged'), gain: num(LIMITS.gain, '1 = unchanged'), offset: num(LIMITS.offset, '0 = unchanged'),
-  ...Object.fromEntries(LOOK_RGB.map(k => [k, rgbSchema('Per-channel delta added to the master value; 0 = unchanged')])), curves: obj({ rgb: curveSchema, r: curveSchema, g: curveSchema, b: curveSchema }),
-});
 const balanceSchema = obj({ exposure: num(LIMITS.exposure, 'stops'), temperature: num(LIMITS.temperature, 'positive = warmer'), tint: num(LIMITS.tint, 'positive = more magenta'), ...Object.fromEntries(WHEELS.map(k => [k, rgbSchema(`Per-channel ${k} delta; 0 = unchanged`)])) });
 export function outputSchema(mode: AssistantMode, clipIds: string[]): Record<string, unknown> {
   if (!['looks', 'balance', 'match'].includes(mode) || !clipIds.length) throw Error('Color Assistant needs a mode and at least one shot.');
   const note = { clipId: { type: 'string', enum: [...clipIds] }, confidence: num(LIMITS.confidence), warnings: arr(obj({ code: { type: 'string', enum: WARNINGS }, text: str(LIMITS.text) }), LIMITS.warnings), rationale: str(LIMITS.text) };
-  if (mode === 'looks') return obj({ options: arr(obj({ name: str(LIMITS.name), intensity: { type: 'string', enum: [...INTENSITIES] }, description: str(LIMITS.text), look: lookSchema, extraNodes: arr(lookSchema, LIMITS.extraNodes), shots: arr(obj(note), clipIds.length) }), 3, 3, 'Exactly three looks in order: natural, bold, extreme.') });
+  // Process order: judge and balance every shot first, then the looks. Reasoning fields come before the numbers they justify.
+  if (mode === 'looks') return obj({
+    shots: arr(obj({ clipId: note.clipId, rationale: note.rationale, keepBalance: { type: 'boolean', description: 'true = leave the shot\'s current Balance node as it is; exposure, temperature and tint are then ignored' },
+      exposure: num(LIMITS.trim, 'Balance exposure in stops; 0 = as shot'), temperature: num(LIMITS.balanceTemperature, 'Balance white balance in linear light; 0 = as shot, positive = warmer'), tint: num(LIMITS.tint, '0 = as shot, positive = more magenta'),
+      confidence: note.confidence, warnings: note.warnings }), clipIds.length, 1, 'One entry per shot.'),
+    options: arr(obj({ intensity: { type: 'string', enum: [...INTENSITIES] }, recipe: { type: 'string', enum: RECIPES.map(r => r.id) }, strength: num(LIMITS.strength, '1 = the look as designed'),
+      warmth: num(LIMITS.warmth, '-1 cooler, 0 as designed, +1 warmer'), name: str(LIMITS.name), description: str(LIMITS.text) }), 3, 3, 'Exactly three looks in order: natural, bold, extreme.'),
+  });
   return obj({ shots: arr(obj({ ...note, balance: balanceSchema }), clipIds.length, 1) });
 }
 
@@ -58,17 +68,6 @@ function text(v: unknown, max: number, path: string, required = false) {
 }
 function list(v: unknown, path: string, max: number, min = 0) { if (!Array.isArray(v) || v.length < min || v.length > max) fail(path, min === max ? `must have exactly ${max} items` : `must have ${min} to ${max} items`); return v as unknown[]; }
 function rgb(v: unknown, path: string): Rgb { const o = record(v, RGB, path); return { r: number(o.r, LIMITS.rgb, `${path}.r`), g: number(o.g, LIMITS.rgb, `${path}.g`), b: number(o.b, LIMITS.rgb, `${path}.b`) }; }
-function curve(v: unknown, path: string): CurvePoints[] {
-  const points = list(v, path, LIMITS.curvePoints).map((p, i) => { const o = record(p, ['x', 'y'], `${path}[${i}]`); return { x: number(o.x, [0, 1], `${path}[${i}].x`), y: number(o.y, [0, 1], `${path}[${i}].y`) }; });
-  if (points.length === 1) fail(path, 'needs no points or 2 to 8 points');
-  if (points.length && (points[0].x !== 0 || points.at(-1)!.x !== 1)) fail(path, 'must start at x=0 and end at x=1');
-  points.forEach((p, i) => { if (i && p.x - points[i - 1].x < .0001) fail(`${path}[${i}].x`, 'must be larger than the previous point'); });
-  return points;
-}
-function look(v: unknown, path: string): LookValues {
-  const o = record(v, [...LOOK_NUMBERS, ...LOOK_RGB, 'curves'], path), c = record(o.curves, CURVES.map(([k]) => k), `${path}.curves`);
-  return { ...Object.fromEntries(LOOK_NUMBERS.map(k => [k, number(o[k], LIMITS[k], `${path}.${k}`)])), ...Object.fromEntries(LOOK_RGB.map(k => [k, rgb(o[k], `${path}.${k}`)])), curves: Object.fromEntries(CURVES.map(([k]) => [k, curve(c[k], `${path}.curves.${k}`)])) } as unknown as LookValues;
-}
 function balance(v: unknown, path: string): BalanceValues {
   const o = record(v, ['exposure', 'temperature', 'tint', ...WHEELS], path);
   return { exposure: number(o.exposure, LIMITS.exposure, `${path}.exposure`), temperature: number(o.temperature, LIMITS.temperature, `${path}.temperature`), tint: number(o.tint, LIMITS.tint, `${path}.tint`), ...Object.fromEntries(WHEELS.map(k => [k, rgb(o[k], `${path}.${k}`)])) } as unknown as BalanceValues;
@@ -84,22 +83,26 @@ function note(o: Record<string, unknown>, path: string, clipIds: string[], seen:
   return { clipId, confidence: number(o.confidence, LIMITS.confidence, `${path}.confidence`), warnings, rationale: text(o.rationale, LIMITS.text, `${path}.rationale`) };
 }
 function checkNode(patch: Partial<GradeNode> & Pick<GradeNode, 'parameters'>) { const node = { id: 'check', projectId: '', clipId: '', name: 'Check', kind: 'serial', enabled: true, ...patch }; validateGradeNode(node); colorStages({ id: '' } as Clip, [node]); }
-export function validateOutput(mode: 'looks', value: unknown, clipIds: string[]): LooksOutput;
+export function validateOutput(mode: 'looks', value: unknown, clipIds: string[]): LooksAnswer;
 export function validateOutput(mode: 'balance' | 'match', value: unknown, clipIds: string[]): BalanceOutput;
-export function validateOutput(mode: AssistantMode, value: unknown, clipIds: string[]): LooksOutput | BalanceOutput;
-export function validateOutput(mode: AssistantMode, value: unknown, clipIds: string[]): LooksOutput | BalanceOutput {
+export function validateOutput(mode: AssistantMode, value: unknown, clipIds: string[]): LooksAnswer | BalanceOutput;
+export function validateOutput(mode: AssistantMode, value: unknown, clipIds: string[]): LooksAnswer | BalanceOutput {
   if (!['looks', 'balance', 'match'].includes(mode)) fail('mode', 'is unknown');
-  let n = 0; const pointId = () => `p${++n}`;
   if (mode === 'looks') {
-    const options = list(record(value, ['options'], 'output').options, 'options', 3, 3).map((v, i): LookOption => {
-      const p = `options[${i}]`, o = record(v, ['name', 'intensity', 'description', 'look', 'extraNodes', 'shots'], p), seen = new Set<string>();
-      if (o.intensity !== INTENSITIES[i]) fail(`${p}.intensity`, `must be ${INTENSITIES[i]}`);
-      return { name: text(o.name, LIMITS.name, `${p}.name`, true), intensity: INTENSITIES[i], description: text(o.description, LIMITS.text, `${p}.description`), look: look(o.look, `${p}.look`),
-        extraNodes: list(o.extraNodes, `${p}.extraNodes`, LIMITS.extraNodes).map((x, j) => look(x, `${p}.extraNodes[${j}]`)),
-        shots: list(o.shots, `${p}.shots`, clipIds.length).map((x, j) => note(record(x, NOTE_KEYS, `${p}.shots[${j}]`), `${p}.shots[${j}]`, clipIds, seen)) };
+    const o = record(value, ['shots', 'options'], 'output'), seen = new Set<string>();
+    const shots = list(o.shots, 'shots', clipIds.length, 1).map((x, i): ShotAnswer => {
+      const p = `shots[${i}]`, s = record(x, [...NOTE_KEYS, 'keepBalance', 'exposure', 'temperature', 'tint'], p);
+      if (typeof s.keepBalance !== 'boolean') fail(`${p}.keepBalance`, 'must be true or false');
+      return { ...note(s, p, clipIds, seen), keepBalance: s.keepBalance, exposure: number(s.exposure, LIMITS.trim, `${p}.exposure`), temperature: number(s.temperature, LIMITS.balanceTemperature, `${p}.temperature`), tint: number(s.tint, LIMITS.tint, `${p}.tint`) };
     });
-    for (const o of options) for (const l of [o.look, ...o.extraNodes]) checkNode(lookNodePatch(l, pointId));
-    return { options };
+    const options = list(o.options, 'options', 3, 3).map((v, i): OptionAnswer => {
+      const p = `options[${i}]`, x = record(v, ['name', 'intensity', 'description', 'recipe', 'strength', 'warmth'], p);
+      if (x.intensity !== INTENSITIES[i]) fail(`${p}.intensity`, `must be ${INTENSITIES[i]}`);
+      if (!RECIPES.some(r => r.id === x.recipe)) fail(`${p}.recipe`, 'is not a look in the library');
+      return { name: text(x.name, LIMITS.name, `${p}.name`, true), intensity: INTENSITIES[i], description: text(x.description, LIMITS.text, `${p}.description`), recipe: x.recipe as string,
+        strength: number(x.strength, LIMITS.strength, `${p}.strength`), warmth: number(x.warmth, LIMITS.warmth, `${p}.warmth`) };
+    });
+    return { shots, options };
   }
   const seen = new Set<string>(), shots = list(record(value, ['shots'], 'output').shots, 'shots', clipIds.length, 1).map((x, i) => {
     const p = `shots[${i}]`, o = record(x, [...NOTE_KEYS, 'balance'], p); return { ...note(o, p, clipIds, seen), balance: balance(o.balance, `${p}.balance`) };
@@ -119,9 +122,20 @@ export function balanceParameters(b: BalanceValues): Record<string, number> {
 /** Complete Look node parameters and curves (an empty channel array means no curve for it). */
 export function lookNodePatch(l: LookValues, id: () => string): Pick<GradeNode, 'parameters' | 'curves'> {
   return {
-    parameters: { ...primaryDefaults, contrast: l.contrast, pivot: l.pivot, saturation: l.saturation, lift: l.lift, gamma: l.gamma, gain: l.gain, offset: l.offset, ...Object.assign({}, ...WHEELS.map(k => rgbParameters(k, l[`${k}Rgb`]))) },
+    parameters: { ...primaryDefaults, contrast: l.contrast, pivot: l.pivot, saturation: l.saturation, lift: l.lift, gamma: l.gamma, gain: l.gain, offset: l.offset, ...Object.assign({}, ...WHEELS.map(k => rgbParameters(k, l[`${k}Rgb`]))),
+      // Stored only when used: absent = 100, and builds before range saturation refuse a node carrying them (rangeDefaults).
+      ...Object.fromEntries(RANGES.flatMap(k => l[k] !== undefined && l[k] !== 100 ? [[k, l[k]]] : [])) },
     curves: Object.fromEntries(CURVES.filter(([k]) => l.curves[k].length).map(([k, key]) => [key, { mode: 'smooth', points: l.curves[k].map(p => ({ id: id(), x: p.x, y: p.y })) } satisfies ColorCurve])),
   };
+}
+
+/** Balance node values for one answered shot (they replace the node's values: the shot was measured before Balance). Undefined = keep the current Balance node. */
+export function shotBalance(shot: ShotAnswer): BalanceValues | undefined {
+  return shot.keepBalance ? undefined : { ...neutralBalance(), exposure: +shot.exposure.toFixed(3), temperature: Math.round(shot.temperature), tint: Math.round(shot.tint) };
+}
+/** A validated option as a look: SharedCut's library values at the chosen strength and warmth. */
+export function lookOption(o: OptionAnswer, shots: ShotNote[]): LookOption {
+  return { name: o.name, intensity: o.intensity, description: o.description, look: recipeLook(o.recipe, o.strength, o.warmth), extraNodes: [], shots, recipe: o.recipe, strength: o.strength, warmth: o.warmth };
 }
 
 const ordered = (clip: Clip, nodes: GradeNode[]) => nodes.filter(n => n.clipId === clip.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));

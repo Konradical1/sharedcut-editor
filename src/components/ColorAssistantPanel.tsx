@@ -3,12 +3,13 @@ import {Check,Info,RotateCw,Sparkles,Square} from 'lucide-react';
 import {useStoreWithoutPlayhead} from '../state/store';
 import type {Clip} from '../state/models';
 import {acesOutputUpgrade} from '../services/color';
-import {eligibility,type LookOption} from '../services/colorAssistant';
+import {eligibility,type BalanceValues,type LookOption,type ShotNote} from '../services/colorAssistant';
+import {RECIPES} from '../services/colorLooks';
 import {assistantJob,cancelAssistant,latestAssistantJob,startAssistant,type AssistantCapabilities,type AssistantJob,type AssistantRequest,type AssistantSkip} from '../services/colorAssistantClient';
 import {Button} from './ui';
 import './colorAssistant.css';
 
-const INTENSITY={natural:'Natural',bold:'Bold',extreme:'Extreme'} as const;
+const INTENSITY={natural:'Natural',bold:'Bold',extreme:'Strong'} as const;
 const STYLES=['Warm film','Teal and orange','Moody night','Bleach bypass','Soft pastel'];
 const running=(job:AssistantJob|null):job is AssistantJob=>job?.status==='waiting'||job?.status==='running';
 const MAX_SHOTS=40; // server/colorAssistant.ts refuses more
@@ -40,7 +41,7 @@ export default function ColorAssistantPanel({shots,current,capabilities}:{shots:
   return <div className="color-assistant">
     <header className="assistant-hero">
       <span className="assistant-mark" aria-hidden><Sparkles size={15}/></span>
-      <div><h3>Color Assistant</h3><p>Three looks for your shots, from natural to extreme. Preview them on your footage, then apply one as editable nodes.</p></div>
+      <div><h3>Color Assistant</h3><p>Balances every shot, then offers three looks from natural to strong. Preview them on your footage and apply one as editable nodes.</p></div>
       <details className="assistant-info"><summary aria-label={`What is sent to ${vendor}`} title={`What is sent to ${vendor}`}><Info size={14}/></summary><div className="assistant-popover">
         <strong>Sent to {vendor} per request</strong><p>Up to about 10 JPEG stills (about 640 px) of graded frames, the measurement numbers, shot names, camera model and log type, and your style prompt.</p>
         <p>Never the original video, audio, other projects or account data. {claude?'It runs on this server\'s Anthropic API key. Anthropic does not train on API data by default.':'It runs through your ChatGPT (Codex) login, counts against its limits, and OpenAI may use it for training per that account\'s setting.'}</p>
@@ -68,6 +69,7 @@ export default function ColorAssistantPanel({shots,current,capabilities}:{shots:
     {shown?.result?.looks&&<section className="assistant-results" aria-label="Three looks">
       <div className="assistant-results-heading"><strong>{used.length} shot{used.length===1?'':'s'}{shown.request.prompt?`, “${shown.request.prompt}”`:''}</strong><Button variant="ghost" disabled={busy} onClick={()=>void run(shown.request)}><RotateCw size={13}/>Regenerate</Button></div>
       {shown.skipped.length>0&&<SkipList skips={shown.skipped} name={name} label="Skipped in this result"/>}
+      {shown.result.shots&&shown.result.shots.length>0&&<BalanceList notes={shown.result.shots} name={name}/>}
       {shown.result.looks.map((option,i)=><OptionCard key={`${shown.id}-${i}`} job={shown} option={option} index={i} name={name} apply={()=>s.applyColorAssistant({mode:shown.mode,...shown.result!},i,used)}/>)}
     </section>}
   </div>;
@@ -79,6 +81,18 @@ function SkipList({skips,name,label='Will be skipped'}:{skips:AssistantSkip[];na
     if(code==='not-aces'&&acesOutputUpgrade(clip,s.nodes))return <button onClick={()=>s.useAcesOutput(clipId)}>Use ACES 2 output</button>;
     if(code==='legacy-pipeline')return <button onClick={()=>s.initializeColorGrade(clipId)}>Start wide-gamut grade</button>;return null;};
   return <div className="assistant-skips" role="group" aria-label={label}><small>{label}</small><ul>{skips.map(skip=><li key={skip.clipId}><span><strong>{name(skip.clipId)}</strong> {skip.text}</span>{fix(skip)}</li>)}</ul></div>;
+}
+
+const sign=(v:number,digits=1)=>`${v>0?'+':''}${+v.toFixed(digits)}`;
+/** What Apply sets on a shot's Balance node, in words a colorist reads. */
+const balanceText=(b?:BalanceValues)=>!b?'Keeps its own balance':[b.exposure?`exposure ${sign(b.exposure)}`:'',b.temperature?`${b.temperature>0?'warmer':'cooler'} ${Math.abs(Math.round(b.temperature))}`:'',b.tint?`tint ${sign(b.tint,0)}`:''].filter(Boolean).join(', ')||'Balance reset to neutral';
+function BalanceList({notes,name}:{notes:(ShotNote&{balance?:BalanceValues})[];name:(id:string)=>string}){
+  const warnings=notes.reduce((n,note)=>n+note.warnings.length,0),changed=notes.filter(note=>note.balance).length;
+  return <details className="assistant-balance"><summary><span>Balance</span><small>{changed} of {notes.length} shot{notes.length===1?'':'s'} corrected first{warnings>0&&<em>{warnings} to check</em>}</small></summary><ul>{notes.map(note=><li key={note.clipId}>
+    <span><strong>{name(note.clipId)}</strong><em>{balanceText(note.balance)}</em></span>
+    {note.rationale&&<p>{note.rationale}</p>}
+    {note.warnings.map((w,j)=><p key={j} className="color-notice">{w.text||w.code}</p>)}
+  </li>)}</ul></details>;
 }
 
 function OptionCard({job,option,index,name,apply}:{job:AssistantJob;option:LookOption;index:number;name:(id:string)=>string;apply:()=>void}){
@@ -98,6 +112,7 @@ function OptionCard({job,option,index,name,apply}:{job:AssistantJob;option:LookO
     </div>}
     {stills.length>1&&<div className="assistant-thumbs" role="group" aria-label="Shot to preview">{stills.map((item,i)=><button key={item.clipId} aria-pressed={item===still} aria-label={`Preview ${name(item.clipId)}`} title={name(item.clipId)} onClick={()=>setPick(i)}><img draggable={false} src={item.after[index]??item.before} alt=""/></button>)}</div>}
     <header><strong>{option.name}</strong><span className={`assistant-intensity ${option.intensity}`} aria-label={`Intensity ${level} of 3: ${INTENSITY[option.intensity]}`}><span aria-hidden>{[1,2,3].map(n=><i key={n} className={n<=level?'on':''}/>)}</span>{INTENSITY[option.intensity]}</span></header>
+    {option.recipe&&<small className="assistant-recipe">{RECIPES.find(r=>r.id===option.recipe)?.name??option.recipe} at {Math.round((option.strength??1)*100)}%{option.warmth?`, ${option.warmth>0?'warmer':'cooler'}`:''}</small>}
     {option.description&&<p>{option.description}</p>}
     {option.shots.length>0&&<details className="assistant-notes"><summary>{option.shots.length} shot note{option.shots.length===1?'':'s'}{warnings>0&&<em>{warnings} to check</em>}</summary><ul>{option.shots.map(note=><li key={note.clipId}>
       <span><strong>{name(note.clipId)}</strong><em className={note.confidence<.5?'low':''}>{Math.round(note.confidence*100)}% confident</em></span>

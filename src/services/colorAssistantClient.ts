@@ -8,7 +8,8 @@ export type AssistantSkip = { clipId: string; code: Extract<Eligibility, { ok: f
 export interface AssistantJob {
   id: string; projectId: string; mode: AssistantMode; status: 'waiting' | 'running' | 'done' | 'failed' | 'cancelled'; stage: string; progress: number; error?: string; createdAt: number;
   request: AssistantRequest; skipped: AssistantSkip[];
-  result?: { looks?: LookOption[]; shots?: (ShotNote & { balance: BalanceValues })[]; stills: { clipId: string; frame: number; before: string; after: (string | null)[] }[] };
+  /** shots: per-shot notes; balance = the Balance node it sets (Three looks: absent = the shot keeps its own). */
+  result?: { looks?: LookOption[]; shots?: (ShotNote & { balance?: BalanceValues })[]; stills: { clipId: string; frame: number; before: string; after: (string | null)[] }[] };
 }
 
 /** Not cached: the answer depends on the signed-in account, and signing out does not reload the page. */

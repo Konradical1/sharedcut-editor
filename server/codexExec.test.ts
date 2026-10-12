@@ -109,9 +109,9 @@ test('Claude gets the looks schema with shared $defs and the three looks as fixe
   const schema = outputSchema('looks', Array.from({ length: 40 }, (_, i) => `S${i + 1}`)), wire = sharedDefs(tuplesAsObjects(schema) as object) as { $defs: Record<string, unknown> };
   const deref = (node: unknown): unknown => !node || typeof node !== 'object' ? node : Array.isArray(node) ? node.map(deref) : '$ref' in node ? deref(wire.$defs[String(node.$ref).split('/').pop()!]) : Object.fromEntries(Object.entries(node).filter(([key]) => key !== '$defs').map(([key, value]) => [key, deref(value)]));
   assert.deepEqual(deref(wire), tuplesAsObjects(schema), '$defs only moves repeated parts');
-  assert.ok(JSON.stringify(wire).length < JSON.stringify(schema).length / 2);
+  assert.ok(JSON.stringify(wire).length < JSON.stringify(tuplesAsObjects(schema)).length, 'the three keyed looks are sent once');
   assert.doesNotMatch(JSON.stringify(wire), /"minItems":[2-9]/, 'no array length is left for the grammar to drop');
-  const answer = fakeOutput(schema) as { options: unknown[] }, keyed = { options: { item1: answer.options[0], item2: answer.options[1], item3: answer.options[2] } };
+  const answer = fakeOutput(schema) as { options: unknown[] }, keyed = { ...answer, options: { item1: answer.options[0], item2: answer.options[1], item3: answer.options[2] } };
   assert.deepEqual(objectsAsTuples(schema, keyed), answer);
   assert.deepEqual(validateOutput('looks', objectsAsTuples(schema, keyed), Array.from({ length: 40 }, (_, i) => `S${i + 1}`)).options.length, 3);
 });

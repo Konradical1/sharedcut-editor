@@ -106,12 +106,21 @@ def measure_frame(di, weights, to709=None):
     # ponytail: "neutral" = mid pixels within ±0.3 ln of green (tolerates ~±1500 K casts); skin can bias it warm.
     grey = mids & (lin > 0).all(1) & (np.abs(lr) < .3) & (np.abs(lb) < .3)
     neutral = ratios(lin[grey]) if grey.mean() >= .02 else None
-    if neutral:
-        rg, bg = neutral['rg'], neutral['bg']; k = 2 / (1 / rg + 1 / bg)
-        neutral.update(temperature=num(np.clip(1e4 * (k / rg - 1), -2000, 2000)), tint=num(np.clip(200 * (1 - k), -100, 100)))
+    # A second witness: the brightest unclipped near-neutral surfaces (white shirts, paper, court lines), least-chroma half around their median.
+    # Warm floors and skin pull the near-grey average; whites often tell the truth there. Neither is always right: the model judges from the stills.
+    cand = (lin > 0).all(1) & (stops > -1) & (stops < 3.5) & (np.abs(lr) < .6) & (np.abs(lb) < .6)
+    whites = None
+    if cand.mean() >= .01:
+        top = cand & (y >= np.percentile(y[cand], 80)); c = np.hypot(lr - np.median(lr[top]), lb - np.median(lb[top]))
+        core = top & (c <= np.percentile(c[top], 50))
+        whites = ratios(lin[core]) if core.mean() >= .002 else None
+    for estimate in (neutral, whites):
+        if estimate:
+            rg, bg = estimate['rg'], estimate['bg']; k = 2 / (1 / rg + 1 / bg)
+            estimate.update(temperature=num(np.clip(1e4 * (k / rg - 1), -4000, 4000)), tint=num(np.clip(200 * (1 - k), -100, 100)))
     pct = np.percentile(flat, [10, 50, 90], axis=0)
     out = {'stops': dict(zip(('p1', 'p10', 'p50', 'p90', 'p99'), map(num, np.percentile(stops, [1, 10, 50, 90, 99])))),
-           'shadows': ratios(lin[shadows]), 'mids': ratios(lin[mids]), 'highlights': ratios(lin[highs]), 'neutral': neutral,
+           'shadows': ratios(lin[shadows]), 'mids': ratios(lin[mids]), 'highlights': ratios(lin[highs]), 'neutral': neutral, 'whites': whites,
            'channels': {c: {'p10': num(pct[0, i]), 'p50': num(pct[1, i]), 'p90': num(pct[2, i])} for i, c in enumerate('rgb')}}
     if to709 is not None:
         v = np.clip(np.maximum(lin @ np.asarray(to709, np.float32).T, 0) ** (1 / 2.4), 0, 1)
@@ -173,6 +182,22 @@ def read_codes(ff, path, shape):
     return np.frombuffer(p.stdout, np.uint8).reshape(shape)
 
 
+def hsv(v):
+    mx, mn = v.max(1), v.min(1); d = np.maximum(mx - mn, 1e-9); r, g, b = v.T
+    hue = np.where(mx == r, ((g - b) / d) % 6, np.where(mx == g, (b - r) / d + 2, (r - g) / d + 4)) * 60
+    return hue, np.where(mx > 0, (mx - mn) / np.maximum(mx, 1e-9), 0), mx
+
+
+def display_check(codes, before):
+    """What a colorist checks on the monitor: shares of pure black and pure white, before and after, and the mean hue shift
+    (degrees, minus = toward magenta) of the pixels that were skin-like before; None when under 0.5% of the frame is skin."""
+    v, w = (np.asarray(c, np.float32).reshape(-1, 3) / 255 for c in (codes, before))
+    black, white = lambda x: num((x.max(1) <= 2 / 255).mean()), lambda x: num((x.max(1) >= 254 / 255).mean())
+    h0, s0, m0 = hsv(w); skin = (h0 <= 50) & (s0 >= .15) & (s0 <= .7) & (m0 > .2)
+    shift = num(np.mean((hsv(v[skin])[0] - h0[skin] + 180) % 360 - 180)) if skin.mean() > .005 else None
+    return {'crushed': black(v), 'clipped': white(v), 'crushedBefore': black(w), 'clippedBefore': white(w), 'skinShift': shift}
+
+
 def render(job):
     """Optional still['compare'] = an earlier still of the same frame: adds meanDiff, the mean absolute 8-bit change from it,
     and colorDiff, the part of that change that moves the channels apart (hue and saturation, not brightness)."""
@@ -188,8 +213,8 @@ def render(job):
         out.append({'out': still['out'], 'width': codes.shape[1], 'height': codes.shape[0],
                     'stats': {c: {'p10': num(pct[0, j]), 'p50': num(pct[1, j]), 'p90': num(pct[2, j])} for j, c in enumerate('rgb')}})
         if still.get('compare'):
-            d = codes.astype(np.int16) - read_codes(ff, still['compare'], codes.shape)
-            out[-1].update(meanDiff=round(float(np.abs(d).mean()), 2), colorDiff=round(float(np.abs(d - d.mean(-1, keepdims=True)).mean()), 2))
+            before = read_codes(ff, still['compare'], codes.shape); d = codes.astype(np.int16) - before
+            out[-1].update(meanDiff=round(float(np.abs(d).mean()), 2), colorDiff=round(float(np.abs(d - d.mean(-1, keepdims=True)).mean()), 2), check=display_check(codes, before))
         progress((n + 1) / len(job['stills']) * 100)
     return {'stills': out}
 

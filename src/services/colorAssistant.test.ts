@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LIMITS, balanceParameters, eligibility, findGradeNodes, lookNodePatch, neutralBalance, neutralLook, outputSchema, proposedNodes, validateOutput, type BalanceValues, type LookValues } from './colorAssistant.ts';
-import { processingStages, starterGrade } from './color.ts';
+import { LIMITS, balanceParameters, eligibility, findGradeNodes, lookNodePatch, lookOption, neutralBalance, neutralLook, outputSchema, proposedNodes, shotBalance, validateOutput, type BalanceValues, type LookValues } from './colorAssistant.ts';
+import { colorStages, processingStages, starterGrade, validateGradeNode } from './color.ts';
+import { recipeLook, RECIPES } from './colorLooks.ts';
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 
 const clip = { id: 'c1', projectId: 'p1', name: 'Shot 1', properties: { colorPipeline: 'nodes-v2', inputProfile: 'S-Log3', inputGamut: 'S-Gamut3.Cine' }, keyframes: {}, effects: [] } as unknown as Clip;
@@ -10,10 +11,10 @@ const grade = (c = clip) => { let n = 0; const nodes = starterGrade(c, asset, ()
 const named = (nodes: GradeNode[], name: string) => nodes.find(n => n.name === name)!;
 const shot = (clipId = 'c1') => ({ clipId, confidence: .8, warnings: [{ code: 'clipping', text: ' Sky is clipped. ' }], rationale: 'Warm window light.' });
 const look = (over: Partial<LookValues> = {}): LookValues => ({ ...neutralLook(), contrast: 1.2, liftRgb: { r: -.02, g: 0, b: .03 }, curves: { rgb: [{ x: 0, y: 0 }, { x: .5, y: .55 }, { x: 1, y: 1 }], r: [], g: [], b: [{ x: 0, y: .02 }, { x: 1, y: .97 }] }, ...over });
-const looks = () => ({ options: [
-  { name: 'Clean', intensity: 'natural', description: 'Close to camera.', look: look(), extraNodes: [], shots: [shot()] },
-  { name: 'Teal night', intensity: 'bold', description: 'A little crazy.', look: look({ saturation: 130 }), extraNodes: [look()], shots: [] },
-  { name: 'Bleach', intensity: 'extreme', description: 'All out.', look: look({ contrast: 2 }), extraNodes: [look(), neutralLook()], shots: [shot('c2'), shot()] },
+const looks = () => ({ shots: [{ ...shot(), keepBalance: false, exposure: .4, temperature: -600, tint: 4 }, { ...shot('c2'), warnings: [], keepBalance: true, exposure: 0, temperature: 0, tint: 0 }], options: [
+  { intensity: 'natural', recipe: 'clean', strength: .8, warmth: 0, name: 'Clean', description: 'Close to camera.' },
+  { intensity: 'bold', recipe: 'teal-amber', strength: .6, warmth: .2, name: 'Teal night', description: 'Teal shadows.' },
+  { intensity: 'extreme', recipe: 'bleach', strength: 1, warmth: -.3, name: 'Bleach', description: 'All out.' },
 ] });
 const bal = (): BalanceValues => ({ ...neutralBalance(), exposure: .5, temperature: -300, tint: 12, lift: { r: .01, g: 0, b: -.02 }, gain: { r: .05, g: 0, b: -.1 } });
 const balances = () => ({ shots: [{ ...shot(), balance: bal() }, { ...shot('c2'), warnings: [], balance: neutralBalance() }] });
@@ -33,6 +34,7 @@ function conforms(schema: any, v: any, path = '$'): void {
     v.forEach((x: unknown, i: number) => conforms(schema.items, x, `${path}[${i}]`));
   } else if (schema.type === 'number') { if (typeof v !== 'number' || v < schema.minimum || v > schema.maximum) bad('number range'); }
   else if (schema.type === 'string') { if (typeof v !== 'string' || v.length > schema.maxLength) bad('string'); }
+  else if (schema.type === 'boolean') { if (typeof v !== 'boolean') bad('boolean'); }
   else bad(`unsupported schema type ${schema.type}`);
 }
 
@@ -40,21 +42,47 @@ test('output schemas are strict, bounded by LIMITS and name only requested shots
   const looksSchema = outputSchema('looks', ids), balanceSchema = outputSchema('balance', ids), text = JSON.stringify([looksSchema, balanceSchema]);
   for (const word of ['allOf', 'anyOf', 'oneOf', '"not"', '"if"', 'patternProperties', 'uniqueItems', '$ref']) assert.ok(!text.includes(word), word);
   conforms(looksSchema, looks()); conforms(balanceSchema, balances()); conforms(outputSchema('match', ids), balances());
-  const options = (looksSchema as any).properties.options, option = options.items.properties, l = option.look.properties;
-  assert.equal(options.minItems, 3); assert.equal(options.maxItems, 3); assert.deepEqual(option.intensity.enum, ['natural', 'bold', 'extreme']);
-  assert.equal(option.extraNodes.maxItems, 2); assert.deepEqual(option.shots.items.properties.clipId.enum, ids); assert.equal(option.name.maxLength, 60);
-  assert.deepEqual([l.contrast.minimum, l.contrast.maximum, l.pivot.minimum, l.saturation.maximum, l.gain.minimum, l.liftRgb.properties.r.maximum], [.5, 2.5, .15, 200, .6, .4]);
-  assert.equal(l.curves.properties.rgb.maxItems, 8); assert.equal(l.curves.properties.rgb.items.properties.x.maximum, 1);
+  const p = (looksSchema as any).properties, options = p.options, option = options.items.properties, q = p.shots.items.properties;
+  assert.deepEqual(Object.keys(p), ['shots', 'options'], 'balance every shot first, then the looks');
+  assert.equal(options.minItems, 3); assert.equal(options.maxItems, 3); assert.deepEqual(option.intensity.enum, ['natural', 'bold', 'extreme']); assert.equal(option.name.maxLength, 60);
+  assert.deepEqual(option.recipe.enum, RECIPES.map(r => r.id)); assert.deepEqual([option.strength.minimum, option.strength.maximum, option.warmth.minimum, option.warmth.maximum], [.2, 1, -1, 1]);
+  assert.deepEqual(q.clipId.enum, ids); assert.equal(p.shots.maxItems, 2); assert.equal(q.keepBalance.type, 'boolean'); assert.deepEqual(Object.keys(q).slice(0, 2), ['clipId', 'rationale'], 'reasoning before numbers');
+  assert.deepEqual([q.exposure.minimum, q.exposure.maximum, q.temperature.minimum, q.temperature.maximum, q.tint.maximum], [-2, 2, -4000, 4000, 100]);
   const b = (balanceSchema as any).properties.shots.items.properties;
   assert.deepEqual([b.balance.properties.exposure.maximum, b.balance.properties.temperature.minimum, b.balance.properties.tint.maximum, b.warnings.maxItems, b.confidence.maximum], [3, -2000, 100, 8, 1]);
   assert.throws(() => outputSchema('looks', []), /at least one shot/);
 });
 
-test('valid output is returned as a trimmed deep copy; looks may cover a subset of shots', () => {
+test('valid output is returned as a trimmed deep copy; the shots list may cover a subset of shots', () => {
   const raw = looks(), out = validateOutput('looks', raw, ids);
-  assert.equal(out.options[0].shots[0].warnings[0].text, 'Sky is clipped.'); assert.equal(out.options[1].shots.length, 0);
-  out.options[0].look.curves.rgb[1].y = .9; assert.equal(raw.options[0].look.curves.rgb[1].y, .55);
+  assert.equal(out.shots[0].warnings[0].text, 'Sky is clipped.'); out.shots[0].warnings[0].text = 'x'; assert.equal(raw.shots[0].warnings[0].text, ' Sky is clipped. ');
+  assert.equal(validateOutput('looks', { ...looks(), shots: [looks().shots[1]] }, ids).shots.length, 1);
+  assert.deepEqual(out.options.map(o => [o.recipe, o.strength, o.warmth]), [['clean', .8, 0], ['teal-amber', .6, .2], ['bleach', 1, -.3]]);
   const b = validateOutput('match', balances(), ids); assert.deepEqual(b.shots[0].balance, bal()); assert.equal(b.shots[1].clipId, 'c2');
+});
+
+test('an answer becomes node values: each shot its Balance (none when kept), each option a library look at its strength and warmth', () => {
+  const out = validateOutput('looks', looks(), ids);
+  assert.deepEqual(shotBalance(out.shots[0]), { ...neutralBalance(), exposure: .4, temperature: -600, tint: 4 }); assert.equal(shotBalance(out.shots[1]), undefined);
+  const option = lookOption(out.options[2], []), bleach = RECIPES.find(r => r.id === 'bleach')!.look;
+  assert.deepEqual([option.recipe, option.look.contrast, option.look.saturation, option.look.saturationShadows, option.extraNodes], ['bleach', bleach.contrast, bleach.saturation, bleach.saturationShadows, []]);
+  assert.ok(option.look.offsetRgb.b > 0 && option.look.offsetRgb.r < 0, 'warmth -0.3 cools');
+  const half = recipeLook('teal-amber', .5), full = recipeLook('teal-amber', 1);
+  assert.equal(half.contrast, +((1 + full.contrast) / 2).toFixed(5)); assert.ok(half.curves.b[1].y - .15 > 0 && half.curves.b[1].y - .15 < full.curves.b[1].y - .15, 'half strength moves curves half way');
+  assert.throws(() => recipeLook('purple-haze', 1), /Unknown look/);
+});
+
+test('every library look, at any strength and warmth, is a node the engine accepts; at strength 0 it changes nothing', () => {
+  assert.equal(new Set(RECIPES.map(r => r.id)).size, RECIPES.length);
+  for (const r of RECIPES) for (const strength of [.2, .6, 1]) for (const warmth of [-1, 0, 1]) {
+    const node = { id: 'n', projectId: '', clipId: '', name: 'Look', kind: 'serial', enabled: true, ...lookNodePatch(recipeLook(r.id, strength, warmth), (() => { let i = 0; return () => `p${++i}`; })()) } as GradeNode;
+    assert.doesNotThrow(() => { validateGradeNode(node); colorStages({ id: '' } as Clip, [node]); }, `${r.id} ${strength} ${warmth}`);
+  }
+  for (const r of RECIPES) {
+    const zero = recipeLook(r.id, 0);
+    assert.deepEqual({ ...zero, curves: neutralLook().curves }, { ...neutralLook(), ...Object.fromEntries(['saturationShadows', 'saturationMidtones', 'saturationHighlights'].filter(k => k in zero).map(k => [k, 100])) }, r.id);
+    assert.ok(Object.values(zero.curves).flat().every(p => Math.abs(p.y - p.x) < 1e-5), `${r.id} curves are identity`);
+  }
 });
 
 test('every rule rejects the whole output with the bad field named', () => {
@@ -65,44 +93,34 @@ test('every rule rejects the whole output with the bad field named', () => {
     ['four options', v => v.options.push(v.options[0]), /options must have exactly 3/],
     ['intensity order', v => { v.options[0].intensity = 'bold'; v.options[1].intensity = 'natural'; }, /options\[0\]\.intensity must be natural/],
     ['extra root key', v => { v.notes = 'hi'; }, /output\.notes is not allowed/],
-    ['extra option key', v => { v.options[2].nodes = []; }, /options\[2\]\.nodes is not allowed/],
+    ['raw look values', v => { v.options[2].look = neutralLook(); }, /options\[2\]\.look is not allowed/],
     ['missing key', v => { delete v.options[1].description; }, /options\[1\]\.description is missing/],
-    ['extra look key', v => { v.options[0].look.exposure = 1; }, /options\[0\]\.look\.exposure is not allowed/],
-    ['string number', v => { v.options[0].look.contrast = '1.2'; }, /look\.contrast must be a number/],
-    ['non-finite', v => { v.options[0].look.gamma = Infinity; }, /look\.gamma must be a number/],
-    ['NaN', v => { v.options[0].look.offset = NaN; }, /look\.offset must be a number/],
-    ['contrast', v => { v.options[2].look.contrast = 2.6; }, /options\[2\]\.look\.contrast must be a number from 0\.5 to 2\.5/],
-    ['pivot', v => { v.options[0].look.pivot = .1; }, /look\.pivot/],
-    ['saturation', v => { v.options[0].look.saturation = 201; }, /look\.saturation/],
-    ['master lift', v => { v.options[0].look.lift = -.41; }, /look\.lift must/],
-    ['master gain', v => { v.options[0].look.gain = 1.5; }, /look\.gain must/],
-    ['rgb delta', v => { v.options[0].look.gainRgb.b = .5; }, /look\.gainRgb\.b/],
-    ['rgb extra key', v => { v.options[0].look.gainRgb.a = 0; }, /look\.gainRgb\.a is not allowed/],
-    ['three extra nodes', v => v.options[2].extraNodes.push(neutralLook()), /extraNodes must have 0 to 2/],
-    ['bad extra node', v => { v.options[1].extraNodes[0].saturation = -1; }, /extraNodes\[0\]\.saturation/],
-    ['one curve point', v => { v.options[0].look.curves.r = [{ x: 0, y: 0 }]; }, /curves\.r needs no points or 2 to 8/],
-    ['nine curve points', v => { v.options[0].look.curves.g = Array.from({ length: 9 }, (_, i) => ({ x: i / 8, y: i / 8 })); }, /curves\.g must have 0 to 8/],
-    ['curve start', v => { v.options[0].look.curves.rgb[0].x = .01; }, /curves\.rgb must start at x=0/],
-    ['curve end', v => { v.options[0].look.curves.rgb[2].x = .999; }, /curves\.rgb must start at x=0 and end at x=1/],
-    ['curve not ascending', v => { v.options[0].look.curves.rgb = [{ x: 0, y: 0 }, { x: .6, y: .5 }, { x: .5, y: .6 }, { x: 1, y: 1 }]; }, /curves\.rgb\[2\]\.x must be larger/],
-    ['curve gap', v => { v.options[0].look.curves.rgb = [{ x: 0, y: 0 }, { x: .5, y: .5 }, { x: .50005, y: .5 }, { x: 1, y: 1 }]; }, /curves\.rgb\[2\]\.x must be larger/],
-    ['curve y', v => { v.options[0].look.curves.b[1].y = 1.1; }, /curves\.b\[1\]\.y/],
-    ['curve point key', v => { v.options[0].look.curves.b[1].slope = 1; }, /curves\.b\[1\]\.slope is not allowed/],
-    ['missing curve channel', v => { delete v.options[0].look.curves.g; }, /curves\.g is missing/],
-    ['unknown clip', v => { v.options[0].shots[0].clipId = 'c9'; }, /options\[0\]\.shots\[0\]\.clipId is not one of the requested shots/],
-    ['duplicate clip', v => { v.options[2].shots[1].clipId = 'c2'; }, /options\[2\]\.shots\[1\]\.clipId repeats c2/],
-    ['too many shots', v => v.options[2].shots.push(shot()), /shots must have 0 to 2/],
-    ['confidence', v => { v.options[0].shots[0].confidence = 1.2; }, /confidence must be a number from 0 to 1/],
+    ['unknown look', v => { v.options[1].recipe = 'purple-haze'; }, /options\[1\]\.recipe is not a look in the library/],
+    ['strength', v => { v.options[2].strength = 1.2; }, /options\[2\]\.strength must be a number from 0\.2 to 1/],
+    ['weak strength', v => { v.options[0].strength = .1; }, /options\[0\]\.strength must be a number from 0\.2/],
+    ['warmth', v => { v.options[0].warmth = -1.5; }, /options\[0\]\.warmth must be a number from -1 to 1/],
+    ['string number', v => { v.options[0].strength = '0.5'; }, /strength must be a number/],
+    ['NaN', v => { v.options[0].warmth = NaN; }, /warmth must be a number/],
+    ['no shots', v => { v.shots = []; }, /shots must have 1 to 2/],
+    ['too many shots', v => v.shots.push(v.shots[0]), /shots must have 1 to 2/],
+    ['unknown clip', v => { v.shots[0].clipId = 'c9'; }, /shots\[0\]\.clipId is not one of the requested shots/],
+    ['duplicate clip', v => { v.shots[1].clipId = 'c1'; }, /shots\[1\]\.clipId repeats c1/],
+    ['keepBalance', v => { v.shots[0].keepBalance = 'no'; }, /shots\[0\]\.keepBalance must be true or false/],
+    ['exposure', v => { v.shots[0].exposure = 2.5; }, /shots\[0\]\.exposure must be a number from -2 to 2/],
+    ['temperature', v => { v.shots[0].temperature = 4001; }, /shots\[0\]\.temperature must be a number from -4000 to 4000/],
+    ['tint', v => { v.shots[0].tint = -101; }, /shots\[0\]\.tint/],
+    ['raw balance', v => { v.shots[0].balance = neutralBalance(); }, /shots\[0\]\.balance is not allowed/],
+    ['confidence', v => { v.shots[0].confidence = 1.2; }, /confidence must be a number from 0 to 1/],
     ['empty name', v => { v.options[1].name = '   '; }, /options\[1\]\.name must not be empty/],
     ['long name', v => { v.options[1].name = 'x'.repeat(61); }, /name must be at most 60/],
     ['long description', v => { v.options[1].description = 'x'.repeat(301); }, /description must be at most 300/],
-    ['non-text rationale', v => { v.options[0].shots[0].rationale = 5; }, /rationale must be text/],
-    ['nine warnings', v => { v.options[0].shots[0].warnings = Array(9).fill({ code: 'other', text: '' }); }, /warnings must have 0 to 8/],
-    ['unknown warning', v => { v.options[0].shots[0].warnings[0].code = 'banding'; }, /warnings\[0\]\.code is not a known warning/],
-    ['long warning', v => { v.options[0].shots[0].warnings[0].text = 'x'.repeat(301); }, /warnings\[0\]\.text must be at most 300/],
+    ['non-text rationale', v => { v.shots[0].rationale = 5; }, /rationale must be text/],
+    ['nine warnings', v => { v.shots[0].warnings = Array(9).fill({ code: 'other', text: '' }); }, /warnings must have 0 to 8/],
+    ['unknown warning', v => { v.shots[0].warnings[0].code = 'banding'; }, /warnings\[0\]\.code is not a known warning/],
+    ['long warning', v => { v.shots[0].warnings[0].text = 'x'.repeat(301); }, /warnings\[0\]\.text must be at most 300/],
   ];
-  for (const [name, mutate, message] of lookCases) { const v = looks(); mutate(v); assert.throws(() => validateOutput('looks', v, ids), message, name); }
-  assert.doesNotThrow(() => validateOutput('looks', { options: looks().options.map(o => ({ ...o, name: `  ${'x'.repeat(60)}  ` })) }, ids), 'length counts after trimming');
+  for (const [name, mutate, message] of lookCases) { const v = looks() as any; mutate(v); assert.throws(() => validateOutput('looks', v, ids), message, name); }
+  assert.doesNotThrow(() => validateOutput('looks', { ...looks(), options: looks().options.map(o => ({ ...o, name: `  ${'x'.repeat(60)}  ` })) }, ids), 'length counts after trimming');
   assert.throws(() => validateOutput('looks', null, ids), /output must be an object/);
   assert.throws(() => validateOutput('looks', [], ids), /output must be an object/);
   const balanceCases: Case[] = [

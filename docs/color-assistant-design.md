@@ -17,7 +17,7 @@ how it was validated), `src/services/color.ts`, `src/services/colorPreview.ts`, 
 | Model | `claude-opus-5-5` for anthropic, `gpt-6-astra` for codex. `FRAME_LINE_AI_MODEL` overrides. |
 | Training setting | Left as is. The stills sent may be used by OpenAI for training; Konrad is fine with that. |
 | Output transform | ACES 2 Output CST stays fixed. The assistant edits only Balance and Look nodes (plus extra look nodes it adds). |
-| Three looks | The model decides the three looks. An optional text prompt steers them ("cool, dramatic night scene"). The three always climb in intensity: **1 close to natural, 2 goes a little crazy, 3 all-out cinematic, dramatic, super stylized.** Be genuinely creative. Everything stays editable afterwards. |
+| Three looks | Graded like a colorist works (2026-10-12, after model-invented looks came out garish): **first a Balance per shot** (exposure, temperature, tint, or keep a deliberate one), **then three looks from a hand-tuned library** (`src/services/colorLooks.ts`) at a strength and warmth the model picks. The model never writes node numbers. Tiers: natural (polish), bold (a named style), strong (UI label; `extreme` in data: the strongest a colorist would still deliver). An optional prompt steers the choice. Everything stays editable. |
 
 ## The pipeline it builds on (already fixed and validated)
 
@@ -70,10 +70,16 @@ space → **Balance** → **Look** → **Output CST (ACES 2, Rec.709 Gamma 2.4)*
   and the ACES 2 output. Encode JPEG stills (about 640 px) for the UI.
 - These renders must equal what Apply produces. Check with the capture/compare harness in
   `artifacts/qa/color-camera-2026-09-26/scripts/` (target: under 1 level mean vs the live preview).
-- Three looks get one review: the model sees its first looks rendered (up to 2 shots: before + 3 looks) with their
-  measured change from before (mean 8-bit levels and the hue/saturation part), and may revise them toward the
-  per-look bands (`LOOK_BANDS`). A failed or invalid review keeps the first answer. Bands and the prompt's screen
-  scale were measured on real footage; retune with `scripts/color-assistant-tune.mjs` (real Codex, 2 calls a run).
+- Balance: the measurement offers two white-balance witnesses per shot, near-grey surfaces (pulled warm by wood floors
+  and skin) and the brightest near-whites (fooled by warm lamps and skin); each comes with the temperature/tint that
+  neutralizes it. The model picks from them by looking at the stills, as a colorist with a picker would. Temperature,
+  tint and exposure are linear-light Balance values, so the result is exact. Apply sets each shot's Balance with the look.
+- Three looks get one review: the model sees its balance and looks rendered (up to 2 shots: before + 3 looks) with
+  what the engine measured on them (change, pure-black and pure-white share before/after, skin hue shift) and may
+  revise. A failed or invalid review keeps the first answer; a shot the review leaves out keeps its first balance.
+- The library was tuned by eye on real footage (S-Log3 stage, Canon Log 3 gym, night soccer, festival lights) with a
+  scripted answer instead of the model: every look keeps skin within about 2° except vintage and cyan-green (+6°, by
+  design). Split toning lives in per-channel curves pinned at black, mid-grey and white, so blacks stay neutral.
 
 ### 3. Model call (server)
 - `server/colorAssistant.ts` owns a single job queue (one Codex call at a time; the docs allow one job stream
@@ -100,7 +106,7 @@ space → **Balance** → **Look** → **Output CST (ACES 2, Rec.709 Gamma 2.4)*
 - **Look:** contrast, pivot, saturation, lift/gamma/gain/offset (+R/G/B), and custom curves (RGB/R/G/B, ≤ 8
   points each). Extreme looks may add up to 2 extra serial look nodes, placed before the Output CST.
 - **Per shot:** `confidence` 0–1, `warnings` (enum + short text), a one-line `rationale`.
-- **Three looks:** exactly 3 options, each with `{name, intensity: natural|bold|extreme, description, nodes}`.
+- **Three looks:** `{shots: [{clipId, rationale, keepBalance, exposure, temperature, tint, confidence, warnings}], options: [3 × {intensity, recipe, strength, warmth, name, description}]}`; SharedCut turns it into Balance and Look node values.
 - **Limits:** use tighter limits than the engine's (`colorStages` in `color.ts`), e.g. exposure ±3, temperature
   ±2000, tint ±100, contrast 0.5–2.5, saturation 0–200, wheel deltas ±0.4. Validate curves with
   `validateGradeNode`. Invalid output is rejected as a whole; nothing is partly applied.

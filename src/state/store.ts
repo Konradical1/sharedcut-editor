@@ -131,7 +131,8 @@ export interface EditorStore extends PersistedState {
   removeNode(id: string): void; reorderNode(id: string, direction: number): void;
   gradeClipboard: {clip:Clip;nodes:GradeNode[]} | null; copyGrade(clipId:string):void; pasteGrade(clipId:string):void;
   /** Color Assistant proposal as normal node values on every eligible shot: one snapshot, one undo. Returns the number of shots changed. */
-  applyColorAssistant(result:{mode:AssistantMode;looks?:LookOption[];shots?:(ShotNote&{balance:BalanceValues})[]},option?:number,clipIds?:string[]):number;
+  /** Applies look `option` (with each shot's Balance from `result.shots`, when the result has one) or a balance/match result, as one undo step. */
+  applyColorAssistant(result:{mode:AssistantMode;looks?:LookOption[];shots?:(ShotNote&{balance?:BalanceValues})[]},option?:number,clipIds?:string[]):number;
   useAcesOutput(clipId:string):void;
   restoreResolveGrade(clipId:string):void; initializeColorGrade(clipId:string):void; arrangeColorNodes(clipId:string):void; moveColorNode(id:string,beforeId:string|null,position?:{x:number;y:number}):void;
   updateNode(id: string, patch: Partial<GradeNode>, gesture?: string): void; applyGrade(nodes: { name: string; parameters: Record<string, number> }[]): void;
@@ -1546,7 +1547,8 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     applyColorAssistant(result,option,clipIds=[]) {
       const state=get();if(!writable())return 0;
       const choice=result.mode==='looks'?result.looks?.[option??-1]:undefined;
-      const targets=new Map<string,Parameters<typeof proposedNodes>[2]>(result.mode==='looks'?choice?clipIds.map(id=>[id,{look:{look:choice.look,extraNodes:choice.extraNodes}}]):[]:(result.shots??[]).map(shot=>[shot.clipId,{balance:shot.balance}]));
+      const balanceOf=(id:string)=>result.shots?.find(shot=>shot.clipId===id)?.balance;
+      const targets=new Map<string,Parameters<typeof proposedNodes>[2]>(result.mode==='looks'?choice?clipIds.map(id=>{const balance=balanceOf(id);return [id,{...(balance&&{balance}),look:{look:choice.look,extraNodes:choice.extraNodes}}];}):[]:(result.shots??[]).flatMap(shot=>shot.balance?[[shot.clipId,{balance:shot.balance}]]:[]));
       const changes:Change[]=[],applied:string[]=[],skipped:string[]=[];
       try{
         for(const [id,change] of targets){

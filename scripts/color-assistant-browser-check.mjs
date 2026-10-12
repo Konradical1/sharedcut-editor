@@ -70,6 +70,7 @@ try {
   await page.getByRole('button', { name: 'Generate three looks' }).click();
   await page.waitForFunction(() => { const cards = document.querySelectorAll('.assistant-option'), images = [...document.querySelectorAll('.assistant-option img')]; return cards.length === 3 && images.length >= 6 && images.every(i => i.complete && i.naturalWidth > 0); }, null, { timeout: 240_000 });
   await page.screenshot({ path: join(out, 'three-looks.png') });
+  assert.equal(await page.getByRole('button', { name: 'Generate three looks' }).isDisabled(), false, 'Generate is ready again once the looks are shown');
   const second = page.locator('.assistant-option').nth(1), compare = second.locator('.assistant-compare');
   assert.notEqual(await compare.locator('img').first().getAttribute('src'), await second.locator('.assistant-before').getAttribute('src'), 'the look still is not the before still');
   await compare.hover({ position: { x: 90, y: 40 } });

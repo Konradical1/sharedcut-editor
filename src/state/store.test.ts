@@ -1173,6 +1173,14 @@ test('Color Assistant apply is one snapshot and one undo across shots; extras ar
   const node = state().nodes.find(n => n.clipId === a.id && n.name === 'Balance')!;
   assert.equal(node.parameters.exposure, .5); assert.equal(node.parameters.temperature, -300); assert.equal(state().snapshots[0].name, 'Before Color Assistant: Balance shots');
   assert.deepEqual(state().nodes.filter(n => n.clipId === b.id), before.nodes.filter(n => n.clipId === b.id));
+  // Three looks: a look sets each shot's own Balance from the result too; a shot without one keeps its Balance.
+  state().undo();
+  const graded2 = { ...result, shots: [{ clipId: b.id, confidence: 1, warnings: [], rationale: '', balance: { ...neutralBalance(), exposure: -.4, temperature: 900, tint: 5 } }] };
+  assert.equal(state().applyColorAssistant(graded2, 2, graded), 2);
+  const balanceOf = (id: string) => state().nodes.find(n => n.clipId === id && n.name === 'Balance')!.parameters;
+  assert.deepEqual([balanceOf(b.id).exposure, balanceOf(b.id).temperature, balanceOf(b.id).tint], [-.4, 900, 5]);
+  assert.deepEqual(balanceOf(a.id), before.nodes.find(n => n.clipId === a.id && n.name === 'Balance')!.parameters, 'no balance in the result: the shot keeps its own');
+  assert.equal(state().nodes.find(n => n.clipId === b.id && n.name === 'Look')!.parameters.contrast, 2);
 });
 
 test('Use ACES 2 output snapshots the grade and switches only the clipping display transform', () => {

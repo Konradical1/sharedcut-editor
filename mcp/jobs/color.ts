@@ -105,7 +105,8 @@ function looksText(job: AssistantJob, preSkipped: string[] = []) {
   return [
     `Color Assistant job ${id}: ${looks.length} looks for ${used.length} shot${used.length === 1 ? '' : 's'} (${used.map(handle).join(',')})${job.request.prompt ? ` · ${quote(job.request.prompt, 60)}` : ''}`,
     ...(skipped.length ? [`skipped: ${skipped.join(' | ')}`] : []),
-    ...looks.map((o, i) => `${i + 1} ${o.intensity} ${quote(o.name, 40)}: ${lookText(o.look)}${o.extraNodes.length ? ` +${o.extraNodes.length} node${o.extraNodes.length > 1 ? 's' : ''} (${o.extraNodes.map(lookText).join('; ')})` : ''}${o.description ? ` — ${quote(o.description, 120)}` : ''}${o.shots.length ? ' · ' + o.shots.map(n => `${handle(n.clipId)} ${Math.round(n.confidence * 100)}%${n.warnings.length ? ' ' + n.warnings.map(w => w.code).join(',') : ''}`).join(' · ') : ''}`),
+    ...(job.result?.shots?.length ? [`balance (applied with any look): ${job.result.shots.map(n => `${handle(n.clipId)} ${n.balance ? [n.balance.exposure ? `exp ${num(n.balance.exposure)}` : '', n.balance.temperature ? `temp ${num(n.balance.temperature)}` : '', n.balance.tint ? `tint ${num(n.balance.tint)}` : ''].filter(Boolean).join(' ') || 'neutral' : 'kept'}${n.warnings.length ? ' ' + n.warnings.map(w => w.code).join(',') : ''}`).join(' · ')}`] : []),
+    ...looks.map((o, i) => `${i + 1} ${o.intensity} ${quote(o.name, 40)}${o.recipe ? ` = ${o.recipe} ${Math.round((o.strength ?? 1) * 100)}%${o.warmth ? ` warmth ${num(o.warmth)}` : ''}` : ''}: ${lookText(o.look)}${o.extraNodes.length ? ` +${o.extraNodes.length} node${o.extraNodes.length > 1 ? 's' : ''} (${o.extraNodes.map(lookText).join('; ')})` : ''}${o.description ? ` — ${quote(o.description, 120)}` : ''}${o.shots.length ? ' · ' + o.shots.map(n => `${handle(n.clipId)} ${Math.round(n.confidence * 100)}%${n.warnings.length ? ' ' + n.warnings.map(w => w.code).join(',') : ''}`).join(' · ') : ''}`),
     `apply one: job{kind:"color-looks", params:{job:"${job.id}", apply:N}} · pictures: same job + stills:true (before + each look) or stills:N (look N on up to 3 shots)`,
   ].join('\n');
 }
@@ -171,7 +172,7 @@ export const jobs: Record<string, JobDef> = {
     },
   },
   'color-looks': {
-    doc: '{clips?, prompt?, stills?} Color Assistant → 3 looks (takes minutes); {job, apply:1-3} applies one; {job, stills?} shows it again',
+    doc: '{clips?, prompt?, stills?} Color Assistant: balances each shot, then 3 library looks (about a minute); {job, apply:1-3} applies balance + that look; {job, stills?} shows it again',
     async start(p) {
       if (p.job !== undefined) {
         const job = await findJob(need(p, 'job'));
