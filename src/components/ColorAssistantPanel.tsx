@@ -1,5 +1,5 @@
-import {useEffect,useState} from 'react';
-import {Info,RotateCw,Sparkles,Square} from 'lucide-react';
+import {useEffect,useState,type CSSProperties,type PointerEvent} from 'react';
+import {Check,Info,RotateCw,Sparkles,Square} from 'lucide-react';
 import {useStoreWithoutPlayhead} from '../state/store';
 import type {Clip} from '../state/models';
 import {acesOutputUpgrade} from '../services/color';
@@ -9,8 +9,11 @@ import {Button} from './ui';
 import './colorAssistant.css';
 
 const INTENSITY={natural:'Natural',bold:'Bold',extreme:'Extreme'} as const;
+const STYLES=['Warm film','Teal and orange','Moody night','Bleach bypass','Soft pastel'];
 const running=(job:AssistantJob|null):job is AssistantJob=>job?.status==='waiting'||job?.status==='running';
 const MAX_SHOTS=40; // server/colorAssistant.ts refuses more
+/** claude-opus-5-5 → Claude Opus 5.5; other ids as they are. */
+const modelName=(id='')=>{const parts=id.split('-'),n=parts.findIndex(p=>/^\d+$/.test(p));return id.startsWith('claude-')&&n>0?`${parts.slice(0,n).map(p=>p[0].toUpperCase()+p.slice(1)).join(' ')} ${parts.slice(n).join('.')}`:id;};
 
 /** Color page Assistant tab: the model proposes Balance/Look values; SharedCut renders the stills and applies them as normal nodes. */
 export default function ColorAssistantPanel({shots,current,capabilities}:{shots:Clip[];current?:Clip;capabilities:AssistantCapabilities}){
@@ -33,27 +36,37 @@ export default function ColorAssistantPanel({shots,current,capabilities}:{shots:
   const run=async(request:AssistantRequest)=>{setError('');setStarting(true);try{const id=await startAssistant(projectId,request);setJob({id,projectId,mode:request.mode,status:'waiting',stage:'Waiting',progress:0,createdAt:Date.now(),request,skipped:[]});}catch(e){setError((e as Error).message);}finally{setStarting(false);}};
   const cancel=()=>job&&cancelAssistant(job.projectId,job.id).then(()=>assistantJob(job.projectId,job.id)).then(setJob).catch(e=>setError((e as Error).message));
   const busy=starting||running(job),failure=error||(job?.status==='failed'?job.error||'The Color Assistant failed.':'');
+  const claude=capabilities.provider==='anthropic',vendor=claude?'Anthropic':'OpenAI';
   return <div className="color-assistant">
-    <div className="assistant-heading"><h3>Assistant</h3><details className="assistant-info"><summary aria-label="What is sent to OpenAI" title="What is sent to OpenAI"><Info size={14}/></summary><div className="assistant-popover">
-      <strong>Sent to OpenAI per request</strong><p>Up to about 10 JPEG stills (about 640 px) of graded frames, the measurement numbers, shot names, camera model and log type, and your style prompt.</p>
-      <p>Never the original video, audio, other projects or account data. It runs through your ChatGPT (Codex) login, counts against its limits, and OpenAI may use it for training per that account's setting.</p>
-      <small>The model only proposes Balance and Look values. SharedCut renders every preview and applies them as editable nodes; the ACES 2 output and camera input are never changed.{capabilities.model?` Model: ${capabilities.model}.`:''}</small>
-    </div></details></div>
-    <div className="assistant-scope color-tabs" role="group" aria-label="Shots to use">
-      <button aria-pressed={scope==='selected'} onClick={()=>setScope('selected')}>Selected shots ({picked.length})</button>
-      <button aria-pressed={scope==='timeline'} onClick={()=>setScope('timeline')}>Whole timeline ({shots.length})</button>
+    <header className="assistant-hero">
+      <span className="assistant-mark" aria-hidden><Sparkles size={15}/></span>
+      <div><h3>Color Assistant</h3><p>Three looks for your shots, from natural to extreme. Preview them on your footage, then apply one as editable nodes.</p></div>
+      <details className="assistant-info"><summary aria-label={`What is sent to ${vendor}`} title={`What is sent to ${vendor}`}><Info size={14}/></summary><div className="assistant-popover">
+        <strong>Sent to {vendor} per request</strong><p>Up to about 10 JPEG stills (about 640 px) of graded frames, the measurement numbers, shot names, camera model and log type, and your style prompt.</p>
+        <p>Never the original video, audio, other projects or account data. {claude?'It runs on this server\'s Anthropic API key. Anthropic does not train on API data by default.':'It runs through your ChatGPT (Codex) login, counts against its limits, and OpenAI may use it for training per that account\'s setting.'}</p>
+        <small>The model only proposes Balance and Look values. SharedCut renders every preview and applies them as editable nodes; the ACES 2 output and camera input are never changed.</small>
+      </div></details>
+      {capabilities.model&&<span className="assistant-model">{modelName(capabilities.model)}</span>}
+    </header>
+    <div className="assistant-field">
+      <span>Shots</span>
+      <div className="assistant-scope color-tabs" role="group" aria-label="Shots to use">
+        <button aria-pressed={scope==='selected'} onClick={()=>setScope('selected')}>Selected shots ({picked.length})</button>
+        <button aria-pressed={scope==='timeline'} onClick={()=>setScope('timeline')}>Whole timeline ({shots.length})</button>
+      </div>
+      {scope==='selected'&&<small className="assistant-hint">Cmd-click (Mac), Ctrl-click or Shift-click shots in the strip to pick several.</small>}
     </div>
-    <small className="assistant-hint">Cmd-click (Mac) or Ctrl-click, or Shift-click shots in the strip to pick several.</small>
     <SkipList skips={skips} name={name}/>
-    <label className="assistant-prompt"><span>Style (optional)</span><textarea maxLength={500} rows={3} placeholder="cool, dramatic night scene" value={prompt} onChange={e=>setPrompt(e.target.value)}/></label>
+    <label className="assistant-field assistant-prompt"><span>Style <small>optional</small></span><textarea maxLength={500} rows={2} placeholder="cool, dramatic night scene" value={prompt} onChange={e=>setPrompt(e.target.value)}/></label>
+    <div className="assistant-styles" role="group" aria-label="Style ideas">{STYLES.map(style=><button key={style} aria-pressed={prompt===style} onClick={()=>setPrompt(prompt===style?'':style)}>{style}</button>)}</div>
     {!capabilities.available&&<p className="color-notice" role="alert">{capabilities.reason}</p>}
     <Button variant="primary" className="assistant-generate" disabled={!capabilities.available||busy||!ids.length||tooMany} onClick={()=>void run({mode:'looks',clipIds:ids,...(prompt.trim()?{prompt:prompt.trim()}:{})})}><Sparkles size={14}/>Generate three looks</Button>
     {tooMany&&<small className="assistant-hint">{ids.length} usable shots; the assistant takes at most {MAX_SHOTS}. Select fewer.</small>}
-    {running(job)&&<div className="assistant-job"><span role="status">{job.stage||'Waiting for the assistant…'}</span><div><progress aria-label="Color Assistant progress" max={100} value={job.progress}/><span>{Math.round(job.progress)}%</span><button aria-label="Cancel Color Assistant" title="Cancel" onClick={()=>void cancel()}><Square size={12}/></button></div></div>}
+    {running(job)&&<div className="assistant-job"><div><span role="status">{job.stage||'Waiting for the assistant…'}</span><span>{Math.round(job.progress)}%</span><button aria-label="Cancel Color Assistant" title="Cancel" onClick={()=>void cancel()}><Square size={11}/></button></div><progress aria-label="Color Assistant progress" max={100} value={job.progress}/><small>Usually about a minute. You can keep grading meanwhile.</small></div>}
     {failure&&<p className="color-notice" role="alert">{failure}</p>}
     {job?.status==='cancelled'&&<small>Cancelled.</small>}
     {shown?.result?.looks&&<section className="assistant-results" aria-label="Three looks">
-      <div className="assistant-results-heading"><strong>{used.length} shot{used.length===1?'':'s'}{shown.request.prompt?` · “${shown.request.prompt}”`:''}</strong><Button disabled={busy} onClick={()=>void run(shown.request)}><RotateCw size={13}/>Regenerate</Button></div>
+      <div className="assistant-results-heading"><strong>{used.length} shot{used.length===1?'':'s'}{shown.request.prompt?`, “${shown.request.prompt}”`:''}</strong><Button variant="ghost" disabled={busy} onClick={()=>void run(shown.request)}><RotateCw size={13}/>Regenerate</Button></div>
       {shown.skipped.length>0&&<SkipList skips={shown.skipped} name={name} label="Skipped in this result"/>}
       {shown.result.looks.map((option,i)=><OptionCard key={`${shown.id}-${i}`} job={shown} option={option} index={i} name={name} apply={()=>s.applyColorAssistant({mode:shown.mode,...shown.result!},i,used)}/>)}
     </section>}
@@ -69,19 +82,28 @@ function SkipList({skips,name,label='Will be skipped'}:{skips:AssistantSkip[];na
 }
 
 function OptionCard({job,option,index,name,apply}:{job:AssistantJob;option:LookOption;index:number;name:(id:string)=>string;apply:()=>void}){
-  const [held,setHeld]=useState(false),[toggled,setToggled]=useState(false),before=held||toggled;
+  const [toggled,setToggled]=useState(false),[wipe,setWipe]=useState<number|null>(null),[pick,setPick]=useState(0),[applied,setApplied]=useState(false);
+  useEffect(()=>{if(!applied)return;const timer=setTimeout(()=>setApplied(false),2000);return()=>clearTimeout(timer);},[applied]);
   // One still per shot, three shots at most: enough to judge the look without a wall of images.
-  const stills=(job.result?.stills??[]).filter((still,i,all)=>all.findIndex(o=>o.clipId===still.clipId)===i).slice(0,3);
-  return <article className="assistant-option" aria-label={`Look ${index+1}: ${option.name}`}>
-    <header><strong>{option.name}</strong><span className={`assistant-intensity ${option.intensity}`}>{INTENSITY[option.intensity]}</span></header>
-    {option.description&&<p>{option.description}</p>}
-    {stills.length>0&&<div className="assistant-stills" title="Press and hold to see before" onPointerDown={()=>setHeld(true)} onPointerUp={()=>setHeld(false)} onPointerLeave={()=>setHeld(false)} onPointerCancel={()=>setHeld(false)}>
-      {stills.map(still=><img key={still.clipId} draggable={false} src={before?still.before:still.after[index]??still.before} alt={`${name(still.clipId)}, ${before?'before':`with ${option.name}`}`}/>)}
+  const stills=(job.result?.stills??[]).filter((still,i,all)=>all.findIndex(o=>o.clipId===still.clipId)===i).slice(0,3),still=stills[Math.min(pick,stills.length-1)];
+  // Split-screen wipe: before left of the line, the look right of it. Hover or drag moves it; Before shows the whole frame ungraded.
+  const split=toggled?100:wipe??0,move=(e:PointerEvent<HTMLDivElement>)=>{const box=e.currentTarget.getBoundingClientRect();setWipe(Math.max(0,Math.min(100,(e.clientX-box.left)/box.width*100)));};
+  const warnings=option.shots.reduce((n,note)=>n+note.warnings.length,0),level=index+1;
+  return <article className="assistant-option" aria-label={`Look ${level}: ${option.name}`}>
+    {still&&<div className="assistant-compare" data-view={toggled?'before':wipe===null?'look':'split'} style={{'--wipe':`${split}%`} as CSSProperties} title="Move across the picture to compare with before" onPointerMove={move} onPointerDown={move} onPointerLeave={()=>setWipe(null)}>
+      <img draggable={false} src={still.after[index]??still.before} alt={`${name(still.clipId)} with ${option.name}`}/>
+      <img draggable={false} className="assistant-before" src={still.before} alt={`${name(still.clipId)} before`}/>
+      {split>0&&split<100&&<i className="assistant-wipe" aria-hidden/>}
+      {split>0&&<span className="assistant-tag" aria-hidden>Before</span>}
     </div>}
-    {option.shots.length>0&&<ul className="assistant-notes">{option.shots.map(note=><li key={note.clipId} title={note.rationale}>
+    {stills.length>1&&<div className="assistant-thumbs" role="group" aria-label="Shot to preview">{stills.map((item,i)=><button key={item.clipId} aria-pressed={item===still} aria-label={`Preview ${name(item.clipId)}`} title={name(item.clipId)} onClick={()=>setPick(i)}><img draggable={false} src={item.after[index]??item.before} alt=""/></button>)}</div>}
+    <header><strong>{option.name}</strong><span className={`assistant-intensity ${option.intensity}`} aria-label={`Intensity ${level} of 3: ${INTENSITY[option.intensity]}`}><span aria-hidden>{[1,2,3].map(n=><i key={n} className={n<=level?'on':''}/>)}</span>{INTENSITY[option.intensity]}</span></header>
+    {option.description&&<p>{option.description}</p>}
+    {option.shots.length>0&&<details className="assistant-notes"><summary>{option.shots.length} shot note{option.shots.length===1?'':'s'}{warnings>0&&<em>{warnings} to check</em>}</summary><ul>{option.shots.map(note=><li key={note.clipId}>
       <span><strong>{name(note.clipId)}</strong><em className={note.confidence<.5?'low':''}>{Math.round(note.confidence*100)}% confident</em></span>
+      {note.rationale&&<p>{note.rationale}</p>}
       {note.warnings.map((w,j)=><p key={j} className="color-notice">{w.text||w.code}</p>)}
-    </li>)}</ul>}
-    <div className="assistant-actions"><Button aria-pressed={toggled} onClick={()=>setToggled(!toggled)}>Before</Button><Button variant="primary" onClick={apply} aria-label={`Apply ${option.name}`}>Apply</Button></div>
+    </li>)}</ul></details>}
+    <div className="assistant-actions"><Button variant="ghost" aria-pressed={toggled} onClick={()=>setToggled(!toggled)}>Before</Button><Button variant="primary" onClick={()=>{apply();setApplied(true);}} aria-label={`Apply ${option.name}`}>{applied?<><Check size={13}/>Applied</>:'Apply look'}</Button></div>
   </article>;
 }

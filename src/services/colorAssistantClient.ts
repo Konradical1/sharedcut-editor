@@ -1,7 +1,7 @@
 import { api, connection } from './api.ts';
 import type { AssistantMode, BalanceValues, Eligibility, LookOption, ShotNote } from './colorAssistant.ts';
 
-export type AssistantCapabilities = { available: boolean; reason?: string; model?: string };
+export type AssistantCapabilities = { available: boolean; reason?: string; model?: string; provider?: string };
 export type AssistantRequest = { mode: AssistantMode; clipIds: string[]; referenceClipId?: string; prompt?: string };
 /** Eligibility codes, plus the server's own ('missing-media', 'invalid-grade'). */
 export type AssistantSkip = { clipId: string; code: Extract<Eligibility, { ok: false }>['code'] | (string & {}); text: string };

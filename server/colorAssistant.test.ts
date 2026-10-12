@@ -137,11 +137,16 @@ test('only allow-listed editors reach the Color Assistant; bad requests, strange
     // Account ids, never emails: any user can set their own email to an address that sits on the list.
     process.env.FRAME_LINE_AI_USERS = ` ${f.konradId} , spare@test.example,`;
     assert.equal(aiColorAllowed(f.konradId), true); assert.equal(aiColorAllowed(f.otherId), false); assert.equal(aiColorAllowed(undefined), false); assert.equal(aiColorAllowed(f.konradId.toUpperCase()), false);
+    await withEnv({ FRAME_LINE_AI_USERS: '*' }, () => { assert.equal(aiColorAllowed(f.otherId), true, '* lets every signed-in account in'); assert.equal(aiColorAllowed(undefined), false); });
     assert.equal((await f.request('/auth/profile', f.other, { email: 'spare@test.example' }, 'PATCH')).status, 200);
     const refused = (await f.request('/color-assistant/capabilities', f.other)).data; assert.equal(refused.available, false); assert.match(refused.reason, /not enabled/, 'an email taken over does not unlock it');
     assert.equal((await post(f, { mode: 'looks', clipIds: ['good'] }, f.other)).status, 403, 'an editor off the allow-list cannot spend the quota');
     assert.equal((await f.request('/projects/film/color-assistant', f.other)).status, 403);
     const mine = (await f.request('/color-assistant/capabilities', f.konrad)).data; assert.equal(mine.available, existsSync(colorPython())); assert.equal(mine.model, 'gpt-6-astra');
+    await withEnv({ FRAME_LINE_AI_PROVIDER: 'anthropic', ANTHROPIC_API_KEY: undefined }, async () => {
+      const claude = (await f.request('/color-assistant/capabilities', f.konrad)).data; assert.equal(claude.model, 'claude-opus-5-5'); assert.equal(claude.provider, 'anthropic');
+      if (existsSync(colorPython())) assert.match(claude.reason, /ANTHROPIC_API_KEY/, 'no key, no Claude');
+    });
     for (const [body, pattern] of [
       [{ mode: 'grade', clipIds: ['good'] }, /Choose Three looks/], [{ mode: 'looks', clipIds: ['nope'] }, /not in this project/], [{ mode: 'looks', clipIds: [] }, /1 to 40/],
       [{ mode: 'looks', clipIds: Array.from({ length: 41 }, (_, i) => `c${i}`) }, /1 to 40/], [{ mode: 'looks', clipIds: ['good'], prompt: 'x'.repeat(501) }, /500/],

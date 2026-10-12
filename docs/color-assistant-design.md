@@ -12,9 +12,9 @@ how it was validated), `src/services/color.ts`, `src/services/colorPreview.ts`, 
 
 | Question | Decision |
 |---|---|
-| Who can run it | Only Konrad. Collaborators may see the results, but they cannot trigger AI calls. |
-| AI connection | Konrad's Codex login (ChatGPT plan) via `codex exec`. No API key for now. |
-| Model | `gpt-6-astra` (the best available; tested OK on Codex CLI 0.157.1). Configurable. |
+| Who can run it | Accounts in `FRAME_LINE_AI_USERS`; `*` = every signed-in account (used with Claude, 2026-10-12). |
+| AI connection | `FRAME_LINE_AI_PROVIDER=anthropic`: Claude on the server's `ANTHROPIC_API_KEY` (production). `codex` (default): Konrad's Codex login via `codex exec`. |
+| Model | `claude-opus-5-5` for anthropic, `gpt-6-astra` for codex. `FRAME_LINE_AI_MODEL` overrides. |
 | Training setting | Left as is. The stills sent may be used by OpenAI for training; Konrad is fine with that. |
 | Output transform | ACES 2 Output CST stays fixed. The assistant edits only Balance and Look nodes (plus extra look nodes it adds). |
 | Three looks | The model decides the three looks. An optional text prompt steers them ("cool, dramatic night scene"). The three always climb in intensity: **1 close to natural, 2 goes a little crazy, 3 all-out cinematic, dramatic, super stylized.** Be genuinely creative. Everything stays editable afterwards. |
@@ -88,8 +88,12 @@ space → **Balance** → **Look** → **Output CST (ACES 2, Rec.709 Gamma 2.4)*
 - `--ignore-user-config` matters. Konrad's personal config loads MCP servers, hooks and skills.
 - The live server runs as Windows user `<user>` (elevated scheduled task, S4U), so it uses his existing
   `codex login`.
-- Add `FRAME_LINE_AI_PROVIDER=fake` (returns fixed valid JSON) for tests. No API-key provider yet; add one only
-  if collaborators ever need to run it.
+- Add `FRAME_LINE_AI_PROVIDER=fake` (returns fixed valid JSON) for tests.
+- `FRAME_LINE_AI_PROVIDER=anthropic` sends the same stills, prompt and schema as one Messages request (structured
+  output, `FRAME_LINE_AI_EFFORT` low..max, refusal fallbacks on). Claude's schema grammar has a size cap and no array
+  length, so repeated parts go to `$defs` and the three looks are asked for as `item1..item3`, then turned back
+  (`server/codexExec.ts`). About 20 s per call; a run is two calls. QA on real Claude:
+  `FRAME_LINE_AI_PROVIDER=anthropic node --experimental-strip-types scripts/color-assistant-browser-check.mjs`.
 
 ### 4. What the model may return (JSON schema, enforced twice)
 - **Balance:** exposure, temperature, tint, and lift/gamma/gain/offset R/G/B deltas.

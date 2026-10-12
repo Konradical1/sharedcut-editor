@@ -1,7 +1,7 @@
 // Color Assistant "three looks" end to end in the browser with the fake model provider: pick two shots, generate,
 // wait for three cards with rendered stills, apply look 2, then one undo. Isolated account, database and a synthetic
 // S-Log3 clip; the live data folder is never read or written. Screenshots land in artifacts/qa/color-assistant/.
-//   node --experimental-strip-types scripts/color-assistant-browser-check.mjs   (QA_DIST=<built client> skips the build)
+//   node --experimental-strip-types scripts/color-assistant-browser-check.mjs   (QA_DIST=<built client> skips the build; FRAME_LINE_AI_PROVIDER=anthropic uses real Claude)
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
@@ -11,7 +11,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { browserExecutable } from './browser-options.mjs';
 
 const EMAIL = 'color-assistant@example.test';
-process.env.FRAME_LINE_AI_PROVIDER = 'fake'; delete process.env.FRAME_LINE_AI_USERS; delete process.env.FRAME_LINE_SIGNUP_CODE;
+process.env.FRAME_LINE_AI_PROVIDER ||= 'fake'; delete process.env.FRAME_LINE_AI_USERS; delete process.env.FRAME_LINE_SIGNUP_CODE;
 const { createFrameLineServer } = await import('../server/index.ts');
 const { starterGrade } = await import('../src/services/color.ts');
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright');
@@ -62,17 +62,21 @@ try {
   await page.getByRole('button', { name: 'Shot 1: Street' }).click();
   await page.getByRole('button', { name: 'Shot 2: Window' }).click({ modifiers: ['ControlOrMeta'] });
   assert.match(await page.getByRole('button', { name: 'Shot 2: Window' }).getAttribute('class'), /picked/, 'Ctrl/Cmd-click marks the extra shot');
-  await page.getByRole('button', { name: 'Show effects panel' }).click();
-  await page.locator('.inspector-tabs').getByRole('button', { name: 'Assistant', exact: true }).click();
+  await page.locator('.assistant-open').click(); // the node toolbar's Assistant button opens the side panel on its tab
+  assert.equal(await page.locator('.inspector-tabs').getByRole('button', { name: 'Assistant', exact: true }).getAttribute('aria-pressed'), 'true');
   await page.getByRole('button', { name: 'Selected shots (2)' }).waitFor();
   await page.getByPlaceholder('cool, dramatic night scene').fill('cool, dramatic night scene');
   const before = await looks(), snapshots = (await saved()).snapshots.length;
   await page.getByRole('button', { name: 'Generate three looks' }).click();
   await page.waitForFunction(() => { const cards = document.querySelectorAll('.assistant-option'), images = [...document.querySelectorAll('.assistant-option img')]; return cards.length === 3 && images.length >= 6 && images.every(i => i.complete && i.naturalWidth > 0); }, null, { timeout: 240_000 });
   await page.screenshot({ path: join(out, 'three-looks.png') });
-  const second = page.locator('.assistant-option').nth(1), after = await second.locator('img').first().getAttribute('src');
+  const second = page.locator('.assistant-option').nth(1), compare = second.locator('.assistant-compare');
+  assert.notEqual(await compare.locator('img').first().getAttribute('src'), await second.locator('.assistant-before').getAttribute('src'), 'the look still is not the before still');
+  await compare.hover({ position: { x: 90, y: 40 } });
+  assert.equal(await compare.getAttribute('data-view'), 'split', 'hovering the still wipes between before and the look');
+  await page.screenshot({ path: join(out, 'wipe.png') });
   await second.getByRole('button', { name: 'Before', exact: true }).click();
-  assert.notEqual(await second.locator('img').first().getAttribute('src'), after, 'Before shows the ungraded-proposal still');
+  assert.equal(await compare.getAttribute('data-view'), 'before', 'Before shows the whole frame before the look');
   await page.waitForFunction(() => [...document.querySelectorAll('.assistant-option img')].every(i => i.complete && i.naturalWidth > 0));
   await page.screenshot({ path: join(out, 'before.png') });
   await second.getByRole('button', { name: 'Before', exact: true }).click();

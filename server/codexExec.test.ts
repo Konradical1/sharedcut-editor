@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { outputSchema, validateOutput } from '../src/services/colorAssistant.ts';
-import { codexArgs, codexCommand, codexShimError, execCodex, fakeOutput, runCodex } from './codexExec.ts';
+import { aiModel, codexArgs, codexCommand, codexShimError, execCodex, fakeOutput, objectsAsTuples, runCodex, sharedDefs, tuplesAsObjects } from './codexExec.ts';
 
 const withEnv = async <T,>(values: Record<string, string | undefined>, work: () => T | Promise<T>): Promise<T> => {
   const previous = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]));
@@ -103,3 +103,20 @@ test('execCodex kills the whole tree on timeout and on cancel', { timeout: 30_00
     await assert.rejects(execCodex(process.execPath, stub(''), 'p', 'o', controller.signal), /cancelled/);
   } finally { await rm(directory, { recursive: true, force: true, maxRetries: 3 }); }
 });
+
+// Claude's grammar has a size cap and no array length: the 40-shot looks schema failed with "compiled grammar is too large", and the review pass came back with the wrong number of looks.
+test('Claude gets the looks schema with shared $defs and the three looks as fixed keys, and the answer comes back in the original shape', () => {
+  const schema = outputSchema('looks', Array.from({ length: 40 }, (_, i) => `S${i + 1}`)), wire = sharedDefs(tuplesAsObjects(schema) as object) as { $defs: Record<string, unknown> };
+  const deref = (node: unknown): unknown => !node || typeof node !== 'object' ? node : Array.isArray(node) ? node.map(deref) : '$ref' in node ? deref(wire.$defs[String(node.$ref).split('/').pop()!]) : Object.fromEntries(Object.entries(node).filter(([key]) => key !== '$defs').map(([key, value]) => [key, deref(value)]));
+  assert.deepEqual(deref(wire), tuplesAsObjects(schema), '$defs only moves repeated parts');
+  assert.ok(JSON.stringify(wire).length < JSON.stringify(schema).length / 2);
+  assert.doesNotMatch(JSON.stringify(wire), /"minItems":[2-9]/, 'no array length is left for the grammar to drop');
+  const answer = fakeOutput(schema) as { options: unknown[] }, keyed = { options: { item1: answer.options[0], item2: answer.options[1], item3: answer.options[2] } };
+  assert.deepEqual(objectsAsTuples(schema, keyed), answer);
+  assert.deepEqual(validateOutput('looks', objectsAsTuples(schema, keyed), Array.from({ length: 40 }, (_, i) => `S${i + 1}`)).options.length, 3);
+});
+
+test('the anthropic provider defaults to Opus 5.5 and refuses a Codex-only effort before any request', () => withEnv({ FRAME_LINE_AI_PROVIDER: 'anthropic', FRAME_LINE_AI_MODEL: undefined, FRAME_LINE_AI_EFFORT: 'minimal' }, async () => {
+  assert.equal(aiModel(), 'claude-opus-5-5');
+  await assert.rejects(runCodex({ prompt: 'p', images: [], schema: {} }), /FRAME_LINE_AI_EFFORT/);
+}));

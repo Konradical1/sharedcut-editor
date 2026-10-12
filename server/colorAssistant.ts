@@ -25,18 +25,19 @@ const JOB_ID = /^[a-f0-9-]{36}$/, PROJECT_ID = /^[a-zA-Z0-9_-]{1,160}$/, STILL =
 export class ColorAssistantError extends Error { status: number; constructor(status: number, message: string) { super(message); this.status = status; } }
 const fail = (status: number, message: string): never => { throw new ColorAssistantError(status, message); };
 
-/** FRAME_LINE_AI_USERS: comma-separated account ids (user-…, see /api/auth/me). Ids, not emails: any user can change their own email. Unset or empty = off for everyone. */
+/** FRAME_LINE_AI_USERS: comma-separated account ids (user-…, see /api/auth/me), or * for every signed-in account. Ids, not emails: any user can change their own email. Unset or empty = off for everyone. */
 export function aiColorAllowed(userId?: string) {
   const users = (process.env.FRAME_LINE_AI_USERS ?? '').split(',').map(item => item.trim()).filter(Boolean);
-  return Boolean(userId) && users.includes(userId!);
+  return Boolean(userId) && (users.includes('*') || users.includes(userId!));
 }
-export function colorAssistantCapabilities(userId?: string): { available: boolean; reason?: string; model?: string } {
-  if (!aiColorAllowed(userId)) return { available: false, reason: 'The Color Assistant is not enabled for this account.' };
-  const model = aiModel(), codex = codexCommand(), shim = aiProvider() === 'codex' ? codexShimError(codex) : undefined;
-  if (shim) return { available: false, reason: shim, model };
-  if (!existsSync(colorPython()) || !existsSync(worker)) return { available: false, reason: 'OpenColorIO is not installed on this server. Run npm run setup:color.', model };
-  if (aiProvider() === 'codex' && isAbsolute(codex) && !existsSync(codex)) return { available: false, reason: `Codex CLI not found at ${codex}. Install it or set FRAME_LINE_CODEX.`, model };
-  return { available: true, model };
+export function colorAssistantCapabilities(userId?: string): { available: boolean; reason?: string; model?: string; provider?: string } {
+  if (!aiColorAllowed(userId)) return { available: false, reason: 'The Color Assistant is not enabled for this account. Ask the server owner to add you.' };
+  const provider = aiProvider(), model = aiModel(), codex = codexCommand(), shim = provider === 'codex' ? codexShimError(codex) : undefined, no = (reason: string) => ({ available: false, reason, model, provider });
+  if (shim) return no(shim);
+  if (!existsSync(colorPython()) || !existsSync(worker)) return no('OpenColorIO is not installed on this server. Run npm run setup:color.');
+  if (provider === 'codex' && isAbsolute(codex) && !existsSync(codex)) return no(`Codex CLI not found at ${codex}. Install it or set FRAME_LINE_CODEX.`);
+  if (provider === 'anthropic' && !process.env.ANTHROPIC_API_KEY) return no('Set ANTHROPIC_API_KEY on the server to use Claude.');
+  return { available: true, model, provider };
 }
 
 export type ColorAssistantRequest = { mode: AssistantMode; clipIds: string[]; referenceClipId?: string; prompt?: string };
@@ -204,7 +205,7 @@ const lastLine = (error: unknown) => (error as Error).message.split('\n').map(li
 export function colorAssistantService(dataDir: string, codex: typeof runCodex = runCodex) {
   const root = join(dataDir, 'color-assistant'), cache = join(dataDir, 'cache', 'color-assistant');
   const active = new Map<string, { job: ColorAssistantJob; controller: AbortController }>(), dropped = new Set<string>();
-  // ponytail: one serial queue for the whole server (one Codex job stream per login); per-account queues if an API-key provider arrives.
+  // ponytail: one serial queue for the whole server (one Codex job stream per login; also caps Claude spend); per-account queues if many people grade at once.
   let queue = Promise.resolve(), closed = false;
   const dir = (projectId: string, id: string) => { if (!PROJECT_ID.test(projectId) || !JOB_ID.test(id)) fail(404, 'Color Assistant result not found.'); return join(root, projectId, id); };
   const url = (job: ColorAssistantJob, file: string) => `/api/projects/${job.projectId}/color-assistant/${job.id}/stills/${file}`;

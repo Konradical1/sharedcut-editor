@@ -61,6 +61,7 @@
     "test:masks:inference": "node --experimental-strip-types scripts/smart-mask-inference-check.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
     "@huggingface/transformers": "^4.2.0",
     "@napi-rs/canvas": "^1.0.9",
     "@tailwindcss/vite": "^4.1.0",

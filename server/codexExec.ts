@@ -2,11 +2,14 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import Anthropic from '@anthropic-ai/sdk';
+import { jsonSchemaOutputFormat } from '@anthropic-ai/sdk/helpers/json-schema';
 import { killProcessTree } from './processTree.ts';
 
-export const aiModel = () => process.env.FRAME_LINE_AI_MODEL || 'gpt-6-astra';
-export const aiEffort = () => process.env.FRAME_LINE_AI_EFFORT || 'medium';
+/** codex = the Codex CLI on one ChatGPT login; anthropic = Claude on the server's ANTHROPIC_API_KEY, usable by every allowed account; fake = tests. */
 export const aiProvider = () => process.env.FRAME_LINE_AI_PROVIDER || 'codex';
+export const aiModel = () => process.env.FRAME_LINE_AI_MODEL || (aiProvider() === 'anthropic' ? 'claude-opus-5-5' : 'gpt-6-astra');
+export const aiEffort = () => process.env.FRAME_LINE_AI_EFFORT || 'medium';
 
 /** The npm `codex.cmd` shim needs a shell, so Windows spawns the vendored codex.exe directly. APPDATA can be unset under the S4U task. */
 export function codexCommand(platform = process.platform, arch = process.arch) {
@@ -54,14 +57,88 @@ export function execCodex(command: string, args: string[], prompt: string, outPa
   });
 }
 
+/** Claude compiles the schema into a size-capped grammar ("compiled grammar is too large" inline): each repeated object or array subtree becomes one $defs entry. */
+export function sharedDefs(schema: object): object {
+  const seen = new Map<string, number>(), names = new Map<string, string>(), $defs: Record<string, unknown> = {};
+  const count = (node: unknown) => {
+    if (!node || typeof node !== 'object') return;
+    const type = (node as { type?: unknown }).type; if (type === 'object' || type === 'array') { const key = JSON.stringify(node); seen.set(key, (seen.get(key) ?? 0) + 1); }
+    Object.values(node).forEach(count);
+  };
+  const swap = (node: unknown, root = false): unknown => {
+    if (!node || typeof node !== 'object') return node;
+    if (Array.isArray(node)) return node.map(item => swap(item));
+    const key = JSON.stringify(node), copy = () => Object.fromEntries(Object.entries(node).map(([name, value]) => [name, swap(value)]));
+    if (root || (seen.get(key) ?? 0) < 2) return copy();
+    if (!names.has(key)) { names.set(key, `d${names.size}`); $defs[names.get(key)!] = copy(); }
+    return { $ref: `#/$defs/${names.get(key)}` };
+  };
+  count(schema);
+  const out = swap(schema, true) as object;
+  return names.size ? { ...out, $defs } : out;
+}
+
+type Node = Record<string, any>;
+const fixedLength = (node: Node) => node.type === 'array' && node.minItems > 1 && node.minItems === node.maxItems;
+const slots = (node: Node) => Array.from({ length: node.minItems as number }, (_, i) => `item${i + 1}`);
+/** Claude's grammar cannot fix an array's length (the SDK moves minItems > 1 into the description), so the three looks came back as two or four.
+ * A fixed-length array is asked for as an object with one key per item; objectsAsTuples turns the answer back. */
+export function tuplesAsObjects(schema: unknown): unknown {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(tuplesAsObjects);
+  const node = schema as Node;
+  if (!fixedLength(node)) return Object.fromEntries(Object.entries(node).map(([key, value]) => [key, tuplesAsObjects(value)]));
+  const keys = slots(node), item = tuplesAsObjects(node.items);
+  return { type: 'object', additionalProperties: false, required: keys, properties: Object.fromEntries(keys.map(key => [key, item])), ...(node.description && { description: node.description }) };
+}
+export function objectsAsTuples(schema: unknown, value: unknown): unknown {
+  if (!schema || typeof schema !== 'object' || !value || typeof value !== 'object') return value;
+  const node = schema as Node, object = value as Node;
+  if (fixedLength(node) && !Array.isArray(value)) return slots(node).map(key => objectsAsTuples(node.items, object[key]));
+  if (Array.isArray(value)) return value.map(item => objectsAsTuples(node.items, item));
+  return Object.fromEntries(Object.entries(object).map(([key, item]) => [key, objectsAsTuples(node.properties?.[key], item)]));
+}
+
+let client: Anthropic | undefined;
+/** One Messages request: the same stills, prompt and schema Codex gets. Structured output; the caller still validates every value. */
+export async function execAnthropic({ prompt, images, schema, signal, timeoutMs }: { prompt: string; images: string[]; schema: object; signal?: AbortSignal; timeoutMs: number }): Promise<unknown> {
+  const effort = aiEffort();
+  if (!['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) throw new Error(`FRAME_LINE_AI_EFFORT must be low, medium, high, xhigh or max for Claude, not "${effort}".`);
+  const stills = await Promise.all(images.map(async image => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: 'image/jpeg' as const, data: (await readFile(image)).toString('base64') } })));
+  const timeout = AbortSignal.timeout(timeoutMs);
+  try {
+    client ??= new Anthropic();
+    // fallbacks: a safety decline is retried server-side on a model that will answer, inside the same call.
+    const message = await client.beta.messages.stream({ model: aiModel(), max_tokens: 32_000, betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default',
+      output_config: { effort: effort as 'medium', format: jsonSchemaOutputFormat(sharedDefs(tuplesAsObjects(schema) as object) as { type: 'object' }) }, messages: [{ role: 'user', content: [...stills, { type: 'text', text: prompt }] }] },
+    { signal: signal ? AbortSignal.any([signal, timeout]) : timeout }).finalMessage();
+    if (message.stop_reason === 'refusal') throw new Error('Claude declined this request.');
+    if (message.stop_reason === 'max_tokens') throw new Error('The AI answer was cut off. Try fewer shots.');
+    const text = message.content.find(block => block.type === 'text')?.text;
+    let value: unknown;
+    try { value = JSON.parse(text ?? ''); } catch { throw new Error('The AI returned no valid JSON.'); }
+    return objectsAsTuples(schema, value);
+  } catch (error) {
+    if (signal?.aborted) throw new Error('AI request cancelled.');
+    if (timeout.aborted) throw new Error(`The AI request timed out after ${Math.round(timeoutMs / 1000)} s.`);
+    if (error instanceof Anthropic.AuthenticationError) throw new Error('Anthropic rejected the API key. Check ANTHROPIC_API_KEY on the server.');
+    if (error instanceof Anthropic.RateLimitError) throw new Error('Anthropic rate limit reached. Try again in a minute.');
+    if (error instanceof Anthropic.APIError) throw new Error(`The AI request failed (Anthropic ${error.status ?? 'connection error'}). ${redact(error.message).slice(0, 300)}`.trim());
+    throw error;
+  }
+}
+
 // ponytail: one global chain, one Codex job stream per auth.json; per-account chains if an API-key provider arrives.
 let queue: Promise<unknown> = Promise.resolve();
 
+/** Dispatches on FRAME_LINE_AI_PROVIDER. */
 export async function runCodex({ prompt, images, schema, signal, timeoutMs = 180_000 }: { prompt: string; images: string[]; schema: object; signal?: AbortSignal; timeoutMs?: number }): Promise<unknown> {
   const provider = aiProvider();
-  if (provider !== 'codex' && provider !== 'fake') throw new Error(`FRAME_LINE_AI_PROVIDER must be codex or fake, not "${provider}".`);
+  if (provider !== 'codex' && provider !== 'anthropic' && provider !== 'fake') throw new Error(`FRAME_LINE_AI_PROVIDER must be codex, anthropic or fake, not "${provider}".`);
   if (signal?.aborted) throw new Error('AI request cancelled.');
   if (provider === 'fake') return fakeOutput(schema);
+  // No queue: the API key has no single-session limit, and the Color Assistant already runs one job at a time.
+  if (provider === 'anthropic') return execAnthropic({ prompt, images, schema, signal, timeoutMs });
   const paths = images.map(image => resolve(image)); // cwd is the temp dir, so relative paths would miss.
   for (const path of paths) if (path.includes(',')) throw new Error(`Codex splits -i on commas; rename ${path}.`);
   const task = queue.then(async () => {
