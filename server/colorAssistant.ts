@@ -19,7 +19,9 @@ const colorRender = fileURLToPath(new URL('../scripts/color-render.py', import.m
 const ENGINE = createHash('sha256').update([worker, colorRender].map(file => { try { return readFileSync(file, 'utf8'); } catch { return ''; } }).join('\0')).digest('hex').slice(0, 16);
 export const colorPython = () => process.env.FRAME_LINE_COLOR_PYTHON || venvPython('.venv-color');
 const ffmpeg = () => process.env.FFMPEG_PATH || 'ffmpeg';
-const WIDTH = 640, FRAMES = 5, MAX_SHOTS = 40, MAX_STILLS = 10, PREVIEW_SHOTS = 3, MAX_ACTIVE = 4, KEEP_JOBS = 20, CACHE_DAYS = 7, PROMPT_BUDGET = 12_000;
+/** Working-frame width, shared with Normalize (the cache key includes it). */
+export const WIDTH = 640;
+const FRAMES = 5, MAX_SHOTS = 40, MAX_STILLS = 10, PREVIEW_SHOTS = 3, MAX_ACTIVE = 4, KEEP_JOBS = 20, CACHE_DAYS = 7, PROMPT_BUDGET = 12_000;
 const MATRICES = ['bt709', 'bt470bg', 'smpte170m', 'bt2020nc'];
 const JOB_ID = /^[a-f0-9-]{36}$/, PROJECT_ID = /^[a-zA-Z0-9_-]{1,160}$/, STILL = /^[a-z0-9-]+\.jpg$/;
 
@@ -90,13 +92,18 @@ const stagesFor = (clip: Clip, asset: MediaAsset, nodes: GradeNode[]) => { const
 /** Index of the first stage from the Balance node on: everything before it is the cached working-space picture. */
 const cutAt = (stages: Stage[], balance: GradeNode) => { const i = stages.findIndex(stage => stage.node.id === balance.id || (stage.node.order ?? 0) > (balance.order ?? 0)); return i < 0 ? stages.length : i; };
 
+/** Decode settings and working-frame cache key of a shot whose stages before the Balance node are `pre` (also Normalize's). `hdr` names an HDR-to-SDR table applied first. */
+export function shotSource(clip: Clip, asset: MediaAsset, pre: Stage[], hdr?: unknown) {
+  const times = sampleTimes(clip, asset), matrix = String(clip.properties.yuvMatrix || asset.colorMatrix || (asset.inputProfile?.startsWith('S-Log') ? 'bt709' : 'auto')).replace('bt2020-ncl', 'bt2020nc');
+  const shot = { times, matrix: MATRICES.includes(matrix) ? matrix : 'auto', range: clip.properties.dataLevels === 'Full' ? 'pc' : clip.properties.dataLevels === 'Video' ? 'tv' : 'auto' };
+  // Only what changes the picture: ids, names, order, kind and positions label or arrange the graph (and a fresh grade's ids change once applied); they must not throw away cached frames.
+  const bare = <T extends { id: string }>({ id: _id, name: _name, ...rest }: T & { name?: string }) => rest;
+  const stages = pre.map(({ node, ...stage }) => ({ ...stage, node: { enabled: node.enabled, parameters: node.parameters, curves: node.curves, mask: node.mask, effects: node.effects?.map(bare) }, ...('effect' in stage && { effect: bare(stage.effect) }) }));
+  return { ...shot, key: createHash('sha256').update(JSON.stringify([ENGINE, asset.id, times, stages, shot.matrix, shot.range, WIDTH, ...(hdr === undefined ? [] : [hdr])])).digest('hex') };
+}
 function prepareShot(clip: Clip, asset: MediaAsset, nodes: GradeNode[], input: string): Shot {
-  const stages = stagesFor(clip, asset, nodes), cut = cutAt(stages, findGradeNodes(clip, nodes).balance!), times = sampleTimes(clip, asset);
-  const matrix = String(clip.properties.yuvMatrix || asset.colorMatrix || (asset.inputProfile?.startsWith('S-Log') ? 'bt709' : 'auto')).replace('bt2020-ncl', 'bt2020nc');
-  const shot = { clip, asset, nodes, input, times, stages, cut, matrix: MATRICES.includes(matrix) ? matrix : 'auto', range: clip.properties.dataLevels === 'Full' ? 'pc' : clip.properties.dataLevels === 'Video' ? 'tv' : 'auto' };
-  // Node positions only move the graph; they must not throw away cached frames.
-  const pre = stages.slice(0, cut).map(stage => ({ ...stage, node: { ...stage.node, position: undefined } }));
-  return { ...shot, key: createHash('sha256').update(JSON.stringify([ENGINE, asset.id, times, pre, shot.matrix, shot.range, WIDTH])).digest('hex') };
+  const stages = stagesFor(clip, asset, nodes), cut = cutAt(stages, findGradeNodes(clip, nodes).balance!);
+  return { clip, asset, nodes, input, stages, cut, ...shotSource(clip, asset, stages.slice(0, cut)) };
 }
 
 const round = (value: number | null | undefined, digits = 2) => value == null || !Number.isFinite(value) ? '?' : String(+value.toFixed(digits));
@@ -198,7 +205,13 @@ export function annotate(answers: ShotAnswer[], labels: string[], ids: string[],
     return [{ clipId: id, confidence: note.confidence, warnings: [...note.warnings, ...found.filter(w => !note.warnings.some(x => x.code === w.code))].slice(0, LIMITS.warnings), rationale: note.rationale, ...(balance && { balance }) }];
   });
 }
-const lastLine = (error: unknown) => (error as Error).message.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('{"progress"')).at(-1)?.slice(0, 500) || 'The Color Assistant failed.';
+export const lastLine = (error: unknown, fallback = 'The Color Assistant failed.') => (error as Error).message.split('\n').map(line => line.trim()).filter(line => line && !line.startsWith('{"progress"')).at(-1)?.slice(0, 500) || fallback;
+
+/** Drops cached working-space frames older than a week (`cache` = <dataDir>/cache/color-assistant, shared with Normalize). */
+export async function pruneCache(cache: string) {
+  const cutoff = Date.now() - CACHE_DAYS * 86_400_000;
+  for (const name of await readdir(cache).catch(() => [] as string[])) { const file = join(cache, name), info = await stat(file).catch(() => undefined); if (info && info.mtimeMs < cutoff) await rm(file, { force: true }).catch(() => {}); }
+}
 
 /** `codex` is replaceable for tests; the server always uses runCodex. */
 export function colorAssistantService(dataDir: string, codex: typeof runCodex = runCodex) {
@@ -231,10 +244,6 @@ export function colorAssistantService(dataDir: string, codex: typeof runCodex = 
   async function python(command: 'measure' | 'render', spec: object, temporary: string, signal: AbortSignal) {
     const file = join(temporary, `${command}.json`); await writeFile(file, JSON.stringify(spec));
     return JSON.parse((await runWorkerProcess(colorPython(), [worker, command, file], signal, undefined, 'Color Assistant')).trim().split('\n').at(-1)!);
-  }
-  async function pruneCache() {
-    const cutoff = Date.now() - CACHE_DAYS * 86_400_000;
-    for (const name of await readdir(cache).catch(() => [] as string[])) { const file = join(cache, name), info = await stat(file).catch(() => undefined); if (info && info.mtimeMs < cutoff) await rm(file, { force: true }).catch(() => {}); }
   }
 
   async function looks(job: ColorAssistantJob, shots: Shot[], signal: AbortSignal, update: (patch: Partial<ColorAssistantJob>, persist?: boolean) => void, temporary: string) {
@@ -305,7 +314,7 @@ export function colorAssistantService(dataDir: string, codex: typeof runCodex = 
     try {
       if (!existsSync(colorPython()) || !existsSync(worker)) throw Error('OpenColorIO is not installed on this server. Run npm run setup:color.');
       update({ status: 'running', stage: 'Measuring shots', progress: 2 }, true);
-      await pruneCache();
+      await pruneCache(cache);
       temporary = await mkdtemp(join(tmpdir(), 'frameline-color-assistant-'));
       const result = await looks(job, shots, signal, update, temporary);
       finish(job, 'done', undefined, result);

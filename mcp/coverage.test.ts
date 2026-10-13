@@ -74,6 +74,7 @@ export const ROUTES: Record<string, string> = {
   '/api/motion-trackers/samples/([a-f0-9]{64})': 'job:track',
   '/api/color-assistant/capabilities': 'job:color-looks',
   '/api/projects/([a-zA-Z0-9_-]+)/color-assistant(?:/([a-f0-9-]{36})(?:/stills/([^/]+))?)?': 'job:color-looks',
+  '/api/projects/([a-zA-Z0-9_-]+)/color-normalize(?:/([a-f0-9-]{36}))?': 'job:color-normalize',
   // Export and Resolve
   '/api/renders': 'job:export',
   '/api/renders/([a-zA-Z0-9_-]+)(?:/(download))?': 'job:exports',

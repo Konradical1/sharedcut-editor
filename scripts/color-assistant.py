@@ -83,6 +83,8 @@ def working_frames(ff, cache, width, shot):
     sources = list(decoders.map(lambda t: decode_frame(ff, shot, t, width), times))
     profile = next((s['effect']['inputGamma'] for s in pre if s['type'] == 'cst'), pre[0].get('gamma', 'Gamma 2.4') if pre else 'Gamma 2.4')
     clipped = [clipped_fraction(s, profile) for s in sources]
+    # HLG/PQ sources: the export's HDR -> SDR table first (hdrToSdr in color.ts), so the grade sees what export sees.
+    if shot.get('hdrCube'): sources = [engine.lut(s, {'cube': shot['hdrCube'], 'amount': 1}).astype(np.float32) for s in sources]
     frames = np.stack([graded(s, pre) for s in sources]).astype(np.float32)
     os.makedirs(cache, exist_ok=True)
     replace_atomic(path + '.json', json.dumps({'times': times, 'clipped': clipped}).encode())

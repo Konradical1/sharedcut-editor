@@ -40,6 +40,7 @@ export const ACTIONS: Record<string, 'edit' | 'context' | 'hidden' | `job:${stri
   addMotionTracker: 'edit', updateMotionTracker: 'edit', deleteMotionTracker: 'edit', applyMotionTracker: 'edit',
   addEffect: 'edit', updateEffect: 'edit', reorderEffect: 'edit', addNode: 'edit', removeNode: 'edit', reorderNode: 'edit',
   copyGrade: 'context', pasteGrade: 'edit', applyColorAssistant: 'edit', useAcesOutput: 'edit',
+  normalizeColorGroup: 'edit', setColorGroup: 'edit', updateColorGroup: 'edit', renameColorGroup: 'edit',
   restoreResolveGrade: 'edit', initializeColorGrade: 'edit', arrangeColorNodes: 'edit', moveColorNode: 'edit', updateNode: 'edit',
   // applyGrade is the old rule-based path with no UI caller: it appends nodes after the Output CST.
   applyGrade: 'hidden',

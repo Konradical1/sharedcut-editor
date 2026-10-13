@@ -42,6 +42,10 @@ test('animation evaluation, text/effect discovery, Bézier handles, holds and sp
  const node={id:'n',projectId:clip.projectId,clipId:clip.id,name:'Correction',kind:'balance',enabled:true,parameters:{exposure:0}};
  const copy={...clip,keyframes:{'nodes.n.parameters.exposure':keys(0,2)}};copyAnimatedNodes(copy,[node],()=>"new-node");assert.ok(copy.keyframes['nodes.new-node.parameters.exposure' as keyof typeof copy.keyframes]);
  assert.equal(evaluateNodes([node],{...clip,keyframes:{'nodes.n.parameters.exposure':keys(0,2)}},11)[0].parameters.exposure,1);
+ // A color group node is one value for the whole group: never listed for keys, stale keys ignored, membership not keyable.
+ const group={...node,id:'g',kind:'group',group:'cg-1'},grouped={...clip,properties:{...clip.properties,colorGroup:'cg-1'}};
+ assert.ok(!animationProperties(grouped,[node,group]).some(p=>p.path.startsWith('nodes.g.')||p.path==='properties.colorGroup'));
+ assert.equal(evaluateNodes([group],{...clip,keyframes:{'nodes.g.parameters.exposure':keys(0,2)}},11)[0].parameters.exposure,0);
  } finally {store.setState(baseline,true);}
 });
 test('timeline reaches 15-frame view, keeps frame ticks legible and accelerates at either edge',()=>{

@@ -9,6 +9,8 @@ import { edit, handle, need, clip as clipOf, project, store, done, bytes, image,
 import { profiles, gamuts, primaryDefaults, rangeDefaults, parseCube, processingStages, interpretation, acesOutputUpgrade } from '../../src/services/color.ts';
 import { eligibility, neutralLook, type LookValues } from '../../src/services/colorAssistant.ts';
 import { assistantCapabilities, startAssistant, assistantJob, latestAssistantJob, cancelAssistant, type AssistantJob } from '../../src/services/colorAssistantClient.ts';
+import { colorGroups, colorGroupOf, type AutoBalance, type NormalizeShot } from '../../src/services/colorGroups.ts';
+import { startNormalize, normalizeJob, cancelNormalize, type NormalizeJob } from '../../src/services/colorNormalizeClient.ts';
 import { createId } from '../../src/services/index.ts';
 import { isDepthKey } from '../../src/services/smartMask.ts';
 import { evaluateNodes } from '../../src/services/animation.ts';
@@ -35,7 +37,7 @@ function nodeLine(node: GradeNode, c: Clip, managed: boolean) {
   const params = Object.entries(node.parameters).filter(([k, v]) => v !== (defaults[k] ?? defaults[k.toLowerCase()] ?? 0) || keyed(`parameters.${k}`)).map(([k, v]) => `${k}=${num(v)}${keyed(`parameters.${k}`)}`);
   const m = node.mask, mask = !m ? '' : `mask ${isDepthKey(m) ? `depth ${m.near}-${m.far} soft ${m.softness}` : `smart ${handle(m.id)}`}${m.invert ? ' inverted' : ''}${m.amount !== 100 ? ` ${m.amount}%` : ''}${m.enabled ? '' : ' off'}`;
   const curves = node.curves && Object.keys(node.curves).length ? `curves ${Object.entries(node.curves).map(([ch, cv]) => `${ch}${cv!.points.length}`).join(',')}${keyed('curves')}` : '';
-  return [`${handle(node.id)} ${quote(node.name, 30)}${node.enabled ? '' : ' (off)'}${keyed('enabled')}`, ...params, curves, ...(node.effects ?? []).map(fxText), mask].filter(Boolean).join(' ');
+  return [`${handle(node.id)} ${quote(node.name, 30)}${node.enabled ? '' : ' (off)'}${keyed('enabled')}`, node.group ? `[group ${node.group}]` : '', ...params, curves, ...(node.effects ?? []).map(fxText), mask].filter(Boolean).join(' ');
 }
 /** One clip's grade for the model: nodes in processing order with what differs from the defaults, plus what would break. */
 export function gradeText(c: Clip, at?: number) {
@@ -145,6 +147,50 @@ function skipText(c: Clip, code: string, text: string) {
   return `${handle(c.id)} ${text}${fix ? ` (fix: act{do:[["${fix}","${handle(c.id)}"]]})` : ''}`;
 }
 
+// ---- Normalize & color groups ---------------------------------------------------------------------------------------
+
+type GroupOption = { id: string } | { name: string } | null;
+const projectGroups = () => { const s = store.getState(); return colorGroups(s.clips.filter(c => c.projectId === s.projectId), s.nodes); };
+/** params.group as the store takes it: an existing group by id (cg-…; a prefix of 11+ characters will do) or name joins it, another name makes one, null takes the shots out. */
+function groupOption(value: unknown): GroupOption | undefined {
+  if (value === undefined || value === null) return value;
+  if (typeof value !== 'string' || !value.trim()) throw new Error('params.group: a group name, a cg-… group id, or null to take the shots out.');
+  const text = value.trim().replace(/^@/, ''), groups = projectGroups();
+  const found = groups.find(g => g.id === text || (text.length >= 11 && g.id.startsWith(text))) ?? groups.find(g => g.name.toLowerCase() === text.toLowerCase());
+  if (found) return { id: found.id };
+  if (text.startsWith('cg-')) throw new Error(`No color group ${text} in this project.`);
+  return { name: text.slice(0, 60) };
+}
+const balanceText = (b: AutoBalance) => [b.exposure ? `exp ${num(b.exposure)}` : '', b.temperature ? `temp ${Math.round(b.temperature)}` : '', b.tint ? `tint ${num(b.tint)}` : '', b.lift ? `lift ${num(b.lift)}` : '', b.gamma ? `gamma ${num(b.gamma)} gain ${num(b.gain ?? 1)}` : ''].filter(Boolean).join(' ') || 'neutral';
+const shotText = (n: NormalizeShot) => `${handle(n.clipId)} ${balanceText(n.balance)} ${Math.round(n.confidence * 100)}%${n.warnings.length ? ' ' + n.warnings.map(w => w.code).join(',') : ''}`;
+/** Polls the Normalize job, then applies its balances (and the group) as one undo step, like the Color page. */
+function followNormalize(projectId: string, jobId: string, targets: string[], options: { group?: GroupOption; clean?: boolean }): Poller {
+  const label = `Normalize ${short(jobId)}`;
+  return {
+    label,
+    async poll(): Promise<Step> {
+      let job: NormalizeJob;
+      try { job = await normalizeJob(projectId, jobId); }
+      catch (error) { const status = (error as { status?: number }).status ?? 0; if (status >= 400 && status < 500) throw error; return { done: false, text: `${label}: server unreachable, retrying` }; }
+      if (job.status === 'waiting' || job.status === 'running') return { done: false, text: `${label}: ${job.stage || 'Waiting'} ${Math.round(job.progress)}%` };
+      if (job.status === 'cancelled') return done(`${label} was cancelled.`);
+      const missed = job.skipped.map(k => `${handle(k.clipId)} ${k.text}`), skipped = missed.length ? `\nskipped: ${missed.join(' | ')}` : '';
+      if (job.status === 'failed') throw new Error(`Normalize failed: ${job.error ?? 'no reason given'}${skipped}`);
+      // Context shots (other group members) were measured for pooling only.
+      const shots = (job.result?.shots ?? []).filter(n => targets.includes(n.clipId));
+      if (!shots.length) return done(`${label}: no shot could be measured.${skipped}`);
+      if (project().id !== projectId) throw new Error(`${label} finished, but another project is open now; open its project and run Normalize again.`);
+      const groupOfShot = (n: NormalizeShot) => colorGroupOf(store.getState().clips.find(c => c.id === n.clipId)), before = shots.map(groupOfShot);
+      const { text, value } = await edit(run => run('normalizeColorGroup', { shots, level: job.result!.level }, options));
+      // The group asked for; a new one is the group a shot actually moved into (a skipped shot keeps its old one).
+      const id = options.group ? ('id' in options.group ? options.group.id : shots.map(groupOfShot).find((g, i) => g && g !== before[i])) : undefined, group = id && projectGroups().find(g => g.id === id);
+      return done([`Normalized ${value} of ${shots.length} shot${shots.length === 1 ? '' : 's'}${group ? ` into ${quote(group.name, 40)} ${group.id} (${group.clipIds.length} shot${group.clipIds.length === 1 ? '' : 's'})` : options.group === null ? ', out of their color groups' : ''}${options.clean ? ', grades rebuilt' : ''}; a snapshot keeps the old grades.`,
+        `balance: ${shots.map(shotText).join(' · ')}${skipped}`, text].join('\n'));
+    },
+    async cancel() { await cancelNormalize(projectId, jobId); },
+  };
+}
+
 export const jobs: Record<string, JobDef> = {
   'color-grade': {
     doc: '{clip, at?:timeline s} → the clip\'s grade nodes in order (@ids, changed values, curves, effects, masks), render check, hints. help color',
@@ -204,6 +250,21 @@ export const jobs: Record<string, JobDef> = {
       return follow(projectId, jobId, p.stills, skipped);
     },
   },
+  'color-normalize': {
+    doc: '{clips?=selected, group?:name|cg-id|null, clean?} measures shots, sets each Balance (exposure, white balance, black point); group joins or makes a color group, null leaves',
+    async start(p) {
+      const s = store.getState(), picked = p.clips !== undefined ? need<string[]>(p, 'clips', 'array') : s.selectedClipIds.length ? s.selectedClipIds : s.selectedClipId ? [s.selectedClipId] : [];
+      const targets = [...new Set(picked.map(id => clipOf(id).id))];
+      if (!targets.length) throw new Error('Give clips, or select shots first (act{select}).');
+      if (targets.length > 200) throw new Error('Normalize takes at most 200 shots at a time.');
+      const group = groupOption(p.group), clean = p.clean === undefined ? undefined : need<boolean>(p, 'clean', 'boolean');
+      // The group being joined (no group given: the targets' own groups) is measured as a whole: its other members go along as context, like the Color page.
+      const joined = new Set(group === undefined ? targets.map(id => colorGroupOf(clipOf(id))) : group && 'id' in group ? [group.id] : []);
+      const context = projectGroups().filter(g => joined.has(g.id)).flatMap(g => g.clipIds).filter(id => !targets.includes(id)).slice(0, 300 - targets.length);
+      const projectId = project().id, jobId = await startNormalize(projectId, { clipIds: targets, ...(context.length ? { contextIds: context } : {}), ...(clean ? { clean } : {}) });
+      return followNormalize(projectId, jobId, targets, { ...(group !== undefined ? { group } : {}), ...(clean !== undefined ? { clean } : {}) });
+    },
+  },
 };
 
 // ---- Help ------------------------------------------------------------------------------------------------------------
@@ -225,7 +286,7 @@ export function primaryTable() {
 function colorTopic() {
     const defaults = JSON.stringify(primaryDefaults).replace(/"/g, '');
     return [
-      'Color grading: act edits the grade; jobs: color-grade (view), color-lut (.cube files), color-looks (Color Assistant).',
+      'Color grading: act edits the grade; jobs: color-grade (view), color-lut (.cube files), color-looks (Color Assistant), color-normalize (Normalize & group).',
       'Model: each clip has grade nodes run in `order`: parameters → curves → node effects (cst/lut, in list order) → mask blend → next node. job color-grade{clip} lists them with @ids and says if preview/export would refuse the grade (an unknown key or out-of-range value saves fine but breaks rendering). get{id:"@node"} shows one node.',
       'Pipelines: a clip starts legacy (nodes work in Gamma 2.4/Rec.709). act initializeColorGrade(clip) makes it nodes-v2: Input CST (source → DaVinci Intermediate/DaVinci Wide Gamut) · Balance · Look · Output CST (→ Gamma 2.4/Rec.709; aces2 for log sources, none for Rec.709). It replaces every node (a snapshot keeps the old grade). Grade between the two CSTs.',
       'Parameters (key default (UI range; per-node render limit)), set with updateNode(node,{parameters:{key:value}}) (keys merge, others stay):',
@@ -247,6 +308,7 @@ function colorTopic() {
       '- highlights clipping on a log grade: useAcesOutput(clip) (color-grade suggests it when it applies).',
       '- source: updateProperty(clip,"inputProfile",gamma) and updateProperty(clip,"inputGamut",gamut), both, from the lists above (nothing checks them; a bad one breaks every render), before initializeColorGrade, which builds the Input CST from them · "dataLevels" Auto|Full|Video. Legacy clips only: inputExposure −6..6, inputTemperature −2000..2000.',
       '- imported DaVinci look: restoreResolveGrade(clip) brings it back (removes the nodes); updateProperty(clip,"bypassResolveLook",true) turns it off.',
+      '- normalize & group: job color-normalize{clips, group?:"Name"|"cg-…"|null, clean?} sets every shot\'s Balance so they match (clean:true rebuilds each grade; snapshot first). A color group is one shared node after Balance on every member ([group cg-…] in color-grade): updateColorGroup("cg-…",{parameters,curves?,enabled?}) or updateNode on any member\'s group node changes all; renameColorGroup(id,name); setColorGroup([clips],{id}|{name}|null).',
       'Gotchas: a keyframed field (~ in color-grade) gets a keyframe at the playhead instead of a new static value (act at:<timeline seconds> picks the frame). Resolve-imported nodes may store capitalised keys (Exposure): write that spelling (get{id:"@node",path:"parameters"}), or the two keys clash. Never use applyGrade (legacy; appends after the output). act undo takes an edit back.',
       'Color Assistant: job color-looks{clips?, prompt?} needs nodes-v2 shots with verified camera input, ACES 2 output and effect-free nodes named exactly Balance and Look; color-grade says "assistant: ready". It runs minutes (poll), returns 3 looks; {job, apply:N} applies one to every shot it used (snapshot first).',
     ].join('\n');

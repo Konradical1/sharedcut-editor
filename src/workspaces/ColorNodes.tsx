@@ -1,10 +1,11 @@
-import {useEffect,useRef,useState,type ReactNode,type PointerEvent} from 'react';
+import {useEffect,useRef,useState,type CSSProperties,type ReactNode,type PointerEvent} from 'react';
 import {Plus,Grid2X2,Scan,Minus,ChevronLeft,ChevronRight,Power,Trash2} from 'lucide-react';
 import type {GradeNode} from '../state/models';
 import {useStoreWithoutPlayhead} from '../state/store';
 import {IconButton,Button} from '../components/ui';
 import {createId} from '../services';
 import {isDepthKey} from '../services/smartMask';
+import {groupColor} from '../services/colorGroups';
 export function ColorNodes({nodes,clipId,selected,thumbnail,onAdd,onEffect,toolbar}:{nodes:GradeNode[];clipId?:string;selected?:string;thumbnail:string;toolbar?:ReactNode;onAdd:()=>void;onEffect:(id:string,type:string)=>void}){
   const s=useStoreWithoutPlayhead(),view=useRef<HTMLDivElement>(null),[viewport,setViewport]=useState({zoom:.85,pan:{x:0,y:0}}),[moving,setMoving]=useState<{id:string;x:number;y:number}|null>(null),[context,setContext]=useState<{id:string;x:number;y:number}|null>(null),[insert,setInsert]=useState<string|null|undefined>(undefined);
   const clip=s.clips.find(c=>c.id===clipId),look=clip?.properties.resolveLookUrl;
@@ -33,11 +34,11 @@ export function ColorNodes({nodes,clipId,selected,thumbnail,onAdd,onEffect,toolb
           {Array.from({length:nodes.length+1},(_,i)=>{const prev=nodes[i-1],next=nodes[i],a=prev?position(prev,i-1):{x:-110,y:80},b=next?position(next,i):{x:(prev?position(prev,i-1).x:60)+190,y:prev?position(prev,i-1).y:80};const x=a.x+130,y=a.y+45,xx=b.x,yy=b.y+45,d=`M${x} ${y} C${x+50} ${y} ${xx-50} ${yy} ${xx} ${yy}`;return <g key={next?.id??'out'}><path d={d} className={insert===(next?.id??null)?'wire active':'wire'}/><path d={d} className="wire-target" data-before={next?.id??''}/></g>;})}
         </svg>
         <span className="graph-terminal" style={{left:0,top:113}}>IN</span>
-        {nodes.map((n,i)=>{const p=position(n,i);return <div key={n.id} className={`grade-node ${selected===n.id?'selected':''} ${n.enabled?'':'disabled'}`} style={{left:p.x,top:p.y}} role="button" tabIndex={0} aria-label={`Node ${i+1}: ${n.name}${n.enabled?'':' (bypassed)'}`} aria-pressed={selected===n.id}
+        {nodes.map((n,i)=>{const p=position(n,i);return <div key={n.id} className={`grade-node ${selected===n.id?'selected':''} ${n.enabled?'':'disabled'} ${n.group?'group-node':''}`} style={{left:p.x,top:p.y,...(n.group&&{'--group-color':groupColor(n.group)})} as CSSProperties} role="button" tabIndex={0} aria-label={`Node ${i+1}: ${n.name}${n.group?' (color group)':''}${n.enabled?'':' (bypassed)'}`} aria-pressed={selected===n.id}
           onPointerDown={e=>{e.stopPropagation();start(e,n.id);}} onClick={()=>s.selectNode(n.id)} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();e.stopPropagation();s.selectNode(n.id);}}}
           onContextMenu={e=>{e.preventDefault();s.selectNode(n.id);const box=view.current!.getBoundingClientRect();setContext({id:n.id,x:Math.min(e.clientX-box.left,box.width-170),y:Math.min(e.clientY-box.top,box.height-140)});}}
           onDragOver={e=>{if((e.dataTransfer.types.includes('application/frameline-color-effect')||e.dataTransfer.types.includes('application/x-frameline-effect'))){e.preventDefault();e.currentTarget.classList.add('effect-drop');}}} onDragLeave={e=>e.currentTarget.classList.remove('effect-drop')} onDrop={e=>{e.preventDefault();e.currentTarget.classList.remove('effect-drop');onEffect(n.id,e.dataTransfer.getData('application/x-frameline-effect')==='Smart Mask'?'smart-mask':e.dataTransfer.getData('application/frameline-color-effect'));}}>
-          <span className="node-port input"/><div className="node-top"><span>{String(i+1).padStart(2,'0')}</span><span className="node-type">{n.mask?.enabled?isDepthKey(n.mask)?'DEPTH':'MASK':n.effects?.some(e=>e.type==='cst')?'CST':n.effects?.some(e=>e.type==='lut')?'LUT':'CORRECTOR'}</span><i className="node-led"/></div><div className="node-thumbnail" style={thumbnail?{backgroundImage:`url(${JSON.stringify(thumbnail)})`}:undefined}/><span className="node-title">{n.name}</span><span className="node-port output"/>{!n.enabled&&<span className="bypass-label">Bypassed</span>}
+          <span className="node-port input"/><div className="node-top"><span>{String(i+1).padStart(2,'0')}</span><span className="node-type">{n.group?'GROUP':n.mask?.enabled?isDepthKey(n.mask)?'DEPTH':'MASK':n.effects?.some(e=>e.type==='cst')?'CST':n.effects?.some(e=>e.type==='lut')?'LUT':'CORRECTOR'}</span><i className="node-led"/></div><div className="node-thumbnail" style={thumbnail?{backgroundImage:`url(${JSON.stringify(thumbnail)})`}:undefined}/><span className="node-title">{n.name}</span><span className="node-port output"/>{!n.enabled&&<span className="bypass-label">Bypassed</span>}
         </div>;})}
         <span className="graph-terminal" style={{left:(nodes.length?position(nodes.at(-1)!,nodes.length-1).x:60)+190,top:(nodes.length?position(nodes.at(-1)!,nodes.length-1).y:80)+33}}>OUT</span>
       </div>

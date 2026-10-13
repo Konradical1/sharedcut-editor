@@ -37,6 +37,7 @@
     "generate:color": "node scripts/venv-run.mjs .venv-color scripts/generate-aces.py",
     "test:color-reference": "node --experimental-strip-types scripts/color-reference-check.mjs && node --experimental-strip-types scripts/color-managed-browser-check.mjs && node --experimental-strip-types scripts/color-managed-export-check.mjs",
     "test:color-assistant": "node scripts/venv-run.mjs .venv-color scripts/color-assistant.py --selftest",
+    "test:color-normalize": "node scripts/venv-run.mjs .venv-color scripts/color-normalize.py --selftest",
     "test:color-assistant:preview": "node --experimental-strip-types scripts/color-assistant-preview-check.mjs",
     "test:color-assistant:browser": "node --experimental-strip-types scripts/color-assistant-browser-check.mjs",
     "setup:masks": "node scripts/setup-venv.mjs .venv-mask scripts/mask-requirements.txt scripts/setup-masks.py",

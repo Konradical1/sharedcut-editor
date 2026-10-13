@@ -33,6 +33,7 @@ function knownIds(s: EditorStore): string[] {
     for (const effect of clip.effects) ids.push(effect.id);
     for (const mask of clip.smartMasks ?? []) ids.push(mask.id);
     for (const tracker of clip.motionTrackers ?? []) ids.push(tracker.id);
+    if (typeof clip.properties.colorGroup === 'string') ids.push(clip.properties.colorGroup);
     for (const keys of Object.values(clip.keyframes ?? {})) for (const key of keys) ids.push(key.id);
   }
   for (const node of s.nodes) for (const effect of node.effects ?? []) ids.push(effect.id);

@@ -48,6 +48,7 @@ import { depthCapabilities, depthService } from './depth.ts';
 import { validateSmartMask, validateSmartMaskBindings } from '../src/services/smartMask.ts';
 import { motionTrackerCapabilities, motionTrackerService } from './motionTracker.ts';
 import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } from './colorAssistant.ts';
+import { colorNormalizeService } from './colorNormalize.ts';
 import { validateMotionTrackers } from '../src/services/motionTracker.ts';
 import { readCameraColor } from './cameraMetadata.ts';
 import { FILMSTRIP_VERSION, FULL_VARIANT, MEDIA_CONCURRENCY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, exportAspect, PROBE_VERSION, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, prepareWaveform, renderTimeline, renderSoundEffect, depthRuns, depthSpan } from './media.ts';
@@ -287,6 +288,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const motionTrackers = motionTrackerService(join(dataDir, 'motion-trackers'));
   const depth = depthService(join(dataDir, 'depth'), { sourceTimes: masks.sourceTimes, freeGpu: () => masks.stopIdlePreview() });
   const colorAssistant = colorAssistantService(dataDir);
+  const colorNormalize = colorNormalizeService(dataDir);
   const flowJobs = new Map<string, FlowPreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
   let flowQueue = Promise.resolve();
   const stabilizeDirectory = join(dataDir, 'stabilize');
@@ -498,6 +500,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       for (const job of bundle.renderJobs ?? []) for (const extension of ['.mp4', '.mov']) rmSync(join(dataDir, 'renders', `${job.id}${extension}`), { force: true });
       if (!reused) db.prepare('DELETE FROM caption_jobs WHERE projectId=?').run(row.id);
       if (!reused) try { colorAssistant.purge(row.id); } catch { /* A still being served; its folder outlives the purge. */ }
+      if (!reused) colorNormalize.purge(row.id);
       db.prepare('DELETE FROM deleted_projects WHERE id=?').run(row.id);
     } catch (error) { console.error(`Purging deleted project ${row.id} failed:`, error); }
   };
@@ -1867,6 +1870,16 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (!jobId && method === 'POST') { const body = await jsonBody(req); send(res, 202, colorAssistant.start({ projectId, body, clips: state.clips, media: state.media, nodes: state.nodes, source: originalPath })); return; }
           fail(405, 'Method not allowed.');
         }
+        // Normalize measures and balances shots on this server; no AI, so no allow-list. Starting and cancelling need an editor role.
+        const normalizeRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)\/color-normalize(?:\/([a-f0-9-]{36}))?$/.exec(path);
+        if (normalizeRoute) {
+          const [, projectId, jobId] = normalizeRoute; requireProject(projectId, userId, method !== 'GET');
+          if (jobId && method === 'GET') { send(res, 200, colorNormalize.get(projectId, jobId)); return; }
+          if (jobId && method === 'DELETE') { colorNormalize.cancel(projectId, jobId); send(res, 200, { ok: true }); return; }
+          if (!jobId && method === 'GET') { send(res, 200, colorNormalize.latest(projectId)); return; }
+          if (!jobId && method === 'POST') { const body = await jsonBody(req); send(res, 202, colorNormalize.start({ projectId, body, clips: state.clips, media: state.media, nodes: state.nodes, source: originalPath })); return; }
+          fail(405, 'Method not allowed.');
+        }
         if (path === '/api/stabilize/capabilities' && method === 'GET') { send(res,200,await stabilizeCapabilities()); return; }
         if (path === '/api/stabilize' && method === 'POST') {
           const body = await jsonBody(req), clip = state.clips.find(c => c.id === textField(body.clipId,160,true)) ?? fail(404,'Clip not found.');
@@ -2095,7 +2108,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     closed = true; saveBeforeExit();
     // Abort everything before awaiting anything: a job queued for the GPU or a heavy slot behind work that is only
     // aborted later would otherwise hold the shutdown (and frameline.lock) for the rest of a long depth run.
-    const services = [masks.close(), depth.close(), motionTrackers.close(), colorAssistant.close()];
+    const services = [masks.close(), depth.close(), motionTrackers.close(), colorAssistant.close(), colorNormalize.close()];
     for (const job of flowJobs.values()) job.controller.abort();
     for (const job of stabilizeJobs.values()) job.controller.abort();
     for (const controller of aborters.values()) controller.abort();

@@ -234,6 +234,8 @@ export function validateGradeNode(node:Partial<GradeNode>){
   const finite=(v:unknown,min=-1e4,max=1e4)=>typeof v==='number'&&Number.isFinite(v)&&v>=min&&v<=max;
   if(node.position&&(!finite(node.position.x,-1e5,1e5)||!finite(node.position.y,-1e5,1e5)))throw Error('Invalid node position.');
   if(node.order!==undefined&&!finite(node.order,-1e6,1e6))throw Error('Invalid node order.');
+  if(node.group!==undefined&&(typeof node.group!=='string'||!/^cg-[A-Za-z0-9-]{1,80}$/.test(node.group)))throw Error('Invalid color group.');
+  if(node.group&&node.effects?.length)throw Error('A color group node holds a grade only; put transforms and LUTs on another node.');
   if(node.curves!==undefined){
     if(!node.curves||typeof node.curves!=='object'||Array.isArray(node.curves))throw Error('Invalid curves.');
     for(const [key,curve]of Object.entries(node.curves)){

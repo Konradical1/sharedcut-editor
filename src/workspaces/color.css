@@ -30,3 +30,15 @@
 .color-overhaul .inspector-tabs>.icon-button{align-self:center;flex:0 0 25px;margin-right:5px;padding:0;border:0}
 .color-overhaul .inspector-tabs{padding-inline:6px;gap:2px}.color-overhaul .inspector-tabs button{padding-inline:6px;font-size:13px}
 .color-overhaul .shot-card.picked{border-color:#b98476;border-style:dashed;background:#2e2829;color:#e3c8c1}
+
+/* Color groups: the shot strip bar, group nodes, the header scope and the Groups tab. */
+.color-overhaul .shot-group{position:absolute;left:0;right:0;top:0;height:3px;z-index:1}
+.color-overhaul .grade-node.group-node{border-top:3px solid var(--group-color)}.color-overhaul .grade-node.group-node .node-led{background:var(--group-color)}
+.color-overhaul .group-scope{display:flex;align-items:center;gap:6px;min-width:0;max-width:300px;font-size:10px;color:#e6d9d5;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.color-groups{padding:13px;display:flex;flex-direction:column;gap:10px;flex:1}.color-groups>p{font-size:11px;line-height:1.6;color:#a8afbc;margin:0}.color-overhaul .color-groups>.button{justify-content:center;min-height:32px}
+.color-groups-hint{line-height:1.6}.color-groups-hint button,.color-group-actions button,.color-group-footer button{border:0;background:transparent;color:#d0b3a9;font-size:10px;padding:0}.color-group-actions button:hover,.color-group-footer button:hover,.color-groups-hint button:hover{color:#f0d7d0;text-decoration:underline}
+.color-group-list{list-style:none;margin:4px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}.color-group-list>li{display:flex;flex-direction:column;gap:8px;padding:9px 10px;background:#2e3139;border:1px solid #484c58;border-left:3px solid var(--group-color);border-radius:5px}.color-group-list>li.open{border-color:#6c6f7a;border-left-color:var(--group-color);background:#33353d}
+.color-group-row{display:flex;align-items:center;gap:7px}.color-group-row input{flex:1;min-width:0;padding:3px 4px;border:1px solid transparent;border-radius:3px;background:transparent;color:#e0e3eb;font-size:12px;font-weight:550}.color-group-row input:hover,.color-group-row input:focus{border-color:#4b4e59;background:#1b1d22}
+.color-group-actions{display:flex;gap:12px;flex-wrap:wrap}.color-group-footer{display:flex;gap:14px;flex-wrap:wrap}.color-group-footer button{display:inline-flex;align-items:center;gap:5px}
+.color-group-controls{display:flex;flex-direction:column;gap:9px;padding-top:9px;border-top:1px solid #454852}.color-group-controls small{line-height:1.6}.color-overhaul .color-group-controls .grade-parameter{grid-template-columns:72px minmax(20px,1fr) 52px}
+.color-groups-empty{font-size:10px;color:#929bab;margin:4px 0 0}

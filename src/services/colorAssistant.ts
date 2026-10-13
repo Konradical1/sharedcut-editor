@@ -139,9 +139,9 @@ export function lookOption(o: OptionAnswer, shots: ShotNote[]): LookOption {
 }
 
 const ordered = (clip: Clip, nodes: GradeNode[]) => nodes.filter(n => n.clipId === clip.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-/** Balance/Look are the effect-free nodes with those names; nodes carrying CSTs or LUTs are never edited. */
+/** Balance/Look are the effect-free nodes with those names; nodes carrying CSTs or LUTs are never edited, nor a color group node named so. */
 export function findGradeNodes(clip: Clip, nodes: GradeNode[]): { balance?: GradeNode; look?: GradeNode; output?: GradeNode; extras: GradeNode[] } {
-  const own = ordered(clip, nodes), plain = (name: string) => own.find(n => n.name === name && !n.effects?.length);
+  const own = ordered(clip, nodes), plain = (name: string) => own.find(n => n.name === name && !n.effects?.length && !n.group);
   return { balance: plain('Balance'), look: plain('Look'), output: own.filter(n => n.enabled && n.effects?.some(e => e.enabled && e.type === 'cst' && e.toneMapping === 'aces2')).at(-1), extras: own.filter(n => n.id.startsWith('ai-look-')) };
 }
 export function eligibility(clip: Clip, asset: MediaAsset | undefined, nodes: GradeNode[]): Eligibility {

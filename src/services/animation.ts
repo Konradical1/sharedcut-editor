@@ -61,7 +61,7 @@ function listProperties(clip: Clip, nodes: GradeNode[]): AnimationProperty[] {
       else if (['number','string','boolean'].includes(typeof item)) result.push({ path, label: name.replace(/([a-z])([A-Z])/g,'$1 $2'), value: item });
     }
   };
-  const hidden = /^(textDocument|shapeDocument|compositionId|resolve|linkGroup|audioDetached|animation|fadeOrigin|fadeDuration|opticalFlow|motionBlur)/;
+  const hidden = /^(textDocument|shapeDocument|compositionId|resolve|linkGroup|colorGroup|audioDetached|animation|fadeOrigin|fadeDuration|opticalFlow|motionBlur)/;
   flatten(Object.fromEntries(Object.entries({...defaultProperties, fadeIn:0,fadeOut:0,audioFadeIn:0,audioFadeOut:0,disabled:clip.disabled,...clip.properties}).filter(([key]) => !hidden.test(key))), 'properties');
   for (const effect of clip.effects) {
     flatten({enabled:effect.enabled,amount:effect.amount},`effects.${effect.id}`,effect.name);
@@ -69,7 +69,8 @@ function listProperties(clip: Clip, nodes: GradeNode[]): AnimationProperty[] {
   }
   if (isTitle(clip)) flatten(getText(clip), 'text', 'Text');
   if (isShape(clip)) flatten(getShape(clip), 'shape', 'Shape');
-  for (const node of nodes.filter(n=>n.clipId===clip.id)) flatten({enabled:node.enabled,parameters:node.parameters},`nodes.${node.id}`,node.name);
+  // A color group node holds one value for the whole group (store: updateColorGroup), so it is never keyed.
+  for (const node of nodes.filter(n=>n.clipId===clip.id&&!n.group)) flatten({enabled:node.enabled,parameters:node.parameters},`nodes.${node.id}`,node.name);
   const names:Record<string,string>={x:'Position X',y:'Position Y',fontSize:'Size',fontWeight:'Weight',text:'Content'};
   return result.map(property=>{const leaf=property.path.split('.').at(-1)!,name=names[leaf]??leaf.replace(/([a-z])([A-Z])/g,'$1 $2').replace(/^./,s=>s.toUpperCase());const run=/^text\.runs\.(\d+)\./.exec(property.path);return {...property,label:run?`Text ${Number(run[1])+1} · ${name}`:property.path.startsWith('properties.')?name:property.path.startsWith('text.')?`Text · ${name}`:property.label.replace(' · parameters','').replace(/[^·]+$/,name)};});
 }
@@ -155,6 +156,7 @@ export function evaluateClip(clip: Clip, playhead: number, fps = 24): Clip {
 export function evaluateNodes(nodes: GradeNode[], clip: Clip, playhead: number): GradeNode[] {
   if (!Object.keys(clip.keyframes ?? {}).some(path => path.startsWith('nodes.'))) return [...nodes];
   return nodes.map(node => {
+    if (node.group) return node;
     let next = node;
     for (const [path, keys] of Object.entries(clip.keyframes ?? {})) {
       const prefix = `nodes.${node.id}.`;

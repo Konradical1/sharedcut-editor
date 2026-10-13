@@ -6,6 +6,8 @@ import { defaultShape, getShape } from '../services/shapes.ts';
 import { evaluateClip } from '../services/animation.ts';
 import type { Clip, Keyframe } from './models.ts';
 import { neutralBalance, neutralLook, type LookOption } from '../services/colorAssistant.ts';
+import type { NormalizeShot } from '../services/colorGroups.ts';
+import { interpretation } from '../services/color.ts';
 import { forwardRoom } from '../services/selection.ts';
 import { depthUi, rememberDepth } from '../services/depthPreview.ts';
 import { nodeMaskId } from '../services/smartMask.ts';
@@ -1768,4 +1770,123 @@ test('files dropped on a lane land there once ready, at the length the server pr
     ready(song.id);
     assert.equal(state().clips.find(c => c.mediaId === song.id)?.trackId, 'a1');
   } finally { connection.enabled = was; uploadQueue.setState({ jobs: [] }); }
+});
+
+// Normalize and color groups. c3 has a legacy grade, c4–c6 none; c14 is an audio clip.
+const measured = (clipId: string, balance: Partial<NormalizeShot['balance']> = {}, warnings: NormalizeShot['warnings'] = []): NormalizeShot => ({ clipId, balance: { exposure: .3, temperature: -500, tint: 2, lift: -.01, ...balance }, confidence: .9, warnings });
+const gradeOf = (clipId: string) => state().nodes.filter(n => n.clipId === clipId).sort((a, b) => a.order! - b.order!);
+const groupNode = (clipId: string) => state().nodes.find(n => n.clipId === clipId && n.group);
+const byId = <T extends { id: string }>(items: T[]) => [...items].sort((a, b) => a.id.localeCompare(b.id));
+
+test('Normalize makes a color group in one snapshot and one undo; joining copies its values; null and clean; undo restores all', () => {
+  const before = structuredClone({ clips: state().clips, nodes: state().nodes }), snapshots = state().snapshots.length;
+  assert.equal(state().normalizeColorGroup({ shots: [measured('c3', {}, [{ code: 'clipping', text: 'sky clips' }]), measured('c4', { exposure: -.2 }), measured('c14')] }, { group: { name: 'Night' } }), 2, 'the audio clip is skipped');
+  assert.equal(state().snapshots.length, snapshots + 1); assert.equal(state().snapshots[0].name, 'Before Normalize: Night');
+  assert.equal(state().operations.length, 1, 'every shot is one undo step');
+  assert.equal(state().notifications.at(-1)!.title, 'Normalized 2 shots into Night');
+  assert.match(state().notifications.at(-1)!.detail!, /Neon crossing: sky clips · Skipped: Midnight people/);
+  const id = clip('c3').properties.colorGroup as string;
+  assert.match(id, /^cg-/); assert.equal(clip('c4').properties.colorGroup, id);
+  for (const c of ['c3', 'c4']) assert.deepEqual(gradeOf(c).map(n => n.name), ['Input CST', 'Balance', 'Night', 'Look', 'Output CST']);
+  assert.deepEqual([gradeOf('c3')[1].parameters.exposure, gradeOf('c4')[1].parameters.exposure, gradeOf('c4')[1].parameters.lift], [.3, -.2, -.01]);
+  state().updateColorGroup(id, { parameters: { saturation: 120 } });
+  assert.equal(state().normalizeColorGroup({ shots: [measured('c5')] }, { group: { id, name: 'ignored' } }), 1);
+  assert.deepEqual([groupNode('c5')!.name, groupNode('c5')!.parameters.saturation], ['Night', 120], 'a new member takes the group values');
+  state().normalizeColorGroup({ shots: [measured('c4')] }, { group: null });
+  assert.equal(clip('c4').properties.colorGroup, undefined); assert.equal(groupNode('c4'), undefined);
+  const look = gradeOf('c3').find(n => n.name === 'Look')!, old = gradeOf('c3').map(n => n.id);
+  state().updateNode(look.id, { parameters: { contrast: 1.4 } });
+  assert.equal(state().normalizeColorGroup({ shots: [measured('c3', { exposure: .1 })] }, { clean: true }), 1);
+  assert.ok(gradeOf('c3').every(n => !old.includes(n.id)), 'clean replaces every node');
+  assert.deepEqual([gradeOf('c3').find(n => n.name === 'Look')!.parameters.contrast, gradeOf('c3')[1].parameters.exposure], [1, .1]);
+  assert.deepEqual([clip('c3').properties.colorGroup, groupNode('c3')!.parameters.saturation], [id, 120], 'no group asked for: the shot stays in its group');
+  for (let i = 0; i < 6; i++) state().undo();
+  assert.deepEqual(state().clips, before.clips); assert.deepEqual(byId(state().nodes), byId(before.nodes));
+  store.setState({ currentUserId: 'non-editor' }); assert.equal(state().normalizeColorGroup({ shots: [measured('c3')] }), 0);
+});
+
+test('a color group changes on every member at once: one undo per drag, through updateNode too; renames; locked shots are named', () => {
+  state().normalizeColorGroup({ shots: ['c3', 'c4', 'c5'].map(c => measured(c)) }, { group: { name: 'Day' } });
+  const id = clip('c3').properties.colorGroup as string, members = ['c3', 'c4', 'c5'], operations = state().operations.length;
+  state().updateColorGroup(id, { parameters: { exposure: .2 } }, 'drag'); state().updateColorGroup(id, { parameters: { exposure: .5 } }, 'drag');
+  assert.equal(state().operations.length, operations + 1, 'one drag, one undo step');
+  for (const c of members) assert.equal(groupNode(c)!.parameters.exposure, .5);
+  state().undo(); for (const c of members) assert.equal(groupNode(c)!.parameters.exposure, 0);
+  const curves = { RGB: { mode: 'smooth' as const, points: [{ id: 'a', x: 0, y: 0 }, { id: 'b', x: .5, y: .6 }, { id: 'c', x: 1, y: 1 }] } }, place = groupNode('c3')!.position;
+  state().updateNode(groupNode('c4')!.id, { parameters: { saturation: 80 }, curves, position: { x: 900, y: 40 } });
+  for (const c of members) assert.deepEqual([groupNode(c)!.parameters.saturation, groupNode(c)!.curves], [80, curves]);
+  assert.deepEqual([groupNode('c4')!.position, groupNode('c3')!.position], [{ x: 900, y: 40 }, place], 'the place stays per node');
+  state().updateNode(groupNode('c5')!.id, { name: 'Daylight' });
+  state().renameColorGroup(id, '  Dusk ');
+  for (const c of members) assert.equal(groupNode(c)!.name, 'Dusk');
+  state().undo(); for (const c of members) assert.equal(groupNode(c)!.name, 'Daylight');
+  store.setState({ locks: [{ id: 'remote', userId: 'ashley', projectId: 'city-after-dark', targetId: 'c5', field: 'grade', expiresAt: Date.now() + LOCK_TTL }] });
+  state().updateColorGroup(id, { enabled: false });
+  assert.deepEqual(members.map(c => groupNode(c)!.enabled), [false, false, true]);
+  assert.equal(state().notifications.at(-1)!.title, 'Daylight changed on 2 of 3 shots'); assert.match(state().notifications.at(-1)!.detail!, /Locked: The last train/);
+});
+
+test('setColorGroup puts shots after Balance with the group values, makes a new group, takes shots out and refuses a bad id', () => {
+  state().normalizeColorGroup({ shots: [measured('c3')] }, { group: { name: 'Wide' } });
+  const id = clip('c3').properties.colorGroup as string;
+  state().updateColorGroup(id, { parameters: { contrast: 1.2 } });
+  state().initializeColorGrade('c4');
+  assert.equal(state().setColorGroup(['c4', 'c6'], { id }), id);
+  assert.match(state().notifications.at(-1)!.detail!, /Balance node, or is locked: A city still awake/, 'a shot without a wide-gamut grade is named');
+  assert.deepEqual(gradeOf('c4').map(n => n.name), ['Input CST', 'Balance', 'Wide', 'Look', 'Output CST']);
+  assert.deepEqual([clip('c4').properties.colorGroup, groupNode('c4')!.parameters.contrast, clip('c6').properties.colorGroup], [id, 1.2, undefined]);
+  const node = groupNode('c4')!.id, close = state().setColorGroup(['c4'], { name: 'Close' })!;
+  assert.match(close, /^cg-/); assert.notEqual(close, id);
+  assert.deepEqual([groupNode('c4')!.id, groupNode('c4')!.group, groupNode('c4')!.name, groupNode('c4')!.parameters.contrast], [node, close, 'Close', 1]);
+  assert.equal(state().setColorGroup(['c4'], null), undefined);
+  assert.deepEqual([clip('c4').properties.colorGroup, groupNode('c4')], [undefined, undefined]);
+  assert.equal(state().setColorGroup(['c3'], { id: 'bad id' }), undefined); assert.equal(state().notifications.at(-1)!.title, 'Invalid color group');
+});
+
+test('grade paste never changes membership; a new grade keeps a grouped shot in its group', () => {
+  state().normalizeColorGroup({ shots: [measured('c3'), measured('c4')] }, { group: { name: 'A' } });
+  const a = clip('c3').properties.colorGroup as string;
+  state().updateColorGroup(a, { parameters: { exposure: .7 } });
+  state().normalizeColorGroup({ shots: [measured('c5')] }, { group: { name: 'B' } });
+  const b = clip('c5').properties.colorGroup as string;
+  state().copyGrade('c3'); state().pasteGrade('c5');
+  assert.equal(clip('c5').properties.colorGroup, b);
+  assert.deepEqual(gradeOf('c5').filter(n => n.group).map(n => [n.group, n.name, n.parameters.exposure]), [[b, 'B', 0]], 'the pasted group node becomes B\'s');
+  state().pasteGrade('c6');
+  const plain = gradeOf('c6').find(n => n.name === 'A')!;
+  assert.deepEqual([plain.group, plain.kind, plain.parameters.exposure, clip('c6').properties.colorGroup], [undefined, 'serial', .7, undefined]);
+  state().initializeColorGrade('c4');
+  assert.deepEqual(gradeOf('c4').map(n => n.name), ['Input CST', 'Balance', 'A', 'Look', 'Output CST']);
+  assert.deepEqual([groupNode('c4')!.group, groupNode('c4')!.parameters.exposure], [a, .7]);
+});
+
+test('deleting a group node takes the shot out of its group in one undo; a pasted grade with no Balance does too; restoring a DaVinci grade too', () => {
+  state().normalizeColorGroup({ shots: ['c3', 'c4', 'c5'].map(c => measured(c)) }, { group: { name: 'Day' } });
+  const id = clip('c3').properties.colorGroup as string, node = groupNode('c3')!.id;
+  state().removeNode(node);
+  assert.deepEqual([clip('c3').properties.colorGroup, groupNode('c3')], [undefined, undefined]);
+  assert.deepEqual(state().clips.filter(c => c.properties.colorGroup === id).map(c => c.id).sort(), ['c4', 'c5'], 'no member left without its group node');
+  state().undo();
+  assert.deepEqual([clip('c3').properties.colorGroup, groupNode('c3')?.id], [id, node]);
+  state().copyGrade('c6'); state().pasteGrade('c4');
+  assert.deepEqual([clip('c4').properties.colorGroup, groupNode('c4')], [undefined, undefined]);
+  assert.equal(state().notifications.at(-1)!.title, `${clip('c4').name} left Day`);
+  store.setState({ clips: state().clips.map(c => c.id === 'c5' ? { ...c, properties: { ...c.properties, resolveLookUrl: '/look.cube' } } : c) });
+  state().restoreResolveGrade('c5');
+  assert.deepEqual([clip('c5').properties.colorGroup, groupNode('c5')], [undefined, undefined]);
+});
+
+test('a pasted grouped clip takes its group values now; Normalize skips a shot re-tagged while it was measured', () => {
+  state().normalizeColorGroup({ shots: [measured('c3'), measured('c4')] }, { group: { name: 'Day' } });
+  const id = clip('c3').properties.colorGroup as string;
+  state().copyClip('c3'); state().updateColorGroup(id, { parameters: { exposure: 1 } });
+  state().setPlayhead(clip('c3').start + clip('c3').duration + 30); state().pasteClip();
+  const pasted = state().selectedClipId!;
+  assert.notEqual(pasted, 'c3'); assert.deepEqual([clip(pasted).properties.colorGroup, groupNode(pasted)!.parameters.exposure], [id, 1]);
+  const input = interpretation(clip('c5'), state().media.find(m => m.id === clip('c5').mediaId));
+  assert.equal(state().normalizeColorGroup({ shots: [{ ...measured('c5'), input }] }), 1, 'unchanged since measured');
+  state().updateProperty('c5', 'inputProfile', input.profile === 'S-Log3' ? 'Canon Log 3' : 'S-Log3');
+  assert.equal(state().normalizeColorGroup({ shots: [{ ...measured('c5', { exposure: 2 }), input }] }), 0);
+  assert.match(state().notifications.at(-1)!.detail!, /\(changed while it was measured: run Normalize again\)/);
+  assert.equal(gradeOf('c5')[1].parameters.exposure, .3);
 });

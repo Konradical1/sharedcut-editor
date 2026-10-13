@@ -414,3 +414,10 @@
 .health-spark-empty{font-size:10px}
 .health-harness>summary{padding:4px 0;color:var(--muted);cursor:pointer}
 .health-harness .health-people{margin-top:8px}
+/* Color groups (NormalizeDialog opens from the Edit timeline and the Color page). */
+.group-dot{display:inline-block;flex:none;width:8px;height:8px;border-radius:50%;background:var(--group-color)}.clip-group-dot{flex:none;width:6px;height:6px;border-radius:50%;box-shadow:0 0 0 1px #0007}
+.normalize-dialog p{margin:0;line-height:1.6}.normalize-groups{display:flex;flex-direction:column;gap:6px;margin:0;padding:10px 12px;border:1px solid #ffffff14;border-radius:8px}.normalize-groups legend{padding:0 4px;font-size:11px;color:#b4bbc0}.normalize-groups>small,.normalize-option small,.normalize-clean small,.normalize-list>small{color:var(--muted)}
+.normalize-option{display:flex;align-items:center;gap:10px;min-height:30px}.normalize-option label{display:flex;align-items:center;gap:8px;min-width:0;cursor:pointer}.normalize-option>input{flex:1;min-width:0;min-height:30px}.normalize-option:not(:has(>input)) label{flex:1}
+.normalize-clean{display:flex;align-items:flex-start;gap:9px;cursor:pointer}.normalize-clean input{margin-top:3px}.normalize-clean small{display:block;margin-top:3px}
+.normalize-progress>div{display:flex;justify-content:space-between;margin-bottom:6px;font-size:11px}.normalize-progress progress{width:100%}
+.normalize-list ul{display:flex;flex-direction:column;gap:5px;margin:6px 0 0;padding-left:16px;line-height:1.5}.normalize-list button{padding:0;border:0;background:transparent;color:var(--accent);font-weight:550;text-decoration:underline}

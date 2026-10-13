@@ -155,7 +155,7 @@ export const PROBE_VERSION = 3;
 /** An alpha plane in the decoded format (ProRes 4444, PNG/QuickTime Animation), or VP9/WebM's alpha side stream. */
 export const alphaFormat = (pixFmt?: string, alphaMode?: string) => /^(yuva|gbrap|ya\d|argb|rgba|abgr|bgra)/.test(pixFmt ?? '') || alphaMode === '1';
 // ponytail: tone-mapping knob; compare 100 against 203 on real footage and set FRAME_LINE_HDR_NPL.
-const hdrNpl = () => Number(process.env.FRAME_LINE_HDR_NPL) || 100;
+export const hdrNpl = () => Number(process.env.FRAME_LINE_HDR_NPL) || 100;
 /** The HDR-to-SDR table as a transform, or undefined for SDR sources. */
 export const hdrTransform = (transfer?: string) => isHdrTransfer(transfer) ? hdrToSdr(transfer!, hdrNpl()) : undefined;
 /**

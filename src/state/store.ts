@@ -1,7 +1,8 @@
 import { createSmartMask, isDepthKey, validateSmartMask, smartMaskSignature, type SmartMaskDocument } from '../services/smartMask.ts';
 import { createMotionTracker, MAX_TRACKERS, validateMotionTracker, type MotionTracker, type MotionTrackerLink } from '../services/motionTracker.ts';
-import { starterGrade, primaryDefaults, interpretation, validateGradeNode, acesOutputUpgrade } from '../services/color.ts';
-import { eligibility, proposedNodes, type AssistantMode, type BalanceValues, type LookOption, type ShotNote } from '../services/colorAssistant.ts';
+import { primaryDefaults, interpretation, validateGradeNode, acesOutputUpgrade } from '../services/color.ts';
+import { eligibility, findGradeNodes, proposedNodes, type AssistantMode, type BalanceValues, type LookOption, type ShotNote } from '../services/colorAssistant.ts';
+import { colorGroupOf, colorGroups, GROUP_ID, groupNodeOf, groupTemplate, isGroupNode, nextGroupName, normalizedGrade, validAutoBalance, type GroupTemplate, type NormalizeResult } from '../services/colorGroups.ts';
 import { captionDocument, captionPreset, groupCaptionWords, isCaption, restyleCaption, validateCaption, type CaptionJob, type CaptionSet, type CaptionWord } from '../services/captions.ts';
 import { isComposition, retimeTitleClip, validateCompositions } from '../services/compositions.ts';
 import { ADJUSTMENT_DURATION, ADJUSTMENT_MEDIA, isAdjustment } from '../services/adjustment.ts';
@@ -135,6 +136,14 @@ export interface EditorStore extends PersistedState {
   /** Color Assistant proposal as normal node values on every eligible shot: one snapshot, one undo. Returns the number of shots changed. */
   /** Applies look `option` (with each shot's Balance from `result.shots`, when the result has one) or a balance/match result, as one undo step. */
   applyColorAssistant(result:{mode:AssistantMode;looks?:LookOption[];shots?:(ShotNote&{balance?:BalanceValues})[]},option?:number,clipIds?:string[]):number;
+  /** Applies a Normalize result: each shot gets its automatic Balance (a fresh wide-gamut grade where needed, or with clean). group: {id} joins that color group, {name} makes a new one, null takes shots out, absent keeps membership. One undo step; a snapshot keeps the old grades. Returns how many shots changed. */
+  normalizeColorGroup(result: NormalizeResult, options?: { group?: { id?: string; name?: string } | null; clean?: boolean }): number;
+  /** Puts shots in a color group (their group node takes the group's current values; a new group when no id) or takes them out with null. Returns the group id. */
+  setColorGroup(clipIds: string[], group: { id?: string; name?: string } | null): string | undefined;
+  /** Changes a color group's shared grade (parameters, curves, enabled) on every member at once. */
+  updateColorGroup(groupId: string, patch: Partial<Pick<GradeNode, 'parameters' | 'curves' | 'enabled'>>, gesture?: string): void;
+  /** Renames a color group. */
+  renameColorGroup(groupId: string, name: string): void;
   useAcesOutput(clipId:string):void;
   restoreResolveGrade(clipId:string):void; initializeColorGrade(clipId:string):void; arrangeColorNodes(clipId:string):void; moveColorNode(id:string,beforeId:string|null,position?:{x:number;y:number}):void;
   updateNode(id: string, patch: Partial<GradeNode>, gesture?: string): void; applyGrade(nodes: { name: string; parameters: Record<string, number> }[]): void;
@@ -280,6 +289,34 @@ let lastProcessingTick = Date.now();
 // The playing clock (tick): its exact time, the playhead it last gave the store, and whether it was running then.
 let clockTime = 0, clockPublished = NaN, clockRunning = false;
 
+// Color groups (services/colorGroups.ts): membership is clip.properties.colorGroup, the shared grade one `group` node per member.
+type GroupChange = { id: string; name: string; template?: GroupTemplate };
+/** The group a clip is in, with its shared values (its own group node first, else any member's): what a rebuilt grade keeps. */
+const membership = (clip: Clip, nodes: GradeNode[]): GroupChange | undefined => {
+  const id = colorGroupOf(clip); if (!id) return;
+  const node = nodes.find(n => n.clipId === clip.id && n.group === id) ?? nodes.find(n => n.group === id);
+  return { id, name: node?.name ?? 'Color group', template: groupTemplate(node) };
+};
+/** One clip's nodes with its group node set to `group` right after Balance (with the group's values), or removed (null). Undefined when there is no Balance node to follow. */
+const placeGroup = (clip: Clip, own: GradeNode[], group: GroupChange | null): GradeNode[] | undefined => {
+  const current = own.find(isGroupNode), rest = own.filter(n => n !== current);
+  if (!group) return rest;
+  const { balance } = findGradeNodes(clip, rest); if (!balance) return;
+  const at = balance.order ?? 0, after = Math.min(...rest.map(n => n.order ?? 0).filter(o => o > at)), values = group.template ?? (current?.group === group.id ? groupTemplate(current)! : { parameters: { ...primaryDefaults }, enabled: true });
+  return [...rest, { id: current?.id ?? createId('grade'), projectId: clip.projectId, clipId: clip.id, name: group.name, kind: 'group', group: group.id, enabled: values.enabled, order: Number.isFinite(after) ? (at + after) / 2 : at + 1,
+    position: current?.position ?? { x: (balance.position?.x ?? 230) + 85, y: (balance.position?.y ?? 80) + 130 }, parameters: { ...values.parameters }, ...(values.curves && { curves: structuredClone(values.curves) }) }];
+};
+/** The changes that turn one clip's `own` nodes into `next`, whole nodes, unchanged ones left out. Throws on an invalid node. */
+const gradeChanges = (own: GradeNode[], next: GradeNode[]): Change[] => [
+  ...own.filter(n => !next.some(x => x.id === n.id)).map(n => ({ collection: 'nodes' as const, id: n.id, value: null })),
+  ...next.filter(n => JSON.stringify(n) !== JSON.stringify(own.find(o => o.id === n.id))).map(n => { validateGradeNode(n); return { collection: 'nodes' as const, id: n.id, value: record(n), replace: true }; }),
+];
+const clipChange = (clip: Clip, properties: Record<string, string | number | boolean>, unset: string[] = [], keyframes?: Clip['keyframes']): Change => {
+  const gone = unset.filter(key => clip.properties[key] !== undefined).map(key => `properties.${key}`);
+  return { collection: 'clips', id: clip.id, value: { ...Object.fromEntries(Object.entries(properties).map(([key, value]) => [`properties.${key}`, value])), ...(keyframes ? { keyframes } : {}) }, ...(gone.length ? { unset: gone } : {}) };
+};
+const parameterFields = (parameters: Record<string, number>) => Object.fromEntries(Object.entries(parameters).filter(([key, number]) => /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(key) && !['constructor', 'prototype'].includes(key) && Number.isFinite(number)).map(([key, number]) => [`parameters.${key}`, number]));
+
 // The server takes up to 2000 ids per lock request; a bigger drag goes out in slices.
 const lockRequest = (method: 'POST' | 'DELETE', projectId: string, ids: string[], field: string) => Promise.all(Array.from({ length: Math.ceil(ids.length / 2000) }, (_, i) => api('/locks', { method, body: JSON.stringify({ projectId, targetIds: ids.slice(i * 2000, (i + 1) * 2000), field }) })));
 export const useEditorStore = create<EditorStore>((set, get) => {
@@ -313,6 +350,17 @@ export const useEditorStore = create<EditorStore>((set, get) => {
   };
   const linkedClips=(clip:Clip)=>get().settings.linkSelection!==false&&clip.properties.linkGroup?get().clips.filter(c=>c.projectId===clip.projectId&&c.timelineId===clip.timelineId&&c.properties.linkGroup===clip.properties.linkGroup):[clip];
   const editableGroup=(clip:Clip,field='manipulation')=>{const group=linkedClips(clip);return group.every(c=>editableClip(c.id,field))?group:null;};
+  // {id} names a color group (made when no shot is in it yet), {name} makes a new one; undefined, with a notice, for a malformed id.
+  const groupTarget=(group:{id?:string;name?:string}):GroupChange|undefined=>{
+    const state=get();if(group.id!==undefined&&!GROUP_ID.test(group.id)){state.notify('Invalid color group','error');return;}
+    const groups=colorGroups(state.clips.filter(c=>c.projectId===state.projectId),state.nodes),existing=groups.find(g=>g.id===group.id);
+    return {id:group.id??createId('cg'),name:existing?.node?.name??(group.name?.trim().slice(0,60)||nextGroupName(groups)),template:groupTemplate(existing?.node)};
+  };
+  // A group's member nodes this user may change now, and the shots that are locked.
+  const groupMembers=(groupId:string)=>{
+    const state=get(),nodes=state.nodes.filter(n=>n.projectId===state.projectId&&n.group===groupId),open=nodes.filter(n=>editableClip(n.clipId,'grade')&&available(n.id,'*'));
+    return {nodes,open,locked:nodes.filter(n=>!open.includes(n)).map(n=>state.clips.find(c=>c.id===n.clipId)?.name??n.clipId)};
+  };
   let lastGesture: { token: string; operationId: string } | undefined;
   // Undo records, newest first: what Redo can re-apply. Any edit you commit clears yours.
   let redoable: Operation[] = [];
@@ -520,6 +568,8 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     if(!source.id&&group.length>1)for(const c of group)c.properties.linkGroup=link;
     else {const links=new Map<string,string>();for(let i=0;i<group.length;i++){const old=sourceGroup[i]?.properties.linkGroup;delete group[i].properties.linkGroup;if(old){if(!links.has(String(old)))links.set(String(old),createId('link'));group[i].properties.linkGroup=links.get(String(old))!;}}}
     const nodes=group.flatMap((c,i)=>copyAnimatedNodes(c,(copied?state.clipboardNodes:state.nodes).filter(n=>n.clipId===sourceGroup[i]?.id),()=>createId('node')));
+    // A pasted color group node takes its group's values now, not the ones it had when copied.
+    if(copied)for(const n of nodes){const live=n.group?state.nodes.find(m=>m.projectId===state.projectId&&m.group===n.group):undefined;if(!live)continue;delete n.curves;Object.assign(n,{name:live.name},groupTemplate(live));}
     const space=insert?insertSpace(group):{changes:[],moved:[]};if(!space)return;
     const overwritten=overwriteChanges(group[0],[...group.map(c=>c.id),...space.moved],group);if(!overwritten)return;changes.push(...space.changes,...overwritten);
     for(const placed of group){cloneContents(placed,changes);changes.push({collection:'clips',id:placed.id,value:record(placed),replace:true});}
@@ -1508,7 +1558,9 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const node=get().nodes.find(n=>n.id===id); if(!node || !editableClip(node.clipId,'grade') || !available(id,'*'))return;
       const clip=get().clips.find(c=>c.id===node.clipId)!;
       const keyframes=Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>!path.startsWith(`nodes.${id}.`)));
-      commit('GradeNodeChanged',id,`removed ${node.name}`,[{collection:'nodes',id,value:null},...(clip.keyframes?[{collection:'clips' as const,id:clip.id,value:{keyframes}}]:[])]);
+      // Deleting its group node takes the shot out of the group in the same undo step.
+      const leave=node.group&&colorGroupOf(clip)===node.group?['colorGroup']:[];
+      commit('GradeNodeChanged',id,`removed ${node.name}`,[{collection:'nodes',id,value:null},...(clip.keyframes||leave.length?[clipChange(clip,{},leave,clip.keyframes?keyframes:undefined)]:[])]);
       set({selectedNodeId:get().nodes.filter(n=>n.clipId===node.clipId).sort((a,b)=>(a.order??0)-(b.order??0))[0]?.id??null});
     },
     reorderNode(id,direction) {
@@ -1531,16 +1583,22 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const fields=['colorPipeline','inputProfile','inputGamut','dataLevels','inputExposure','inputTemperature','resolveLookUrl','bypassResolveLook','resolveNodeNames'];
       const isGrade=(path:string)=>path.startsWith('nodes.')||fields.some(key=>path===`properties.${key}`);
       const copy={...clip,keyframes:structuredClone(Object.fromEntries(Object.entries(source.clip.keyframes??{}).filter(([path])=>isGrade(path))))};
-      const nodes=copyAnimatedNodes(copy,source.nodes,()=>createId('grade'));
+      let nodes=copyAnimatedNodes(copy,source.nodes,()=>createId('grade'));
       const sameSource=source.clip.mediaId===clip.mediaId;
       const masks=sameSource?structuredClone(source.clip.smartMasks??[]):[];
       const maskIds=new Map(masks.map(mask=>[mask.id,createId('mask')]));
       for(const mask of masks)mask.id=maskIds.get(mask.id)!;
       // A depth key reads the target's own analysis, so it travels with the grade; a subject belongs to its source.
       for(const node of nodes)if(node.mask&&!isDepthKey(node.mask)){const id=maskIds.get(node.mask.id);if(id)node.mask={...node.mask,id};else delete node.mask;}
+      // Paste keeps color group membership: a grouped target keeps its group's node and values, an ungrouped one gets a plain node.
+      // Only a pasted grade without a Balance node to follow takes the target out, rather than leave a member with no group node.
+      const member=membership(clip,state.nodes),placed=member&&placeGroup(clip,nodes,member);
+      if(member)nodes=placed||nodes.filter(n=>!isGroupNode(n));
+      else for(const node of nodes)if(isGroupNode(node)){delete node.group;node.kind='serial';}
       const value:Record<string,unknown>={...(masks.length?{smartMasks:[...(clip.smartMasks??[]),...masks]}:{}),keyframes:{...Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>!isGrade(path))),...copy.keyframes}};
       const unset:string[]=[];
       for(const key of fields){if(source.clip.properties[key]===undefined)unset.push(`properties.${key}`);else value[`properties.${key}`]=source.clip.properties[key];}
+      if(member&&!placed){unset.push('properties.colorGroup');state.notify(`${clip.name} left ${member.name}`,'info','The pasted grade has no Balance node for the group to follow.');}
       commit('GradeNodeChanged',clipId,`replaced grade on ${clip.name}`, [
         ...old.map(n=>({collection:'nodes' as const,id:n.id,value:null})),
         {collection:'clips',id:clipId,value,unset},
@@ -1554,21 +1612,21 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const keyframes=Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>!path.startsWith('nodes.')));
       commit('GradeNodeChanged',clipId,'restored imported DaVinci grade',[
         ...old.map(n=>({collection:'nodes' as const,id:n.id,value:null})),
-        {collection:'clips',id:clipId,value:{'properties.colorPipeline':'legacy','properties.bypassResolveLook':false,'properties.inputExposure':0,'properties.inputTemperature':0,keyframes}},
+        {collection:'clips',id:clipId,value:{'properties.colorPipeline':'legacy','properties.bypassResolveLook':false,'properties.inputExposure':0,'properties.inputTemperature':0,keyframes},...(colorGroupOf(clip)?{unset:['properties.colorGroup']}:{})},
       ]);set({selectedNodeId:null});
     },
     initializeColorGrade(clipId) {
       const state=get(),clip=editableClip(clipId,'grade');if(!clip)return;
       const old=state.nodes.filter(n=>n.clipId===clipId);if(old.some(n=>!available(n.id,'*')))return;
-      const asset=state.media.find(m=>m.id===clip.mediaId),source=interpretation(clip,asset),nodes=starterGrade(clip,asset,()=>createId('grade'));
-      const output=nodes[3].effects![0];if(output.type==='cst'){output.toneMapping=['Rec.709','Gamma 2.4'].includes(source.profile)?'none':'aces2';output.gamutMapping='none';}
+      // Input CST → Balance → Look → Output (ACES 2 for log, none for Rec.709); a grouped shot gets its group node back after Balance.
+      const {next:nodes,properties,ids}=normalizedGrade(clip,state.media.find(m=>m.id===clip.mediaId),state.nodes,{clean:true,group:membership(clip,state.nodes)},createId);
       state.saveSnapshot(`Before new grade: ${clip.name}`,'Preserved before starting the wide-gamut grade.');
       const keyframes=Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>!path.startsWith('nodes.')));
       commit('GradeNodeAdded',clipId,'started a wide-gamut grade',[
         ...old.map(n=>({collection:'nodes' as const,id:n.id,value:null})),
-        {collection:'clips',id:clipId,value:{'properties.colorPipeline':'nodes-v2','properties.inputProfile':source.profile,'properties.inputGamut':source.gamut,keyframes}},
+        clipChange(clip,properties,[],keyframes),
         ...nodes.map(n=>({collection:'nodes' as const,id:n.id,value:record(n),replace:true})),
-      ]);set({selectedNodeId:nodes[1].id,selectedClipId:clipId});
+      ]);set({selectedNodeId:ids.balance,selectedClipId:clipId});
     },
     applyColorAssistant(result,option,clipIds=[]) {
       const state=get();if(!writable())return 0;
@@ -1593,6 +1651,66 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       state.notify(`Applied ${label} to ${count}`,'success',skipped.length?`Skipped: ${skipped.join(', ')}`:undefined);
       return applied.length;
     },
+    normalizeColorGroup(result,options={}) {
+      const state=get();if(!writable())return 0;
+      const target=options.group===null?null:options.group?groupTarget(options.group):undefined;if(options.group&&!target)return 0;
+      const changes:Change[]=[],applied:string[]=[],skipped:string[]=[],warned:string[]=[],seen=new Set<string>();
+      for(const shot of result.shots??[]){
+        if(seen.has(shot.clipId))continue;seen.add(shot.clipId);
+        const clip=state.clips.find(c=>c.id===shot.clipId&&c.projectId===state.projectId),asset=state.media.find(m=>m.id===clip?.mediaId);
+        if(!clip||asset?.kind!=='video'||!validAutoBalance(shot.balance)){skipped.push(clip?.name??shot.clipId);continue;}
+        const own=state.nodes.filter(n=>n.clipId===clip.id);
+        if(!editableClip(clip.id,'grade')||own.some(n=>!available(n.id,'*'))){skipped.push(clip.name);continue;}
+        // No group asked for: a grouped shot stays in its group, so a clean rebuild re-creates its group node.
+        // The job measured through the interpretation it saw at start; a shot re-tagged since would get a balance solved for other footage.
+        try{const now=interpretation(clip,asset);if(shot.input&&(shot.input.profile!==now.profile||shot.input.gamut!==now.gamut))throw Error('changed while it was measured: run Normalize again');
+          const grade=normalizedGrade(clip,asset,state.nodes,{balance:shot.balance,clean:options.clean,group:target===undefined?membership(clip,state.nodes):target},createId);changes.push(...gradeChanges(own,grade.next),clipChange(clip,grade.properties,grade.unset,grade.keyframes));}
+        catch(error){skipped.push(`${clip.name} (${(error as Error).message})`);continue;}
+        applied.push(clip.id);const check=shot.warnings?.filter(w=>w.code!=='low-confidence'&&w.code!=='display-referred')??[];if(check.length)warned.push(`${clip.name}: ${check.map(w=>w.text).join('; ')}`);
+      }
+      if(!applied.length){state.notify('No shot could be normalized','info',skipped.length?`Skipped: ${skipped.join(', ')}`:undefined);return 0;}
+      const into=target?` into ${target.name}`:'',count=`${applied.length} shot${applied.length===1?'':'s'}`;
+      state.saveSnapshot(`Before Normalize${target?`: ${target.name}`:''}`,options.clean?'Preserved the old grades before Normalize rebuilt them.':'Preserved before Normalize.');
+      commit('GradeNodeChanged',applied[0],`normalized ${count}${into}`,changes);
+      if(state.selectedNodeId&&!get().nodes.some(n=>n.id===state.selectedNodeId))set({selectedNodeId:null});
+      const detail=[...warned.slice(0,5),...(warned.length>5?[`${warned.length-5} more with warnings`]:[]),...(skipped.length?[`Skipped: ${skipped.join(', ')}`]:[])].join(' · ');
+      state.notify(`Normalized ${count}${into}`,'success',detail||undefined);
+      return applied.length;
+    },
+    setColorGroup(clipIds,group) {
+      const state=get();if(!writable())return;
+      const target=group&&groupTarget(group);if(group&&!target)return;
+      const changes:Change[]=[],moved:string[]=[],skipped:string[]=[];
+      for(const id of new Set(clipIds)){
+        const clip=state.clips.find(c=>c.id===id&&c.projectId===state.projectId);if(!clip)continue;
+        const own=state.nodes.filter(n=>n.clipId===id),current=colorGroupOf(clip);
+        if(target?current===target.id&&groupNodeOf(id,own):!current&&!groupNodeOf(id,own))continue;
+        const next=placeGroup(clip,own,target??null);
+        if(!next||!editableClip(id,'grade')||own.some(n=>!available(n.id,'*'))){skipped.push(clip.name);continue;}
+        changes.push(...gradeChanges(own,next),clipChange(clip,target?{colorGroup:target.id}:{},target?[]:['colorGroup']));moved.push(id);
+      }
+      const reason=skipped.length?`Needs a wide-gamut grade with a Balance node, or is locked: ${skipped.join(', ')}`:undefined;
+      if(!changes.length){if(reason)state.notify(target?`Could not add to ${target.name}`:'Could not take shots out of their color group','info',reason);return reason?undefined:target?.id;}
+      const count=`${moved.length} shot${moved.length===1?'':'s'}`;
+      commit('GradeNodeChanged',target?.id??moved[0],target?`added ${count} to ${target.name}`:`took ${count} out of color groups`,changes);
+      if(reason)state.notify(target?`Added ${count} to ${target.name}`:`Took ${count} out of color groups`,'info',reason);
+      return target?.id;
+    },
+    updateColorGroup(groupId,patch,gesture) {
+      const state=get();if(!writable()||!state.nodes.some(n=>n.projectId===state.projectId&&n.group===groupId))return;
+      try{validateGradeNode({curves:patch.curves});}catch(error){state.notify((error as Error).message,'error');return;}
+      const value:Record<string,unknown>={...(patch.parameters?parameterFields(patch.parameters):{}),...(patch.curves?{curves:patch.curves}:{}),...(typeof patch.enabled==='boolean'?{enabled:patch.enabled}:{})};
+      const {nodes,open,locked}=groupMembers(groupId);if(!Object.keys(value).length||!open.length)return;
+      // Never keyframed: one value for the whole group. Same targetId per group, so a slider drag is one undo step.
+      commit('GradeNodeChanged',groupId,`adjusted ${nodes[0].name}`,open.map(n=>({collection:'nodes' as const,id:n.id,value:{...value}})),gesture);
+      if(locked.length)state.notify(`${nodes[0].name} changed on ${open.length} of ${nodes.length} shots`,'info',`Locked: ${locked.join(', ')}`);
+    },
+    renameColorGroup(groupId,name) {
+      const state=get(),clean=name.trim().slice(0,60);if(!clean||!writable()||!state.nodes.some(n=>n.projectId===state.projectId&&n.group===groupId))return;
+      const {open,locked}=groupMembers(groupId),changes=open.filter(n=>n.name!==clean).map(n=>({collection:'nodes' as const,id:n.id,value:{name:clean}}));
+      if(changes.length)commit('GradeNodeChanged',groupId,`renamed color group to ${clean}`,changes);
+      if(locked.length)state.notify(`Renamed ${clean} on ${open.length} shots`,'info',`Locked: ${locked.join(', ')}`);
+    },
     useAcesOutput(clipId) {
       const state=get(),clip=state.clips.find(c=>c.id===clipId&&c.projectId===state.projectId);if(!clip)return;
       const upgrade=acesOutputUpgrade(clip,state.nodes);if(!upgrade)return;
@@ -1613,6 +1731,13 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     updateNode(id, patch, gesture) {
       const node = get().nodes.find(node => node.id === id && node.projectId === get().projectId);
       if (!node || !editableClip(node.clipId, 'grade') || !available(id, '*')) return;
+      // A color group node shares its grade and name with every member; its mask and place stay its own.
+      if(node.group){
+        const {parameters,curves,enabled,name,...own}=patch;
+        if(parameters||curves||typeof enabled==='boolean')get().updateColorGroup(node.group,{parameters,curves,enabled},gesture);
+        if(name?.trim())get().renameColorGroup(node.group,name);
+        if(!Object.keys(own).length)return;patch=own;
+      }
       if(('mask' in patch?patch.mask:node.mask)?.enabled&&(patch.effects??node.effects)?.some(e=>e.enabled&&e.type==='cst')){get().notify('Keep color-space transforms on an unmasked node','info');return;}
       try{validateGradeNode({...node,...patch});}catch(error){get().notify((error as Error).message,'error');return;}
       const value: Record<string, unknown> = {};
@@ -1623,7 +1748,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if(patch.effects)value.effects=patch.effects;
       if (typeof patch.enabled === 'boolean') value.enabled = patch.enabled;
       if (patch.name?.trim()) value.name = patch.name.trim().slice(0, 80);
-      if (patch.parameters) for (const [key, number] of Object.entries(patch.parameters)) if (/^[a-zA-Z][a-zA-Z0-9_-]*$/.test(key) && !['constructor', 'prototype'].includes(key) && Number.isFinite(number)) value[`parameters.${key}`] = number;
+      if (patch.parameters) Object.assign(value, parameterFields(patch.parameters));
       const clip=get().clips.find(c=>c.id===node.clipId)!;
       const keyframes={...clip.keyframes};
       for(const [field,next] of Object.entries(value))if(keyframes[`nodes.${id}.${field}`]) { const fps=get().projects.find(p=>p.id===clip.projectId)?.fps||24,time=frameTime(clamp(get().playhead-clip.start,0,clip.duration-1/fps),fps),path=`nodes.${id}.${field}`;keyframes[path]=[...keyframes[path].filter(k=>Math.abs(k.time-time)>.5/fps),{id:createId('key'),time,value:next as KeyframeValue,interpolation:typeof next==='number'?'linear' as const:'hold' as const}].sort((a,b)=>a.time-b.time);delete value[field]; }

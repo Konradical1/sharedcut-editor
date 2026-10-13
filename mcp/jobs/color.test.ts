@@ -33,6 +33,13 @@ let polls = 0, cancelled = 0, failWith = 0;
 const job = () => ({ id: jobId, projectId, mode: 'looks', createdAt: 1, request: posted[0], skipped: [],
   ...(polls < 2 ? { status: 'running', stage: 'Asking fake', progress: 40 } : { status: 'done', stage: 'Done', progress: 100,
     result: { looks: [option('Clean', 'natural', 1.2), option('Neon', 'bold', 1.5), option('Bleach', 'extreme', 2)], stills: [{ clipId: a.id, frame: 0, before: `${base}/${jobId}/stills/s0-f0-before.jpg`, after: [1, 2, 3].map(i => `${base}/${jobId}/stills/s0-f0-look${i}.jpg`) }] } }) });
+// Normalize: answers every posted shot (targets and context) at once; the job applies the targets only.
+// phone: a display-referred answer (gamma/gain only); stale: a shot measured through another interpretation, which the store skips.
+const normalizeId = 'feed0000-2222-3333-4444-555555555555', nbase = `/api/projects/${projectId}/color-normalize`, normalizePosted: any[] = [];
+let phone = false, stale = '';
+const normalized = () => { const body = normalizePosted.at(-1); return { id: normalizeId, projectId, status: 'done', stage: 'Done', progress: 100, createdAt: 1, skipped: [{ clipId: 'gone', code: 'missing-media', text: 'Media is missing.' }],
+  result: { shots: [...body.clipIds, ...(body.contextIds ?? [])].map((clipId: string) => ({ clipId, balance: phone ? { exposure: 0, temperature: 0, tint: 0, lift: 0, gamma: .5, gain: .8 } : { exposure: .3, temperature: -500, tint: 2, lift: -.01 }, confidence: .9, warnings: [{ code: 'clipping', text: 'sky' }],
+    ...(clipId === stale && { input: { profile: 'Rec.709', gamut: 'Rec.709' } }) })), level: { group: .18, target: .18 } } }; };
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 globalThis.fetch = (async (input: string | URL, init: RequestInit = {}) => {
   const url = new URL(String(input)), path = url.pathname, method = init.method ?? 'GET';
@@ -44,6 +51,8 @@ globalThis.fetch = (async (input: string | URL, init: RequestInit = {}) => {
   if (path === base) return json(job());
   if (path === `${base}/${jobId}` && method === 'DELETE') { cancelled++; return json({ ok: true }); }
   if (path === `${base}/${jobId}`) { if (failWith) return json({ error: `fake ${failWith}` }, failWith); polls++; return json(job()); }
+  if (path === nbase && method === 'POST') { normalizePosted.push(JSON.parse(String(init.body))); return json({ jobId: normalizeId }, 202); }
+  if (path === `${nbase}/${normalizeId}`) return json(normalized());
   if (path.startsWith(`${base}/${jobId}/stills/`)) return new Response(Buffer.from(path), { headers: { 'content-type': 'image/jpeg' } });
   return json({ error: `not faked: ${method} ${path}` }, 404);
 }) as typeof fetch;
@@ -134,6 +143,43 @@ test('color-lut adds a .cube like the UI import and rewrites a list without the 
   await writeFile(file, 'LUT_3D_SIZE 2\n0 0 0\n');
   await assert.rejects(run('color-lut', { node: balance.id, file }), /Incomplete LUT data/);
   await assert.rejects(run('color-lut', { node: balance.id, effects: [{ id: 'x', type: 'lut', enabled: true }] }), /was refused: Invalid node effect|Invalid 3D LUT|Unsupported effect input/);
+});
+
+test('color-normalize measures, applies as one undo into a new group, and joins it by name with the members as context', async () => {
+  const snapshots = server.snapshots.length, other = s().clips.find(c => c.id === 'c4')!;
+  const step = await run('color-normalize', { clips: [a.id, legacy.id, b.id], group: 'Night' });
+  assert.deepEqual(normalizePosted[0], { clipIds: [a.id, legacy.id, b.id] });
+  const id = server.clips.find(c => c.id === a.id)!.properties.colorGroup as string;
+  assert.match(step.text, new RegExp(`^Normalized 2 of 3 shots into "Night" ${id} \\(2 shots\\); a snapshot keeps the old grades\\.`), 'the still is skipped by the store');
+  assert.match(step.text, /\nbalance: @\w+ exp 0\.3 temp -500 tint 2 lift -0\.01 90% clipping · @\w+ .*\nskipped: @gone Media is missing\./);
+  for (const clip of [a, legacy]) {
+    assert.deepEqual(nodes(clip.id).map(n => n.name), ['Input CST', 'Balance', 'Night', 'Look', 'Output CST']);
+    assert.equal(nodes(clip.id)[1].parameters.exposure, .3);
+  }
+  assert.equal(server.snapshots.length, snapshots + 1);
+  assert.match((await run('color-grade', { clip: a.id })).text, new RegExp(`"Night" \\[group ${id}\\]`));
+
+  const joined = await run('color-normalize', { clips: [other.id], group: 'night', clean: true });
+  assert.deepEqual(normalizePosted[1], { clipIds: [other.id], contextIds: [legacy.id, a.id], clean: true }, 'the members go along for pooling, in timeline order; clean is measured as rebuilt');
+  assert.match(joined.text, new RegExp(`^Normalized 1 of 1 shot into "Night" ${id} \\(3 shots\\), grades rebuilt;`));
+  assert.equal(server.clips.find(c => c.id === other.id)!.properties.colorGroup, id);
+  await assert.rejects(run('color-normalize', { clips: [a.id], group: 'cg-nope' }), /No color group cg-nope/);
+  s().selectClips([]); await assert.rejects(run('color-normalize', {}), /select shots first/);
+});
+
+test('color-normalize names the group the shots moved into, measures a grouped shot with its group, and reports a phone balance', async () => {
+  const other = s().clips.find(c => c.id === 'c4')!, night = server.clips.find(c => c.id === a.id)!.properties.colorGroup;
+  await run('color-normalize', { clips: [other.id], group: null });
+  stale = a.id;
+  const dusk = await run('color-normalize', { clips: [a.id, other.id], group: 'Dusk' }), id = server.clips.find(c => c.id === other.id)!.properties.colorGroup as string;
+  stale = '';
+  assert.equal(server.clips.find(c => c.id === a.id)!.properties.colorGroup, night, 'the skipped shot keeps its group');
+  assert.match(dusk.text, new RegExp(`^Normalized 1 of 2 shots into "Dusk" ${id} \\(1 shot\\);`), 'not the skipped shot\'s group');
+  phone = true;
+  const own = await run('color-normalize', { clips: [a.id] });
+  phone = false;
+  assert.deepEqual(normalizePosted.at(-1), { clipIds: [a.id], contextIds: [legacy.id] }, 'no group given: the rest of the shot\'s group is measured too');
+  assert.match(own.text, /\nbalance: @\w+ gamma 0\.5 gain 0\.8 90% clipping/);
 });
 
 test('the help topic carries the app\'s slider ranges, render limits and color spaces', () => {

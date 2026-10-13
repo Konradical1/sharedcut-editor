@@ -191,6 +191,8 @@ test('proposed nodes render through the engine, land between Look and ACES outpu
   const names = processingStages(clip, next).map(s => s.node.name).filter((name, i, all) => name !== all[i - 1]);
   assert.deepEqual(names, ['Input CST', 'Balance', 'Look', 'Look 2', 'Look 3', 'Output CST']);
   const { look: lookNode, output, extras, balance } = findGradeNodes(clip, next);
+  const groupNamedLook = { ...named(base, 'Look'), id: 'cg-node', group: 'cg-1', order: named(base, 'Balance').order! + .5 };
+  assert.equal(findGradeNodes(clip, [...base, groupNamedLook]).look!.id, named(base, 'Look').id, 'a color group named Look is never the Look node');
   assert.deepEqual(extras.map(n => n.name), ['Look 2', 'Look 3']); assert.ok(extras.every(n => n.order! > lookNode!.order! && n.order! < output!.order! && n.id.startsWith('ai-look-') && n.kind === 'serial' && n.enabled && n.projectId === 'p1'));
   assert.deepEqual(extras.map(n => n.position), [{ x: lookNode!.position!.x, y: lookNode!.position!.y + 120 }, { x: lookNode!.position!.x, y: lookNode!.position!.y + 240 }]);
   assert.equal(extras[0].parameters.saturation, 60); assert.equal(extras[1].parameters.contrast, .8);
