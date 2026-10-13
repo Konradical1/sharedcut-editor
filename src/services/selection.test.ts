@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { forwardRoom, forwardSelection } from './selection.ts';
+import { adjacentShot, forwardRoom, forwardSelection } from './selection.ts';
 import type { Clip, Track } from '../state/models.ts';
 
 /** Only the fields the two helpers read. */
@@ -179,4 +179,16 @@ test('room: clips of another timeline that share a trackId do not limit', () => 
 test('room: a moving set holding linked peers on two tracks takes the tighter side', () => {
   const clips = [clip('vStay', 'v1', 0, 17), clip('aStay', 'a1', 0, 18.5), clip('v', 'v1', 20, 10), clip('a', 'a1', 20, 10)];
   assert.equal(forwardRoom(clips, ['v', 'a']), 1.5);
+});
+
+test('color next/previous edit steps shot starts; a long overlay starting with a shot never takes the step', () => {
+  // The volleyball edit: a logo on V3 from 11 s to 96 s starts on the same frame as the V1 shot, and V1 has a gap.
+  const tracks = [track('v1', { number: 1 }), track('v3', { number: 3 }), track('v2', { number: 2, hidden: true })];
+  const shots = [clip('s5', 'v1', 6.917, 4.083), clip('logo', 'v3', 11, 85.494), clip('s6', 'v1', 11, 2.109), clip('s7', 'v1', 13.125, 1.894), clip('hid', 'v2', 12, 1)];
+  const step = (at: number, direction: number) => adjacentShot(shots, tracks, at, direction, 24)?.id;
+  assert.equal(step(9, 1), 's6');
+  assert.equal(step(11, 1), 's7', 'the end of s6 and the hidden shot are not stops');
+  assert.equal(step(13.125, -1), 's6');
+  assert.equal(step(12, -1), 's6', 'previous from inside a shot goes to its start');
+  assert.equal(step(13.125, 1), undefined);
 });

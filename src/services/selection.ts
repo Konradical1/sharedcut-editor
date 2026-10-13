@@ -26,6 +26,15 @@ export function forwardSelection(clips: readonly Clip[], tracks: readonly Track[
   }
   return { ids, crossing };
 }
+/** Next/Previous edit on the Color page: the shot starting next (or last) half a frame past the playhead, on the lowest
+ *  track when several start together. Clip ends, gaps and a logo running over many shots are never stops. */
+export function adjacentShot(shots: readonly Clip[], tracks: readonly Track[], playhead: number, direction: number, fps: number) {
+  const slack = .5 / (fps || 24), track = (c: Clip) => tracks.find(t => t.id === c.trackId);
+  const live = shots.filter(c => !c.disabled && !track(c)?.hidden), starts = live.map(c => c.start).filter(t => direction > 0 ? t > playhead + slack : t < playhead - slack);
+  if (!starts.length) return undefined;
+  const at = direction > 0 ? Math.min(...starts) : Math.max(...starts);
+  return live.filter(c => Math.abs(c.start - at) < slack).sort((a, b) => (track(a)?.number ?? 0) - (track(b)?.number ?? 0))[0];
+}
 /** How far the moving clips can slide left before one meets a clip that stays behind on its own track,
  *  or time zero — so dragging a forward selection back closes a gap instead of overwriting the edit. */
 export function forwardRoom(clips: readonly Clip[], moving: readonly string[]) {
