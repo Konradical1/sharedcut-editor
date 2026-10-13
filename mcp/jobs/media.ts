@@ -96,8 +96,15 @@ function report(items: Item[], jobs: Map<string, UploadJob>, final: boolean): St
   return { done: !busy, text: [head, ...shown.map(l => l.text), ...(lines.length > shown.length ? [`… ${lines.length - shown.length} more ready`] : [])].join('\n') };
 }
 
-type Follow = { final?: boolean; note?: string; bin?: { id: string; projectId: string }; cancel?: () => Promise<void> };
-/** Polls until every item is ready or failed. With a bin, each new row moves there once the server has it. */
+type Follow = { final?: boolean; note?: string; bin?: { id: string; projectId: string }; place?: { at: number; track?: string }; cancel?: () => Promise<void> };
+/** `at` (s) and optional `track` from a job's params: where its media goes on the open timeline once ready, like a file drop on a lane. */
+const placeOf = (params: Record<string, unknown>) => {
+  if (params.at === undefined) return undefined;
+  const at = Number(params.at);
+  if (!Number.isFinite(at) || at < 0) throw new Error('at is seconds on the timeline, 0 or more.');
+  return { at, track: params.track === undefined ? undefined : String(params.track) };
+};
+/** Polls until every item is ready or failed. With a bin, each new row moves there once the server has it; with place, the ready ones then go on the timeline, end to end. */
 function follow(label: string, items: Item[], opts: Follow = {}): Poller {
   return {
     label,
@@ -114,6 +121,11 @@ function follow(label: string, items: Item[], opts: Follow = {}): Poller {
         catch (error) { note += `\nbin move failed: ${error instanceof Error ? error.message : error}`; }
       }
       const step = report(items, jobs, !!opts.final);
+      if (step.done && opts.place) {
+        const rows = store.getState().media, ids = items.map(i => i.id ?? (i.key ? jobs.get(i.key)?.assetId : undefined)).filter(id => rows.some(m => m.id === id && m.status === 'ready'));
+        if (ids.length) try { note += `\n${(await edit(run => run('addMediaToTimeline', ids, opts.place!.at, opts.place!.track))).text}`; }
+        catch (error) { note += `\nnot placed: ${error instanceof Error ? error.message : error}`; }
+      }
       return { ...step, text: note ? `${note.trim()}\n${step.text}` : step.text };
     },
     ...(opts.cancel ? { cancel: opts.cancel } : {}),
@@ -128,10 +140,10 @@ const keyOf = (projectId: string, file: File, assetId?: string) => `${projectId}
 
 export const jobs: Record<string, JobDef> = {
   upload: {
-    doc: '{paths:[file|folder], bin?, force?} upload local media into the open project → @media lines once ready; rerun resumes. help media',
+    doc: '{paths:[file|folder], bin?, force?, at?, track?} upload local media into the open project → @media once ready (at:s places it); rerun resumes. help media',
     async start(params) {
       const paths = typeof params.paths === 'string' ? [params.paths] : need<string[]>(params, 'paths', 'array');
-      const p = project(), list = await localFiles(paths);
+      const p = project(), place = placeOf(params), list = await localFiles(paths);
       if (!list.length) throw new Error(`No media files there (folders take ${EXTENSIONS.join(' ')}).`);
       const { maxUploadBytes } = await call<{ maxUploadBytes: number }>('/uploads/info');
       const big = list.find(f => f.size > maxUploadBytes);
@@ -148,7 +160,7 @@ export const jobs: Record<string, JobDef> = {
       for (const key of keys) if (uploadQueue.getState().jobs.find(j => j.key === key)?.status === 'uploaded') dismissUpload(key);
       await started(() => store.getState().uploadMedia(files), () => keys.every(k => uploadQueue.getState().jobs.some(j => j.key === k)));
       const note = [`Uploading ${files.length} (${MB(todo.reduce((n, f) => n + f.size, 0))}) to "${p.name}"${bin ? ` → bin ${bin.name}` : ''}`, ...notes].join('\n');
-      return follow(`uploading ${files.length} file${files.length === 1 ? '' : 's'}`, todo.map((f, i) => ({ name: f.name, key: keys[i] })), { note, bin: bin && { id: bin.id, projectId: p.id }, cancel: pauseAll(keys) });
+      return follow(`uploading ${files.length} file${files.length === 1 ? '' : 's'}`, todo.map((f, i) => ({ name: f.name, key: keys[i] })), { note, bin: bin && { id: bin.id, projectId: p.id }, place, cancel: pauseAll(keys) });
     },
   },
   replace: {
@@ -170,9 +182,9 @@ export const jobs: Record<string, JobDef> = {
     },
   },
   link: {
-    doc: '{url, audio?, quality?:720|1080|2160, bin?} import a YouTube video or Spotify track (always audio) → @media once ready',
+    doc: '{url, audio?, quality?:720|1080|2160, bin?, at?, track?} import a YouTube video or Spotify track (always audio) → @media once ready (at:s places it)',
     async start(params) {
-      const url = need(params, 'url'), p = project();
+      const url = need(params, 'url'), p = project(), place = placeOf(params);
       // The editor's LinkImport form: save pending edits, then the same request.
       await flush();
       const { asset } = await call<{ asset: MediaAsset }>('/media/import-link', { method: 'POST', json: { projectId: p.id, url, mode: params.audio ? 'audio' : 'video', quality: params.quality ?? 1080 } });
@@ -181,7 +193,7 @@ export const jobs: Record<string, JobDef> = {
       if (params.bin) try { bin = await binFor(String(params.bin)); } catch (error) { binNote = `\nno bin: ${error instanceof Error ? error.message : error}`; }
       await refresh();
       return follow(`importing ${handle(asset.id)}`, [{ name: asset.name, id: asset.id }], {
-        note: `Importing ${url}${bin ? ` → bin ${bin.name}` : ''}${binNote}`, bin: bin && { id: bin.id, projectId: p.id },
+        note: `Importing ${url}${bin ? ` → bin ${bin.name}` : ''}${binNote}`, bin: bin && { id: bin.id, projectId: p.id }, place,
         async cancel() { await call(`/media/${asset.id}/cancel`, { method: 'POST' }); await refresh(); },
       });
     },

@@ -1727,3 +1727,32 @@ test('pen points given without a box are frame positions, fitted like the pen to
   assert.deepEqual([doc.x, doc.y, +doc.width.toFixed(3), +doc.height.toFixed(3)], [.1, .1, .8, .8]);
   assert.deepEqual(doc.points[2], { x: .5, y: 1 });
 });
+
+test('files dropped on a lane land there once ready, at the length the server probed; audio finds its own lane', async () => {
+  const { connection } = await import('../services/api.ts');
+  const { uploadQueue, fingerprintOf } = await import('../services/upload.ts');
+  const was = connection.enabled; connection.enabled = true;
+  const p = state().projectId, video = state().media.find(m => m.projectId === p && m.kind === 'video')!;
+  const drop = (name: string, kind: 'video' | 'audio') => {
+    const file = new File(['x'], name, { lastModified: 1 }), id = `media-${name}`;
+    uploadQueue.setState(q => ({ jobs: [...q.jobs, { key: `${p}:${fingerprintOf(file)}`, projectId: p, name, assetId: id, status: 'uploading', candidates: [], progress: { bytes: 0, total: 1, speed: 0, elapsed: 0, message: '' } }] }));
+    store.setState({ media: [{ ...video, id, name, kind, status: 'processing', duration: 12.5 }, ...state().media] });
+    return { file, id };
+  };
+  const ready = (id: string) => store.setState({ media: state().media.map(m => m.id === id ? { ...m, status: 'ready' } : m) });
+  try {
+    const clipFile = drop('drop.mp4', 'video');
+    state().uploadMedia([clipFile.file], { start: 30, trackId: 'v1', duration: 12 });
+    assert.deepEqual(state().pendingDrops.map(d => [d.trackId, d.start, d.duration, d.name]), [['v1', 30, 12, 'drop.mp4']]);
+    assert.ok(!state().clips.some(c => c.mediaId === clipFile.id), 'nothing lands while the server still prepares it');
+    ready(clipFile.id);
+    const placed = state().clips.find(c => c.mediaId === clipFile.id && c.trackId === 'v1');
+    assert.deepEqual([placed?.start, placed?.duration], [30, 12.5]);
+    assert.equal(state().pendingDrops.length, 0);
+
+    const song = drop('song.wav', 'audio');
+    state().uploadMedia([song.file], { start: 60, trackId: 'v1' });
+    ready(song.id);
+    assert.equal(state().clips.find(c => c.mediaId === song.id)?.trackId, 'a1');
+  } finally { connection.enabled = was; uploadQueue.setState({ jobs: [] }); }
+});

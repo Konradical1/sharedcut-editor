@@ -124,11 +124,12 @@ const controllers = new Map<string, AbortController>();
 let queueEpoch = 0;
 const patchJob = (key: string, patch: Partial<UploadJob>) => uploadQueue.setState(state => ({ jobs: state.jobs.map(job => job.key === key ? { ...job, ...patch } : job) }));
 
-/** `assetId` uploads into that existing media (a replacement) instead of creating one. */
+/** `assetId` uploads into that existing media (a replacement) instead of creating one. Returns each file's job key. */
 export function enqueueUploads(projectId: string, files: File[], candidates: MediaAsset[], assetId?: string) {
-  const jobs = [...uploadQueue.getState().jobs];
+  const jobs = [...uploadQueue.getState().jobs], keys: string[] = [];
   for (const file of files) {
     const key = `${projectId}:${fingerprintOf(file)}${assetId ? `:${assetId}` : ''}`;
+    keys.push(key);
     const existing = jobs.find(job => job.key === key);
     if (existing && !(assetId && existing.status === 'uploaded')) { if (['paused', 'failed'].includes(existing.status)) { existing.status = 'queued'; existing.error = undefined; existing.file = file; } continue; }
     if (existing) jobs.splice(jobs.indexOf(existing), 1);
@@ -136,6 +137,19 @@ export function enqueueUploads(projectId: string, files: File[], candidates: Med
   }
   uploadQueue.setState({ jobs: [...jobs] });
   pumpUploads();
+  return keys;
+}
+
+/** How long a dropped file looks to this browser, for its ghost on the timeline: an image or a file it cannot open is `still` seconds. */
+export function fileSeconds(file: File, still: number) {
+  if (file.type.startsWith('image/')) return Promise.resolve(still);
+  const element = document.createElement(file.type.startsWith('audio/') ? 'audio' : 'video'), url = URL.createObjectURL(file);
+  return new Promise<number>(resolve => {
+    const done = (seconds: number) => { clearTimeout(timer); element.removeAttribute('src'); URL.revokeObjectURL(url); resolve(seconds > 0 && Number.isFinite(seconds) ? seconds : still); };
+    const timer = setTimeout(() => done(0), 3000);
+    element.preload = 'metadata'; element.onloadedmetadata = () => done(element.duration); element.onerror = () => done(0);
+    element.src = url;
+  });
 }
 
 export function resetUploads() {

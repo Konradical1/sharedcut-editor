@@ -117,3 +117,16 @@ test('docs stay one line and the help topic leads with its header', () => {
   for (const [kind, job] of Object.entries(jobs)) assert.ok(!job.doc.includes('\n') && job.doc.length < 160, kind);
   assert.match(topics.media.split('\n')[0], /^media: /);
 });
+
+test('at places the media on the timeline once ready, at the length the server probed', async () => {
+  saved = { ...saved, media: saved.media.filter((m: any) => m.id !== ID) }; revision++;
+  const started = await jobs.link.start({ url: 'https://youtu.be/dQw4w9WgXcQ', at: 4, track: 'v1' });
+  assert.ok(isPoller(started));
+  assert.equal((await started.poll()).done, false);
+  assert.ok(!saved.clips.some((c: any) => c.mediaId === ID), 'nothing lands before it is ready');
+  change({ name: 'Song.mp4', status: 'ready', progress: 100, duration: 12.5, resolution: '1920×1080', fps: 25, kind: 'video' });
+  assert.equal((await started.poll()).done, true);
+  const placed = saved.clips.find((c: any) => c.mediaId === ID);
+  assert.deepEqual([placed?.trackId, placed?.start, placed?.duration], ['v1', 4, 12.5]);
+  await assert.rejects(jobs.upload.start({ paths: [tmpdir()], at: -1 }), /at is seconds/);
+});

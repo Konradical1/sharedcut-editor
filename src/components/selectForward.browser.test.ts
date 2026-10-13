@@ -174,6 +174,23 @@ test('Escape cancels a forward drag even while edge scrolling keeps the timeline
   }
 });
 
+test('a selection box held at the edge scrolls the timeline and keeps its corner where it was drawn', async t => {
+  const { page, xAt, laneBox } = await openScene(t, scene, { filler: 240 });
+  const scroll = page.locator('.timeline-scroll'), view = (await scroll.boundingBox())!, lane = await laneBox('v3'), step = (await xAt(1)) - (await xAt(0));
+  // Filler on v3 (every third, 1.5 s apart from 30 s) that starts past the right edge before any scrolling.
+  const edge = (view.x + view.width - await xAt(0)) / step, beyond = Array.from({ length: 80 }, (_, i) => ({ id: `fill${i * 3 + 2}`, start: 30 + i * 1.5 })).filter(c => c.start > edge).map(c => c.id);
+  assert.ok(beyond.length, 'some v3 clips start off screen');
+  await page.mouse.move(await xAt(12.5), lane.y + lane.height / 3); await page.mouse.down();
+  await page.mouse.move(view.x + view.width - 10, lane.y + lane.height * 2 / 3, { steps: 8 });
+  await page.waitForFunction(ids => ids.some(id => document.querySelector(`[data-clip="${id}"]`)?.getAttribute('aria-pressed') === 'true'), beyond, { timeout: 10_000 });
+  assert.ok(await scroll.evaluate(el => el.scrollLeft) > 0, 'the timeline scrolled');
+  const pressed = (id: string) => page.locator(`[data-clip="${id}"]`).getAttribute('aria-pressed');
+  assert.equal(await pressed('G'), 'true', 'G, scrolled off to the left, is still inside the box');
+  assert.equal(await pressed('F'), 'false', 'F, left of where the box began, stays out');
+  await page.mouse.up();
+  assert.equal(await page.locator('.selection-marquee').count(), 0);
+});
+
 test('a clip whose linked partner is on a locked track stays out of the selection, and the rest still drags', async t => {
   const linked: Spec[] = [...scene.filter(c => c.id !== 'G'), { id: 'G', track: 'v3', start: 16, duration: 2, link: 'pair' }, { id: 'H', track: 'v1', start: 20, duration: 2, link: 'pair' }];
   const { page, state, saved, press, hint, xAt } = await openScene(t, linked, { locked: ['v3'] });

@@ -22,7 +22,7 @@ import { advancePlayhead, playheadMotion, type PlayheadMotion } from '../service
 import { closedShift, commonGaps, companionAudioTrack, markersOf, trackGap, trimRoom, uncoveredParts } from '../services/timeline.ts';
 import { getText, isTitle, remapTextRuns, presetDocument, styleText, validateText, type TextDocument, type TextStyle, type TextRange } from '../services/text.ts';
 import { api, connection } from '../services/api.ts';
-import { enqueueUploads } from '../services/upload.ts';
+import { enqueueUploads, uploadQueue } from '../services/upload.ts';
 import { forwardSelection } from '../services/selection.ts';
 
 type Collection = 'clips' | 'tracks' | 'nodes' | 'comments' | 'timelines';
@@ -53,6 +53,8 @@ export interface EditorStore extends PersistedState {
   playhead: number; rangeIn: number; rangeOut: number; playing: boolean; playbackBuffering: boolean; workspace: Workspace; sidePanel: SidePanel; modal: string | null;
   saveStatus: 'Saving…' | 'Saved' | 'Save failed'; liveMode: LiveMode; followUserId: string | null;
   clipboard: Clip | null; clipboardClips: Clip[]; clipboardNodes: GradeNode[]; clipPreview: Clip | null; draggingMediaId: string | null; inspectorTab: string;
+  /** Files dropped on a lane that are still uploading or being prepared: drawn as ghosts until their clips land. */
+  pendingDrops: { id: string; trackId: string; start: number; duration: number; name: string }[];
   shapeTool: string | null; compositionTrail: {timelineId:string;playhead:number;clipId:string}[]; selectedClipIds: string[];
   addShape(kind:string,box?:Partial<ShapeDocument>,placement?:{start:number;trackId:string}):void;
   addAdjustment(placement?:{start:number;trackId:string}):void;
@@ -144,7 +146,8 @@ export interface EditorStore extends PersistedState {
   addComment(text: string, target?: { clipId?: string; range?: [number, number] }): void;
   replyComment(id: string, text: string): void; resolveComment(id: string): void;
   enqueueRender(name: string, preset: string, settings: Record<string, string>): void; updateRender(id: string, patch: Partial<RenderJob>): void;
-  uploadMedia(files: File[]): void; renameMedia(id: string, name: string): void; removeMedia(id: string): void; retryMedia(id: string): void; revealMedia(id: string | null): void;
+  /** With `place`, the files also go on the timeline at `start` on `trackId` (end to end, one undo) once the server has them ready, so each clip takes its file's real length. `duration` only sizes the ghost meanwhile. */
+  uploadMedia(files: File[], place?: { start: number; trackId: string; duration?: number }): void; renameMedia(id: string, name: string): void; removeMedia(id: string): void; retryMedia(id: string): void; revealMedia(id: string | null): void;
   /** Upload `file` as the new original of media `id`: same id, so every clip keeps pointing at it. */
   replaceMedia(id: string, file: File): void;
   /** Media picked in the bin: what `,` inserts and `.` overwrites at the playhead. */
@@ -533,6 +536,25 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     insertClip({ id: '', projectId: state.projectId, timelineId: state.timelineId, trackId: track.id, mediaId: media.id, name: media.name, start: 0, duration: assetDuration(media), sourceIn: 0, color: media.kind === 'audio' ? '#427A68' : '#467879', disabled: false, properties: { ...defaultProperties }, effects: [] }, Math.round(Math.max(0, start) * fps) / fps, media.name, false, gesture, insert);
     return true;
   };
+  // Files dropped on a lane land once every one is ready or failed: the server has probed them by then, so each clip
+  // takes its file's real length. A paused upload keeps the drop waiting; another project or timeline drops it.
+  const placeWhenReady = (keys: string[], place: { start: number; trackId: string; duration?: number }, name: string) => {
+    const { projectId, timelineId } = get(), id = createId('drop');
+    set(s => ({ pendingDrops: [...s.pendingDrops, { id, name, start: place.start, trackId: place.trackId, duration: place.duration ?? 0 }] }));
+    const check = () => {
+      const jobs = keys.map(key => uploadQueue.getState().jobs.find(job => job.key === key)), media = get().media;
+      const rows = jobs.map(job => media.find(m => m.id === job?.assetId));
+      if (jobs.some((job, i) => job && job.status !== 'failed' && rows[i]?.status !== 'ready' && rows[i]?.status !== 'failed')) return;
+      for (const stop of stops) stop();
+      set(s => ({ pendingDrops: s.pendingDrops.filter(d => d.id !== id) }));
+      const state = get(), ready = rows.filter(row => row?.status === 'ready') as MediaAsset[], track = state.tracks.find(t => t.id === place.trackId);
+      if (!ready.length || state.projectId !== projectId || state.timelineId !== timelineId) return;
+      // An audio file dropped on a video lane (or the reverse) goes to its own kind's lane rather than being refused.
+      state.addMediaToTimeline(ready.map(row => row.id), place.start, ready.some(row => track?.kind === (row.kind === 'audio' ? 'audio' : 'video')) ? place.trackId : undefined);
+    };
+    const stops = [uploadQueue.subscribe(check), useEditorStore.subscribe(check)];
+    check();
+  };
   return {
     shapeTool:null, compositionTrail:[], selectedClipIds:[], textTool: false, selectedTextIds: [], textSelection: null, textPreview: [],
     session: 'loading', serverOnline: false, syncConflict: [], cursor: null,
@@ -541,7 +563,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     notifications: recoveryMessage ? [{ id: 'recovery', title: 'Recovered the demo project', detail: recoveryMessage, kind: 'error', timestamp: Date.now() }] : [],
     dragPreview: null, presence: demo.presence, locks: [{ id: 'demo-speed-lock', projectId: 'city-after-dark', targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }],
     playhead: 42, rangeIn: 0, rangeOut: 180, revealedMediaId: null, playing: false, playbackBuffering: false, workspace: 'edit', sidePanel: 'inspector', modal: null,
-    selectedMarkerIds: [], selectedMediaIds: [], markerClipboard: null, clipPreview: null, draggingMediaId: null, inspectorTab: 'Video', selectedTransition: null, draggingTransition: null, leaks: [], transitionPresets: [], transitionFavorites: [], saveStatus: 'Saved', liveMode: 'independent', followUserId: null, clipboard: null, clipboardClips: [], clipboardNodes: [], gradeClipboard: null,
+    selectedMarkerIds: [], selectedMediaIds: [], markerClipboard: null, clipPreview: null, draggingMediaId: null, pendingDrops: [], inspectorTab: 'Video', selectedTransition: null, draggingTransition: null, leaks: [], transitionPresets: [], transitionFavorites: [], saveStatus: 'Saved', liveMode: 'independent', followUserId: null, clipboard: null, clipboardClips: [], clipboardNodes: [], gradeClipboard: null,
     addTitle(preset = 0, box = {}, placement, animated = true) {
       const state=get();if(!writable())return;
       const fps=state.projects.find(p=>p.id===state.projectId)?.fps||24;
@@ -1700,7 +1722,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     resolveComment(id) { const comment = get().comments.find(c => c.id === id && c.projectId === get().projectId); if (comment && writable(true)) commit('CommentChanged', id, `${comment.resolved ? 'reopened' : 'resolved'} a review comment`, [{ collection: 'comments', id, value: { resolved: !comment.resolved } }]); },
     enqueueRender(name, preset, settings) { const state = get(); if (!writable()) return; if (connection.enabled) { void connection.flush().then(() => api('/renders', { method: 'POST', body: JSON.stringify({ projectId: state.projectId, name, preset, settings }) })).then(() => { state.notify('Render queued on your server', 'success'); return connection.refresh(); }).catch(error => state.notify(error.message, 'error')); return; } const job = renderService.enqueue(state.projectId, name, preset, settings, state.renderJobs.some(job => job.status === 'rendering')); set({ renderJobs: [job, ...state.renderJobs] }); state.notify('Added to the demo render queue', 'success', 'Processing is simulated locally.'); },
     updateRender(id, patch) { const state = get(); if (!writable()) return; if (connection.enabled) { const job = state.renderJobs.find(j => j.id === id); if (!job) return; void (patch.status === 'waiting' ? api('/renders', { method: 'POST', body: JSON.stringify({ projectId: job.projectId, name: job.name, preset: job.preset, settings: job.settings }) }) : api(`/renders/${encodeURIComponent(id)}`, { method: 'DELETE' })).then(() => connection.refresh()).catch(error => state.notify(error.message, 'error')); return; } set({ renderJobs: state.renderJobs.map(job => job.id === id && job.projectId === state.projectId ? { ...job, ...(patch.status && ['rendering', 'waiting', 'complete', 'failed'].includes(patch.status) ? { status: patch.status } : {}), ...(typeof patch.remaining === 'string' ? { remaining: patch.remaining } : {}), ...(Number.isFinite(patch.progress) ? { progress: clamp(patch.progress!, 0, 100) } : {}) } : job) }); },
-    uploadMedia(files) { const state = get(); if (!writable() || !files.length) return; if (connection.enabled) { enqueueUploads(state.projectId, files, state.media); return; } const assets = mediaService.importFiles(files, state.projectId); set({ media: [...assets, ...state.media] }); state.notify(`${assets.length} files added to demo upload queue`, 'info', 'File processing is simulated; originals stay on your computer.'); },
+    uploadMedia(files, place) { const state = get(); if (!writable() || !files.length) return; if (connection.enabled) { const keys = enqueueUploads(state.projectId, files, state.media); if (place) placeWhenReady(keys, place, files.length > 1 ? `${files.length} files` : files[0].name); return; } const assets = mediaService.importFiles(files, state.projectId); set({ media: [...assets, ...state.media] }); state.notify(`${assets.length} files added to demo upload queue`, 'info', 'File processing is simulated; originals stay on your computer.'); },
     renameMedia(id, name) { const state = get(); if (!writable() || !name.trim()) return; if (connection.enabled) { void api(`/media/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ name: name.trim() }) }).then(() => connection.refresh()).catch(error => state.notify(error.message,'error')); return; } set({ media: state.media.map(asset => asset.id === id && asset.projectId === state.projectId ? { ...asset, name: name.trim().slice(0, 255) } : asset) }); },
     removeMedia(id) {
       const state = get(); if (!writable()) return;
