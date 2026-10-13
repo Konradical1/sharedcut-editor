@@ -1,0 +1,13 @@
+.transform-overlay{position:absolute;inset:0;z-index:2;pointer-events:none}
+.transform-overlay>svg{display:block;width:100%;height:100%;overflow:visible;pointer-events:all;touch-action:none}
+.transform-overlay.transform-inactive>svg{pointer-events:none}
+.transform-hit{fill:transparent;stroke:transparent;stroke-width:1;vector-effect:non-scaling-stroke;cursor:move;outline:none}
+.transform-hit:hover{stroke:#8ab8ee80}
+.transform-hit.selected{stroke:#8ab8ee;stroke-width:1.5}
+.transform-hit:focus-visible{stroke:#d3e6ff;stroke-width:2}
+.transform-handle{fill:#e8f1fc;stroke:#284868;stroke-width:1;vector-effect:non-scaling-stroke}
+.transform-corner-0,.transform-corner-2{cursor:nwse-resize}
+.transform-corner-1,.transform-corner-3{cursor:nesw-resize}
+.transform-rotate{cursor:grab}
+.transform-guide{stroke:#8ab8ee;stroke-width:1;vector-effect:non-scaling-stroke;pointer-events:none}
+.transform-overlay .snap-guide{stroke:#ff3d9a;stroke-width:1;stroke-dasharray:4 3;vector-effect:non-scaling-stroke;pointer-events:none}

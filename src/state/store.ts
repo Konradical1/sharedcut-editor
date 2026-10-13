@@ -80,7 +80,7 @@ export interface EditorStore extends PersistedState {
   setPlayhead(time: number): void; setRange(inTime: number, outTime: number): void; setPlaying(playing: boolean): void; setSidePanel(panel: SidePanel): void; setModal(modal: string | null): void;
   updateProperty(clipId: string, key: string, value: number | string | boolean, gesture?: string): void;
   setKeyframes(clipId: string, path: string, keys: Keyframe[], gesture?: string): void;
-  keyframeProperty(clipId: string, path: string, value?: KeyframeValue): void;
+  keyframeProperty(clipId: string, path: string, value?: KeyframeValue, gesture?: string): void;
   unlinkClip(id: string): void; linkClip(id: string): void;
   /** Moves the clip (with its linked clips, and the selection it belongs to) to `start` seconds, onto `trackId` if given; it overwrites whatever it lands on. */
   moveClip(id: string, start: number, trackId?: string): void;
@@ -855,14 +855,14 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const timing=['properties.speed','properties.reverse','properties.freeze'].includes(path),group=timing?editableGroup(clip,'*'):[clip];if(!group)return;
       commit('PropertyChanged', clipId, `edited ${property.label} keyframes on ${clip.name}`, group.map(c=>{const channels={...c.keyframes};if(sorted.length)channels[path]=sorted.map(k=>({...k,time:k.time+clip.start-c.start}));else delete channels[path];return {collection:'clips',id:c.id,value:{keyframes:channels,...(timing?{duration:retimedDuration(c,{...c,keyframes:channels},get().clips)}:{})}};}), gesture);
     },
-    keyframeProperty(clipId, path, value) {
+    keyframeProperty(clipId, path, value, gesture) {
       const clip = editableClip(clipId, '*'); if (!clip) return;
       const state=get(), property=animationProperties(evaluateClip(clip,state.playhead),evaluateNodes(state.nodes,clip,state.playhead)).find(p=>p.path===path);
       if (!property) return;
       const fps=state.projects.find(p=>p.id===clip.projectId)?.fps || 24;
       const time=frameTime(clamp(state.playhead-clip.start,0,Math.max(0,clip.duration-1/fps)),fps);
       const keys=clip.keyframes?.[path] ?? [], existing=keys.find(k=>Math.abs(k.time-time)<.5/fps);
-      state.setKeyframes(clipId,path,[...keys.filter(k=>k!==existing),{id:existing?.id??createId('key'),time,value:value??property.value,interpolation:existing?.interpolation??(typeof property.value==='number'?'linear':'hold'),...(existing?.curve?{curve:existing.curve}:{})}]);
+      state.setKeyframes(clipId,path,[...keys.filter(k=>k!==existing),{id:existing?.id??createId('key'),time,value:value??property.value,interpolation:existing?.interpolation??(typeof property.value==='number'?'linear':'hold'),...(existing?.curve?{curve:existing.curve}:{})}],gesture);
     },
     updateProperty(clipId, key, value, gesture) {
       if (key === 'shapeDocument') {try{validateShape(JSON.parse(String(value)));}catch{return;}}
@@ -890,7 +890,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         if (key === 'gain') next = clamp(value, -60, 24);
         if (key === 'pan') next = clamp(value, -100, 100);
       }
-      if (clip.keyframes?.[`properties.${key}`]) { get().keyframeProperty(clipId,`properties.${key}`,next); return; }
+      if (clip.keyframes?.[`properties.${key}`]) { get().keyframeProperty(clipId,`properties.${key}`,next,gesture); return; }
       const field = key === 'disabled' ? 'disabled' : `properties.${key}`;
       const group=['speed','reverse','freeze'].includes(key)?editableGroup(clip,key):[clip];if(!group)return;
       commit('PropertyChanged', clipId, `changed ${key} on ${clip.name}`, group.map(c=>({ collection: 'clips', id: c.id, value: { [field]: next, ...(['fadeIn','fadeOut','audioFadeIn','audioFadeOut'].includes(key)?{'properties.fadeOrigin':0,'properties.fadeDuration':c.duration}:{}), ...(key === 'speed' ? { duration: retimedDuration(c, { ...c, properties: { ...c.properties, speed: next } }, get().clips) } : {}) } })), gesture);

@@ -6,6 +6,7 @@ import MotionTrackerOverlay from './MotionTrackerOverlay';
 import { DepthFocusPicker } from './DepthInspector';
 import TextOverlay from './TextOverlay';
 import ShapeOverlay from './ShapeOverlay';
+import TransformOverlay from './TransformOverlay';
 import { refreshFonts, useFonts, detectLocalFonts } from '../services/fonts';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import { SkipBack, SkipForward, Play, Pause, ChevronLeft, ChevronRight, Volume2, VolumeX, Maximize, Scan, Settings2, Columns2, Radio } from 'lucide-react';
@@ -135,6 +136,7 @@ function Viewer({ compact = false, colorAccurate=false }: { compact?: boolean; c
           {focusKind === 'tracker' && <MotionTrackerEditor bar={focusBar} strip={focusStrip}/>}
           {focusKind === 'mask' && <SmartMaskEditor bar={focusBar} strip={focusStrip}/>}
         </> : <>
+          <TransformOverlay/>
           <TextOverlay/>
           <ShapeOverlay/>
           <MotionTrackerOverlay/>
