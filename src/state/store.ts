@@ -104,7 +104,7 @@ export interface EditorStore extends PersistedState {
   deleteGaps(ids: string[]): void;
   /** Closes the empty span between clips on a track (pass the gap's exact bounds), pulling later clips left. */
   deleteGap(trackId:string,start:number,end:number):void;
-  /** Cuts the clip and its linked clips at the playhead, which must be inside it. */
+  /** Cuts the clip and its linked clips at the playhead, which must be inside it; a linked clip the playhead misses stays whole, linked to the piece on its side. */
   splitClip(id: string): void;
   /** `ripple` also closes the time the clips held on their tracks. */
   deleteClip(id: string, ripple?: boolean): void;
@@ -995,10 +995,14 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     splitClip(id) {
       const clip=editableClip(id);if(!clip)return;
       const state=get(),group=editableGroup(clip);if(!group)return;
-      const frame=1/(state.projects.find(p=>p.id===state.projectId)?.fps||24);
-      if(group.some(c=>state.playhead-c.start<frame||c.start+c.duration-state.playhead<frame)){state.notify('Place the playhead inside the linked clips to split them','info');return;}
-      const changes:Change[]=[],linkGroup=createId('link'),rights:string[]=[];let selected='';
-      for(const c of group){const cut=cutClip(c,state.playhead,group.length>1?linkGroup:undefined);if(c.id===id)selected=cut.right.id;rights.push(cut.right.id);changes.push(...cut.changes);}
+      const at=state.playhead,frame=1/(state.projects.find(p=>p.id===state.projectId)?.fps||24),inside=(c:Clip)=>at-c.start>=frame&&c.start+c.duration-at>=frame;
+      if(!inside(clip)){state.notify('Place the playhead inside the clip to split it','info');return;}
+      // Linked clips the playhead misses (audio slipped off its video) stay whole and keep the link with the piece they sit beside.
+      const cut=group.filter(inside),after=group.filter(c=>!inside(c)&&c.start+c.duration/2>at),before=group.filter(c=>!after.includes(c));
+      const changes:Change[]=[],linkGroup=cut.length+after.length>1?createId('link'):undefined,rights:string[]=[];let selected='';
+      for(const c of cut){const part=cutClip(c,at,linkGroup);if(c.id===id)selected=part.right.id;rights.push(part.right.id);changes.push(...part.changes);}
+      for(const c of after)changes.push(linkGroup?{collection:'clips',id:c.id,value:{'properties.linkGroup':linkGroup}}:{collection:'clips',id:c.id,value:{},unset:['properties.linkGroup']});
+      if(group.length>1&&before.length<2)for(const c of before)changes.push({collection:'clips',id:c.id,value:{},unset:['properties.linkGroup']});
       commit('ClipTrimmed',id,`split ${clip.name} at the playhead`,changes);
       // The right halves replace the whole selection; keeping the old ids selected the left half too.
       set({selectedClipId:selected,selectedClipIds:rights,selectedTextIds:isTitle(clip)?[selected]:[],textSelection:null,selectedNodeId:get().nodes.find(n=>n.clipId===selected)?.id??null});

@@ -602,6 +602,19 @@ test('video inserts linked audio, edits atomically, and unlinks without reviving
   state().undo();store.setState({locks:[{id:'peer-lock',userId:'ashley',projectId:video.projectId,targetId:audio.id,field:'manipulation',expiresAt:Date.now()+10000}]});state().moveClip(video.id,50);assert.equal(clip(video.id).start,13);
 });
 
+test('splitting a video past the end of its linked audio cuts the video; the audio stays linked to the piece it sits under',()=>{
+  const asset={...state().media[0],hasAudio:true,duration:20,status:'ready' as const};
+  for(const [audioStart,audioSide] of [[10,'left'],[25,'right']] as const){
+    store.setState({media:[asset],clips:[],nodes:[],comments:[],settings:{...state().settings,linkSelection:true}});
+    state().addMediaToTimeline(asset.id,10);const video=state().clips.find(c=>state().tracks.find(t=>t.id===c.trackId)?.kind==='video')!,audio=state().clips.find(c=>c.id!==video.id)!;
+    store.setState({clips:state().clips.map(c=>c.id===audio.id?{...c,start:audioStart,duration:2}:c)});
+    state().setPlayhead(20);state().splitClip(video.id);
+    assert.equal(state().clips.length,3);const right=clip(state().selectedClipId!),left=clip(video.id);
+    assert.equal(left.duration,10);assert.equal(right.start,20);assert.equal(clip(audio.id).duration,2);
+    const [withAudio,alone]=audioSide==='left'?[left,right]:[right,left];
+    assert.ok(withAudio.properties.linkGroup);assert.equal(clip(audio.id).properties.linkGroup,withAudio.properties.linkGroup);assert.equal(alone.properties.linkGroup,undefined);
+  }
+});
 
 test('cut and paste retain the linked soundtrack and correction nodes',()=>{
   const asset={...state().media[0],hasAudio:true,duration:10,status:'ready' as const};store.setState({media:[asset],clips:[],nodes:[],comments:[],settings:{...state().settings,linkSelection:true}});
