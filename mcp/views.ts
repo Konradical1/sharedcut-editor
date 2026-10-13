@@ -78,7 +78,8 @@ export function projectsView(s: EditorStore) {
   const role = (p: EditorStore['projects'][number]) => p.members.find(m => m.userId === s.currentUserId)?.role ?? (p.shared ? p.classRole ?? 'Viewer' : '?');
   const rows = [...s.projects].sort((a, b) => b.modifiedAt - a.modifiedAt).map(p => {
     const timelines = s.timelines.filter(t => t.projectId === p.id && !t.composition).length;
-    return `${p.id === s.projectId ? '*' : ' '}${handle(p.id)} ${quote(p.name)} ${p.resolution.replace(/ /g, '')} ${p.fps}fps ${role(p)} · ${p.status} · ${timelines} timeline${timelines === 1 ? '' : 's'} · ${ago(p.modifiedAt)} ago`;
+    const live = s.presence.filter(person => person.projectId === p.id && person.userId !== s.currentUserId).map(person => s.users.find(u => u.id === person.userId)?.name ?? person.userId);
+    return `${p.id === s.projectId ? '*' : ' '}${handle(p.id)} ${quote(p.name)} ${p.resolution.replace(/ /g, '')} ${p.fps}fps ${role(p)} · ${p.status} · ${timelines} timeline${timelines === 1 ? '' : 's'} · ${ago(p.modifiedAt)} ago${live.length ? ` · editing now: ${live.join(', ')}` : ''}`;
   });
   return rows.length ? rows.join('\n') : 'No projects. Create one with act createProject.';
 }

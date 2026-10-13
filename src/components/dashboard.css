@@ -458,6 +458,18 @@ input.dash-switch[type=checkbox] { appearance: none; padding: 0; cursor: pointer
 .drive-thumbnail img { width: 100%; height: 100%; object-fit: cover; }
 .drive-thumbnail > span { position: absolute; bottom: 8px; right: 8px; padding: 3px 6px; border-radius: 4px; background: #111c; color: #e5eee7; font-size: 10px; }
 .drive-project-meta { display: flex; justify-content: space-between; padding: 13px 14px; font-size: 10px; color: #a3b1a8; gap: 8px; }
+/* Someone else has this project open: a live pill on the cover, faces beside the name in list view. */
+.drive-project.live { border-color: #3d6249; }
+.drive-live { position: absolute; z-index: 1; top: 8px; left: 8px; display: flex; align-items: center; gap: 6px; max-width: calc(100% - 16px); padding: 3px 9px 3px 8px; border-radius: 999px; background: #0d1210d9; backdrop-filter: blur(6px); color: #e5eee7; font-size: 10px; box-shadow: 0 1px 4px #0006; }
+.drive-live b { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drive-live > i { flex: none; width: 7px; height: 7px; border-radius: 50%; background: #5fd38a; animation: drive-live-pulse 1.8s ease-out infinite; }
+@keyframes drive-live-pulse { from { box-shadow: 0 0 0 0 #5fd38aa0; } to { box-shadow: 0 0 0 6px #5fd38a00; } }
+@media (prefers-reduced-motion: reduce) { .drive-live > i { animation: none; } }
+.drive-live-faces { display: flex; flex: none; }
+.drive-live-faces .avatar { box-shadow: 0 0 0 1.5px #0d1210; }
+.drive-live-faces .avatar + .avatar { margin-left: -5px; }
+.drive-project-title .drive-live-faces { display: none; margin-left: auto; }
+.drive-grid.as-list .drive-project-title .drive-live-faces { display: flex; }
 .drive-options { position: absolute; top: 11px; right: 9px; width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; border: 0; background: none; color: #b4c0b7; }
 .drive-options:hover { background: #ffffff15; }
 /* A Final Cut import with no picture yet: clip bars, the cover the importer's own card preview shows. */

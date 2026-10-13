@@ -10,6 +10,15 @@ import { receivedPresence } from './presence.ts';
 import { backoffDelay } from './backoff.ts';
 import { createPresencePacer } from './syncPacing.ts';
 import { takeHealthReport } from './playbackHealth.ts';
+import { createStore } from 'zustand/vanilla';
+
+/** Who else has each visible project open, for the home screen. Fed by the presence on every state answer. */
+export const liveEditors = createStore<{ list: { projectId: string; userId: string }[] }>(() => ({ list: [] }));
+function receiveEditors(presence: Presence[]) {
+  const me = useEditorStore.getState().currentUserId;
+  const list = presence.filter(person => person.userId !== me).map(({ projectId, userId }) => ({ projectId, userId }));
+  if (!same(list, liveEditors.getState().list)) liveEditors.setState({ list });
+}
 
 // serverStartedAt: when the answering server process started, the same in every answer it gives. Lock changes are
 // numbered from that start, so a different stamp means a restart and the lock counter this tab remembers is void.
@@ -100,6 +109,7 @@ function resetSession(session: 'loading' | 'signedOut' = 'signedOut') {
   apply(Object.fromEntries(persistedKeys.map(key => [key, key === 'settings' ? { ...useEditorStore.getInitialState().settings } : key === 'currentUserId' ? '' : []])) as unknown as PersistedState);
   useEditorStore.setState({ transitionPresets: [], transitionFavorites: [], leaks: [], session, cursor: null, dragPreview: null, playing: false, playbackBuffering: false, presence: [], locks: [], modal: null, syncConflict: [], notifications: [], clipboard: null, clipboardClips: [], clipboardNodes: [], projectId: '', timelineId: '', selectedClipId: null, selectedClipIds:[], shapeTool:null,compositionTrail:[], selectedTextIds: [], textSelection: null, textPreview: [], textTool: false, selectedNodeId: null, revealedMediaId: null, liveMode: 'independent', followUserId: null });
   connection.enabled = false;
+  liveEditors.setState({ list: [] });
 }
 // Media is server-owned. Progress must keep moving even while an edit is saving or conflicted.
 function receiveMedia(envelope: Envelope) {
@@ -128,6 +138,7 @@ function receive(envelope: Envelope, base = baseline) {
     serverLockRevision = Math.max(serverLockRevision, envelope.lockRevision!);
   }
   if (envelope.revision > serverRevision) serverRevision = envelope.revision;
+  if (envelope.presence) receiveEditors(envelope.presence);
   // A reply to an already-current poll carries locks and presence but no workspace copy.
   if (!envelope.state) {
     lockRevision = Math.max(lockRevision, envelope.lockRevision ?? -1);
