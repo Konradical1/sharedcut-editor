@@ -122,5 +122,7 @@ Only one server may open a data folder: a second `npm start` beside the live one
 - Depth saves Depth subjects (`maskId` on a Depth effect) and depth keys (`mask.source: 'depth'`), which the save check of
   any build without Depth rejects. Once either exists, even in a restore backup, such a build refuses every save on the
   server: do not roll back past Depth, fix forward.
+- Picture Noise Reduction renamed the audio effect to 'Audio Noise Reduction'. A build without it saves such clips but
+  refuses any export that has one: do not roll back past it, fix forward.
 - `node scripts/remote-playback-check.mjs` plays a timeline on sharedcut.com as a signed-in user and
   reports pictures/s, freezes and loading time; run it before and after any playback change.

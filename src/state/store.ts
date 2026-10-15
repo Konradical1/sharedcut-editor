@@ -130,7 +130,9 @@ export interface EditorStore extends PersistedState {
   deleteMotionTracker(clipId:string,trackerId:string):void;
   /** Write keyframes a track produced onto `targetId` and record the link, as one undoable edit. */
   applyMotionTracker(clipId:string,trackerId:string,targetId:string,channels:Record<string,Keyframe[]>,link:MotionTrackerLink):boolean;
-  addEffect(clipId: string, name: string): void; updateEffect(clipId: string, effectId: string, patch: { enabled?: boolean; amount?: number; parameters?: Record<string, number> } | null, gesture?: string): void; reorderEffect(clipId: string, effectId: string, direction: number): void; addNode(name: string, parameters?: Record<string, number>): void;
+  /** Add effect `name` to a clip. `reveal` (default true) selects the clip and opens the Inspector's Effects tab; false
+   *  leaves the panels alone (the Color page adds Noise Reduction in its own panel). */
+  addEffect(clipId: string, name: string, reveal?: boolean): void; updateEffect(clipId: string, effectId: string, patch: { enabled?: boolean; amount?: number; parameters?: Record<string, number> } | null, gesture?: string): void; reorderEffect(clipId: string, effectId: string, direction: number): void; addNode(name: string, parameters?: Record<string, number>): void;
   removeNode(id: string): void; reorderNode(id: string, direction: number): void;
   gradeClipboard: {clip:Clip;nodes:GradeNode[]} | null; copyGrade(clipId:string):void; pasteGrade(clipId:string):void;
   /** Color Assistant proposal as normal node values on every eligible shot: one snapshot, one undo. Returns the number of shots changed. */
@@ -1501,15 +1503,16 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       commit('PropertyChanged',targetId,link.target==='camera'?`made ${clip.name} follow ${tracker.name}`:`attached ${target.name} to ${tracker.name}`,changes);
       return true;
     },
-    addEffect(clipId, name) {
+    addEffect(clipId, name, reveal = true) {
       if(name==='Smart Mask'){get().addSmartMask(clipId);return;}
       const clip = editableClip(clipId, 'effects');
-      if (!clip || !acceptsEffect(clip, get().media.find(m => m.id === clip.mediaId)?.kind, name)) return;
+      // A clip on an audio track only ever plays sound (the audio half of a linked pair has a video asset): picture effects do nothing there.
+      if (!clip || !acceptsEffect(clip, get().tracks.find(t => t.id === clip.trackId)?.kind === 'audio' ? 'audio' : get().media.find(m => m.id === clip.mediaId)?.kind, name)) return;
       const effect = { id: createId('effect'), name, enabled: true, amount: initialAmount(name) };
       commit('EffectAdded', clipId, `added ${name} to ${clip.name}`, [{ collection: 'clips', id: clipId, value: { effects: [...clip.effects, effect] } }]);
       // Only the browser that adds Depth shows its map while it fills in; collaborators keep the picture.
       if (name === 'Depth') depthUi.setShowMap(effect.id, true);
-      set({ selectedClipId: clipId, selectedTextIds: [], textSelection: null, sidePanel: 'inspector', inspectorTab: 'Effects' });
+      if (reveal) set({ selectedClipId: clipId, selectedTextIds: [], textSelection: null, sidePanel: 'inspector', inspectorTab: 'Effects' });
     },
     updateEffect(clipId, effectId, patch, gesture) {
       const clip = editableClip(clipId, 'effects');
@@ -1595,7 +1598,13 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const member=membership(clip,state.nodes),placed=member&&placeGroup(clip,nodes,member);
       if(member)nodes=placed||nodes.filter(n=>!isGroupNode(n));
       else for(const node of nodes)if(isGroupNode(node)){delete node.group;node.kind='serial';}
-      const value:Record<string,unknown>={...(masks.length?{smartMasks:[...(clip.smartMasks??[]),...masks]}:{}),keyframes:{...Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>!isGrade(path))),...copy.keyframes}};
+      // Noise Reduction cleans the original before the grade, so the source's travels with it and replaces the target's
+      // (a fresh id; its keyframes stay behind, export refuses them). A source without one leaves the target's alone.
+      const noise=source.clip.effects.find(e=>e.name==='Noise Reduction'),others=clip.effects.filter(e=>e.name!=='Noise Reduction');
+      const carry=noise&&acceptsEffect({...clip,effects:others},state.media.find(m=>m.id===clip.mediaId)?.kind,'Noise Reduction')?{...structuredClone(noise),id:createId('effect')}:undefined;
+      const dropped=carry?clip.effects.filter(e=>e.name==='Noise Reduction').map(e=>`effects.${e.id}.`):[];
+      const value:Record<string,unknown>={...(masks.length?{smartMasks:[...(clip.smartMasks??[]),...masks]}:{}),...(carry?{effects:others.length<clip.effects.length?(i=>[...others.slice(0,i),carry,...others.slice(i)])(clip.effects.findIndex(e=>e.name==='Noise Reduction')):[...clip.effects,carry]}:{}),
+        keyframes:{...Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>!isGrade(path)&&!dropped.some(prefix=>path.startsWith(prefix)))),...copy.keyframes}};
       const unset:string[]=[];
       for(const key of fields){if(source.clip.properties[key]===undefined)unset.push(`properties.${key}`);else value[`properties.${key}`]=source.clip.properties[key];}
       if(member&&!placed){unset.push('properties.colorGroup');state.notify(`${clip.name} left ${member.name}`,'info','The pasted grade has no Balance node for the group to follow.');}

@@ -95,13 +95,14 @@ test('real media preparation and timeline export preserve picture, sound, timing
     await ff(['-i', source, '-vn', '-c:a', 'pcm_s16le', audioSource]);
     const audioPrepared = await prepareMedia({ inputPath: audioSource, outputDir: path.join(dir, 'audio-prepared'), baseUrl: '/audio' });
     assert.equal(audioPrepared.kind, 'audio'); assert.ok(audioPrepared.waveform.some(value => value > .03));
-    const audioClip = clip('audio', 'audio', 0, 1); audioClip.effects = ['EQ', 'Compressor', 'Limiter', 'Noise Reduction'].map(name => ({ id: name, name, amount: 50, enabled: true }));
+    const audioClip = clip('audio', 'audio', 0, 1); audioClip.effects = ['EQ', 'Compressor', 'Limiter', 'Audio Noise Reduction'].map(name => ({ id: name, name, amount: 50, enabled: true }));
     await renderTimeline({ ...request, clips: [audioClip], tracks: [track('audio', 1, 'audio')], assets: [{ asset: { ...asset, kind: 'audio' }, path: audioSource }], settings: { ...request.settings, rangeOut: '1' } });
     assert.ok((await pixel(outputPath, .5)).every(value => value < 10), 'Audio-only exports use a black video canvas.');
     const treated = clip('treated', 'base', 0, 1);
     treated.properties = { ...treated.properties, zoom: 110, rotation: 4, cropLeft: 3, opacity: 80, anchorX: 2, x: 3 };
-    treated.effects = ['Film grain', 'Vignette', 'Gaussian blur', 'Sharpen', 'Noise Reduction'].map(name => ({ id: name, name, amount: 10, enabled: true }));
-    treated.effects.forEach(effect => { effect.parameters = effect.name === 'Vignette' ? {centerX:35,centerY:65} : effect.name === 'Gaussian blur' ? {radius:12} : effect.name === 'Sharpen' ? {radius:3} : effect.name === 'Film grain' ? {seed:42} : {temporal:8}; });
+    // Audio Noise Reduction on a picture clip shapes only its sound; the picture passes it by.
+    treated.effects = ['Film grain', 'Vignette', 'Gaussian blur', 'Sharpen', 'Audio Noise Reduction'].map(name => ({ id: name, name, amount: 10, enabled: true }));
+    treated.effects.forEach(effect => { effect.parameters = effect.name === 'Vignette' ? {centerX:35,centerY:65} : effect.name === 'Gaussian blur' ? {radius:12} : effect.name === 'Sharpen' ? {radius:3} : effect.name === 'Film grain' ? {seed:42} : {Reduction:50}; });
     const grade = { id: 'grade', projectId: 'project', clipId: 'treated', name: 'Balance', kind: 'balance', enabled: true, parameters: { Exposure: .1, Contrast: 1.1, Pivot: .45, Saturation: 90, Temperature: 200, Tint: 2, lift: .01, gamma: .1, gain: 1.01, offset: .01 } };
     await renderTimeline({ ...request, clips: [treated], nodes: [grade], settings: { ...request.settings, rangeOut: '1' } });
     assert.ok((await probeMedia(outputPath)).duration >= 1);

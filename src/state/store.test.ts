@@ -532,6 +532,22 @@ test('Depth: the map shows only where it was added, and first Lens blur takes Fo
   state().updateEffect('c3', id, null);
 });
 
+test('addEffect with reveal false adds the effect and leaves the panels alone (the Color page adds Noise Reduction in place)', () => {
+  store.setState({ sidePanel: 'history', inspectorTab: 'Video' });
+  state().addEffect('c3', 'Noise Reduction', false);
+  const noise = clip().effects.find(e => e.name === 'Noise Reduction')!;
+  assert.ok(noise); assert.equal(state().sidePanel, 'history'); assert.equal(state().inspectorTab, 'Video');
+  state().updateEffect('c3', noise.id, null);
+  store.setState({ sidePanel: 'inspector' });
+});
+
+test('picture effects stay off the audio half of a linked pair; its sound effects are still added', () => {
+  const picture = clip('c3'), audio = state().tracks.find(t => t.kind === 'audio' && t.timelineId === picture.timelineId)!;
+  store.setState({ clips: [...state().clips, { ...picture, id: 'c3-sound', trackId: audio.id, effects: [] }] });
+  for (const name of ['Noise Reduction', 'Stabilize', 'Sharpen', 'Audio Noise Reduction']) state().addEffect('c3-sound', name, false);
+  assert.deepEqual(clip('c3-sound').effects.map(e => e.name), ['Audio Noise Reduction']);
+});
+
 test('Depth subject: picks one of the clip\'s Smart Masks or none, undoably, and only a mask of this clip', () => {
   state().addEffect('c3', 'Smart Mask'); state().addEffect('c3', 'Depth');
   const mask = clip().smartMasks![0], depth = () => clip().effects.find(e => e.name === 'Depth')!;
@@ -912,6 +928,32 @@ test('grade paste replaces the look, nodes and grade animation without inserting
   assert.ok(pasted.keyframes?.[`nodes.${copied.id}.parameters.exposure`]);
   state().undo();assert.deepEqual(state().clips,before.clips);assert.deepEqual([...state().nodes].sort((a,b)=>a.id.localeCompare(b.id)),before.nodes.sort((a,b)=>a.id.localeCompare(b.id)));
   store.setState({currentUserId:'non-editor'});state().pasteGrade(target.id);assert.deepEqual(state().clips,before.clips);
+});
+
+test('grade paste carries Noise Reduction: the source\'s replaces the target\'s, with a new id and without the old keyframes',()=>{
+  const source=clip('c3'),target=state().clips.find(c=>c.projectId===source.projectId&&c.id!==source.id&&state().tracks.find(t=>t.id===c.trackId)?.kind==='video'&&state().media.find(m=>m.id===c.mediaId)?.kind==='video')!;
+  state().addEffect(source.id,'Noise Reduction');const noise=clip(source.id).effects.find(e=>e.name==='Noise Reduction')!;
+  state().updateEffect(source.id,noise.id,{amount:70,parameters:{frames:3}});
+  state().addEffect(target.id,'Noise Reduction');const old=clip(target.id).effects.find(e=>e.name==='Noise Reduction')!;
+  state().setKeyframes(target.id,`effects.${old.id}.amount`,[{id:'nr-key',time:0,value:20,interpolation:'linear'}]);
+  const before=structuredClone(state().clips);
+  state().copyGrade(source.id);state().pasteGrade(target.id);
+  const pasted=clip(target.id).effects.filter(e=>e.name==='Noise Reduction');
+  assert.equal(pasted.length,1);assert.notEqual(pasted[0].id,noise.id);assert.notEqual(pasted[0].id,old.id);
+  assert.deepEqual([pasted[0].amount,pasted[0].parameters],[70,{frames:3}]);
+  assert.ok(!Object.keys(clip(target.id).keyframes??{}).some(k=>k.startsWith(`effects.${old.id}.`)));
+  state().undo();assert.deepEqual(state().clips,before);
+});
+
+test('grade paste onto a clip with two legacy Noise Reductions keeps one, in the first one\'s place, with an id of its own',()=>{
+  const source=clip('c3'),target=state().clips.find(c=>c.projectId===source.projectId&&c.id!==source.id&&state().tracks.find(t=>t.id===c.trackId)?.kind==='video'&&state().media.find(m=>m.id===c.mediaId)?.kind==='video')!;
+  state().addEffect(source.id,'Noise Reduction');
+  const legacy=(id:string)=>({id,name:'Noise Reduction',enabled:true,amount:40});
+  store.setState({clips:state().clips.map(c=>c.id===target.id?{...c,effects:[{id:'sharp',name:'Sharpen',enabled:true,amount:20},legacy('legacyA'),{id:'grain',name:'Film grain',enabled:true,amount:10},legacy('legacyB')]}:c)});
+  state().copyGrade(source.id);state().pasteGrade(target.id);
+  const effects=clip(target.id).effects;
+  assert.deepEqual(effects.map(e=>e.name),['Sharpen','Noise Reduction','Film grain']);
+  assert.equal(new Set(effects.map(e=>e.id)).size,effects.length);assert.ok(!['legacyA','legacyB'].includes(effects[1].id));
 });
 
 test('restoring a DaVinci LUT removes conflicting CSTs and is undoable',()=>{

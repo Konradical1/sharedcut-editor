@@ -163,7 +163,8 @@ export function smartMaskService(directory: string) {
     clearTimeout(current.idle);
     for (const request of current.pending.values()) request.reject(new SmartMaskError(503, reason));
     current.pending.clear();
-    killProcessTree(current.child, 'SIGTERM');
+    // Once the worker is gone a taskkill /T could hit whatever reused its PID (see runWorkerProcess).
+    if (current.child.exitCode === null && current.child.signalCode === null) killProcessTree(current.child, 'SIGTERM');
   };
   const previewWorkerFor = () => {
     if (previewWorker) return previewWorker;

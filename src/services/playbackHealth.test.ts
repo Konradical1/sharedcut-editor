@@ -327,8 +327,9 @@ test('a graded video-element layer re-stamps its picture with the colour copy th
   // no test builds the stamp inside the player.
   const source = readFileSync(new URL('./playback.ts', import.meta.url), 'utf8');
   assert.match(source, /const stampAt = [^;\r\n]*pictureStamps\.push\(`\$\{clip\.id\}@\$\{sourceTimestamp\}`\) - 1 : -1;/);
-  assert.match(source, /finishLayer\(framed,asset,time,layerTarget,element instanceof HTMLVideoElement\?element:undefined,warp,queuedFrame,flip,stampAt\);/);
-  assert.match(source, /if\(element\)\{sourceTimestamp=result\.dataset\.sourceTimestamp \?\? '';if\(stampAt>=0\)pictureStamps\[stampAt\]=`\$\{clip\.id\}@\$\{sourceTimestamp\}`;\}/);
+  assert.match(source, /finishLayer\(framed,asset,time,layerTarget,element instanceof HTMLVideoElement\?element:undefined,warp,queuedFrame,flip,stampAt,denoised\);/);
+  // A Noise Reduction chunk's media time 0 is source second `offset`: the stamp stays in source time.
+  assert.match(source, /if\(element\)\{const drawn=result\.dataset\.sourceTimestamp;sourceTimestamp=drawn\?String\(\+drawn\+offset\):'';if\(stampAt>=0\)pictureStamps\[stampAt\]=`\$\{clip\.id\}@\$\{sourceTimestamp\}`;\}/);
 });
 
 test('the Settings switch writes the key the reporter reads, and the harness marks its runs', () => {

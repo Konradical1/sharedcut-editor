@@ -279,7 +279,7 @@ export const jobs: Record<string, JobDef> = {
 
 const range = (path: string) => `${boundedAnimationValue(path, -1e9)}–${boundedAnimationValue(path, 1e9)}`;
 const lufs = loudnessTargets.map(t => `${t.lufs} ${t.label}`).join(', ');
-const audioEffects = Object.entries(effectDefinitions).filter(([, d]) => d.kind !== 'video').map(([name]) => name).join(', ');
+const audioEffects = Object.entries(effectDefinitions).filter(([, d]) => d.kind === 'audio').map(([name]) => name).join(', ');
 
 export const topics: Record<string, string> = {
   audio: [

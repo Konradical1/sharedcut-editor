@@ -47,6 +47,7 @@ import { fcpProjectId, importFcpxml, importStatus } from './fcpxml.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
 import { depthCapabilities, depthService } from './depth.ts';
+import { denoiseCapabilities, denoiseQualities, denoiseService, denoiseSettingsOf } from './denoise.ts';
 import { validateSmartMask, validateSmartMaskBindings } from '../src/services/smartMask.ts';
 import { motionTrackerCapabilities, motionTrackerService } from './motionTracker.ts';
 import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } from './colorAssistant.ts';
@@ -288,7 +289,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const flowDirectory = join(dataDir, 'optical-flow');
   const masks = smartMaskService(join(dataDir, 'smart-masks'));
   const motionTrackers = motionTrackerService(join(dataDir, 'motion-trackers'));
-  const depth = depthService(join(dataDir, 'depth'), { sourceTimes: masks.sourceTimes, freeGpu: () => masks.stopIdlePreview() });
+  const denoise = denoiseService(join(dataDir, 'denoise'), { freeGpu: () => masks.stopIdlePreview() });
+  const depth = depthService(join(dataDir, 'depth'), { sourceTimes: masks.sourceTimes, freeGpu: () => { masks.stopIdlePreview(); denoise.stopIdle(); } });
   const colorAssistant = colorAssistantService(dataDir);
   const colorNormalize = colorNormalizeService(dataDir);
   const flowJobs = new Map<string, FlowPreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
@@ -672,7 +674,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
               const quiet = Math.floor((Date.now() - advancedAt) / 1000);
               updateJob(job.id, { progress: progressValue, remaining: `${stage} · ${elapsed}s elapsed${quiet >= 30 ? ` · No new frames for ${quiet}s` : ''}` }, false); };
             const heartbeat = setInterval(report, 250);
-            try { let previous = -1; await renderTimeline({ ...snapshot, depth, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { clock.enter(next); stage = next; advancedAt = Date.now(); report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); logTimes('finished'); }
+            try { let previous = -1; await renderTimeline({ ...snapshot, depth, freeGpu: () => { masks.stopIdlePreview(); denoise.stopIdle(); }, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, denoiseDir:join(dataDir, 'denoise'), resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { clock.enter(next); stage = next; advancedAt = Date.now(); report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); logTimes('finished'); }
             catch (error) { logTimes(signal.aborted ? 'cancelled' : 'failed'); rmSync(outputPath, { force: true }); if (!closed) updateJob(job.id, { status: 'failed', remaining: signal.aborted ? 'Cancelled' : 'Export failed', error: signal.aborted ? 'Cancelled by user.' : error instanceof Error ? error.message : 'Export failed.' }); }
             finally { clearInterval(heartbeat); if (!closed) db.prepare('DELETE FROM render_snapshots WHERE id=?').run(job.id); }
     }, true, () => { for (const release of releases) release(); }, signal => awaitDepth(job, snapshot, signal, releases));
@@ -1792,6 +1794,27 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const {controller,projectId,clipId,generation:jobGeneration,...result}=job;
           send(res,200,result); return;
         }
+        if (path === '/api/denoise/capabilities' && method === 'GET') { const { workerIdentity, ...capabilities } = await denoiseCapabilities(); send(res, 200, capabilities); return; }
+        if (path === '/api/denoise' && method === 'POST') {
+          const body = await jsonBody(req), clip = state.clips.find(c => c.id === textField(body.clipId,160,true)) ?? fail(404,'Clip not found.');
+          // Playback asks for this for every viewer, reviewers included; the GPU queue and the 8-job cap bound the work.
+          const project = requireProject(clip.projectId,userId);
+          const asset = state.media.find(a => a.id === clip.mediaId && a.projectId === project.id);
+          if (!asset || asset.kind !== 'video' || !clip.effects.some(e => e.name === 'Noise Reduction')) fail(400,'Add Noise Reduction to a video clip first.');
+          if (asset!.hasAlpha) fail(400,'Noise Reduction does not work on footage with transparency.');
+          const quality = textField(body.quality,20,true); if (!denoiseQualities.includes(quality)) fail(400,'Invalid preview quality.');
+          const view = body.view === undefined || body.view === 'denoised' ? 'denoised' : body.view === 'noise' ? 'noise' : fail(400,'Invalid Noise Reduction view.');
+          const chunk = numberField(body.chunk,0,1e6); if (!Number.isInteger(chunk)) fail(400,'Invalid preview chunk.');
+          if (!existsSync(originalPath(asset!.id))) fail(409,'Noise Reduction reads the original media, which is not on this server.');
+          send(res,200,await denoise.preview({projectId:project.id,clipId:clip.id,input:originalPath(asset!.id),asset:asset!,chunk,quality,view,settings:denoiseSettingsOf(body.settings)})); return;
+        }
+        const denoiseRoute = /^\/api\/denoise\/([a-f0-9]{64})(?:\/files\/video\.mp4)?$/.exec(path);
+        if (denoiseRoute) {
+          const projectId = textField(url.searchParams.get('projectId'),160,true); requireProject(projectId,userId);
+          // The chunk's URL holds /files/ and ends .mp4, so playback decodes it like the proxy it stands in for.
+          if (method==='DELETE'&&!path.endsWith('.mp4')) { denoise.cancel(projectId,denoiseRoute[1]); send(res,200,{ok:true}); return; }
+          if (['GET','HEAD'].includes(method)&&path.endsWith('.mp4')) { streamFile(req,res,denoise.chunk(projectId,denoiseRoute[1]),'video/mp4',undefined,true); return; }
+        }
         const flowRoute = /^\/api\/optical-flow\/([a-f0-9]{64})(?:\/(video))?$/.exec(path);
         if (flowRoute) {
           const projectId = textField(url.searchParams.get('projectId'),160,true); requireProject(projectId,userId);
@@ -2136,7 +2159,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     closed = true; saveBeforeExit();
     // Abort everything before awaiting anything: a job queued for the GPU or a heavy slot behind work that is only
     // aborted later would otherwise hold the shutdown (and frameline.lock) for the rest of a long depth run.
-    const services = [masks.close(), depth.close(), motionTrackers.close(), colorAssistant.close(), colorNormalize.close()];
+    const services = [masks.close(), depth.close(), denoise.close(), motionTrackers.close(), colorAssistant.close(), colorNormalize.close()];
     for (const job of flowJobs.values()) job.controller.abort();
     for (const job of stabilizeJobs.values()) job.controller.abort();
     for (const controller of aborters.values()) controller.abort();

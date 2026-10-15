@@ -196,7 +196,7 @@ const TimelineClipView = memo(function TimelineClipView({ near, span, clip, asse
     style={{ left: `${start / span * 100}%`, width: `max(12px, ${duration / span * 100}%)`, '--clip-color': clip.color, '--selection-color': selectionColor } as CSSProperties}
     onDragOver={e => { if (e.dataTransfer.types.includes('application/x-frameline-effect')) { e.preventDefault(); e.stopPropagation(); e.dataTransfer.dropEffect = locked ? 'none' : 'copy'; if (!locked) cb.effect(clip.id); } }}
     onDragLeave={() => cb.effect(null)}
-    onDrop={e => { const name = e.dataTransfer.getData('application/x-frameline-effect'); if (!name) return; e.preventDefault(); e.stopPropagation(); cb.effect(null); if (!locked && acceptsEffect(clip, asset?.kind, name)) actions().addEffect(clip.id, name); }}
+    onDrop={e => { const name = e.dataTransfer.getData('application/x-frameline-effect'); if (!name) return; e.preventDefault(); e.stopPropagation(); cb.effect(null); if (!locked && acceptsEffect(clip, kind === 'audio' ? 'audio' : asset?.kind, name)) actions().addEffect(clip.id, name); }}
     onPointerDown={e => cb.down(e, clip, 'move')} onPointerMove={cb.move} onPointerUp={cb.up} onPointerCancel={cb.cancel} onLostPointerCapture={cb.lost}
     onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); if (e.key === 'Enter' && isComposition(clip)) actions().openComposition(clip.id); else actions().selectClip(clip.id); } if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); e.stopPropagation(); actions().moveClip(clip.id, clip.start + (e.key === 'ArrowRight' ? 1 : -1) / fps); } }}
     onDoubleClick={e => { e.stopPropagation(); if (isComposition(clip)) actions().openComposition(clip.id); }}
