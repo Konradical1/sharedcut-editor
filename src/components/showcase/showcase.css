@@ -22,7 +22,7 @@
 .sc-top-right{display:flex;align-items:center;gap:6px;font-size:10px;color:#8b969b}.sc-top-right button{width:28px;height:28px;display:grid;place-items:center;border-radius:6px;color:#8b969b}.sc-top-right button:hover{background:#ffffff0a}
 .sc-replay-dot{width:7px;height:7px;border-radius:50%;background:#f06a70;box-shadow:0 0 0 3px #f06a7022;animation:sc-blink 2s ease-in-out infinite}
 @keyframes sc-blink{50%{opacity:.35}}
-.sc-upper{display:grid;grid-template-columns:200px minmax(0,1fr) 250px;height:clamp(240px,32vh,380px);border-bottom:1px solid #24292d}
+.sc-upper{display:grid;grid-template-columns:200px minmax(0,1fr) 250px;height:clamp(260px,34vh,380px);border-bottom:1px solid #24292d}
 .sc-panel-title{height:34px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 12px;font-size:11px;color:#9aa4a9;font-weight:520;flex-shrink:0;border-bottom:1px solid #ffffff08}
 .sc-bin,.sc-activity{display:flex;flex-direction:column;background:var(--panel);min-height:0;overflow:hidden}.sc-bin{border-right:1px solid #24292d}.sc-activity{border-left:1px solid #24292d}
 .sc-bin-heading{display:flex;align-items:center;gap:6px;padding:9px 12px 6px;font-size:10px;color:#7f8a90}.sc-bin-heading span{margin-left:auto}
