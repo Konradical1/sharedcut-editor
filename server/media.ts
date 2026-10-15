@@ -19,7 +19,9 @@ import { isTitle, getText, drawText, validateText } from '../src/services/text.t
 import { isShape, getShape, drawShape, validateShape } from '../src/services/shapes.ts';
 import { adjustmentAsset, isAdjustment } from '../src/services/adjustment.ts';
 import { placement, streamsTransform, transformFilters } from './streamedTransform.ts';
-import { effectDefinitions, effectValue, effectEnabled, loudnessTarget } from '../src/services/effects.ts';
+import { audioEffectNames, effectDefinitions, effectValue, effectEnabled, loudnessTarget } from '../src/services/effects.ts';
+import { denoiseEffect, denoiseKeys, denoiseSettings } from '../src/services/denoise.ts';
+import { denoiseBake, trimDenoiseBakes } from './denoise.ts';
 import { eqBiquads } from '../src/services/audioDsp.ts';
 import { clipSpan, extendClip } from '../src/services/playback.ts';
 import { blendModeOf } from '../src/services/blendModes.ts';
@@ -397,25 +399,36 @@ const knownMatrix = (matrix?: string) => ['bt709', 'bt470bg', 'smpte170m', 'bt20
  * `videoStart` / `audioStart`: a separate input's own start time, kept instead of moved to zero. FFmpeg zeroes each input
  * on its own, so a picture that starts after its sound (an edit list in color-v1) would otherwise slide onto the sound.
  */
-export async function encodePreviews(options: { video: string; prepared: boolean; audio?: string; audioCopy?: boolean; videoStart?: number; audioStart?: number; metadata: { fps: number; duration: number; colorMatrix?: string; colorRange?: string; colorTransfer?: string }; outputs: PreviewOutput[]; temp: string; signal?: AbortSignal; onProgress?: (percent: number) => void }) {
-  const { video, metadata, outputs, temp } = options, sizing = 'flags=lanczos+accurate_rnd+full_chroma_int';
-  const base = options.prepared ? `scale=w='min(1920,iw)':h=-2:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv:${sizing}`
-    : `scale=w='min(1920,iw)':h=-2:in_color_matrix=${knownMatrix(metadata.colorMatrix)}:out_color_matrix=bt709:in_range=${metadata.colorRange === 'pc' ? 'pc' : metadata.colorRange === 'tv' ? 'tv' : 'auto'}:out_range=tv:${sizing}${await toneMap(metadata.colorTransfer, temp)}`;
-  // Tags go on the frames: FFmpeg 8+ takes primaries and transfer from them and ignores -color_primaries / -color_trc.
-  const bt709 = 'setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709';
-  const recipes = {
-    // Primaries and transfer stay untagged as on the grading proxy: the colour pipeline reads the planes itself.
-    full: { name: FULL_VARIANT, scale: '', tag: 'setparams=range=tv:color_primaries=unknown:color_trc=unknown:colorspace=bt709', codec: ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17', '-g', gop(metadata.fps, .5), '-pix_fmt', 'yuv422p10le'] },
-    stream: { name: STREAM_VARIANT, scale: 960, tag: bt709, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '16', '-g', gop(metadata.fps, 2), '-pix_fmt', 'yuv420p'] },
-    low: { name: STREAM_LOW_VARIANT, scale: 480, tag: bt709, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20', '-maxrate', '900k', '-bufsize', '1800k', '-g', gop(metadata.fps, .5), '-pix_fmt', 'yuv420p'] },
-  };
+type PreviewMetadata = { fps: number; colorMatrix?: string; colorRange?: string; colorTransfer?: string };
+const sizing = 'flags=lanczos+accurate_rnd+full_chroma_int';
+/** The conversion every v3 preview file starts from: up to 1920 wide, BT.709, video range, tone-mapped. */
+const previewBase = async (prepared: boolean, metadata: PreviewMetadata, temp: string) => prepared ? `scale=w='min(1920,iw)':h=-2:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv:${sizing}`
+  : `scale=w='min(1920,iw)':h=-2:in_color_matrix=${knownMatrix(metadata.colorMatrix)}:out_color_matrix=bt709:in_range=${metadata.colorRange === 'pc' ? 'pc' : metadata.colorRange === 'tv' ? 'tv' : 'auto'}:out_range=tv:${sizing}${await toneMap(metadata.colorTransfer, temp)}`;
+// Tags go on the frames: FFmpeg 8+ takes primaries and transfer from them and ignores -color_primaries / -color_trc.
+const bt709 = 'setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709';
+const previewRecipes = (fps: number) => ({
+  // Primaries and transfer stay untagged as on the grading proxy: the colour pipeline reads the planes itself.
+  full: { name: FULL_VARIANT, scale: 0, tag: 'setparams=range=tv:color_primaries=unknown:color_trc=unknown:colorspace=bt709', codec: ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '17', '-g', gop(fps, .5), '-pix_fmt', 'yuv422p10le'] },
+  stream: { name: STREAM_VARIANT, scale: 960, tag: bt709, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '16', '-g', gop(fps, 2), '-pix_fmt', 'yuv420p'] },
+  low: { name: STREAM_LOW_VARIANT, scale: 480, tag: bt709, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20', '-maxrate', '900k', '-bufsize', '1800k', '-g', gop(fps, .5), '-pix_fmt', 'yuv420p'] },
+});
+/** What one file adds after the shared 4:2:2 frames: its own size, then its tags. */
+const previewTail = (recipe: ReturnType<typeof previewRecipes>[keyof ReturnType<typeof previewRecipes>]) => `${recipe.scale ? `scale=w='min(${recipe.scale},iw)':h=-2:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv:${sizing},format=yuv420p,setsar=1,` : ''}${recipe.tag}`;
+/** One preview file's exact conversion and encode for an original's own Y′CbCr frames: a Noise Reduction chunk stands in for
+ *  that file, so the browser's grade must read the same planes from it. `scale` is the file's widest picture. */
+export async function previewEncode(output: Exclude<PreviewOutput, 'audio'>, metadata: PreviewMetadata, temp: string) {
+  const recipe = previewRecipes(metadata.fps)[output];
+  return { filter: `${await previewBase(false, metadata, temp)},setsar=1,format=yuv422p10le,${previewTail(recipe)}`, codec: recipe.codec, scale: recipe.scale || 1920 };
+}
+export async function encodePreviews(options: { video: string; prepared: boolean; audio?: string; audioCopy?: boolean; videoStart?: number; audioStart?: number; metadata: PreviewMetadata & { duration: number }; outputs: PreviewOutput[]; temp: string; signal?: AbortSignal; onProgress?: (percent: number) => void }) {
+  const { video, metadata, outputs, temp } = options, base = await previewBase(options.prepared, metadata, temp), recipes = previewRecipes(metadata.fps);
   const pictures = outputs.filter((output): output is Exclude<PreviewOutput, 'audio'> => output !== 'audio');
   const audioInput = options.audio === undefined ? undefined : options.audio === video ? 0 : 1;
   const audioCodec = options.audioCopy ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '128k'];
   const kept = (start?: number) => start ? ['-itsoffset', String(start)] : [];
   const args = [...common, ...options.prepared ? [] : await decodeAccel(), ...kept(options.videoStart), ...safeInput, '-i', video, ...audioInput === 1 ? [...kept(options.audioStart), ...safeInput, '-i', options.audio!] : []];
   if (pictures.length) args.push('-filter_complex', [`[0:v]${base},setsar=1,format=yuv422p10le,split=${pictures.length}${pictures.map((_, i) => `[v${i}]`).join('')}`,
-    ...pictures.map((output, i) => `[v${i}]${recipes[output].scale ? `scale=w='min(${recipes[output].scale},iw)':h=-2:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv:${sizing},format=yuv420p,setsar=1,` : ''}${recipes[output].tag}[o${i}]`)].join(';'));
+    ...pictures.map((output, i) => `[v${i}]${previewTail(recipes[output])}[o${i}]`)].join(';'));
   pictures.forEach((output, i) => args.push('-map', `[o${i}]`, ...audioInput === undefined ? [] : ['-map', `${audioInput}:a:0?`, ...audioCodec], ...recipes[output].codec, '-movflags', '+faststart', path.join(temp, recipes[output].name)));
   if (outputs.includes('audio') && audioInput !== undefined) args.push('-map', `${audioInput}:a:0`, '-vn', ...audioCodec, '-movflags', '+faststart', path.join(temp, AUDIO_VARIANT));
   if (options.onProgress) args.push('-progress', 'pipe:1', '-nostats');
@@ -592,8 +605,8 @@ export function audioFilters(clip: Clip): string[] {
     if (effect.name === 'EQ') filters.push('aresample=48000', ...eqBiquads(value('EQ_Low cut', 80, 20, 500), value('EQ_Presence', 2, -12, 12), value('EQ_Air', 1, -12, 12), 48000).map(([b0, b1, b2, a1, a2]) => `biquad=b0=${b0}:b1=${b1}:b2=${b2}:a0=1:a1=${a1}:a2=${a2}`));
     else if (effect.name === 'Compressor') filters.push(`acompressor=threshold=${10 ** (value('Compressor_Threshold', -18, -60, 0) / 20)}:ratio=${value('Compressor_Ratio', 3, 1, 20)}:attack=${value('Compressor_Attack', 15, 1, 100)}:release=${value('Compressor_Release', 120, 10, 1000)}:makeup=1`);
     else if (effect.name === 'Limiter') filters.push(`volume=${-value('Limiter_Threshold', -6, -24, 0)}dB`, `alimiter=limit=${10 ** (value('Limiter_Ceiling', -1, -12, 0) / 20)}:release=${value('Limiter_Release', 80, 10, 500)}:level=0:latency=1`);
-    else if (effect.name === 'Noise Reduction') filters.push(`afftdn=nr=${.01 + value('Noise Reduction_Reduction', 35, 0, 100) * .96}:nf=${-20 - value('Noise Reduction_Sensitivity', 50, 0, 100) * .6}:gs=${Math.round(value('Noise Reduction_Smoothing', 25, 0, 100) / 2)}`);
-    else if (!['Film grain', 'Vignette', 'Gaussian blur', 'Sharpen', 'Bloom', 'Smart Mask', 'Depth'].includes(effect.name)) throw new Error(`${clip.name}: ${effect.name} is not supported for audio.`);
+    else if (effect.name === 'Audio Noise Reduction') filters.push(`afftdn=nr=${.01 + value('Audio Noise Reduction_Reduction', 35, 0, 100) * .96}:nf=${-20 - value('Audio Noise Reduction_Sensitivity', 50, 0, 100) * .6}:gs=${Math.round(value('Audio Noise Reduction_Smoothing', 25, 0, 100) / 2)}`);
+    else if (!['Film grain', 'Vignette', 'Gaussian blur', 'Sharpen', 'Bloom', 'Smart Mask', 'Depth', 'Stabilize', 'Noise Reduction'].includes(effect.name)) throw new Error(`${clip.name}: ${effect.name} is not supported for audio.`);
   }
   return filters;
 }
@@ -627,8 +640,8 @@ function videoFilters(clip: Clip, lutPath: string | undefined, asset: MediaAsset
     else if (effect.name === 'Vignette') filters.push(`vignette=angle=${amount / 100 * Math.PI / 3}:x0=w*${effectValue(clip,effect,'centerX')/100}:y0=h*${effectValue(clip,effect,'centerY')/100}`);
     else if (effect.name === 'Gaussian blur') filters.push('premultiply=inplace=1', `gblur=sigma=${amount / 100 * effectValue(clip,effect,'radius')}`, 'unpremultiply=inplace=1');
     else if (effect.name === 'Sharpen') filters.push(`unsharp=${Math.round(effectValue(clip,effect,'radius'))*2+1}:${Math.round(effectValue(clip,effect,'radius'))*2+1}:${amount / 25}`);
-    else if (effect.name === 'Noise Reduction') filters.push(`hqdn3d=${amount / 25}:${amount / 25 * .75}:${effectValue(clip,effect,'temporal')}:${effectValue(clip,effect,'temporal')*.75}`);
-    else if (!['EQ', 'Compressor', 'Limiter'].includes(effect.name)) throw new Error(`${clip.name}: ${effect.name} is not supported for video. Remove or bypass the effect.`);
+    else if (effect.name === 'Noise Reduction') { /* Baked from the camera original before anything else (renderDenoisedTimeline). */ }
+    else if (!audioEffectNames.includes(effect.name)) throw new Error(`${clip.name}: ${effect.name} is not supported for video. Remove or bypass the effect.`);
   }
   return filters;
 }
@@ -704,6 +717,8 @@ export interface RenderRequest {
   project: Project; timeline: Timeline; timelines?: Timeline[]; clips: Clip[]; tracks: Track[]; nodes: GradeNode[];
   assets: { asset: MediaAsset; path: string }[]; settings: Record<string, string>; outputPath: string;
   signal?: AbortSignal; onProgress?: (percent: number) => void; onStage?: (stage: string) => void; resolveDir?: string; smartMaskDir?: string; stabilizeDir?: string;
+  /** Noise Reduction storage (server/denoise.ts): noise profiles and the export bakes it keeps between exports. */
+  denoiseDir?: string;
   /** Internal composition renders keep alpha and defer the master limiter to the outer timeline. */
   transparent?: boolean; compositionPath?: string[]; sampledFrame?: boolean;
   transformSamples?: Record<string, MotionPose[]>;
@@ -729,8 +744,13 @@ export interface RenderRequest {
   onWait?: (text: string | null) => void;
   /** Depth analysis: clips with a Depth effect start or join their run and wait for it. */
   depth?: Pick<ReturnType<typeof depthService>, 'ready' | 'focus'> & Partial<Pick<ReturnType<typeof depthService>, 'freeGpu'>>;
+  /** Gives idle GPU workers' memory back before a CUDA bake (Smart Mask and Noise Reduction previews). */
+  freeGpu?: () => void;
   /** Internal: the camera original behind a Stabilize bake, keyed by clip, for a Depth that reads its analysis. */
   stabilized?: Map<string, { clip: Clip; source: { asset: MediaAsset; path: string }; offset: number; solve: StabilizeSolve }>;
+  /** Internal: the camera original behind a Noise Reduction bake, keyed by clip. Stabilize analyses it (so its cache and the
+   *  editor's preview stay valid) and Depth reads its analysis. The bake's frame k is the original's frame at offset + k / fps. */
+  denoised?: Map<string, { clip: Clip; source: { asset: MediaAsset; path: string }; offset: number }>;
   /** Internal: hand over the finished FFmpeg command, which writes the lone clip's layer as raw rgba64le on stdout,
    *  instead of running it (the Depth bake reads its pre-depth frames this way). */
   decoder?: (command: string[]) => Promise<void>;
@@ -837,6 +857,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&isCaption(c)))return renderCaptionTimeline(request);
   rejectDepth(request);
   if(request.clips.some(c=>c.timelineId===request.timeline.id&&c.mediaId==='frameline-composition'&&!c.disabled))return renderCompositions(request);
+  if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&denoisesPicture(request,c)))return renderDenoisedTimeline(request);
   if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&stabilizeEffect(c)))return renderStabilizedTimeline(request);
   if(!request.sampledFrame&&request.clips.some(c=>c.timelineId===request.timeline.id&&!c.disabled&&c.properties.opticalFlow))return renderFlowTimeline(request);
   if(!request.sampledFrame&&depthClips(request).length)return renderDepthTimeline(request);
@@ -1254,7 +1275,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       const largest = motion ? Math.max(...poses.map(pose => Math.max(pose.scaleX, pose.scaleY))) * width : streamed ? Math.max(...streamed.map(frame => Math.max(frame.zoom, frame.zoomY))) * width : Math.max(scaledWidth, Math.round(width * (zoom * (scaleY / 100)) / 2) * 2);
       const canvas = Math.min(1, largest / projectWidth), canvasWidth = Math.max(2, Math.round(projectWidth * canvas)), canvasHeight = Math.max(2, Math.round(projectHeight * canvas));
       const fit = `w=${canvasWidth}:h=${canvasHeight}:force_original_aspect_ratio=decrease`;
-      const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && !['EQ', 'Compressor', 'Limiter', 'Stabilize', 'Depth'].includes(e.name));
+      const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && ![...audioEffectNames, 'Stabilize', 'Depth', 'Noise Reduction'].includes(e.name));
       video.push(`fps=${fps}`, `trim=duration=${length}`, 'setsar=1', ...videoFilters(clip, lutPath, source.asset, maskStreams, videoIndex === index, fitFirst ? fit : undefined, acesInterpolation));
       // After grade and matte (both in source orientation), before crop (measured on what the viewer sees).
       if (p.flipH && !isTitle(clip) && !isShape(clip)) video.push('hflip');
@@ -1504,9 +1525,12 @@ async function renderStabilizedTimeline(request: RenderRequest) {
     if(activeDepthKeys(clip,request.nodes).length)throw Error(`${clip.name}: a depth key and Stabilize cannot share a clip in export yet. Remove the depth key or Stabilize.`);
     const source=assets.find(a=>a.asset.id===clip.mediaId),track=tracks.find(t=>t.id===clip.trackId);
     if(!source||source.asset.kind!=='video'||!track)throw new Error(`${clip.name}: Stabilize requires a video source.`);
-    const span=clipSpan(clip,records),geo=extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
-    const sourceFps=source.asset.fps||finite(request.settings.fps||request.project.fps,'Frame rate',1,120);
-    const range=stabilizeRange(geo,sourceFps,source.asset.duration);
+    // Under a Noise Reduction bake everything below runs in the original's time on the original, as the editor's analysis
+    // did; only the render reads the clean bake, `shift` seconds later into its own file.
+    const denoised=request.denoised?.get(clip.id),original=denoised?.source??source,shift=denoised?.offset??0,base=denoised?.clip??clip;
+    const span=clipSpan(base,records),geo=extendClip(base,Math.max(0,span.start),span.end-Math.max(0,span.start));
+    const sourceFps=original.asset.fps||finite(request.settings.fps||request.project.fps,'Frame rate',1,120);
+    const range=stabilizeRange(geo,sourceFps,original.asset.duration);
     const settings=stabilizeSettings(clip,stabilizeEffect(clip)!);
     // Resolve every matte against the original before the source is swapped for the bake, then move each one
     // with the picture's own matrices. Stabilize first, Smart Mask on top of the stabilized frame.
@@ -1521,31 +1545,32 @@ async function renderStabilizedTimeline(request: RenderRequest) {
     const step=1/sourceFps,matteOffset=(times?:number[])=>times?.find(t=>t>=range.from-step/2-1e-6)??range.from;
     for(const [order,document] of documents.entries()) {
       if(!request.smartMaskDir)throw Error(`${clip.name}: Smart Mask storage is unavailable.`);
-      const artifact=resolveSmartMaskArtifact(request.smartMaskDir,clip,document,source.path,source.asset);
+      // A Noise Reduction bake already resolved it against the original.
+      const artifact=request.maskArtifacts?.get(`${clip.id}:${document.id}`)??resolveSmartMaskArtifact(request.smartMaskDir,clip,document,source.path,source.asset);
       const warped=path.join(directory,`mask-${clip.id}-${document.id}`);
       await mkdir(path.join(warped,'frames'),{recursive:true});
-      await stabilizeWarpMattes({input:source.path,directory:request.stabilizeDir??directory,range,settings,signal:request.signal,
+      await stabilizeWarpMattes({input:original.path,directory:request.stabilizeDir??directory,range,settings,signal:request.signal,
         onProgress:p=>report(mattes*(order+p/100)/documents.length),
         frames:artifact.manifest.frames.map(f=>({input:path.join(artifact.directory,f.file),output:path.join(warped,f.file),time:f.time}))});
       maskArtifacts.set(`${clip.id}:${document.id}`,{directory:warped,manifest:artifact.manifest,offset:matteOffset(artifact.manifest.sourceTimes)});
     }
     request.onStage?.(`Stabilizing · ${clip.name}`);
-    const baked=await renderStabilized({input:source.path,directory:bakes,analysisDirectory:request.stabilizeDir,range,from:range.from,to:range.to,settings,preview:false,signal:request.signal,onProgress:p=>report(mattes+(1-mattes)*p/100)});
+    const baked=await renderStabilized({input:source.path,...denoised?{analysisInput:original.path,inputOffset:shift,inputKey:path.basename(source.path)}:{},directory:bakes,analysisDirectory:request.stabilizeDir,range,from:range.from,to:range.to,settings,preview:false,signal:request.signal,onProgress:p=>report(mattes+(1-mattes)*p/100)});
     claimed.push(baked.key);stabilizeBakesInUse.set(baked.key,(stabilizeBakesInUse.get(baked.key)??0)+1);
     // Read again: the cache keeps what was used last.
     const now=new Date();await utimes(baked.output,now,now).catch(()=>{});
     // A Depth on this clip reads analysis of the original and warps it with the picture's own matrices.
-    if(depthEffect(clip))stabilized.set(clip.id,{clip,source,offset:range.from,solve:(await stabilizeSolve({input:source.path,directory:request.stabilizeDir??directory,range,settings,signal:request.signal})).solve});
+    if(depthEffect(clip))stabilized.set(clip.id,{clip:base,source:original,offset:range.from,solve:(await stabilizeSolve({input:original.path,directory:request.stabilizeDir??directory,range,settings,signal:request.signal})).solve});
     const mediaId=`stabilize-${clip.id}`,metadata=await probeMedia(baked.output,request.signal);
     assets.push({path:baked.output,asset:{...source.asset,id:mediaId,duration:range.to-range.from,fps:metadata.fps||sourceFps,hasAudio:false,colorRange:metadata.colorRange,colorMatrix:metadata.colorMatrix}});
-    clips[clips.indexOf(clip)]={...clip,mediaId,sourceIn:clip.sourceIn-range.from,effects:clip.effects.filter(e=>e.name!=='Stabilize'),properties:{...clip.properties,audioDetached:true}};
+    clips[clips.indexOf(clip)]={...clip,mediaId,sourceIn:clip.sourceIn-(range.from-shift),effects:clip.effects.filter(e=>e.name!=='Stabilize'),properties:{...clip.properties,audioDetached:true}};
     const explicitAudio=request.clips.some(other=>other.id!==clip.id&&tracks.find(t=>t.id===other.trackId)?.kind==='audio'&&other.mediaId===clip.mediaId&&other.start===clip.start&&other.sourceIn===clip.sourceIn&&other.duration===clip.duration);
     if(source.asset.hasAudio&&!clip.properties.audioDetached&&!explicitAudio&&request.settings.audio!=='Disabled') {
       const audioId=`stabilize-audio-${clip.id}`;
       tracks.push({...track,id:audioId,kind:'audio'});
       // The original carries the sound; the bake is picture only.
       // opticalFlow off: the sound is never interpolated, and renderFlowTimeline would otherwise bake this clip's picture a second time.
-      clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,opticalFlow:false,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name))});
+      clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,opticalFlow:false,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>audioEffectNames.includes(e.name))});
     }
   }
   // The oldest bakes beyond the budget go, and the leftovers of a render the server died in.
@@ -1553,6 +1578,97 @@ async function renderStabilizedTimeline(request: RenderRequest) {
   await renderTimeline({...request,clips,assets,tracks,maskArtifacts,stabilized,onProgress:p=>request.onProgress?.(45+p*.55)});
   } finally {
     for(const key of claimed){const left=(stabilizeBakesInUse.get(key)??1)-1;if(left>0)stabilizeBakesInUse.set(key,left);else stabilizeBakesInUse.delete(key);}
+    await rm(directory,{recursive:true,force:true});
+  }
+}
+/** A clip whose picture Noise Reduction bakes. One on an audio track (an Audio workspace insert from before Audio Noise
+ *  Reduction existed) shapes nothing: picture and sound filters both pass it by. */
+export const denoisesPicture = (request: Pick<RenderRequest, 'tracks'>, clip: Clip) => !!denoiseEffect(clip) && request.tracks.find(t => t.id === clip.trackId)?.kind === 'video'
+  // A legacy or Final Cut Noise Reduction on what is not camera footage is a no-op, as the filter chain treats it.
+  && !isTitle(clip) && !isShape(clip) && !isAdjustment(clip) && !clip.properties.compositionId;
+// Noise Reduction export bakes a running export still reads (a re-export reuses the rest, see trimDenoiseBakes).
+const denoiseBakesInUse=new Map<string,number>();
+/**
+ * Bake each clip's Noise Reduction from the camera original into source-time replacement media before anything else reads
+ * it, whatever its place in the stack, as Stabilize does: Stabilize, Smart Mask, Depth, optical flow and the grade all take
+ * the clean frames. The clip keeps its timing and grade and plays the bake from a remapped sourceIn; its sound plays from
+ * the original through a carrier clip.
+ */
+async function renderDenoisedTimeline(request: RenderRequest) {
+  const directory=await mkdtemp(path.join(tmpdir(),'frameline-denoise-export-')),claimed:string[]=[];
+  try {
+  const clips=[...request.clips],assets=[...request.assets],tracks=[...request.tracks];
+  const bakes=request.denoiseDir?path.join(request.denoiseDir,'exports'):directory,profiles=request.denoiseDir?path.join(request.denoiseDir,'profiles'):directory;
+  const records=timelineTransitions(clips.filter(c=>c.projectId===request.project.id),request.timeline.id,assets.map(a=>a.asset));
+  const denoising=clips.filter(c=>c.timelineId===request.timeline.id&&!c.disabled&&denoisesPicture(request,c));
+  const strip=(clip:Clip):Clip=>({...clip,effects:clip.effects.filter(e=>e.name!=='Noise Reduction')});
+  // Never drawn (outside the range, on a hidden track) or no footage to bake (a still with a legacy or Final Cut Noise
+  // Reduction): the clip only loses the effect, keeping its own media and sound.
+  const skipped=(c:Clip)=>outsideRange(request,c,records)||!!tracks.find(t=>t.id===c.trackId)?.hidden||assets.find(a=>a.asset.id===c.mediaId)?.asset.kind!=='video';
+  for(const clip of denoising.filter(skipped))clips[clips.indexOf(clip)]=strip(clip);
+  const candidates=denoising.filter(c=>!skipped(c)),{rangeIn,rangeOut}=exportRange(request);
+  const maskArtifacts=new Map(request.maskArtifacts),denoised=new Map(request.denoised);
+  for(const [index,whole] of candidates.entries()) {
+    const effect=denoiseEffect(whole)!,source=assets.find(a=>a.asset.id===whole.mediaId)!,track=tracks.find(t=>t.id===whole.trackId);
+    if(!track)throw new Error(`${whole.name}: Noise Reduction requires a video source.`);
+    if(source.asset.hasAlpha)throw new Error(`${whole.name}: Noise Reduction cannot bake footage with transparency. Remove Noise Reduction from this clip.`);
+    // One bake per clip: a setting that changes over time would need the whole clip denoised once per value. Only the paths the
+    // bake reads count: older builds keyed parameters no panel shows any more, which the user could not find to remove.
+    const read=['enabled',...denoiseKeys.map(k=>k==='amount'?k:`parameters.${k}`)].map(k=>`effects.${effect.id}.${k}`);
+    if(read.some(key=>whole.keyframes?.[key]?.length))throw new Error(`${whole.name}: Noise Reduction settings cannot be keyframed. Remove their keyframes.`);
+    // ponytail: a depth key reads the original's analysis at the clip's own times; it needs the bake offset like Depth has.
+    if(activeDepthKeys(whole,request.nodes).length)throw new Error(`${whole.name}: a depth key and Noise Reduction cannot share a clip in export yet. Remove the depth key or Noise Reduction.`);
+    // Bake only what this render shows (an In/Out export), widened to the clip's transitions that reach into it, as Depth
+    // does; the worker reads its own context frames around that. A later Stabilize or optical-flow bake reads the whole clip.
+    let lo=rangeIn,hi=rangeOut;
+    const end=whole.start+whole.duration;
+    if(stabilizeEffect(whole)||whole.properties.opticalFlow){lo=-Infinity;hi=Infinity;}
+    else for(const r of records)if((r.outgoingId===whole.id||r.incomingId===whole.id)&&r.start<hi&&r.end>lo){lo=Math.min(lo,r.start);hi=Math.max(hi,r.end);}
+    const from=lo-whole.start>1/120?lo:whole.start,to=end-hi>1/120?hi:end;
+    let clip=whole;
+    if(from!==whole.start||to!==end){
+      clip={...clipPart(whole,from,to),transition:from===whole.start?whole.transition:''};
+      if(to!==end)clip.properties={...clip.properties,transitionOut:''};
+      clips.splice(clips.indexOf(whole),1,clip,...uncoveredParts(whole,from,to).filter(part=>part!==whole).map((part,i)=>({...strip(part),id:`${whole.id}-outside-${i}`,transition:part.start===whole.start?whole.transition:'',properties:{...part.properties,transitionOut:part.start===whole.start?'':whole.properties.transitionOut,audioDetached:true}})));
+    }
+    const handles=clipSpan(whole,records),span={start:from===whole.start?handles.start:from,end:to===end?handles.end:to};
+    const geo=extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
+    const sourceFps=source.asset.fps||finite(request.settings.fps||request.project.fps,'Frame rate',1,120);
+    const range=stabilizeRange(geo,sourceFps,source.asset.duration);
+    request.onStage?.(`Noise Reduction · ${clip.name}`);
+    // `keep`: this export's earlier bakes are claimed below before the next one starts, so making room never takes them.
+    const baked=await denoiseBake({name:clip.name,input:source.path,directory:bakes,profiles,range,fps:sourceFps,frameRate:source.asset.frameRate,duration:source.asset.duration,settings:denoiseSettings(whole,effect),signal:request.signal,freeGpu:request.freeGpu,
+      dataLevels:whole.properties.dataLevels,keep:new Set(denoiseBakesInUse.keys()),onProgress:p=>request.onProgress?.((index+Math.max(0,Math.min(1,p/100)))/candidates.length*45)});
+    claimed.push(baked.key);denoiseBakesInUse.set(baked.key,(denoiseBakesInUse.get(baked.key)??0)+1);
+    // Read again: the cache keeps what was used last.
+    const now=new Date();await utimes(baked.output,now,now).catch(()=>{});
+    // The bake's frame k is the original's frame first + k on the constant-rate grid, so mattes move by that frame's time.
+    const offset=baked.first/sourceFps,step=1/sourceFps;
+    for(const document of activeSmartMasks(clip,request.nodes)) {
+      if(!request.smartMaskDir)throw Error(`${clip.name}: Smart Mask storage is unavailable.`);
+      const key=`${clip.id}:${document.id}`,artifact=maskArtifacts.get(key)??resolveSmartMaskArtifact(request.smartMaskDir,whole,document,source.path,source.asset);
+      maskArtifacts.set(key,{...artifact,offset:artifact.manifest.sourceTimes?.find(t=>t>=offset-step/2-1e-6)??offset});
+    }
+    denoised.set(clip.id,{clip,source,offset});
+    const mediaId=`denoise-${clip.id}`;
+    // Same colour metadata: the bake is the original's own Y′CbCr with its own tags, so grade, LUT and camera fields still apply.
+    // Except the range: a full-range source is baked converted to video range (denoiseBake), the only range a MOV reads back as.
+    // So is one a Data levels override calls full; any override then says Video, which is what the bake holds.
+    const levels=(await probeMedia(baked.output,request.signal)).colorRange,override=clip.properties.dataLevels==='Full'||clip.properties.dataLevels==='Video';
+    assets.push({path:baked.output,asset:{...source.asset,id:mediaId,duration:baked.frames/sourceFps,fps:sourceFps,hasAudio:false,colorRange:levels}});
+    clips[clips.indexOf(clip)]={...strip(clip),mediaId,sourceIn:clip.sourceIn-offset,properties:{...clip.properties,audioDetached:true,...override?{dataLevels:'Video'}:{}}};
+    const explicitAudio=request.clips.some(other=>other.id!==whole.id&&tracks.find(t=>t.id===other.trackId)?.kind==='audio'&&other.mediaId===whole.mediaId&&other.start===whole.start&&other.sourceIn===whole.sourceIn&&other.duration===whole.duration);
+    if(source.asset.hasAudio&&!clip.properties.audioDetached&&!explicitAudio&&request.settings.audio!=='Disabled') {
+      const audioId=`denoise-audio-${clip.id}`;
+      tracks.push({...track,id:audioId,kind:'audio'});
+      // The original carries the sound; opticalFlow off, or renderFlowTimeline would bake this clip's picture a second time.
+      clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,opticalFlow:false,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>audioEffectNames.includes(e.name))});
+    }
+  }
+  if(bakes!==directory)await trimDenoiseBakes(bakes,new Set(denoiseBakesInUse.keys()));
+  await renderTimeline({...request,clips,assets,tracks,maskArtifacts,denoised,onProgress:p=>request.onProgress?.(45+p*.55)});
+  } finally {
+    for(const key of claimed){const left=(denoiseBakesInUse.get(key)??1)-1;if(left>0)denoiseBakesInUse.set(key,left);else denoiseBakesInUse.delete(key);}
     await rm(directory,{recursive:true,force:true});
   }
 }
@@ -1605,15 +1721,15 @@ function renderedTimelines<T extends Shown & Pick<RenderRequest, 'timelines'>>(r
 /** Whether rendering this request reads depth anywhere (a Depth bake or a depth key), compositions included. */
 export const readsDepth = (request: Shown & Pick<RenderRequest, 'nodes' | 'timelines'>) => renderedTimelines(request).some(part => shownClips(part, readsDepthClip(request.nodes)).length > 0);
 /**
- * Whether rendering these clips first bakes whole clips: a composition (its entire timeline, whatever the range), Stabilize,
- * optical flow, or keyframes (one FFmpeg run per frame, several at once). Each test is the one renderTimeline's dispatch
+ * Whether rendering these clips first bakes whole clips: a composition (its entire timeline, whatever the range), Noise
+ * Reduction, Stabilize, optical flow, or keyframes (one FFmpeg run per frame, several at once). Each test is the one renderTimeline's dispatch
  * makes before it renders anything (composition, Stabilize, optical flow, then the per-frame animation bake that streamable
  * titles and shapes skip), and they look at every clip of the timeline. Hand over only the clips that can reach the range
  * and a composition elsewhere in the project no longer counts.
  */
 export function bakesWholeClips(request: Pick<RenderRequest, 'clips' | 'timeline' | 'tracks' | 'settings'>): boolean {
   const own = request.clips.filter(c => c.timelineId === request.timeline.id && !c.disabled);
-  return own.some(c => c.mediaId === 'frameline-composition' || stabilizeEffect(c) || c.properties.opticalFlow)
+  return own.some(c => c.mediaId === 'frameline-composition' || denoisesPicture(request, c) || stabilizeEffect(c) || c.properties.opticalFlow)
     || animationWork(request).some(c => !streamableGraphic(c));
 }
 /** Refused by name before anything is decoded or baked. */
@@ -1666,7 +1782,7 @@ async function renderDepthTimeline(request: RenderRequest) {
       if (image && keyed.length) throw new Error(`${clip.name}: Depth keyframes on a still image cannot be exported yet. Remove them.`);
       const metadata = await probeMedia(source.path, request.signal), width = metadata.width ?? 0, height = metadata.height ?? 0;
       if (width < 16 || height < 16 || width % 2 || height % 2 || width > 4096 || height > 4096) throw new Error(`${clip.name}: Depth export needs an even source size up to 4096 pixels; this source is ${width} × ${height}.`);
-      const original = request.stabilized?.get(clip.id), offset = original?.offset ?? 0, originalAsset = original?.source.asset ?? source.asset;
+      const stabilized = request.stabilized?.get(clip.id), original = stabilized ?? request.denoised?.get(clip.id), offset = original?.offset ?? 0, originalAsset = original?.source.asset ?? source.asset;
       const sourceFps = image ? fps : source.asset.fps || metadata.fps;
       const handles = clipSpan(whole, records), span = { start: from === whole.start ? handles.start : from, end: to === end ? handles.end : to };
       const geo = extendClip(clip, Math.max(0, span.start), span.end - Math.max(0, span.start));
@@ -1682,8 +1798,8 @@ async function renderDepthTimeline(request: RenderRequest) {
       let origin = 0, base = analysis.first, frames = 1;
       if (!image) {
         if (original) {
-          // The Stabilize bake resamples to constant rate from `offset`: its frame k is the original frame nearest to
-          // offset + k / fps (a tie goes to the earlier one), matrix k of the solve.
+          // A Stabilize or Noise Reduction bake resamples to constant rate from `offset`: its frame k is the original frame
+          // nearest to offset + k / fps (a tie goes to the earlier one), matrix k of a Stabilize solve.
           const first = Math.floor(range.from * sourceFps + 1e-6);
           origin = first / sourceFps; base = analysis.first + Math.max(0, times.findIndex(t => t >= offset - step / 2 - 1e-6)) + first;
           frames = Math.min(Math.round(source.asset.duration * sourceFps) - first, Math.ceil((range.to - origin) * sourceFps - 1e-6));
@@ -1753,8 +1869,8 @@ async function renderDepthTimeline(request: RenderRequest) {
           if (track.values.length) animated = { ...animated, focus: Array.from({ length: frames }, (_, k) => (following[k] ?? params.followSubject) >= .5 ? depthFocusAt(track, base + k)! : animated?.focus?.[k] ?? params.focus) };
         }
       }
-      const warps = original && Array.from({ length: frames }, (_, k) => {
-        const m = stabilizeMatrixAt(original.solve, offset + origin + k / sourceFps), sx = width / original.solve.width, sy = height / original.solve.height;
+      const warps = stabilized && Array.from({ length: frames }, (_, k) => {
+        const m = stabilizeMatrixAt(stabilized.solve, offset + origin + k / sourceFps), sx = width / stabilized.solve.width, sy = height / stabilized.solve.height;
         return [m[0], m[1] * sx / sy, m[2] * sx, m[3] * sy / sx, m[4], m[5] * sy];
       });
       const duration = frames / sourceFps, job = path.join(directory, `${index}.json`);
@@ -1793,7 +1909,7 @@ async function renderDepthTimeline(request: RenderRequest) {
         const audioId = `depth-audio-${whole.id}`;
         tracks.push({ ...track, id: audioId, kind: 'audio' });
         // The original, whole clip carries the sound; the bake is picture only.
-        clips.push({ ...whole, id: audioId, trackId: audioId, transition: '', properties: { ...whole.properties, transitionOut: '', audioDetached: false }, keyframes: Object.fromEntries(Object.entries(whole.keyframes ?? {}).filter(([key]) => timingPaths.includes(key) || /^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(key) || key.startsWith('effects.'))), effects: whole.effects.filter(e => ['EQ', 'Compressor', 'Limiter', 'Noise Reduction'].includes(e.name)) });
+        clips.push({ ...whole, id: audioId, trackId: audioId, transition: '', properties: { ...whole.properties, transitionOut: '', audioDetached: false }, keyframes: Object.fromEntries(Object.entries(whole.keyframes ?? {}).filter(([key]) => timingPaths.includes(key) || /^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(key) || key.startsWith('effects.'))), effects: whole.effects.filter(e => audioEffectNames.includes(e.name)) });
       }
     }
     await renderTimeline({ ...request, clips, assets, tracks, nodes, maskArtifacts, onProgress: p => request.onProgress?.(45 + p * .55) });
@@ -1853,7 +1969,7 @@ async function renderFlowTimeline(request: RenderRequest) {
         const audioId=`flow-audio-${clip.id}`;
         tracks.push({...track,id:audioId,kind:'audio'});
         // Retain the established audio renderer, including its pitch preservation and automation.
-        clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,opticalFlow:false,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name))});
+        clips.push({...clip,id:audioId,trackId:audioId,transition:'',properties:{...clip.properties,opticalFlow:false,transitionOut:'',audioDetached:false},keyframes:Object.fromEntries(Object.entries(clip.keyframes??{}).filter(([path])=>timingPaths.includes(path)||/^properties\.(gain|pan|audioFadeIn|audioFadeOut)$/.test(path)||path.startsWith('effects.'))),effects:clip.effects.filter(e=>audioEffectNames.includes(e.name))});
       }
     }
     await trimFlowCache(bakes,new Set(bakesInUse.keys()),8*1024**3,'mov');
@@ -1946,7 +2062,7 @@ async function bakeRetimedAudio(request: RenderRequest, directory: string): Prom
       const trackId = `retimed-track-${clip.id}`;
       tracks.push({ ...track, id: trackId, kind: 'audio', hidden: false });
       clips[clips.indexOf(clip)] = { ...clip, properties: { ...p, audioDetached: true } };
-      clips.push({ ...sound, id: mediaId, trackId, effects: clip.effects.filter(e => ['EQ', 'Compressor', 'Limiter', 'Noise Reduction'].includes(e.name)) });
+      clips.push({ ...sound, id: mediaId, trackId, effects: clip.effects.filter(e => audioEffectNames.includes(e.name)) });
     }
   }
   return { ...request, clips, assets, tracks };
@@ -2035,7 +2151,7 @@ async function renderAnimatedTimeline(request: RenderRequest) {
           if(!asset?.hasAudio||clip.properties.audioDetached||twin||request.settings.audio==='Disabled')return [picture];
           const soundId=`frame-sound-${original.id}`;
           soundTracks.push({...track,id:soundId,kind:'audio',hidden:false});
-          return [picture,{...frame,id:soundId,trackId:soundId,properties:{...frame.properties,audioDetached:false},effects:frame.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name))}];
+          return [picture,{...frame,id:soundId,trackId:soundId,properties:{...frame.properties,audioDetached:false},effects:frame.effects.filter(e=>audioEffectNames.includes(e.name))}];
         });
         await renderTimeline({...request,signal,threads:4,onStage:undefined,sampledFrame:true,transformSamples,clips:frameClips,tracks:[...request.tracks,...soundTracks],nodes,timeline:{...request.timeline,duration},outputPath:files[position],onProgress:undefined,settings:{...request.settings,rangeIn:'0',rangeOut:String(duration),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
         request.onProgress?.(++rendered/total*90);

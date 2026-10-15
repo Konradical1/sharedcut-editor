@@ -86,8 +86,8 @@ Dell a 4K 10-bit 4:2:2 HEVC shot tracks at about 20–40 frames a second. Tracks
 content-addressed sample files in `data/motion-trackers/` and travel with project bundles.
 
 `npm run doctor` checks each local worker. Individual installers are
-`setup:captions`, `setup:flow`, `setup:masks`, `setup:depth`, `setup:stabilize`, `setup:tracker`, `setup:color`, and
-`setup:imports`. Each has a FRAME_LINE_*_PYTHON override; optical flow uses
+`setup:captions`, `setup:flow`, `setup:masks`, `setup:depth`, `setup:denoise`, `setup:stabilize`, `setup:tracker`,
+`setup:color`, and `setup:imports`. Each has a FRAME_LINE_*_PYTHON override; optical flow uses
 FRAME_LINE_FLOW_PYTHON. FRAME_LINE_CAPTION_DEVICE accepts auto (default), cpu,
 or cuda (GPU required, useful for tests). The default caption model is large-v3;
 FRAME_LINE_WHISPER_MODEL can select another faster-whisper model.
@@ -104,6 +104,16 @@ constant-frame-rate sources up to 4096 wide and refuses optical flow; a depth ke
 A build without Depth refuses every save once a Depth subject or depth key exists (backups included), so roll forward,
 never back past Depth.
 Depth-assisted Smart Mask cleanup (cut SAM leaks at depth jumps, fill holes at the subject's depth) was tried on the soccer and hurdles clips and rejected: at every threshold it cut off hands, feet and arms, while leaks onto players at the same distance stayed and hole filling made them solid.
+
+## Noise Reduction
+
+`npm run setup:denoise` installs the denoise worker into `.venv-mask` (CUDA torch from `setup:masks`). Preview chunks come
+from one resident GPU worker and export bakes from one-shot runs; a CUDA bake first frees idle Smart Mask and Noise
+Reduction preview workers. Variables: `FRAME_LINE_DENOISE_PYTHON`, `FRAME_LINE_DENOISE_WORKER`,
+`FRAME_LINE_DENOISE_DEVICE`, `FRAME_LINE_DENOISE_TRITON=0` (no Triton kernels), `FRAME_LINE_DENOISE_BAKES_GB` (60, export
+bakes under `data\denoise\exports`) and `FRAME_LINE_DENOISE_PREVIEW_GB` (4, preview chunks). A bake short of disk frees old
+bakes first and never takes the disk below the 5 GB reserve. A build without Audio Noise Reduction refuses any export that
+has one, so roll forward, never back past it.
 
 ## Host guard and playback health
 

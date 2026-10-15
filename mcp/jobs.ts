@@ -6,6 +6,7 @@ import * as captions from './jobs/captions.ts';
 import * as masks from './jobs/masks.ts';
 import * as depth from './jobs/depth.ts';
 import * as motion from './jobs/motion.ts';
+import * as denoise from './jobs/denoise.ts';
 import * as tracker from './jobs/tracker.ts';
 import * as color from './jobs/color.ts';
 import * as exporting from './jobs/export.ts';
@@ -14,7 +15,7 @@ import * as projects from './jobs/projects.ts';
 import * as visual from './jobs/visual.ts';
 import * as showcase from './jobs/showcase.ts';
 
-const MODULES = [media, captions, masks, depth, motion, tracker, color, exporting, assets, projects, visual, showcase];
+const MODULES = [media, captions, masks, depth, motion, denoise, tracker, color, exporting, assets, projects, visual, showcase];
 export const JOBS: Record<string, JobDef> = Object.assign({}, ...MODULES.map(m => m.jobs));
 export const JOB_TOPICS: Record<string, string> = Object.assign({}, ...MODULES.map(m => m.topics ?? {}));
 export const JOB_KINDS = Object.keys(JOBS);

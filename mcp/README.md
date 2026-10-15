@@ -52,7 +52,7 @@ cd /tmp/sharedcut-mcp && git commit -am "SharedCut MCP <version>" && git push
 | `media` | the project's media and bins |
 | `get` | full JSON of one clip, node, track, media, effect… |
 | `act` | run editor actions in order, saved as one batch (all or nothing) |
-| `job` | server work: uploads, captions, masks, depth, stabilize, tracking, color assistant, color normalize, exports, Resolve, sounds, fonts |
+| `job` | server work: uploads, captions, masks, depth, stabilize, noise reduction, tracking, color assistant, color normalize, exports, Resolve, sounds, fonts |
 | `frame` | a small picture of the timeline or a source frame |
 | `help` | catalogs: actions, effects, transitions, titles, shapes, color, properties, jobs… |
 | `api` | escape hatch to any `/api` endpoint |

@@ -304,7 +304,7 @@ function colorTopic() {
       `- new correction before the output (the UI's New Node defaults; pivot .5 on a legacy clip): act{select:["@clip"], do:[["selectNode",null],["addNode","Correction",${defaults}]]}; after a given node use ["selectNode","@node"]. The new node prints as "+ node @id". Without selectNode it lands after an arbitrary node (select picks one).`,
       '- adjust: act{do:[["updateNode","@node",{parameters:{exposure:.3,saturation:115}}]]}; bypass {enabled:false}; rename {name:"Skin"}.',
       '- order: reorderNode(node,-1|1) · moveColorNode(node, beforeNode|null=end) · removeNode(node) · arrangeColorNodes(clip) tidies the graph.',
-      '- copy a grade: act{do:[["copyGrade","@from"],["pasteGrade","@to1"],["pasteGrade","@to2"]]} (replaces all nodes, source settings and node keyframes on each target; same project).',
+      '- copy a grade: act{do:[["copyGrade","@from"],["pasteGrade","@to1"],["pasteGrade","@to2"]]} (replaces all nodes, source settings and node keyframes on each target, and its Noise Reduction when @from has one; same project).',
       '- highlights clipping on a log grade: useAcesOutput(clip) (color-grade suggests it when it applies).',
       '- source: updateProperty(clip,"inputProfile",gamma) and updateProperty(clip,"inputGamut",gamut), both, from the lists above (nothing checks them; a bad one breaks every render), before initializeColorGrade, which builds the Input CST from them · "dataLevels" Auto|Full|Video. Legacy clips only: inputExposure −6..6, inputTemperature −2000..2000.',
       '- imported DaVinci look: restoreResolveGrade(clip) brings it back (removes the nodes); updateProperty(clip,"bypassResolveLook",true) turns it off.',

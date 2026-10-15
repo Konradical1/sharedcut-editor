@@ -1,5 +1,6 @@
 import SmartMaskInspector from './SmartMaskInspector';
 import DepthInspector from './DepthInspector';
+import NoiseReductionInspector from './NoiseReductionInspector';
 import MotionTrackerInspector from './MotionTrackerInspector';
 import { PanelTabPresence, usePanelTabPresence } from './PanelTabPresence';
 import CaptionInspector from './CaptionInspector';
@@ -150,6 +151,7 @@ export default function Inspector() {
   // the panel resolves that clip itself rather than lighting it up on the timeline.
   const selected=useEditorStore(s=>s.clips.find(c=>c.id===(s.selectedTransition?.clipId??s.selectedClipId)));
   const asset=useEditorStore(s=>s.media.find(m=>m.id===selected?.mediaId));
+  const trackKind=useEditorStore(s=>s.tracks.find(t=>t.id===selected?.trackId)?.kind);
   const storedTab=useEditorStore(s=>s.inspectorTab);
   const caption=selected&&isCaption(selected);
   const title = selected && isTitle(selected);
@@ -190,9 +192,9 @@ export default function Inspector() {
           </div><p className="inspector-note">{effectDefinitions[effect.name]?.description}</p>
           {effect.name==='Smart Mask'&&<SmartMaskInspector clip={selected} maskId={effect.maskId} targetId={effect.id}/>}
           {effect.name==='Stabilize'&&<StabilizeStatus clipId={selected.id} lock={effect.parameters?.lock??0}/>}
-          {effect.name==='Depth'?<DepthInspector clip={selected} effect={effect}/>:(effectDefinitions[effect.name]?.parameters??[]).map(p=><Property key={p.key} effectId={effect.id} name={p.key} label={p.label} initial={p.initial} min={p.min} max={p.max} step={p.step} suffix={p.suffix}/>)}
-          {effect.name==='Noise Reduction'&&<p className="inspector-note">Temporal picture smoothing is applied during export. Audio preview uses a noise gate.</p>}
-        </details>)}<label className="form-field effect-add"><span>Add an effect</span><select data-cursor-anchor="add-effect" aria-label="Add clip effect" defaultValue="" onChange={e=>{if(e.target.value)s().addEffect(selected.id,e.target.value);e.target.value='';}}><option value="">Choose effect…</option>{Object.keys(effectDefinitions).filter(name=>acceptsEffect(selected,asset?.kind,name)).map(name=><option key={name}>{name}</option>)}</select></label></>}
+          {effect.name==='Depth'?<DepthInspector clip={selected} effect={effect}/>:effect.name==='Noise Reduction'?<NoiseReductionInspector clip={selected} effect={effect}/>:(effectDefinitions[effect.name]?.parameters??[]).map(p=><Property key={p.key} effectId={effect.id} name={p.key} label={p.label} initial={p.initial} min={p.min} max={p.max} step={p.step} suffix={p.suffix}/>)}
+          {effect.name==='Audio Noise Reduction'&&<p className="inspector-note">Preview uses a noise gate; export uses spectral denoise.</p>}
+        </details>)}<label className="form-field effect-add"><span>Add an effect</span><select data-cursor-anchor="add-effect" aria-label="Add clip effect" defaultValue="" onChange={e=>{if(e.target.value)s().addEffect(selected.id,e.target.value);e.target.value='';}}><option value="">Choose effect…</option>{Object.keys(effectDefinitions).filter(name=>acceptsEffect(selected,trackKind==='audio'?'audio':asset?.kind,name)).map(name=><option key={name}>{name}</option>)}</select></label></>}
       {tab==='Info'&&<Section title="Source metadata" icon={<Info size={12}/>}><dl className="metadata-list"><dt>File</dt><dd>{asset?.name}</dd><dt>Media ID</dt><dd className="mono">{selected.mediaId}</dd><dt>Duration</dt><dd>{durationLabel(selected.duration)}</dd><dt>Resolution</dt><dd>{asset?.resolution}</dd><dt>Frame rate</dt><dd>{fpsLabel(asset?.fps)} fps</dd><dt>Camera</dt><dd>{asset?.camera??'Camera original'}</dd><dt>Proxy</dt><dd className="accent-text">{asset?.status==='ready'?'Ready · linked':asset?.status}</dd></dl></Section>}
     </div></>}
   </section>;

@@ -1,5 +1,7 @@
 import SmartMaskInspector from '../components/SmartMaskInspector';
 import { DepthKeyInspector } from '../components/DepthInspector';
+import NoiseReductionInspector from '../components/NoiseReductionInspector';
+import { acceptsEffect, effectEnabled } from '../services/effects';
 import { isDepthKey } from '../services/smartMask';
 import { isAdjustment } from '../services/adjustment';
 import { adjacentShot } from '../services/selection';
@@ -48,6 +50,17 @@ const ColorScrub=memo(function ColorScrub({clip,fps}:{clip?:Clip;fps:number}){
   useLayoutEffect(()=>{if(!playing)return;let shown='';return onPicture(p=>{const text=timecode(Math.max(0,p-start),fps);if(text===shown)return;shown=text;if(input.current)input.current.value=String(p);if(time.current)time.current.textContent=text;});},[playing,start,fps]);
   return <div className="color-scrub"><span className="scrub-clip-name" title={clip?.name}>{clip?.name??'No clip selected'}</span><input ref={input} type="range" aria-label="Scrub color footage" aria-valuetext={timecode(playhead,fps)} disabled={!clip||following} min={start} max={Math.max(start,start+(clip?.duration??0)-1/fps)} step={1/fps} value={playhead} onPointerDown={()=>s().setPlaying(false)} onChange={e=>{s().setPlaying(false);s().setPlayhead(Number(e.target.value));}}/><span ref={time} key={String(playing)} className="mono">{timecode(Math.max(0,playhead-start),fps)}</span></div>;
 });
+// Noise Reduction cleans the camera original before the grade, so it sits above Source & workflow. It is the clip's one effect,
+// the same the Inspector edits; adding it here stays on the Color page.
+function NoiseSettings({clip,kind}:{clip:Clip;kind?:string}){
+  const s=useEditorStore.getState,effect=clip.effects.find(e=>e.name==='Noise Reduction');
+  if(!effect&&!acceptsEffect(clip,kind,'Noise Reduction'))return null;
+  const on=!!effect&&effectEnabled(clip,effect);
+  return <details className="source-settings noise-settings" open={!!effect}><summary>Noise Reduction{effect&&<span className={`noise-state ${on?'on':''}`}>{on?'On':'Off'}</span>}</summary>
+    {effect?<section className={`node-effect ${on?'':'bypassed'}`}><div className="effect-heading"><IconButton label={on?'Bypass Noise Reduction':'Turn on Noise Reduction'} aria-pressed={on} onClick={()=>s().updateEffect(clip.id,effect.id,{enabled:!on})}><Power size={14}/></IconButton><strong>Camera original · before the grade</strong><IconButton label="Remove Noise Reduction" onClick={()=>s().updateEffect(clip.id,effect.id,null)}><Trash2 size={13}/></IconButton></div><NoiseReductionInspector clip={clip} effect={effect}/></section>
+      :<><p>Removes sensor noise from the camera original before the grade, measured for this camera. The Inspector shows the same effect.</p><Button onClick={()=>s().addEffect(clip.id,'Noise Reduction',false)}><Plus size={13}/>Add Noise Reduction</Button></>}
+  </details>;
+}
 const timelineShots=(s:Pick<ReturnType<typeof useEditorStore.getState>,'clips'|'tracks'|'media'|'timelineId'>)=>s.clips.filter(c=>c.timelineId===s.timelineId&&s.tracks.find(t=>t.id===c.trackId)?.kind==='video'&&(isAdjustment(c)||s.media.some(m=>m.id===c.mediaId))).sort((a,b)=>a.start-b.start);
 // The viewer's Next/Previous edit step shot to shot and show that shot's grade. Module-level, so the memoized viewer keeps its props.
 const stepShot=(direction:number)=>{const s=useEditorStore.getState(),shot=adjacentShot(timelineShots(s),s.tracks,s.playhead,direction,s.projects.find(p=>p.id===s.projectId)?.fps||24);if(shot){s.selectClip(shot.id);s.setPlayhead(shot.start);}};
@@ -128,6 +141,7 @@ export default function ColorWorkspace(){
           <button className="effect-reset" onClick={()=>changeEffect(effect.type==='cst'?defaultCST(effect.id,effect.inputGamma,effect.inputGamut,effect.outputGamma,effect.outputGamut):{...effect,amount:1,enabled:true})}><RotateCcw size={12}/>Reset effect</button></section>)}
           {!node.effects?.length&&<div className="no-effects"><Spline size={22}/><p>This node uses primaries and curves.</p><button onClick={()=>setRightTab('Library')}>Add an effect from the library</button></div>}</>:<p>Select a node to inspect its effects.</p>}
       </div>}
+      {rightTab!=='Assistant'&&rightTab!=='Groups'&&clip&&<NoiseSettings clip={clip} kind={asset?.kind}/>}
       {rightTab!=='Assistant'&&rightTab!=='Groups'&&<details className="source-settings"><summary>Source & workflow</summary><Button disabled={!clip} onClick={()=>{s.initializeColorGrade(clip!.id);setRightTab('Settings');}}>Start wide-gamut grade</Button>{autoButton}<p>{asset?.colorEvidence||'Choose the recording gamma and gamut below.'}</p><ColorSelect label="Source gamma" value={source.profile} options={profiles} change={v=>property('inputProfile',v)}/><ColorSelect label="Source gamut" value={source.gamut} options={gamuts} change={v=>property('inputGamut',v)}/><ColorSelect label="Data levels" value={String(clip?.properties.dataLevels||'Auto')} options={['Auto','Full','Video']} change={v=>property('dataLevels',v)}/>{!managed&&<><Parameter name="Camera exposure" min={-6} max={6} value={Number(clip?.properties.inputExposure??0)} onChange={v=>property('inputExposure',v)}/><Parameter name="Camera warmth" min={-2000} max={2000} step={10} value={Number(clip?.properties.inputTemperature??0)} onChange={v=>property('inputTemperature',v)}/></>}{imported&&<><label><input type="checkbox" checked={clip?.properties.bypassResolveLook===true} onChange={e=>property('bypassResolveLook',e.target.checked)}/>Bypass imported Resolve look</label><a href={`/api/projects/${s.projectId}/resolve/project.drp?download`}>Original Resolve project</a></>}<p>Start wide-gamut grade creates Input CST, Balance, Look and Output CST nodes. Auto balance sets the Balance node from the footage. A snapshot preserves the previous grade.</p>{managed&&<small>Source labels describe the recording. The editable CST nodes perform all conversions.</small>}</details>}
     </div></aside>}
     {shotMenu&&(()=>{const menuShots=s.selectedClipIds.includes(shotMenu.id)?shots.filter(c=>s.selectedClipIds.includes(c.id)):shots.filter(c=>c.id===shotMenu.id),grouped=menuShots.filter(c=>colorGroupOf(c)),act=(run:()=>void)=>{setShotMenu(null);run();};
