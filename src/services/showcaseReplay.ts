@@ -13,6 +13,8 @@ export interface ReplayPackage {
   sourceAssets: number; sourceClips: number; firstTimestamp: number; lastTimestamp: number;
   authors: ReplayAuthor[]; media: ReplayMedia[]; frames: ReplayFrame[];
   chapters: { at: number; label: string }[];
+  /** One prerendered film that follows the replay shot by shot. */
+  film?: string;
   provenance: { cursorMotion: 'illustrated'; idleTime: 'compressed'; preview: 'source-and-recorded-color'; checkpointCorrections: number };
 }
 export interface HistoryBundle extends ProjectState { project: Project; media: MediaAsset[]; operations: Operation[] }
@@ -59,7 +61,7 @@ const verbs:Record<string,string>={ClipAdded:'adds footage',ClipMoved:'moves a s
 const colorKeys=['colorPipeline','inputProfile','inputGamut','inputExposure','inputTemperature','exposure','contrast','saturation'];
 
 /** Compile a public, visual-only package. Account email, comments, paths, and raw history never enter it. */
-export function compileReplay(bundle: HistoryBundle, users: User[], options: { slug?: string; seconds?: number; window?: number }={}) {
+export function compileReplay(bundle: HistoryBundle, users: User[], options: { slug?: string; seconds?: number; window?: number; frames?: number }={}) {
   const {baseline,operations,differences}=reconstructHistory(bundle);
   if(!operations.length)throw Error('This project has no recorded editing history');
   const byId=new Map(users.map(u=>[u.id,u])), canonical=new Map<string,string>(), authors:ReplayAuthor[]=[];
@@ -82,13 +84,17 @@ export function compileReplay(bundle: HistoryBundle, users: User[], options: { s
     frames.push({at:0,timestamp:op?.timestamp??operations[0].timestamp,actionCount:index,author:op?canonical.get(op.userId)!:'',action:op?verbs[op.type]??'refines the edit':'The starting timeline',type:op?.type??'Start',focus:focus?.id??null,tracks,preview,clips:visible.map(c=>({id:c.id,track:c.trackId,media:c.mediaId,name:c.name,start:c.start,duration:c.duration,sourceIn:c.sourceIn,color:c.color}))});
   };
   snapshot(undefined,0);
-  let previous:Operation|undefined;
-  const stride=Math.max(1,Math.ceil(operations.length/120));let lastCapture=0;const seen=new Set<string>();
-  operations.forEach((op,i)=>{applyReplayChanges(state,op.newState);const author=canonical.get(op.userId)!;const changedAuthor=previous&&canonical.get(previous.userId)!==author&&i-lastCapture>=12;const newSession=previous&&op.timestamp-previous.timestamp>20*60_000;if(i-lastCapture>=stride||changedAuthor||newSession||!seen.has(author)||i===operations.length-1){snapshot(op,i+1);lastCapture=i;seen.add(author);}previous=op;});
+  // Screen time follows the square root of each person's real edits: the busiest editor still leads, everyone else is seen
+  // doing their own edits (all of them when they made only a few). Authorship is never moved between people.
+  const counts=new Map<string,number>();for(const op of operations){const a=canonical.get(op.userId)!;counts.set(a,(counts.get(a)??0)+1);}
+  const roots=[...counts.values()].reduce((s,n)=>s+Math.sqrt(n),0),target=options.frames??220;
+  const strides=new Map([...counts].map(([a,n])=>[a,Math.max(1,Math.round(n/Math.max(target*Math.sqrt(n)/roots,Math.min(n,12))))]));
+  const done=new Map<string,number>();
+  operations.forEach((op,i)=>{applyReplayChanges(state,op.newState);const author=canonical.get(op.userId)!,n=done.get(author)??0;done.set(author,n+1);if(n%(strides.get(author)??1)!==0&&i<operations.length-1)return;snapshot(op,i+1);});
   // Old versions omitted some cleanup/rebuilds. Finish on the saved checkpoint without inventing authorship.
   for(const key of collections)Object.assign(state,{[key]:clone(bundle[key]??[])});
   snapshot(undefined,operations.length);Object.assign(frames.at(-1)!,{action:'The saved project',type:'Checkpoint',timestamp:bundle.project.modifiedAt});
-  const duration=options.seconds??60;
+  const duration=options.seconds??45;
   frames.forEach((f,i)=>f.at=i/(frames.length-1)*duration);
   const media:ReplayMedia[]=bundle.media.map(m=>({id:m.id,name:m.name,kind:m.kind,duration:m.duration,fps:m.fps,inputProfile:m.inputProfile,inputGamut:m.inputGamut,waveform:(m.waveform??[]).filter((_,i,a)=>i%Math.max(1,Math.ceil(a.length/48))===0).slice(0,48)}));
   const dates=new Set<string>(),chapters:ReplayPackage['chapters']=[];
