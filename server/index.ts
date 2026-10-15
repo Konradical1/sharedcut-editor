@@ -1,5 +1,6 @@
 import { createPreviewCache, createStillCache, mediaStill, stillSettings, StillSkipped, PreviewBusyError, type PreviewAdmission } from './previewCache.ts';
 import { createHostGuard, JOB_COST_BYTES, VICTIM_ORDER, type HostGuard } from './hostGuard.ts';
+import { showcaseFile } from './showcase.ts';
 import { createHostHealthLog } from './hostHealthLog.ts';
 import { canSeeHealth, createPlaybackReports, type Identity } from './playbackReports.ts';
 import { liveChildren, setStartGate } from './processTree.ts';
@@ -915,6 +916,12 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
         if (req.headers['sec-fetch-site'] === 'cross-site') fail(403, 'Cross-site requests are not allowed.');
         if (req.headers.origin) { let origin: URL; try { origin = new URL(req.headers.origin); } catch { fail(403, 'Invalid request origin.'); } if (origin!.host !== req.headers.host) fail(403, 'Cross-site requests are not allowed.'); }
+      }
+      const showcase=/^\/api\/showcase\/([a-z0-9-]+)\/([a-zA-Z0-9_.-]+)$/.exec(path);
+      if(showcase&&(method==='GET'||method==='HEAD')){
+        const file=showcaseFile(dataDir,showcase[1],showcase[2]);if(!file)fail(404,'That replay has not been published.');
+        if(showcase[2]==='replay.json'&&method==='GET')send(res,200,JSON.parse(readFileSync(file!,'utf8')));
+        else streamFile(req,res,file!,undefined,undefined,showcase[2]!=='replay.json');return;
       }
       if (path === '/api/health' && method === 'GET') {
         let database = true, free = -1; try { db.prepare('SELECT 1').get(); } catch { database = false; } try { free = freeBytes(); } catch { /* Unknown disk: report it, do not fail on it. */ }

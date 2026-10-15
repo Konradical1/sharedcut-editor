@@ -18,6 +18,7 @@ import { JOBS } from './jobs.ts';
  *   no: <reason>     deliberately not offered
  */
 export const ROUTES: Record<string, string> = {
+  '/api/showcase/([a-z0-9-]+)/([a-zA-Z0-9_.-]+)': 'job:showcase',
   '/api/health': 'no: a liveness probe for the tunnel and npm run doctor',
   '/api/uploads/info': 'job:upload',
   '/api/auth/me': 'session',
