@@ -220,28 +220,28 @@ export function createStillCache(directory: string, render: (request: RenderRequ
   // so nothing writes them now; one still held (Windows) waits for the next start.
   try { for (const name of readdirSync(directory)) if (name.includes('.pending.')) rmSync(join(directory, name), { force: true }); } catch { /* No frames yet. */ }
   return {
-    /** The JPEG of the one frame `snapshot.settings` names. Throws StillSkipped, PreviewBusyError or StillFailed. */
-    async still(snapshot: Snapshot, signal?: AbortSignal): Promise<string> {
+    /** The JPEG (or a lossless PNG, for Grab still) of the one frame `snapshot.settings` names. Throws StillSkipped, PreviewBusyError or StillFailed. */
+    async still(snapshot: Snapshot, signal?: AbortSignal, format: 'jpg' | 'png' = 'jpg'): Promise<string> {
       const slice = previewSlice(snapshot), live = stillLive(slice);
       if (live) throw new StillSkipped(live);
       // Bump STILL_VERSION whenever the renderer's output changes, or a cached still keeps showing the old picture.
-      const key = sha([STILL_VERSION, previewKey(slice!)]), file = join(directory, `${key}.jpg`);
+      const key = sha([STILL_VERSION, previewKey(slice!)]), file = join(directory, `${key}.${format}`);
       if (existsSync(file)) { const at = new Date(); await utimes(file, at, at).catch(() => {}); return file; }
-      const running = rendering.get(key); if (running) return running;
+      const running = rendering.get(file); if (running) return running;
       if (rendering.size >= MAX_PREPARING) throw new PreviewBusyError('Two frames are already rendering.');
       const admission = admit?.('preview') ?? { ok: true as const, release: () => {} };
       if (!admission.ok) throw new PreviewBusyError(admission.reason);
-      const n = ++temporaries, movie = join(directory, `${key}.${n}.pending.mov`), picture = join(directory, `${key}.${n}.pending.jpg`);
+      const n = ++temporaries, movie = join(directory, `${key}.${n}.pending.mov`), picture = join(directory, `${key}.${n}.pending.${format}`);
       const work = (async () => {
         // ponytail: a shared render follows its first asker's disconnect; the others then retry.
         const timeout = AbortSignal.timeout(STILL_TIMEOUT_MS), stop = signal ? AbortSignal.any([signal, timeout]) : timeout;
         try {
           await mkdir(directory, { recursive: true });
           await render(previewRenderRequest(structuredClone(slice!), movie, stop, () => {}));
-          await run(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-y', '-i', movie, '-frames:v', '1', '-q:v', '4', picture], { signal: stop });
+          await run(process.env.FFMPEG_PATH || 'ffmpeg', ['-v', 'error', '-y', '-i', movie, '-frames:v', '1', ...(format === 'jpg' ? ['-q:v', '4'] : []), picture], { signal: stop });
           // Defender and the indexer hold a fresh file for a moment on Windows.
           await renameWithRetry(picture, file);
-          try { await trimFlowCache(directory, new Set([key]), STILL_CACHE_BYTES, 'jpg'); } catch (error) { log?.(`Frame cache trim failed: ${error instanceof Error ? error.message : String(error)}`); }
+          try { await trimFlowCache(directory, new Set([key]), STILL_CACHE_BYTES, format); } catch (error) { log?.(`Frame cache trim failed: ${error instanceof Error ? error.message : String(error)}`); }
           return file;
         } catch (error) {
           // Its first asker left: no failure, and nothing to log. Anyone who joined is told to ask again (429), not "Canceled by you".
@@ -255,9 +255,9 @@ export function createStillCache(directory: string, render: (request: RenderRequ
           if (!HOST_PATH.test(message) && message.length < 400) throw new StillFailed(message);
           log?.(`Frame failed for project ${snapshot.project.id}, key ${key.slice(0, 12)}: ${message}`);
           throw new StillFailed(STILL_FAILED);
-        } finally { admission.release(); rendering.delete(key); await rm(movie, { force: true }); await rm(picture, { force: true }); }
+        } finally { admission.release(); rendering.delete(file); await rm(movie, { force: true }); await rm(picture, { force: true }); }
       })();
-      rendering.set(key, work);
+      rendering.set(file, work);
       return work;
     },
   };

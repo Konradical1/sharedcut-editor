@@ -52,6 +52,10 @@ test('a frame renders graded through the export renderer, is cached, and skips w
     assert.equal(await cache.still({ ...base, settings: still.settings }), file, 'the same frame again');
     assert.equal(renders.length, 1, 'is served from the cache');
     assert.equal(released, 1, 'and its guard slot was given back');
+    // Grab still asks for the same frame lossless: its own render and file, never the JPEG.
+    const png = await cache.still({ ...base, settings: still.settings }, undefined, 'png');
+    assert.deepEqual([...(await readFile(png)).subarray(0, 4)], [0x89, 0x50, 0x4e, 0x47], 'a PNG');
+    assert.equal(renders.length, 2, 'rendered on its own');
 
     // An untouched file on its own timeline is its source picture: red, not graded.
     const source = await cache.still({ ...mediaStill(project, asset, video), settings: stillSettings(project, 2, 1, 256).settings });

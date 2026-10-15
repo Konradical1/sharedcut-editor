@@ -9,7 +9,7 @@ export const users: User[] = [
 export const bins: Bin[] = [
   { id: 'all', name: 'All media' }, { id: 'interviews', name: 'Interviews' },
   { id: 'broll', name: 'B-roll' }, { id: 'drone', name: 'Drone' },
-  { id: 'audio', name: 'Audio' }, { id: 'graphics', name: 'Graphics' },
+  { id: 'audio', name: 'Audio' }, { id: 'graphics', name: 'Graphics' }, { id: 'stills', name: 'Stills' },
 ];
 
 const now = Date.now();

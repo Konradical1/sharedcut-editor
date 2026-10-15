@@ -39,6 +39,7 @@ export const ROUTES: Record<string, string> = {
   '/api/media': 'job:upload',
   '/api/media/([a-zA-Z0-9_-]+)(?:/(.*))?': 'job:upload', // upload, replace, original, files; PATCH/retry/DELETE are act renameMedia/retryMedia/removeMedia
   '/api/media/import-link': 'job:link',
+  '/api/media/still': 'job:still',
   '/api/media/move': 'store:moveMedia',
   // Projects and sharing
   '/api/projects/([a-zA-Z0-9_-]+)': 'job:project', // PATCH; DELETE is job delete-project

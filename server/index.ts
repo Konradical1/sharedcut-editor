@@ -17,7 +17,8 @@ import { isShape, getShape, validateShape } from '../src/services/shapes.ts';
 import { isComposition, validateCompositions } from '../src/services/compositions.ts';
 import { isAdjustment } from '../src/services/adjustment.ts';
 import { validateKeyframes } from '../src/services/animation.ts';
-import { clipSpan, extendClip } from '../src/services/playback.ts';
+import { clipSpan, extendClip, projectSize } from '../src/services/playback.ts';
+import { timecode } from '../src/services/timecode.ts';
 import { flowChunkSeconds, flowTiming, type FlowPreview } from '../src/services/opticalFlow.ts';
 import { flowWorker, flowEngineLabel, flowIdentity, renderOpticalFlow, trimFlowCache } from './opticalFlow.ts';
 import { normalizeSettings, pickStabilizeJob, stabilizeCapabilities, stabilizeSolve, trimStabilizeCache } from './stabilize.ts';
@@ -1397,6 +1398,26 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             else {mkdirSync(resolveDir(projectId),{recursive:true,mode:0o700});writeFileSync(target,data,{mode:0o600,flag:'wx'});}
             send(res,200,{ok:true});return;
           }
+        }
+        if (path === '/api/media/still' && method === 'POST') {
+          // Grab still: the timeline frame at t through the export renderer at the project's full size, saved as a PNG image in Stills.
+          const body = await jsonBody(req), project = requireProject(textField(body.projectId, 160, true), userId, true);
+          const timeline = state.timelines.find(t => t.id === body.timelineId && t.projectId === project.id) ?? fail(404, 'Timeline not found.');
+          requireSpace(0);
+          const still = stillSettings(project, timeline.duration, numberField(body.t, 0, 86400), Math.max(...projectSize(project.resolution)));
+          let file: string;
+          try { file = await stills.still({ ...previewSnapshot(project, timeline, {}), settings: still.settings }, undefined, 'png'); }
+          catch (error) {
+            // The editor then saves its own viewer picture instead.
+            if (error instanceof StillSkipped) { send(res, 409, { error: error.message, live: error.live }); return; }
+            if (error instanceof PreviewBusyError) { res.setHeader('Retry-After', String(error.retryAfterSeconds)); fail(429, 'Frame queue busy'); }
+            throw error;
+          }
+          const id = `media-${randomUUID()}`, name = `${timeline.name} ${timecode(still.time, project.fps).replaceAll(':', '.')}.png`;
+          const asset: Asset = { id, projectId: project.id, name, kind: 'image', binId: 'stills', thumbnail: '', duration: 0, resolution: '', fps: 0, size: '', status: 'processing', progress: 0 };
+          mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); copyFileSync(file, originalPath(id));
+          state.media = [asset, ...state.media]; persist();
+          processAsset(id); send(res, 202, { asset }); return;
         }
         if (path === '/api/media/import-link' && method === 'POST') {
           const body = await jsonBody(req);

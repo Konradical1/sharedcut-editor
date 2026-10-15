@@ -16,7 +16,7 @@ import { projectBins } from '../../src/state/store.ts';
 import type { MediaAsset } from '../../src/state/models.ts';
 import { flush } from '../session.ts';
 import { clock, secs } from '../views.ts';
-import { call, refresh, edit, handle, need, media, project, store, done, sleep, type JobDef, type Poller, type Step } from './kit.ts';
+import { call, refresh, edit, handle, need, media, project, timeline, store, done, sleep, type JobDef, type Poller, type Step } from './kit.ts';
 // A path the model writes as ~/… means the home folder, as in a shell.
 const expand = (path: string) => resolve(path.replace(/^~(?=$|[\\/])/, homedir()));
 
@@ -198,6 +198,17 @@ export const jobs: Record<string, JobDef> = {
       });
     },
   },
+  still: {
+    doc: '{time?, timeline?} Grab still: the timeline frame at time (default playhead), rendered like Export at full size → PNG @media in bin Stills',
+    async start(params) {
+      const p = project(), tl = timeline(params.timeline), t = params.time === undefined ? store.getState().playhead : Number(params.time);
+      // The editor's Grab still button: save pending edits, then the same request.
+      await flush();
+      const { asset } = await call<{ asset: MediaAsset }>('/media/still', { method: 'POST', json: { projectId: p.id, timelineId: tl.id, t } });
+      await refresh();
+      return follow(`grabbing ${handle(asset.id)}`, [{ name: asset.name, id: asset.id }]);
+    },
+  },
   download: {
     doc: '{media, to, proxy?, overwrite?} save an original (proxy: its playable preview) to a local file or folder',
     async start(params) {
@@ -248,7 +259,7 @@ export const topics: Record<string, string> = {
   media: [
     'media: upload, link import, replace, download, rename, bins, remove, retry. The media tool lists rows (first line: bin ids).',
     'status: uploading (bytes arriving) | downloading (link import) → processing N% <stage> → ready | failed: <error>. ready = playable and allowed on a timeline; extra previews may still run (a stage after "ready"; job pending{final:true} waits for them). ready with an error lost only extra previews and still plays.',
-    'jobs: upload, replace, link, download, pending (help jobs has their params). They wait up to `wait` s, then give an id for job status.',
+    'jobs: upload, replace, link, still, download, pending (help jobs has their params). They wait up to `wait` s, then give an id for job status.',
     `upload: folders go in recursively, skipping dot files, taking ${EXTENSIONS.join(' ')}. A file whose name is already in the project is skipped unless force:true. Max size per file is the server's (default 10 GiB). Kind comes from the extension: audio wav mp3 aac aif(f) flac m4a ogg; image png jpg webp gif tif bmp heic; else video.`,
     'upload resume: transfers run inside this MCP process. job cancel pauses them; running the same upload again (same paths) resumes from the server\'s offset, also after an MCP restart; one stopped before its first byte starts a new row instead (removeMedia the stuck one). An unfinished upload left alone 24 h is discarded by the server.',
     'replace: same kind (by extension) as the media; refused while it is processing or the project has an export or captions running (a refused last chunk fails the transfer: run it again later). Clips keep their in points: a shorter file leaves them past its end.',
