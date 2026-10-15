@@ -6,7 +6,7 @@ import { clipSpan, projectSize } from '../src/services/playback.ts';
 import { stabilizeEffect } from '../src/services/stabilize.ts';
 import { timelineTransitions, type TransitionRecord } from '../src/services/transitions.ts';
 import type { MediaAsset, Project } from '../src/state/models.ts';
-import { bakesWholeClips, readsDepth, run, type RenderRequest } from './media.ts';
+import { bakesWholeClips, denoisesPicture, readsDepth, run, type RenderRequest } from './media.ts';
 import { trimFlowCache } from './opticalFlow.ts';
 import { renameWithRetry } from './platform.ts';
 
@@ -30,7 +30,9 @@ const MAX_PREPARING = 2, BUSY_RETRY_SECONDS = 3, RECORDS_KEPT = 64, CACHE_BYTES 
 /** The renderer's own tolerance for "this clip is inside the range" (media.ts inRange). */
 const EDGE = 1e-6;
 const PREVIEW_FAILED = 'Preview failed; it plays live in the editor.';
-const LIVE = { bake: 'Compositions, Stabilize, optical flow and keyframes play live in the editor.', depth: 'Depth plays live in the editor.', cut: 'This cut plays live in the editor.' };
+const LIVE = { bake: 'Compositions, Stabilize, optical flow and keyframes play live in the editor.', denoise: 'Noise Reduction plays live in the editor.', depth: 'Depth plays live in the editor.', cut: 'This cut plays live in the editor.' };
+/** The editor plays a Noise Reduction clip from its own denoised chunks, so a render of the range is never wanted. */
+const denoises = (slice: Snapshot) => slice.clips.some(clip => clip.timelineId === slice.timeline.id && !clip.disabled && denoisesPicture(slice, clip));
 /** Media fields that change while a file is prepared or shown but never reach a rendered picture. */
 const VOLATILE_ASSET = ['status', 'progress', 'preparationStage', 'error', 'proxyUrl', 'colorProxyUrl', 'proxyVariants', 'audioProxyUrl', 'waveformVersion', 'filmstripFrames', 'filmstripVersion', 'importLink', 'matchedSourceUrl', 'matchedSourceTitle'];
 
@@ -79,7 +81,7 @@ function previewKey(slice: Snapshot) {
 /** Why the browser plays this range live instead of waiting for a render, if it must. */
 function liveReason(slice: Snapshot | undefined) {
   if (!slice) return LIVE.cut;
-  if (bakesWholeClips(slice)) return LIVE.bake;
+  if (bakesWholeClips(slice)) return denoises(slice) ? LIVE.denoise : LIVE.bake;
   return readsDepth(slice) ? LIVE.depth : undefined;
 }
 
@@ -163,7 +165,7 @@ export function createPreviewCache(directory: string, schedule: (id: string, wor
 }
 
 /** Why one still (GET /api/frames) is not rendered on its own. `composition`: the caller looks inside it instead. */
-export const STILL_LIVE = { composition: 'A composition renders its whole timeline for one frame; look inside it.', bake: 'Stabilize and optical flow bake whole clips; this frame shows live in the editor.', depth: LIVE.depth, cut: LIVE.cut };
+export const STILL_LIVE = { composition: 'A composition renders its whole timeline for one frame; look inside it.', bake: 'Stabilize and optical flow bake whole clips; this frame shows live in the editor.', denoise: 'Noise Reduction bakes whole clips; this frame shows live in the editor.', depth: LIVE.depth, cut: LIVE.cut };
 export type StillLive = keyof typeof STILL_LIVE;
 export class StillSkipped extends Error { live: StillLive; constructor(live: StillLive) { super(STILL_LIVE[live]); this.live = live; } }
 /** A still the renderer refused or failed: the message is the export's own (safe to show) or a fixed sentence. */
@@ -204,6 +206,7 @@ const stillLive = (slice: Snapshot | undefined): StillLive | undefined => {
   const own = slice.clips.filter(clip => clip.timelineId === slice.timeline.id && !clip.disabled);
   if (own.some(clip => clip.mediaId === 'frameline-composition')) return 'composition';
   // Keyframes are fine: a one-frame range is exactly one per-frame render.
+  if (own.some(clip => denoisesPicture(slice, clip))) return 'denoise';
   if (own.some(clip => stabilizeEffect(clip) || clip.properties.opticalFlow)) return 'bake';
   return readsDepth(slice) ? 'depth' : undefined;
 };

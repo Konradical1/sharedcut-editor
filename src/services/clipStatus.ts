@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react';
 
-/** Per-clip background work (Stabilize, optical flow, Smart Mask) so the timeline can show it on the clip itself. */
+/** Per-clip background work (Stabilize, optical flow, Noise Reduction, Smart Mask) so the timeline can show it on the clip itself. */
 export type ClipActivity = { kind: string; status: 'preparing' | 'ready' | 'failed'; progress: number; error?: string };
 const activities = new Map<string, Map<string, ClipActivity>>();
 const listeners = new Set<() => void>();
@@ -34,11 +34,13 @@ if (typeof window !== 'undefined') {
   const fromEvent = (kind: string) => (event: Event) => {
     const detail = (event as CustomEvent).detail as { clipId: string; status?: string; progress?: number; error?: string };
     if (!detail?.clipId) return;
-    const status = detail.status === 'ready' ? 'ready' : detail.status === 'failed' ? 'failed' : 'preparing';
-    setClipActivity(detail.clipId, kind, { kind, status, progress: Math.round(detail.progress ?? 0), error: detail.error });
+    // Noise Reduction's `flow` (optical flow previews instead) stays quiet; `unavailable` is a failure; no status clears it.
+    const status = detail.status === 'ready' || detail.status === 'flow' ? 'ready' : detail.status === 'failed' || detail.status === 'unavailable' ? 'failed' : 'preparing';
+    setClipActivity(detail.clipId, kind, detail.status ? { kind, status, progress: Math.round(detail.progress ?? 0), error: detail.error } : undefined);
   };
   window.addEventListener('frameline:stabilize', fromEvent('Stabilize'));
   window.addEventListener('frameline:optical-flow', fromEvent('Optical flow'));
+  window.addEventListener('frameline:denoise', fromEvent('Noise Reduction'));
 }
 
 type MaskJobs = Record<string, { status: string; progress?: number; error?: string }>;

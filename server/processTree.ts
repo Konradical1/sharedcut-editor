@@ -46,7 +46,7 @@ export function trackChild(child: ChildProcess): void {
 /** Estimated memory of the Python workers the guard holds, by the label their caller gives. Anything not listed is not held. */
 const WORKER_COST_BYTES: Readonly<Record<string, number>> = {
   Depth: JOB_COST_BYTES.depth, 'Optical flow': JOB_COST_BYTES.flow, Stabilize: JOB_COST_BYTES.stabilize,
-  'Motion tracker': JOB_COST_BYTES.tracker, 'Smart Mask': JOB_COST_BYTES.smartMask,
+  'Motion tracker': JOB_COST_BYTES.tracker, 'Smart Mask': JOB_COST_BYTES.smartMask, 'Noise Reduction': JOB_COST_BYTES.denoise,
 };
 // A prefix, not the whole name: FFMPEG_PATH and FFPROBE_PATH may point at a renamed build such as ffprobe-7.1.exe.
 const PROBE_PROGRAM = /^ff(probe|mpeg)/i;

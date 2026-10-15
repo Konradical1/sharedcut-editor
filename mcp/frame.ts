@@ -1,7 +1,7 @@
 // The frame tool: the real picture, rendered by the server's export renderer (GET /api/frames), so grades, titles,
 // transitions, keyframes and masks look exactly as Export draws them. Read-only; pending edits are saved first because
 // the server renders from its own copy. What it cannot render alone (a composition renders its whole timeline;
-// Stabilize, optical flow and depth bake whole clips) falls back to the composition's inside or the clip's source.
+// Noise Reduction, Stabilize, optical flow and depth bake whole clips) falls back to the composition's inside or the clip's source.
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { useEditorStore as store } from '../src/state/store.ts';
 import type { Clip, MediaAsset, Timeline } from '../src/state/models.ts';
@@ -18,7 +18,7 @@ import { image, sleep, project, timeline as openTimeline, type Content } from '.
 type Shot = { jpeg: Buffer; note: string };
 const OLD_SERVER = 'API endpoint not found.', SHEET_BUDGET_MS = 40_000;
 /** Why /api/frames skipped a still (server/previewCache.ts STILL_LIVE), in a few words. */
-const LIVE: Record<string, string> = { composition: 'a composition under the top clip', bake: 'Stabilize/optical flow', depth: 'Depth', cut: 'this dissolve' };
+const LIVE: Record<string, string> = { composition: 'a composition under the top clip', bake: 'Stabilize/optical flow', denoise: 'Noise Reduction', depth: 'Depth', cut: 'this dissolve' };
 
 /** One JPEG from /api/frames; a busy queue (429) is waited out a few times. */
 async function render(query: Record<string, string | number>): Promise<Buffer> {

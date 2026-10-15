@@ -26,6 +26,8 @@ import './clipStatus.ts';
 import * as footageCache from './footageCache.ts';
 import { flowChunkSeconds, type FlowPreview } from './opticalFlow.ts';
 import { shownSourceTime, sourceSize } from './motionTracker.ts';
+import { denoiseEffect, type DenoisePreview } from './denoise.ts';
+import { createDenoisePreview, denoiseStatus, denoiseStatusText, noiseUi, subscribeDenoise } from './denoisePreview.ts';
 
 export function sourceTime(clip: Clip, playhead: number, fps = 24, duration = Infinity) {
   const elapsed = Math.max(0, Math.min(clip.duration, playhead - clip.start));
@@ -338,6 +340,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   const flowStatuses = new Map<string,string>();
   const stabilizePreview = createStabilizePreview(() => { dirty = true; });
   const stabilizeStatuses = new Map<string,string>();
+  // Noise Reduction: denoised chunks for this viewer; a retry or "Show removed noise" draws again.
+  const denoisePreview = createDenoisePreview(() => { dirty = true; });
+  const unsubscribeDenoise = subscribeDenoise(() => { dirty = true; });
   // Depth: decoded depth frames for this viewer, its WebGL pass, and a repaint whenever an analysis moves on.
   const depthFrames = createDepthPreview(() => { dirty = true; });
   let depthFx: ReturnType<typeof createDepthFx> | undefined;
@@ -525,6 +530,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       retained = state.clips;
       flowPreview.retain(new Set(state.clips.filter(c=>c.properties.opticalFlow&&!c.disabled).map(c=>c.id)));
       stabilizePreview.retain(new Set(state.clips.filter(c=>stabilizeEffect(c)&&!c.disabled).map(c=>c.id)));
+      denoisePreview.retain(new Set(state.clips.filter(c=>denoiseEffect(c)&&!c.disabled).map(c=>c.id)));
     }
     if (options.fontsRevision !== fontsRevision) { fontsRevision = options.fontsRevision; textDocuments = new WeakMap(); }
     const divisor = options.quality === '1/4' ? 4 : options.quality === '1/2' || options.quality === 'Stream' ? 2 : 1;
@@ -593,7 +599,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       // Normalize loudness: the source's measured loudness brought to the target. The export measures the clip itself.
       const loudness=clip.properties.normalize?(byId(state.media).get(clip.mediaId) as MediaAsset&{loudness?:number}|undefined)?.loudness:undefined;
       let gain=audible?10**((track.gain+Number(clip.properties.gain??0)+(loudness===undefined?0:loudnessTarget(clip)-loudness))/20)*fadeLevel(clip,time,true):0;
-      const noises=clip.effects.filter(e=>e.name==='Noise Reduction'&&effectEnabled(clip,e));
+      const noises=clip.effects.filter(e=>e.name==='Audio Noise Reduction'&&effectEnabled(clip,e));
       for(const noise of noises){
         // ponytail: realtime noise gate; FFmpeg uses spectral denoising for final exports.
         if(rms<10**((-70+effectValue(clip,noise,'Sensitivity')*.5)/20))gain*=1-effectValue(clip,noise,'Reduction')/100;
@@ -758,6 +764,62 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         const signature=`${Math.floor(performance.now()/1000)}:${JSON.stringify(detail)}`;
         if(stabilizeStatuses.get(clip.id)!==signature){stabilizeStatuses.set(clip.id,signature);window.dispatchEvent(new CustomEvent('frameline:stabilize',{detail}));}
       }
+      // Noise Reduction: the server's denoised chunk of source frames stands in for the proxy once its decoder has this
+      // picture, through the same decode path, so speed, reverse, freeze, WebCodecs, Stabilize, masks, Depth and the grade
+      // read it as they read the proxy. Its media time 0 is source second `from`. Optical flow wins (denoisePreview).
+      const denoiseFx = visual && asset.kind === 'video' ? denoiseEffect(original) : undefined;
+      let denoised: { decoder: Decoder; id: string; asset: MediaAsset; clip: Clip; from: number; noise: boolean } | undefined;
+      if (denoiseFx) {
+        const at = sourceTime(original, time, sourceFps, asset.duration || Infinity), shownAt = state.playing ? at : Math.max(at, Math.min((asset.duration || Infinity) - 1 / sourceFps, shownSourceTime(original, time, at, project?.fps || 24, sourceFps)));
+        const noise = noiseUi.showRemoved(denoiseFx.id), speed = rate * Number(clip.properties.speed ?? 100) / 100;
+        // The clip's last shown source time in playing order (its out point, or its in point reversed): nothing past it is prepared.
+        const endAt = sourceTime(original, original.start + original.duration - 1e-6, sourceFps, asset.duration || Infinity);
+        const chunk = denoisePreview.get(original, asset, shownAt, options.original ? 'Original' : options.quality, noise ? 'noise' : 'denoised', endAt), status = denoiseStatus(clip.id);
+        if (status && (status.status !== 'ready' || !warning)) warning = `Noise Reduction · ${denoiseStatusText(status)}`;
+        const open = (record: DenoisePreview | undefined) => {
+          if (record?.status !== 'ready' || !record.url) return undefined;
+          // Its own asset id: a chunk that fails to load fails (failedDecoder) and the clip's proxy plays, rather than the
+          // decoder's error fallback swapping in the original's Stream proxy at the chunk's clock (the wrong part of the take).
+          const id = `${clip.id}:nr:${record.key}`, chunkAsset: MediaAsset = { ...asset, id: `${asset.id}:nr:${record.key}`, hasAudio: false, colorProxyUrl: record.url, sourceUrl: record.url, proxyUrl: record.url, proxyVariants: {}, duration: record.duration, fps: record.fps };
+          const decoder = decoderFor({ ...clip, id }, chunkAsset, true, options);
+          // First failure of this chunk (the server restarted and forgot it, or trimmed it): ask the server again. It
+          // re-registers a file it still has, or prepares it again; failedDecoder's backoff then reopens the decoder.
+          if (decoder?.error && !failures.has(id)) denoisePreview.forget(record.key);
+          if (!decoder || failedDecoder(id, decoder)) return undefined;
+          const frames = rate > 0 && speed <= 2 ? buffered(decoder, clip, asset.fps || 24, state.settings.footageCache !== false) : undefined;
+          // Natively decoded (reverse, freeze, over 2x, WebCodecs failed): nothing else loads a preload='none' element.
+          if (!frames) (decoder.element as HTMLMediaElement).preload = 'auto';
+          return { decoder, id, asset: chunkAsset, clip: { ...original, sourceIn: original.sourceIn - record.from }, from: record.from, frames };
+        };
+        const current = open(chunk);
+        if (current) {
+          activeIds.add(current.id);
+          // The proxy plays on until the chunk's decoder has this picture, so a chunk arriving never stalls the viewer.
+          const local = Math.max(0, shownAt - current.from), media = current.decoder.element as HTMLVideoElement; current.frames?.update(local);
+          // ponytail: decoded natively (reverse, over 2x, no WebCodecs) a forward audible clip keeps the proxy, which carries its sound.
+          // Native: ready once it has a picture, and through its own seeks (Chrome drops readyState to 1 while seeking).
+          if (current.frames ? current.frames.frame(local) : (media.readyState >= 2 || media.seeking) && (!audible || clip.properties.reverse)) {
+            // A native chunk not at this picture (warmed at 0, or left elsewhere) seeks now. `seeking` is then true, so the main
+            // path holds the layer's last frame instead of drawing this one. Its tolerance playing is the main path's own.
+            if (!current.frames && !media.seeking && (state.playing ? Math.abs(media.currentTime - local) > .45 : Math.floor(media.currentTime * sourceFps + 1e-6) !== Math.floor(local * sourceFps + 1e-6))) media.currentTime = (Math.floor(local * sourceFps + 1e-6) + .5) / sourceFps;
+            denoised = { ...current, noise };
+          }
+        }
+        // Playing, the next chunk's decoder opens early, as the next cut's does, so a chunk boundary never waits.
+        const upcoming = state.playing && denoised ? open(denoisePreview.next(clip.id)) : undefined;
+        if (upcoming) { warmIds.add(upcoming.id); upcoming.frames?.update(0); }
+        // Until the next chunk is open, the proxy follows the clock through the chunk's last second, so a late chunk falls back
+        // to a warm proxy at the boundary instead of a stale or evicted one.
+        else if (denoised && state.playing && rate > 0 && !clip.properties.reverse && !clip.properties.freeze && endAt > denoised.from + denoised.asset.duration && shownAt - denoised.from > denoised.asset.duration - 1) {
+          const proxy = decoderFor(clip, asset, true, options);
+          if (proxy && !proxy.error) {
+            warmIds.add(clip.id);
+            const frames = speed <= 2 ? buffered(proxy, clip, asset.fps || 24, state.settings.footageCache !== false) : undefined;
+            if (frames) frames.update(at);
+            else { const element = proxy.element as HTMLVideoElement; element.preload = 'auto'; if (element.readyState >= 1 && !element.seeking && Math.abs(element.currentTime - at) > .25) seeks.push([element, at]); }
+          }
+        }
+      }
       const interpolated = flowDecoder(flow);
       if(original.properties.opticalFlow&&visual&&time-original.start+flowChunkSeconds<original.duration) {
         const next=flowPreview.get(original,time+flowChunkSeconds,project?.fps||24,options.original?'Original':options.quality);
@@ -768,8 +830,10 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       const fallback = !url && visual && asset.thumbnail;
       if (!url) missing = true;
       if (!url && !fallback) continue;
-      const decoderId=!visual&&asset.kind==='video'?`${clip.id}:audio`:clip.id;
-      const decoder = flowReady && !audible ? interpolated : decoderFor(decoderId===clip.id?clip:{...clip,id:decoderId}, asset, visual && !flowReady, options);
+      const decoderId=denoised?.id??(!visual&&asset.kind==='video'?`${clip.id}:audio`:clip.id);
+      const decoder = flowReady && !audible ? interpolated : denoised?.decoder ?? decoderFor(decoderId===clip.id?clip:{...clip,id:decoderId}, asset, visual && !flowReady, options);
+      // The picture's own media and clock: a denoised chunk's, or the clip's. Sound always plays the clip's source.
+      const pictureAsset = denoised?.asset ?? asset, pictureClip = denoised?.clip ?? original, offset = denoised?.from ?? 0;
       if (!decoder) continue;
       if(decoder!==interpolated)activeIds.add(decoderId);
       if (failedDecoder(decoderId, decoder)) { skipped.set(decoderId, `${clip.name} (${decoder.error})`); footageCache.setDecoderStatus(clip.id, decoder.url, `${asset.name}: ${decoder.error}`, true); continue; }
@@ -779,10 +843,10 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if(!frames&&decoder.frames){decoder.frames.dispose();decoder.frames=undefined;}
       let queuedFrame:VideoFrame|undefined;
       if(frames){
-        const media=decoder.element as HTMLVideoElement,sourceEnd=Number.isFinite(media.duration)?media.duration:asset.duration||Infinity,targetTime=sourceTime(original,time,asset.fps||24,sourceEnd);
+        const media=decoder.element as HTMLVideoElement,sourceEnd=Number.isFinite(media.duration)?media.duration:pictureAsset.duration||Infinity,targetTime=sourceTime(pictureClip,time,asset.fps||24,sourceEnd);
         // Paused, show the frame the export delivers here (they differ when the rates do: 59.94 fps on a 30 fps
         // timeline); playing, the picture keeps the clock's own frame so nothing about playback changes.
-        const pictureTime=state.playing||focusing?targetTime:Math.max(targetTime,Math.min(sourceEnd-1/(asset.fps||24),shownSourceTime(original,time,targetTime,project?.fps||24,asset.fps||24)));
+        const pictureTime=state.playing||focusing?targetTime:Math.max(targetTime,Math.min(sourceEnd-1/(asset.fps||24),shownSourceTime(pictureClip,time,targetTime,project?.fps||24,asset.fps||24)));
         if(decoder.gain&&audio)decoder.gain.gain.setValueAtTime(0,audio.currentTime);
         media.muted=true;
         const scrub=scrubFor(clip,asset,decoder);
@@ -796,7 +860,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
             const element=sound.element as HTMLMediaElement;
             const running=state.playing&&!stalled;
             if(!running)element.pause();
-            if(element.readyState>=1&&!element.seeking&&Math.abs(element.currentTime-targetTime)>(running?.12:1/(asset.fps||24)))seeks.push([element,targetTime]);
+            if(element.readyState>=1&&!element.seeking&&Math.abs(element.currentTime-targetTime-offset)>(running?.12:1/(asset.fps||24)))seeks.push([element,targetTime+offset]);
             element.playbackRate=Math.max(.0625,Math.min(8,rate*Number(clip.properties.speed??100)/100));
             connect(sound,clip,()=>audio!.createMediaElementSource(element),destination);updateAudio(sound,clip,track,time,running);element.muted=!sound.gain||sound.blocked;
             if(running)play(sound);
@@ -811,7 +875,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           // saved). A slow decode, or a cold start on a fast line, would trade quality for nothing: that wait used to drop
           // any not-yet-cached clip to the low stream. While nothing measures the line (no answer: cache off, no controlling
           // footage worker, no rate yet) the wait is the signal.
-          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&asset.proxyVariants?.StreamLow&&decoder.url!==asset.proxyVariants.StreamLow&&preferLowStream(decoder.url)!==false){automaticStreams.add(asset.id);cleanup(decoder);decoders.delete(decoderId);dirty=true;holdLayer();continue;}
+          if(options.quality==='Stream'&&!options.original&&performance.now()-decoder.waitingSince>1200&&pictureAsset.proxyVariants?.StreamLow&&decoder.url!==pictureAsset.proxyVariants.StreamLow&&preferLowStream(decoder.url)!==false){automaticStreams.add(asset.id);cleanup(decoder);decoders.delete(decoderId);dirty=true;holdLayer();continue;}
           // Failed codecs switch through buffered() immediately. A network timeout remains visible.
           if(performance.now()-decoder.waitingSince>30000){decoder.framesFailed=true;frames.dispose();decoder.frames=undefined;dirty=true;}
           holdLayer();footageCache.setDecoderStatus(clip.id,decoder.url,`${asset.name} · ${frames.ahead?'Decoding requested frame':'Buffering video'}`);continue;
@@ -826,7 +890,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         if (media.readyState < 2 || media.seeking) {
           decoder.waitingSince ??= performance.now();
           const waited = performance.now() - decoder.waitingSince;
-          const stream = asset.proxyVariants?.Stream, requested = playbackUrl(asset, options, visual);
+          const stream = pictureAsset.proxyVariants?.Stream, requested = playbackUrl(pictureAsset, options, visual);
           if (waited > 8000 && stream && stream !== decoder.url && requested) { streamFallbacks.set(requested, stream); dirty = true; }
           if (waited > 30000) { decoder.error = 'playback stalled'; dirty = true; }
           footageCache.setDecoderStatus(clip.id, decoder.url, `${asset.name} · ${media.seeking ? 'Seeking frame' : media.readyState < 1 ? 'Loading media metadata' : 'Buffering / decoding frame'}`);
@@ -835,12 +899,12 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if (!decoder.image && decoder!==interpolated && !frames) {
         const media = decoder.element as HTMLMediaElement;
         const fps = asset.fps || project?.fps || 24;
-        const sourceEnd = Number.isFinite(media.duration) ? media.duration : asset.duration || Infinity;
-        const targetTime = sourceTime(original, time, fps, sourceEnd);
+        const sourceEnd = Number.isFinite(media.duration) ? media.duration : pictureAsset.duration || Infinity;
+        const targetTime = sourceTime(pictureClip, time, fps, sourceEnd);
         const speed = rate * Number(clip.properties.speed ?? 100) / 100;
         const normalPlayback = state.playing && !stalled && !clip.properties.reverse && !clip.properties.freeze && speed >= .0625 && speed <= 8;
         // Paused, the frame the export delivers here; see the WebCodecs path above.
-        const pictureTime = normalPlayback || focusing ? targetTime : Math.max(targetTime, Math.min(sourceEnd - 1 / fps, shownSourceTime(original, time, targetTime, project?.fps || 24, fps)));
+        const pictureTime = normalPlayback || focusing ? targetTime : Math.max(targetTime, Math.min(sourceEnd - 1 / fps, shownSourceTime(pictureClip, time, targetTime, project?.fps || 24, fps)));
         if (!normalPlayback) media.pause();
         // Paint the completed seek before starting the newest request; never queue stale pointer positions.
         const drift = media.readyState >= 1 ? media.currentTime - targetTime : 0;
@@ -885,7 +949,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         if(media.seeking){loading=true;continue;}
       }
       sourceClip = clip.id;
-      sourceTimestamp = String(queuedFrame?queuedFrame.timestamp/1e6:element instanceof HTMLVideoElement ? Math.floor(element.currentTime * (asset.fps || 24) + 1e-6) / (asset.fps || 24) : 0);
+      sourceTimestamp = String(offset+(queuedFrame?queuedFrame.timestamp/1e6:element instanceof HTMLVideoElement ? Math.floor(element.currentTime * (asset.fps || 24) + 1e-6) / (asset.fps || 24) : 0));
       const sourceWidth = queuedFrame?.displayWidth ?? (element instanceof HTMLVideoElement ? element.videoWidth : element.naturalWidth);
       const sourceHeight = queuedFrame?.displayHeight ?? (element instanceof HTMLVideoElement ? element.videoHeight : element.naturalHeight);
       if (!sourceWidth || !sourceHeight) continue;
@@ -899,7 +963,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       // While the analysis runs, hold the original at the crop the solve will apply so the framing never jumps.
       const framed = stabilizeFx && !stabilizeSolveFor ? {...clip, properties:{...clip.properties, zoom: Number(clip.properties.zoom ?? 100) * stabilizeZoom(stabilizeSettings(original, stabilizeFx))}} : clip;
       const warp = stabilizeSolveFor ? {solve:stabilizeSolveFor,time:sourceTime(original,time,sourceFps,asset.duration||Infinity),sourceWidth,sourceHeight,blend:decoder===interpolated} : undefined;
-      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip,stampAt);
+      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip,stampAt,denoised);
     }
     flush(Infinity);
     };
@@ -908,8 +972,11 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
      *  matte on the stabilized frame instead of the original framing. */
     const warpTransform = (warp:LayerWarp) => stabilizeLayerTransform(warp.solve,warp.time,width,height,warp.sourceWidth,warp.sourceHeight,warp.blend);
     const mirrorLayer = () => { layerContext.save(); layerContext.setTransform(-1, 0, 0, 1, width, 0); layerContext.globalCompositeOperation = 'copy'; layerContext.drawImage(layer, 0, 0); layerContext.restore(); };
-    const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp,snapshot?:VideoFrame,flip=false,stampAt=-1) => {
+    /** `denoised`: the picture is a Noise Reduction chunk whose media time 0 is source second `from`; `noise` (Show removed
+     *  noise) draws it as decoded, with no grade or effects. */
+    const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp,snapshot?:VideoFrame,flip=false,stampAt=-1,denoised?:{from:number;noise:boolean}) => {
       let masks=new Map<string,SmartMaskPixels>();
+      const offset=denoised?.from??0;
       try {
         const nodes = evaluateNodes(nodesOf(state.nodes, clip.id),focusing?.clip??clip,focusing?.time??time).filter(node=>node.enabled);
         const maskCount=activeSmartMasks(clip,nodes).length,depthKeys=activeDepthKeys(clip,nodes);
@@ -942,12 +1009,12 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           }
           return masks;
         };
-        if(maskCount || nodes.length || clip.properties.resolveLookUrl || Number(clip.properties.inputExposure) || Number(clip.properties.inputTemperature) || clip.properties.yuvMatrix || clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto') {
+        if(!denoised?.noise && (maskCount || nodes.length || clip.properties.resolveLookUrl || Number(clip.properties.inputExposure) || Number(clip.properties.inputTemperature) || clip.properties.yuvMatrix || clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto')) {
           color ??= createColorPreview(()=>{dirty=true;});
           const previewAsset=element?.src.includes('/files/')?{...asset,colorMatrix:'bt709'}:asset;
-          const result = color.draw(layer,clip,previewAsset,nodes,element,sampleTime=>loadMasks(element?sampleTime:sourceTime(clip,time,asset.fps||24,asset.duration)),snapshot);
+          const result = color.draw(layer,clip,previewAsset,nodes,element,sampleTime=>loadMasks(element?sampleTime+offset:sourceTime(clip,time,asset.fps||24,asset.duration)),snapshot);
           // The copy shown can lag the element (native path): the picture counters follow what was drawn, so re-stamp this layer's entry.
-          if(element){sourceTimestamp=result.dataset.sourceTimestamp ?? '';if(stampAt>=0)pictureStamps[stampAt]=`${clip.id}@${sourceTimestamp}`;}
+          if(element){const drawn=result.dataset.sourceTimestamp;sourceTimestamp=drawn?String(+drawn+offset):'';if(stampAt>=0)pictureStamps[stampAt]=`${clip.id}@${sourceTimestamp}`;}
           canvas.dataset.colorPrecision=result.dataset.colorPrecision??'8-bit RGB fallback';
           layerContext.clearRect(0,0,width,height); layerContext.drawImage(result,0,0);
           // Show key (viewer only): where the node grades, white where it grades fully (Invert included).
@@ -965,7 +1032,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         layerContext.setTransform(...warpTransform(warp));layerContext.drawImage(warpScratch,0,0);
         layerContext.restore();
       }
-      for (const effect of clip.effects.filter(e=>effectEnabled(clip,e))) {
+      for (const effect of denoised?.noise ? [] : clip.effects.filter(e=>effectEnabled(clip,e))) {
         const amount=effectValue(clip,effect,'amount');
         if(!amount)continue;
         if(effect.name==='Smart Mask') {
@@ -1046,7 +1113,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           const gradient=layerContext.createRadialGradient(x,y,Math.min(width,height)*.15,x,y,Math.max(width,height)*.65);
           gradient.addColorStop(0,'transparent');gradient.addColorStop(1,`rgba(0,0,0,${amount/100})`);
           layerContext.globalCompositeOperation='source-atop';layerContext.fillStyle=gradient;layerContext.fillRect(0,0,width,height);layerContext.globalCompositeOperation='source-over';
-        } else if(['Film grain','Sharpen','Noise Reduction'].includes(effect.name)) {
+        } else if(['Film grain','Sharpen'].includes(effect.name)) {
           const pixels=layerContext.getImageData(0,0,width,height);
           detailPixels(pixels.data,width,height,clip,effect,Math.floor(time*(project?.fps||24)));
           layerContext.putImageData(pixels,0,0);
@@ -1076,6 +1143,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       renderLayers(state.timelineId,state.playhead,context,referenceContext,false,true);
       context.drawImage(prepared.frame,0,0,width,height);picture=true;engine='render-cache';warning='Rendered preview · ready';sourceClip=`preview:${prepared.key}`;sourceTimestamp=String(state.playhead);pictureStamps.push(`${sourceClip}@${sourceTimestamp}`);
     }else renderLayers(state.timelineId,state.playhead,context,referenceContext);
+    // Every drawn Noise Reduction clip asked for its chunk above; the rest stop preparing, so the one on screen never queues.
+    denoisePreview.sweep();
     if(!prepared&&!loading&&state.playing&&performance.now()-renderStarted>1000/previewFps*.7){
       if(++expensiveFrames>=6){expensiveUntil=performance.now()+15000;expensiveFrames=0;}
     }else if(!loading)expensiveFrames=Math.max(0,expensiveFrames-1);
@@ -1132,7 +1201,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       // of idle decoders quietly competes with the clip on screen for the same uplink. Only the warm
       // set (the next cuts) is worth buffering ahead; everything else drops back to metadata.
       if (!decoder.image) { const media = decoder.element as HTMLMediaElement; if(!decoder.frames||!warmIds.has(id))media.pause(); const want = decoder.frames ? 'none' : warmIds.has(id) ? 'auto' : 'metadata'; if (media.preload !== want) media.preload = want; }
-      if (!byId(state.clips).has(id.endsWith(':audio') ? id.slice(0, -6) : id.includes(':flow:') ? id.slice(0, id.indexOf(':flow:')) : id)) { cleanup(decoder); decoders.delete(id); failures.delete(id); }
+      if (!byId(state.clips).has(id.endsWith(':audio') ? id.slice(0, -6) : id.includes(':flow:') ? id.slice(0, id.indexOf(':flow:')) : id.includes(':nr:') ? id.slice(0, id.indexOf(':nr:')) : id)) { cleanup(decoder); decoders.delete(id); failures.delete(id); }
     }
     // Recently scrubbed files stay open while paused, so crossing back over a cut is instant.
     for (const [url, scrub] of scrubs) if (state.playing && !focused || scrubs.size > SCRUB_POOL && !scrubIds.has(url)) { scrub.frames.dispose(); scrubs.delete(url); }
@@ -1221,6 +1290,6 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       for (const decoder of decoders.values()) decoder.blocked = false;
       dirty = true;
     },
-    dispose() { disposed = true; for (const scrub of scrubs.values()) scrub.frames.dispose(); scrubs.clear(); timelinePreview.dispose();maskPreview.dispose();depthFrames.dispose();depthFx?.dispose();unsubscribeDepth();fittedMasks.clear();maskCuts.clear();motion?.dispose(); flowPreview.dispose(); stabilizePreview.dispose(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',scopeRequested); color?.dispose(); cancelAnimationFrame(frame); for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); } decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
+    dispose() { disposed = true; for (const scrub of scrubs.values()) scrub.frames.dispose(); scrubs.clear(); timelinePreview.dispose();maskPreview.dispose();depthFrames.dispose();depthFx?.dispose();unsubscribeDepth();fittedMasks.clear();maskCuts.clear();motion?.dispose(); flowPreview.dispose(); stabilizePreview.dispose(); denoisePreview.dispose(); unsubscribeDenoise(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',scopeRequested); color?.dispose(); cancelAnimationFrame(frame); for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); } decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
   };
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { Clip, Effect } from '../state/models.ts';
-import { detailPixels, effectValue } from './effects.ts';
+import { acceptsEffect, audioEffectNames, detailPixels, effectValue } from './effects.ts';
 
 test('effect parameters retain legacy settings, clamp values, and produce repeatable detail previews', () => {
   const clip = { properties: { EQ_Presence: 4 } } as unknown as Clip;
@@ -17,5 +17,14 @@ test('effect parameters retain legacy settings, clamp values, and produce repeat
   const noisy = new Uint8ClampedArray([0,0,0,255,100,100,100,255,0,0,0,255]);
   detailPixels(noisy,3,1,clip,{...eq,name:'Sharpen'});assert.ok(noisy[4]>100);
   const smooth = new Uint8ClampedArray([0,0,0,255,100,100,100,255,0,0,0,255]);
-  detailPixels(smooth,3,1,clip,{...eq,name:'Noise Reduction'});assert.ok(smooth[4]<100);
+  // Picture Noise Reduction is baked from the camera original (server/denoise.ts), never smoothed here.
+  detailPixels(smooth,3,1,clip,{...eq,name:'Noise Reduction'});assert.equal(smooth[4],100);
+});
+
+test('picture and audio Noise Reduction go where they belong, one picture Noise Reduction per clip', () => {
+  const clip = { properties: {}, effects: [] } as unknown as Clip;
+  assert.ok(acceptsEffect(clip,'video','Noise Reduction'));assert.ok(!acceptsEffect(clip,'audio','Noise Reduction'));
+  assert.ok(acceptsEffect(clip,'audio','Audio Noise Reduction'));
+  assert.ok(!acceptsEffect({...clip,effects:[{id:'n',name:'Noise Reduction',enabled:true,amount:50}]},'video','Noise Reduction'));
+  assert.deepEqual(audioEffectNames,['EQ','Compressor','Limiter','Audio Noise Reduction']);
 });

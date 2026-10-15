@@ -71,6 +71,8 @@ export const JOB_COST_BYTES = {
   tracker: 2 * GIB,
   /** RAM only: depth needs 2.7 GiB of VRAM as well (measured 2.68 peak), which this guard does not manage. */
   depth: 4 * GIB,
+  /** Estimate: the denoise worker holds a few 4K frames as float on the device, its decoder and encoder (spec: under 3 GiB of VRAM). */
+  denoise: 3 * GIB,
   /** Estimate: the resident SAM2 worker takes 3-5 GiB. */
   smartMask: 5 * GIB,
   /** Estimate: Whisper transcription. */

@@ -69,7 +69,7 @@ export const TOOLS: Record<string, Tool> = {
     run: act,
   },
   job: {
-    description: 'Server work: upload files, import links, captions, smart masks, depth, stabilize, optical flow, tracking, color assistant, exports, Resolve, sound effects, fonts. kind + params; returns when done or after wait seconds (then poll with kind "status" + id). help{topic:"jobs"} lists kinds.',
+    description: 'Server work: upload files, import links, captions, smart masks, depth, stabilize, optical flow, noise reduction, tracking, color assistant, exports, Resolve, sound effects, fonts. kind + params; returns when done or after wait seconds (then poll with kind "status" + id). help{topic:"jobs"} lists kinds.',
     inputSchema: schema({ kind: { type: 'string', enum: [...JOB_KINDS, 'status', 'cancel'] }, id: { ...str, description: 'Job id to poll (kind "status")' }, wait: { ...num, description: 'Seconds to wait, default 45' }, params: { type: 'object', description: 'Kind-specific, see help jobs' } }, ['kind']),
     async run({ kind, id, wait, params }) {
       await ready();

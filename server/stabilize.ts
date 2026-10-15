@@ -43,8 +43,9 @@ async function inputIdentity(input: string) { const file = await stat(input); re
 export async function stabilizeAnalysisIdentity(input: string, from: number, to: number) {
   return hash(['stabilize-analysis-v1', await workerIdentity(), await inputIdentity(input), round(from), round(to)]);
 }
-export async function stabilizeIdentity(analysisKey: string, settings: StabilizeSettings, from: number, to: number, preview: boolean, input?: string) {
-  return hash(['stabilize-render-v2', analysisKey, normalizeSettings(settings), round(from), round(to), preview, input ? await inputIdentity(input) : null]);
+/** `inputKey` stands in for the input file's identity when that file is itself a cached bake (named by its content). */
+export async function stabilizeIdentity(analysisKey: string, settings: StabilizeSettings, from: number, to: number, preview: boolean, input?: string, inputKey?: string) {
+  return hash(['stabilize-render-v2', analysisKey, normalizeSettings(settings), round(from), round(to), preview, inputKey ?? (input ? await inputIdentity(input) : null)]);
 }
 /** The solve depends on the analysis and settings only, never on a range or a render size. */
 export const stabilizeSolveIdentity = (analysisKey: string, settings: StabilizeSettings) => hash(['stabilize-solve-v1', analysisKey, normalizeSettings(settings)]);
@@ -75,27 +76,33 @@ export async function stabilizeAnalysis(options: { input: string; directory: str
 }
 
 /** Stabilized picture for [from,to) of the source in source time. Preview: x264 mp4. Export: ProRes mov. */
-/** `analysisInput` is the camera original: proxies lose tracking and invent rotation. `input` may be a proxy of the same aspect for previews. */
-export async function renderStabilized(options: { input: string; analysisInput?: string; directory: string; analysisDirectory?: string; range: { from: number; to: number }; from: number; to: number; settings: StabilizeSettings; preview: boolean; signal?: AbortSignal; onProgress?: (value: number) => void }) {
-  const { input, analysisInput = input, directory, analysisDirectory = directory, range, from, to, preview, signal, onProgress } = options, settings = normalizeSettings(options.settings);
+/** `analysisInput` is the camera original: proxies lose tracking and invent rotation. `input` may be a proxy of the same aspect for previews,
+ *  or a Noise Reduction bake of the original whose time 0 is the original's `inputOffset` (times stay the original's). */
+export async function renderStabilized(options: { input: string; analysisInput?: string; inputOffset?: number; inputKey?: string; directory: string; analysisDirectory?: string; range: { from: number; to: number }; from: number; to: number; settings: StabilizeSettings; preview: boolean; signal?: AbortSignal; onProgress?: (value: number) => void }) {
+  const { input, analysisInput = input, inputOffset: shift = 0, directory, analysisDirectory = directory, range, from, to, preview, signal, onProgress } = options, settings = normalizeSettings(options.settings);
   if (!(to > from) || from < range.from - 1e-6 || to > range.to + 1e-6) throw new Error('Stabilize render range must lie inside the analysed range.');
   // Honest progress: a fresh analysis is most of the first section's wait, so it owns 0–70; once cached, the render owns 0–100.
   const weight = existsSync(join(analysisDirectory, `${await stabilizeAnalysisIdentity(analysisInput, range.from, range.to)}.path.json`)) ? 0 : .7;
   const analysis = await stabilizeAnalysis({ input: analysisInput, directory: analysisDirectory, from: range.from, to: range.to, signal, onProgress: value => onProgress?.(value * weight) });
   await mkdir(directory, { recursive: true, mode: 0o700 });
-  const key = await stabilizeIdentity(analysis.key, settings, from, to, preview, input), output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`), sidecar = join(directory, `${key}.json`);
+  const key = await stabilizeIdentity(analysis.key, settings, from, to, preview, input, options.inputKey), output = join(directory, `${key}.${preview ? 'mp4' : 'mov'}`), sidecar = join(directory, `${key}.json`);
   // The camera-path solve depends on the analysis and settings only: one file serves every section and both preview tiers.
   const solve = join(analysisDirectory, `${stabilizeSolveIdentity(analysis.key, settings)}.solve.npz`);
   const zoomOf = async () => { try { const value = JSON.parse(await readFile(sidecar, 'utf8')); return { zoom: Number.isFinite(Number(value.zoom)) ? Number(value.zoom) : undefined, zoomMin: Number.isFinite(Number(value.zoomMin)) ? Number(value.zoomMin) : undefined }; } catch { return { zoom: undefined, zoomMin: undefined }; } };
   if (existsSync(output)) { onProgress?.(100); return { key, output, ...await zoomOf() }; }
-  const { temporary, output: log } = await runStage({ stage: 'render', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, path: analysis.output, solve, from, to, preview, settings, output: join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`) }, directory, '.stabilize-render-', signal, value => onProgress?.(weight * 100 + value * (1 - weight)));
+  // The worker seeks `from` in its input and indexes matrices from the path's own `from`: a shifted input gets both moved by
+  // the same amount, so matrix k still lands on the original's frame k.
+  let path = analysis.output;
+  if (shift) { const moved = JSON.parse(await readFile(path, 'utf8')); moved.from -= shift; moved.to -= shift; path = join(directory, `.render-${key}.path.json`); await writeFile(path, JSON.stringify(moved)); }
+  const { temporary, output: log } = await runStage({ stage: 'render', ffmpeg: ffmpeg(), ffprobe: ffprobe(), input, path, solve, from: Math.max(0, from - shift), to: to - shift, preview, settings, output: join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`) }, directory, '.stabilize-render-', signal, value => onProgress?.(weight * 100 + value * (1 - weight)))
+    .catch(async error => { if (shift) await rm(path, { force: true }); throw error; });
   try {
     const report = log.split('\n').map(line => { try { return JSON.parse(line) as { zoom?: number; zoomMin?: number }; } catch { return undefined; } }).find(value => value && Number.isFinite(Number(value.zoom)));
     const zoom = report ? Number(report.zoom) : undefined, zoomMin = report && Number.isFinite(Number(report.zoomMin)) ? Number(report.zoomMin) : zoom;
     if (zoom !== undefined) await writeFile(sidecar, JSON.stringify({ zoom, zoomMin }));
     await rename(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), output); onProgress?.(100); return { key, output, zoom, zoomMin };
   }
-  finally { await rm(temporary, { recursive: true, force: true }); await rm(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), { force: true }); }
+  finally { await rm(temporary, { recursive: true, force: true }); await rm(join(directory, `.render-${key}.tmp.${preview ? 'mp4' : 'mov'}`), { force: true }); if (shift) await rm(path, { force: true }); }
 }
 
 export type StabilizeSolve = { version: 1; width: number; height: number; fps: number; from: number; to: number; zoom: number; zoomMin: number; matrices: number[][] };

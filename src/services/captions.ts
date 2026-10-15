@@ -1,4 +1,5 @@
 import type { Clip, Track } from '../state/models.ts';
+import { audioEffectNames } from './effects.ts';
 
 export interface CaptionWord { text: string; start: number; end: number; uncertain?: boolean }
 /** `accent` overrides the preset's highlight color (and turns the highlight on); `wordPop` pops each word as it is spoken. */
@@ -68,7 +69,7 @@ export function captionSignature(clips: Clip[], tracks: Track[], timelineId: str
   const visit=(id:string,from:number,to:number,depth=0):unknown[]=>{
     if(depth>16)return ['cycle'];
     const localTracks=tracks.filter(t=>t.timelineId===id&&!t.captionSets).sort((a,b)=>a.id.localeCompare(b.id));
-    return [localTracks.map(t=>[t.id,t.kind,t.muted,t.solo,t.gain,t.pan]),clips.filter(c=>c.timelineId===id&&!isCaption(c)&&c.mediaId!=='frameline-title'&&c.mediaId!=='frameline-shape'&&c.start<to&&c.start+c.duration>from&&(!trackIds.length||depth>0||trackIds.includes(c.trackId))).sort((a,b)=>a.id.localeCompare(b.id)).map(c=>[c.id,c.mediaId,c.trackId,c.start,c.duration,c.sourceIn,c.disabled,audioKeys.map(k=>c.properties[k]??null),c.effects.filter(e=>['EQ','Compressor','Limiter','Noise Reduction'].includes(e.name)),Object.entries(c.keyframes??{}).filter(([k])=>audioKeys.some(p=>k===`properties.${p}`)||k.startsWith('effects.')).sort(),c.mediaId==='frameline-composition'?visit(String(c.properties.compositionId),0,Infinity,depth+1):null])];
+    return [localTracks.map(t=>[t.id,t.kind,t.muted,t.solo,t.gain,t.pan]),clips.filter(c=>c.timelineId===id&&!isCaption(c)&&c.mediaId!=='frameline-title'&&c.mediaId!=='frameline-shape'&&c.start<to&&c.start+c.duration>from&&(!trackIds.length||depth>0||trackIds.includes(c.trackId))).sort((a,b)=>a.id.localeCompare(b.id)).map(c=>[c.id,c.mediaId,c.trackId,c.start,c.duration,c.sourceIn,c.disabled,audioKeys.map(k=>c.properties[k]??null),c.effects.filter(e=>audioEffectNames.includes(e.name)),Object.entries(c.keyframes??{}).filter(([k])=>audioKeys.some(p=>k===`properties.${p}`)||k.startsWith('effects.')).sort(),c.mediaId==='frameline-composition'?visit(String(c.properties.compositionId),0,Infinity,depth+1):null])];
   };
   const value=JSON.stringify(visit(timelineId,start,end));let a=2166136261,b=5381;
   for(let i=0;i<value.length;i++){a=Math.imul(a^value.charCodeAt(i),16777619);b=Math.imul(b,33)^value.charCodeAt(i);}

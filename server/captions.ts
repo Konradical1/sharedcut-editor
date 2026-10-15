@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { renderTimeline, type RenderRequest } from './media.ts';
 import { validateWords, type CaptionWord } from '../src/services/captions.ts';
+import { audioEffectNames } from '../src/services/effects.ts';
 import { killProcessTree } from './processTree.ts';
 import { gpuJob } from './workQueue.ts';
 
@@ -28,8 +29,7 @@ export async function transcribeTimeline(request:RenderRequest,trackIds:string[]
   const directory=await mkdtemp(join(tmpdir(),'frameline-transcription-'));
   try {
     const tracks=request.tracks.map(t=>({...t,hidden:true,muted:t.muted||(t.timelineId===request.timeline.id&&trackIds.length>0&&!trackIds.includes(t.id))}));
-    const audioEffects=['EQ','Compressor','Limiter','Noise Reduction'];
-    const clips=request.clips.filter(c=>!['frameline-title','frameline-shape'].includes(c.mediaId)&& (c.mediaId==='frameline-composition'||request.assets.some(a=>a.asset.id===c.mediaId&&a.asset.hasAudio))).map(c=>({...c,transition:'',properties:{...c.properties,transitionOut:'',blendMode:'Normal',stabilization:false},effects:c.effects.filter(e=>audioEffects.includes(e.name)),keyframes:Object.fromEntries(Object.entries(c.keyframes??{}).filter(([k])=>/^properties\.(speed|reverse|freeze|gain|pan|normalize|audioFadeIn|audioFadeOut)$/.test(k)||k.startsWith('effects.')))}));
+    const clips=request.clips.filter(c=>!['frameline-title','frameline-shape'].includes(c.mediaId)&& (c.mediaId==='frameline-composition'||request.assets.some(a=>a.asset.id===c.mediaId&&a.asset.hasAudio))).map(c=>({...c,transition:'',properties:{...c.properties,transitionOut:'',blendMode:'Normal',stabilization:false},effects:c.effects.filter(e=>audioEffectNames.includes(e.name)),keyframes:Object.fromEntries(Object.entries(c.keyframes??{}).filter(([k])=>/^properties\.(speed|reverse|freeze|gain|pan|normalize|audioFadeIn|audioFadeOut)$/.test(k)||k.startsWith('effects.')))}));
     const files:string[]=[];
     for(let from=start;from<end;from+=60) {
       const outputPath=join(directory,`audio-${files.length}.mov`),to=Math.min(end,from+60);
