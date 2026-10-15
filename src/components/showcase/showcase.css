@@ -115,3 +115,4 @@
 }
 @media (prefers-reduced-motion:reduce){.sc-replay-dot,.sc-loading-editor div,.sc-clip{animation:none;transition:none}}
 .sc-cursor.flip span{left:auto;right:6px;border-radius:5px 0 5px 5px}
+@media (max-height:980px) and (min-width:901px){.sc-person{padding:4px 6px}.sc-person small{display:none}.sc-avatar{width:24px;height:24px}.sc-current{margin-top:6px}}
