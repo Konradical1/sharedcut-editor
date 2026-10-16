@@ -38,7 +38,7 @@ export const ACTIONS: Record<string, 'edit' | 'context' | 'hidden' | `job:${stri
   addTransition: 'edit', updateTransition: 'edit', removeTransition: 'edit', expandTransitionAudio: 'edit', applyTransitionAtPlayhead: 'edit',
   addSmartMask: 'edit', updateSmartMask: 'edit', attachSmartMask: 'edit',
   addMotionTracker: 'edit', updateMotionTracker: 'edit', deleteMotionTracker: 'edit', applyMotionTracker: 'edit',
-  addEffect: 'edit', updateEffect: 'edit', reorderEffect: 'edit', addNode: 'edit', removeNode: 'edit', reorderNode: 'edit',
+  addEffect: 'edit', updateEffect: 'edit', reorderEffect: 'edit', denoiseAll: 'job:denoise-all', addNode: 'edit', removeNode: 'edit', reorderNode: 'edit',
   copyGrade: 'context', pasteGrade: 'edit', applyColorAssistant: 'edit', useAcesOutput: 'edit',
   normalizeColorGroup: 'edit', setColorGroup: 'edit', updateColorGroup: 'edit', renameColorGroup: 'edit',
   restoreResolveGrade: 'edit', initializeColorGrade: 'edit', arrangeColorNodes: 'edit', moveColorNode: 'edit', updateNode: 'edit',

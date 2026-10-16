@@ -1,7 +1,8 @@
 import { useSyncExternalStore } from 'react';
 
 /** Per-clip background work (Stabilize, optical flow, Noise Reduction, Smart Mask) so the timeline can show it on the clip itself. */
-export type ClipActivity = { kind: string; status: 'preparing' | 'ready' | 'failed'; progress: number; error?: string };
+/** `whole`: progress across the whole clip (Denoise all), shown before a chunk's around the playhead. */
+export type ClipActivity = { kind: string; status: 'preparing' | 'ready' | 'failed'; progress: number; error?: string; whole?: boolean };
 const activities = new Map<string, Map<string, ClipActivity>>();
 const listeners = new Set<() => void>();
 let version = 0;
@@ -20,7 +21,7 @@ export function clipActivity(clipId: string): ClipActivity | undefined {
   const current = activities.get(clipId);
   if (!current) return undefined;
   const list = [...current.values()];
-  return list.find(a => a.status === 'preparing') ?? list.find(a => a.status === 'failed');
+  return list.find(a => a.status === 'preparing' && a.whole) ?? list.find(a => a.status === 'preparing') ?? list.find(a => a.status === 'failed');
 }
 /** Re-renders whenever any clip's background work changes; the ruler bar reads every clip at once. */
 export function useActivityVersion() {

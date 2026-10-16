@@ -26,7 +26,8 @@ import type { MediaAsset } from '../state/models';
  * 80 Mbit/s — fine across the room, impossible across the internet. Anyone who needs frame-accurate
  * picture on the LAN can still pick one.
  */
-const viewerQuality = (preference: unknown) => preference === 'Quarter resolution' ? '1/4' : preference === 'Half resolution' ? '1/2' : preference === 'Full resolution' ? 'Full' : 'Stream';
+/** The quality a viewer opens at, from Settings; Denoise all renders for it. */
+export const viewerQuality = (preference: unknown) => preference === 'Quarter resolution' ? '1/4' : preference === 'Half resolution' ? '1/2' : preference === 'Full resolution' ? 'Full' : 'Stream';
 
 /** The footage panel re-reads the cache with the timeline's badges (footageRelay): decoder statuses change at every cut. */
 function FootageLoading({ retry }: { retry: () => void }) {

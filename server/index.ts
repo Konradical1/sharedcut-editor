@@ -49,6 +49,7 @@ import { parseCube, validateGradeNode } from '../src/services/color.ts';
 import { smartMaskService, smartMaskCapabilities, resolveSmartMaskArtifact } from './smartMask.ts';
 import { depthCapabilities, depthService } from './depth.ts';
 import { denoiseCapabilities, denoiseQualities, denoiseService, denoiseSettingsOf } from './denoise.ts';
+import { denoiseClipChunks, denoiseEffect, denoiseSettings } from '../src/services/denoise.ts';
 import { validateSmartMask, validateSmartMaskBindings } from '../src/services/smartMask.ts';
 import { motionTrackerCapabilities, motionTrackerService } from './motionTracker.ts';
 import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } from './colorAssistant.ts';
@@ -1822,6 +1823,23 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const chunk = numberField(body.chunk,0,1e6); if (!Number.isInteger(chunk)) fail(400,'Invalid preview chunk.');
           if (!existsSync(originalPath(asset!.id))) fail(409,'Noise Reduction reads the original media, which is not on this server.');
           send(res,200,await denoise.preview({projectId:project.id,clipId:clip.id,input:originalPath(asset!.id),asset:asset!,chunk,quality,view,settings:denoiseSettingsOf(body.settings)})); return;
+        }
+        if (path === '/api/denoise/all') {
+          if (method === 'GET') { const project = requireProject(textField(url.searchParams.get('projectId'),160,true),userId); send(res,200,denoise.allStatus(project.id)); return; }
+          if (method === 'DELETE') { const project = requireProject(textField(url.searchParams.get('projectId'),160,true),userId,true); denoise.stopAll(project.id); send(res,200,denoise.allStatus(project.id)); return; }
+          if (method === 'POST') {
+            const body = await jsonBody(req), project = requireProject(textField(body.projectId,160,true),userId,true), timelineId = textField(body.timelineId,160,true);
+            const quality = textField(body.quality,20,true); if (!denoiseQualities.includes(quality)) fail(400,'Invalid preview quality.');
+            // Every clip of the timeline the viewer would denoise, left to right; optical flow previews instead (denoisePreview.ts).
+            const clips = state.clips.filter(c => c.projectId === project.id && c.timelineId === timelineId && !c.disabled && !c.properties.opticalFlow && denoiseEffect(c) && state.tracks.find(t => t.id === c.trackId)?.kind === 'video').sort((a, b) => a.start - b.start).flatMap(c => {
+              const asset = state.media.find(a => a.id === c.mediaId && a.projectId === project.id);
+              if (asset?.kind !== 'video' || asset.hasAlpha || !(asset.fps > 0) || !existsSync(originalPath(asset.id))) return [];
+              return [{ clipId: c.id, input: originalPath(asset.id), asset, settings: denoiseSettingsOf(denoiseSettings(c, denoiseEffect(c)!)), chunks: denoiseClipChunks(c, asset) }];
+            });
+            if (!clips.length) fail(400,'No clip on this timeline has Noise Reduction to denoise.');
+            const capabilities = await denoiseCapabilities(); if (!capabilities.available) fail(503, capabilities.reason || 'Noise Reduction is not available on this server.');
+            send(res,200,denoise.all({ projectId: project.id, timelineId, quality, clips })); return;
+          }
         }
         const denoiseRoute = /^\/api\/denoise\/([a-f0-9]{64})(?:\/files\/video\.mp4)?$/.exec(path);
         if (denoiseRoute) {

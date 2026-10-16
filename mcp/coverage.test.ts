@@ -69,6 +69,7 @@ export const ROUTES: Record<string, string> = {
   '/api/optical-flow/([a-f0-9]{64})(?:/(video))?': 'no: as /api/optical-flow',
   '/api/denoise/capabilities': 'job:denoise',
   '/api/denoise': 'no: preview chunks only feed browser playback; export bakes from the original',
+  '/api/denoise/all': 'job:denoise-all',
   '/api/denoise/([a-f0-9]{64})(?:/files/video\\.mp4)?': 'no: as /api/denoise',
   '/api/motion-trackers/*': 'job:track',
   '/api/motion-trackers/capabilities': 'job:track',

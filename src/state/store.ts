@@ -137,6 +137,8 @@ export interface EditorStore extends PersistedState {
    *  leaves the panels alone (the Color page adds Noise Reduction in its own panel). */
   addEffect(clipId: string, name: string, reveal?: boolean): void; updateEffect(clipId: string, effectId: string, patch: { enabled?: boolean; amount?: number; parameters?: Record<string, number> } | null, gesture?: string): void; reorderEffect(clipId: string, effectId: string, direction: number): void; addNode(name: string, parameters?: Record<string, number>): void;
   removeNode(id: string): void; reorderNode(id: string, direction: number): void;
+  /** Denoise all: Noise Reduction on, with these settings, on every video clip of the open timeline, as one undo step. Returns how many clips. */
+  denoiseAll(settings: Record<'amount' | 'chroma' | 'frames' | 'spatial' | 'detail', number>): number;
   gradeClipboard: {clip:Clip;nodes:GradeNode[]} | null; copyGrade(clipId:string):void; pasteGrade(clipId:string):void;
   /** Color Assistant proposal as normal node values on every eligible shot: one snapshot, one undo. Returns the number of shots changed. */
   /** Applies look `option` (with each shot's Balance from `result.shots`, when the result has one) or a balance/match result, as one undo step. */
@@ -1619,6 +1621,20 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         keyframes[property.path]=[...keyframes[property.path].filter(k=>Math.abs(k.time-time)>.5/fps),{id:createId('key'),time,value:property.value,interpolation:typeof property.value==='number'?'linear' as const:'hold' as const}].sort((a,b)=>a.time-b.time);
       } else for(const path of Object.keys(keyframes))if(path.startsWith(`effects.${effectId}.`))delete keyframes[path];
       commit('PropertyChanged', clipId, `${patch === null ? 'removed' : 'changed'} ${effect.name} on ${clip.name}`, [{ collection: 'clips', id: clipId, value: { effects, ...(clip.keyframes?{keyframes}:{}), ...(patch?.enabled && clip.properties[`${effect.name}_enabled`] === false ? { [`properties.${effect.name}_enabled`]: true } : {}) } }], gesture);
+    },
+    denoiseAll({ amount, ...parameters }) {
+      const state = get(); if (!writable()) return 0;
+      const changes: Change[] = [];
+      for (const clip of state.clips) {
+        const asset = state.media.find(m => m.id === clip.mediaId), track = state.tracks.find(t => t.id === clip.trackId), existing = clip.effects.find(e => e.name === 'Noise Reduction');
+        if (clip.projectId !== state.projectId || clip.timelineId !== state.timelineId || clip.disabled || track?.kind !== 'video' || track.locked || asset?.kind !== 'video' || asset.hasAlpha) continue;
+        if (!(existing || acceptsEffect(clip, 'video', 'Noise Reduction')) || !editableClip(clip.id, 'effects')) continue;
+        const effect = { ...existing ?? { id: createId('effect'), name: 'Noise Reduction' }, enabled: true, amount: clamp(amount, 0, 100), parameters: { ...existing?.parameters, ...parameters } };
+        changes.push({ collection: 'clips', id: clip.id, value: { effects: existing ? clip.effects.map(e => e === existing ? effect : e) : [...clip.effects, effect], ...clip.properties['Noise Reduction_enabled'] === false ? { 'properties.Noise Reduction_enabled': true } : {} } });
+      }
+      if (!changes.length) { state.notify('No video clips to denoise on this timeline', 'info'); return 0; }
+      commit('EffectAdded', changes[0].id, `added Noise Reduction to ${changes.length} clip${changes.length === 1 ? '' : 's'}`, changes);
+      return changes.length;
     },
     reorderEffect(clipId, effectId, direction) {
       const clip = editableClip(clipId, 'effects'); if (!clip || ![-1, 1].includes(direction)) return;

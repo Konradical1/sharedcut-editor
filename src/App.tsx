@@ -2,7 +2,7 @@ import './components/captions.css';
 import { loadCaptionFonts } from './services/fonts';
 import { lazy, useEffect, useRef, useState, type PointerEvent } from 'react';
 import { MotionConfig } from 'motion/react';
-import { ChevronLeft, ChevronDown, PanelLeft, SlidersHorizontal, Scissors, Palette, AudioLines, ArrowUpRight, History, Camera, Users, MessageSquare, Radio, Settings, Check, Cloud, X, MonitorPlay, NotebookPen } from 'lucide-react';
+import { ChevronLeft, ChevronDown, PanelLeft, SlidersHorizontal, Scissors, Palette, AudioLines, ArrowUpRight, History, Camera, Users, MessageSquare, Radio, Settings, Check, Cloud, X, MonitorPlay, NotebookPen, WandSparkles } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useEditorStore, initializeEditorServices } from './state/store';
 import type { Workspace } from './state/models';
@@ -22,6 +22,7 @@ const ColorWorkspace = lazy(() => import('./workspaces/ColorWorkspace'));
 const AudioWorkspace = lazy(() => import('./workspaces/AudioWorkspace'));
 const DeliverWorkspace = lazy(() => import('./workspaces/DeliverWorkspace'));
 const PlanWorkspace = lazy(() => import('./workspaces/PlanWorkspace'));
+const DenoiseWorkspace = lazy(() => import('./workspaces/DenoiseWorkspace'));
 import { useEditorShortcuts, useFocusRelease } from './shortcuts';
 import { connectSession, signOut, resolveSyncConflict } from './services/sync';
 import { startPlaybackReporting } from './services/playbackHealthStart';
@@ -29,7 +30,7 @@ import { startPlaybackReporting } from './services/playbackHealthStart';
 const MIN_MEDIA_WIDTH=232;
 void loadCaptionFonts();
 
-const workspaceItems: {id:Workspace;name:string;icon:typeof Scissors}[]=[{id:'edit',name:'Edit',icon:Scissors},{id:'color',name:'Color',icon:Palette},{id:'audio',name:'Audio',icon:AudioLines},{id:'deliver',name:'Deliver',icon:ArrowUpRight}];
+const workspaceItems: {id:Workspace;name:string;icon:typeof Scissors}[]=[{id:'edit',name:'Edit',icon:Scissors},{id:'color',name:'Color',icon:Palette},{id:'audio',name:'Audio',icon:AudioLines},{id:'denoise',name:'Denoise',icon:WandSparkles},{id:'deliver',name:'Deliver',icon:ArrowUpRight}];
 function EditorStatus() {
   const ready=useEditorStore(s=>s.media.filter(m=>m.projectId===s.projectId).every(m=>m.status==='ready'));
   const clips=useEditorStore(s=>s.clips.filter(c=>c.timelineId===s.timelineId).length);
@@ -94,7 +95,7 @@ function Editor({onHome}:{onHome:()=>void}) {
         <div className="edit-upper">{mediaVisible&&<><div className="edit-media" style={{width:leftWidth}}><MediaPanel onClose={()=>setMediaVisible(false)}/></div><div role="separator" aria-label="Resize media panel" aria-orientation="vertical" tabIndex={0} className="panel-resizer" onPointerDown={e=>resize(e,'left')} onKeyDown={e=>{if(e.key==='ArrowRight')setLeftWidth(Math.min(420,leftWidth+10));if(e.key==='ArrowLeft')setLeftWidth(Math.max(MIN_MEDIA_WIDTH,leftWidth-10));}}/></>}<Viewer/>{sidePanel&&<><div role="separator" aria-label="Resize side panel" aria-orientation="vertical" tabIndex={0} className="panel-resizer" onPointerDown={e=>resize(e,'right')} onKeyDown={e=>{if(e.key==='ArrowLeft')setRightWidth(Math.min(420,rightWidth+10));if(e.key==='ArrowRight')setRightWidth(Math.max(220,rightWidth-10));}}/><aside className="edit-inspector" style={{width:rightWidth}}>{rightPanel}</aside></>}</div>
         <div role="separator" aria-label="Resize timeline" aria-orientation="horizontal" tabIndex={0} className="panel-resizer horizontal" onPointerDown={e=>resize(e,'vertical')} onKeyDown={e=>{if(e.key==='ArrowUp')setSplit(Math.max(.35,split-.03));if(e.key==='ArrowDown')setSplit(Math.min(.7,split+.03));}}/>
         <Timeline/>
-      </div>:workspace==='color'?<ColorWorkspace/>:workspace==='audio'?<AudioWorkspace/>:workspace==='plan'?<PlanWorkspace/>:<DeliverWorkspace/>}</LazySuspense>
+      </div>:workspace==='color'?<ColorWorkspace/>:workspace==='audio'?<AudioWorkspace/>:workspace==='plan'?<PlanWorkspace/>:workspace==='denoise'?<DenoiseWorkspace/>:<DeliverWorkspace/>}</LazySuspense>
       {workspace!=='edit'&&sidePanel&&sidePanel!=='inspector'&&<aside className="floating-side-panel">{rightPanel}</aside>}
       <RemoteCursors/>
     </main>

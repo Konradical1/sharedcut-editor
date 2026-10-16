@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { execFileSync } from 'node:child_process';
+import { rmSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -107,5 +108,16 @@ test('Noise Reduction: the viewer asks for the chunk under the playhead, plays i
   assert.equal(reversed[0], 1, 'reversed, the playhead starts on the last chunk');
   for (let i = 0; i < 120 && !native.some(key => !chunks.slice(0, 2).includes(key)); i++) await page.waitForTimeout(250);
   assert.ok(native.some(key => !chunks.slice(0, 2).includes(key)), 'the reversed clip\'s chunk is loaded by its video element');
+
+  // The Denoise page: Denoise all sets the page's settings on the clip, and the clip's bar shows the run while it is held.
+  await page.getByRole('button', { name: 'Denoise', exact: true }).click();
+  await page.getByRole('slider', { name: 'Strength' }).fill('60');
+  writeFileSync(join(temp, 'slow'), '');
+  await page.getByRole('button', { name: 'Denoise all', exact: true }).click();
+  await page.locator('[data-clip="shot"] .clip-preparing', { hasText: /^Denoising · \d+%$/ }).waitFor({ timeout: 30000 });
+  rmSync(join(temp, 'slow'));
+  await page.getByRole('status').filter({ hasText: 'Done · 1 of 1 clips · 100%' }).waitFor({ timeout: 60000 });
+  const after = (await (await context.request.get(`${url}/api/state`)).json()).state.clips.find((c: { id: string }) => c.id === 'shot');
+  assert.equal(after.effects.find((e: { name: string }) => e.name === 'Noise Reduction').amount, 60);
   assert.deepEqual(errors, []);
 });

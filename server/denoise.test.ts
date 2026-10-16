@@ -11,7 +11,7 @@ import { promisify } from 'node:util';
 import { bakesWholeClips, denoisesPicture, probeMedia, renderTimeline, run, type RenderRequest } from './media.ts';
 import { denoiseBake, denoiseCapabilities, denoisePixfmt, denoiseService, denoiseSettingsOf } from './denoise.ts';
 import { gpuJob } from './workQueue.ts';
-import { denoiseChunkFrames, denoiseChunkOf, denoiseFrameAt } from '../src/services/denoise.ts';
+import { denoiseChunkFrames, denoiseChunkOf, denoiseClipChunks, denoiseFrameAt } from '../src/services/denoise.ts';
 import { STILL_LIVE } from './previewCache.ts';
 import { useDenoiseStandIn } from './denoise.fixture.ts';
 import type { Clip, MediaAsset, Project, Track } from '../src/state/models.ts';
@@ -38,6 +38,10 @@ test('chunk math, settings and pixel formats', () => {
   assert.equal(next, total);
   for (const i of [0, 119, 120, 121, 500]) assert.equal(denoiseChunkOf(i / fps, fps), Math.floor(i / (2 * fps) + 1e-9));
   assert.equal(denoiseFrameAt(1.5 / 24, 24), 1, 'a tie between two frames takes the earlier one');
+  // Denoise all asks for the chunks a clip shows: its source span at its speed, one for a freeze, never past the source.
+  const shows = (sourceIn: number, length: number, properties: Record<string, unknown> = {}) => denoiseClipChunks({ sourceIn, duration: length, properties } as never, { fps: 24, duration: 9 });
+  assert.deepEqual(shows(0, 2), [0]); assert.deepEqual(shows(1, 2), [0, 1]); assert.deepEqual(shows(3, 2, { speed: 200 }), [1, 2, 3]);
+  assert.deepEqual(shows(5, 4, { freeze: true }), [2]); assert.deepEqual(shows(0, 30), [0, 1, 2, 3, 4]);
   assert.deepEqual(['yuv420p', 'p010le', 'yuvj420p', 'yuv422p10le', 'v210', 'yuv444p12le', 'gbrp10le', 'yuva444p10le'].map(denoisePixfmt), ['yuv420p16le', 'yuv420p16le', 'yuv420p16le', 'yuv422p16le', 'yuv422p16le', 'yuv444p16le', 'yuv444p16le', 'yuv444p16le']);
   assert.deepEqual(denoiseSettingsOf({ ...settings, amount: 50.0000004 }), settings);
   assert.throws(() => denoiseSettingsOf({ ...settings, frames: 1.5 }), /Frames must be between 0 and 3/);
@@ -113,6 +117,32 @@ test('preview chunks: proxy size and encode per quality, cache hits, stale gener
     service.stopIdle();
     await ready(1, 'Full');
     assert.equal(readFileSync(path.join(dir, 'serve.log'), 'utf8').split('\n').length - 1, 2);
+  } finally { await service.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('Denoise all prepares every chunk of each clip in turn, reports per-clip progress and stops on request', { timeout: 120000 }, async () => {
+  const dir = await setup(), service = denoiseService(path.join(dir, 'data'));
+  try {
+    const source = path.join(dir, 'source.mov');
+    await exec(ffmpeg, ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=320x180:r=24:d=5', '-c:v', 'prores_ks', '-profile:v', '3', '-pix_fmt', 'yuv422p10le', source]);
+    const asset = { id: 'a', kind: 'video', fps: 24, frameRate: '24/1', duration: 5, colorMatrix: 'bt709', colorRange: 'tv' } as MediaAsset;
+    const item = (clipId: string, chunks: number[]) => ({ clipId, input: source, asset, settings, chunks });
+    assert.equal(service.allStatus('p').status, 'none');
+    service.all({ projectId: 'p', timelineId: 't', quality: '1/4', clips: [item('one', [0, 1]), item('two', [2])] });
+    await until(() => service.allStatus('p').status === 'done');
+    assert.deepEqual(service.allStatus('p').clips, { one: { done: 2, total: 2 }, two: { done: 1, total: 1 } });
+    // Its chunks are the viewer's: asking for one again is a cache hit.
+    assert.equal((await service.preview({ projectId: 'p', clipId: 'one', input: source, asset, chunk: 1, quality: '1/4', view: 'denoised', settings })).status, 'ready');
+    // Stop: the held chunk is cancelled, the clip never finishes, and the run says stopped.
+    writeFileSync(path.join(dir, 'slow'), '');
+    const before = jobsRun(dir).length;
+    service.all({ projectId: 'p', timelineId: 't', quality: 'Stream', clips: [item('one', [0, 1])] });
+    await until(() => jobsRun(dir).length > before);
+    service.stopAll('p');
+    rmSync(path.join(dir, 'slow'));
+    assert.equal(service.allStatus('p').status, 'stopped');
+    assert.deepEqual(service.allStatus('p').clips.one, { done: 0, total: 2 });
+    assert.throws(() => service.all({ projectId: 'p', timelineId: 't', quality: 'Huge', clips: [] }), /Invalid preview quality/);
   } finally { await service.close(); await rm(dir, { recursive: true, force: true }); }
 });
 

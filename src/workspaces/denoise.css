@@ -1,0 +1,15 @@
+.denoise-workspace { height: 100%; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 300px; grid-template-rows: minmax(0, 1.1fr) minmax(0, 1fr); gap: 7px; padding: 7px; overflow: hidden; }
+.denoise-viewer { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.denoise-viewer > .viewer { flex: 1; min-height: 0; }
+.denoise-panel { min-height: 0; display: flex; flex-direction: column; }
+.denoise-body { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 10px 12px; }
+.denoise-setting { display: grid; grid-template-columns: 62px minmax(0, 1fr) 40px; align-items: center; gap: 8px; font-size: 10px; color: #a1b6c1; }
+.denoise-setting b { font-weight: 500; text-align: right; color: var(--text); }
+.denoise-actions { display: flex; gap: 6px; }
+.denoise-actions .button { flex: 1; justify-content: center; }
+.denoise-summary { font-size: 10px; color: #a1b6c1; }
+.denoise-timeline { grid-column: 1 / -1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.denoise-timeline > .timeline { flex: 1; min-height: 0; }
+@media (max-width: 760px) {
+  .denoise-workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto minmax(0, 1fr); padding: 4px 0; }
+}

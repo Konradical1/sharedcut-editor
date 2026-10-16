@@ -15,7 +15,7 @@ import { renameWithRetry, venvPython } from './platform.ts';
 import { depthDiskFloor } from './depth.ts';
 import { trimFlowCache } from './opticalFlow.ts';
 import { decodeAccel, previewEncode } from './media.ts';
-import { denoiseChunkFrames, denoiseKeys, type DenoisePreview, type DenoiseSettings, type DenoiseView } from '../src/services/denoise.ts';
+import { denoiseChunkFrames, denoiseKeys, type DenoiseAllStatus, type DenoisePreview, type DenoiseSettings, type DenoiseView } from '../src/services/denoise.ts';
 import { effectDefinitions } from '../src/services/effects.ts';
 import { isHdrTransfer } from '../src/services/color.ts';
 import type { MediaAsset } from '../src/state/models.ts';
@@ -162,7 +162,9 @@ const RECIPE: Record<string, 'full' | 'stream' | 'low'> = { Full: 'full', Color:
 export const denoiseQualities = Object.keys(RECIPE);
 /** FFmpeg's `w='min(n,iw)':h=-2`: never wider than `max`, the height rounded to an even number. */
 const fit = ([width, height]: number[], max: number) => width <= max ? [width, Math.round(height / 2) * 2] : [max, Math.round(height * max / width / 2) * 2];
-type Job = DenoisePreview & { projectId: string; clipId: string; generation: string; controller: AbortController; failedAt?: number };
+type Job = DenoisePreview & { projectId: string; clipId: string; generation: string; controller: AbortController; failedAt?: number; settled?: Promise<unknown> };
+/** A Denoise all run: `keys` are its finished chunks, which the preview trim keeps. */
+type Batch = DenoiseAllStatus & { controller: AbortController; keys: Set<string>; current?: string };
 type Pending = { resolve: (result: Record<string, unknown>) => void; reject: (error: Error) => void; message: (message: Record<string, unknown>) => void };
 type Resident = { child: ChildProcess; ready: Promise<string>; pending: Map<string, Pending>; idle?: ReturnType<typeof setTimeout> };
 
@@ -171,7 +173,7 @@ type Resident = { child: ChildProcess; ready: Promise<string>; pending: Map<stri
 export function denoiseService(directory: string, options: { freeGpu?: () => void } = {}) {
   const chunks = join(directory, 'chunks'), profiles = join(directory, 'profiles');
   for (const folder of [chunks, profiles, join(directory, 'exports')]) { mkdirSync(folder, { recursive: true, mode: 0o700 }); void sweep(folder); }
-  const jobs = new Map<string, Job>();
+  const jobs = new Map<string, Job>(), batches = new Map<string, Batch>();
   let resident: Resident | undefined, closed = false;
   const stop = (reason: string) => {
     const current = resident; if (!current) return; resident = undefined;
@@ -236,9 +238,9 @@ export function denoiseService(directory: string, options: { freeGpu?: () => voi
       if (resident === current && !current.pending.size) { clearTimeout(current.idle); current.idle = setTimeout(() => { if (!current.pending.size) stop('Idle.'); }, IDLE_MS); current.idle.unref(); }
     }
   };
-  const view = ({ controller, projectId, clipId, generation, failedAt, ...preview }: Job): DenoisePreview => preview;
+  const view = ({ controller, projectId, clipId, generation, failedAt, settled, ...preview }: Job): DenoisePreview => preview;
   const owned = (projectId: string, key: string) => { const job = jobs.get(key); if (!job || job.projectId !== projectId) fail(404, 'Noise Reduction preview not found. Prepare it again.'); return job!; };
-  return {
+  const service = {
     /** The chunk of source frames holding `chunk`, denoised at the size and encode of the file `quality` plays. A cache hit is
      *  ready at once; otherwise it is queued for the GPU and reported as preparing until it is. */
     async preview(o: { projectId: string; clipId: string; input: string; asset: MediaAsset; chunk: number; quality: string; view: DenoiseView; settings: DenoiseSettings }): Promise<DenoisePreview> {
@@ -273,7 +275,7 @@ export function denoiseService(directory: string, options: { freeGpu?: () => voi
         const current: Job = job = { ...base, status: 'preparing', progress: 0, stage: 'queued', controller: new AbortController() }, signal = current.controller.signal;
         jobs.set(key, current);
         for (const [old, record] of jobs) { if (jobs.size <= 256) break; if (record.status !== 'preparing') jobs.delete(old); }
-        void gpuJob(() => heavyJob(async () => {
+        current.settled = gpuJob(() => heavyJob(async () => {
           if (capabilities.device === 'cuda') options.freeGpu?.();
           const temp = await mkdtemp(join(chunks, '.denoise-'));
           try {
@@ -289,7 +291,8 @@ export function denoiseService(directory: string, options: { freeGpu?: () => voi
             await renameWithRetry(out, file);
           } finally { await removeTemp(temp); }
           Object.assign(current, { status: 'ready', progress: 100, stage: undefined, url });
-          const keep = new Set([...jobs.values()].filter(j => j.status === 'preparing').map(j => j.key).concat(key));
+          // ponytail: a Denoise all keeps its whole timeline's chunks past the 4 GB cap; check disk first if timelines get long.
+          const keep = new Set([...jobs.values()].filter(j => j.status === 'preparing').map(j => j.key).concat(key, ...[...batches.values()].flatMap(b => [...b.keys])));
           await trimFlowCache(chunks, keep, gigabytes('FRAME_LINE_DENOISE_PREVIEW_GB', 4)).catch(error => console.error('Noise Reduction cache trim failed:', error));
         }, signal), signal).catch(error => Object.assign(current, { status: 'failed', failedAt: Date.now(), error: signal.aborted ? 'Cancelled.' : (error as Error).message }));
       }
@@ -301,6 +304,48 @@ export function denoiseService(directory: string, options: { freeGpu?: () => voi
     cancel(projectId: string, key: string) { const job = owned(projectId, key); if (job.status === 'ready') return; job.controller.abort(); jobs.delete(key); },
     /** Depth, Smart Mask or an export bake is about to take the GPU: an idle preview worker gives its memory back. */
     stopIdle() { if (resident && !resident.pending.size) stop('Stopped to free the GPU.'); },
-    async close() { closed = true; for (const job of jobs.values()) job.controller.abort(); stop('The server is stopping.'); },
+    /** Denoise all: every chunk of `clips` at one quality, one chunk at a time so viewers' own chunks queue beside it. One run per
+     *  project; a new one replaces it. A chunk a viewer cancelled (a scrub) is asked again; a failed clip stops at its error. */
+    all(o: { projectId: string; timelineId: string; quality: string; clips: { clipId: string; input: string; asset: MediaAsset; settings: DenoiseSettings; chunks: number[] }[] }): DenoiseAllStatus {
+      if (closed) fail(503, 'The server is stopping.');
+      if (!RECIPE[o.quality]) fail(400, 'Invalid preview quality.');
+      service.stopAll(o.projectId);
+      const batch: Batch = { status: 'running', timelineId: o.timelineId, quality: o.quality, controller: new AbortController(), keys: new Set(), clips: Object.fromEntries(o.clips.map(c => [c.clipId, { done: 0, total: c.chunks.length }])) };
+      batches.set(o.projectId, batch);
+      const signal = batch.controller.signal;
+      const one = async (item: typeof o.clips[number], chunk: number) => {
+        for (let cancelled = 0; ;) {
+          if (signal.aborted) return 'Stopped.';
+          let answer: DenoisePreview;
+          try { answer = await service.preview({ projectId: o.projectId, clipId: item.clipId, input: item.input, asset: item.asset, chunk, quality: o.quality, view: 'denoised', settings: item.settings }); }
+          catch (error) { if ((error as DenoiseError).status !== 429) return (error as Error).message; await new Promise(r => setTimeout(r, 1000)); continue; }
+          batch.current = answer.key;
+          if (answer.status === 'preparing') await jobs.get(answer.key)?.settled;
+          if (regularFile(join(chunks, `${answer.key}.mp4`))) { batch.keys.add(answer.key); return; }
+          const job = jobs.get(answer.key);
+          if (job?.status === 'failed' && job.error !== 'Cancelled.') return job.error ?? 'Noise Reduction failed.';
+          if (++cancelled > 3) return 'Cancelled: the clip changed while it was denoising.';
+        }
+      };
+      void (async () => {
+        for (const item of o.clips) for (const chunk of item.chunks) {
+          const error = await one(item, chunk);
+          if (signal.aborted) return;
+          if (error) { batch.clips[item.clipId].error = error; break; }
+          batch.clips[item.clipId].done++;
+        }
+        batch.status = 'done';
+      })();
+      return service.allStatus(o.projectId);
+    },
+    allStatus(projectId: string): DenoiseAllStatus { const b = batches.get(projectId); return b ? { status: b.status, timelineId: b.timelineId, quality: b.quality, clips: b.clips } : { status: 'none', clips: {} }; },
+    /** Stops the run and the chunk it was waiting for; finished chunks stay. */
+    stopAll(projectId: string) {
+      const b = batches.get(projectId); if (b?.status !== 'running') return;
+      b.status = 'stopped'; b.controller.abort();
+      const job = jobs.get(b.current ?? ''); if (job?.status === 'preparing') job.controller.abort();
+    },
+    async close() { closed = true; for (const b of batches.values()) b.controller.abort(); for (const job of jobs.values()) job.controller.abort(); stop('The server is stopping.'); },
   };
+  return service;
 }

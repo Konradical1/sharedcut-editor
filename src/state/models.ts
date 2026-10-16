@@ -1,5 +1,5 @@
 /** `plan` is the tucked-away pre-production workspace (script, shot list, mood board); it is not in the workspace nav. */
-export type Workspace = 'edit' | 'color' | 'audio' | 'deliver' | 'plan';
+export type Workspace = 'edit' | 'color' | 'audio' | 'denoise' | 'deliver' | 'plan';
 export type Role = 'Owner' | 'Editor' | 'Commenter' | 'Viewer';
 /** `guest`: a name-only sign-in from sharedcut.com/importer. It can import Final Cut projects and nothing else until it saves its account. */
 export interface User { id: string; name: string; email: string; initials: string; color: string; guest?: boolean }
