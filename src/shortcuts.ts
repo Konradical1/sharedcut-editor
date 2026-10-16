@@ -1,7 +1,7 @@
 import { useEffect, type Dispatch, type SetStateAction } from 'react';
 import { useEditorStore } from './state/store';
 import { fieldOwnsKey, typingSurface } from './services/focus';
-export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + Shift + Z, Ctrl + Y','Redo what I undid'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + X','Cut selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['⌘ / Ctrl + Shift + V','Paste and push later clips right (insert)'], ['⌘ / Ctrl + drop','Insert media instead of overwriting'], [', / .','Insert / overwrite the selected bin media at the playhead'], ['I / O','Mark In / Out'], ['V / B / A','Selection / blade / select forward tool'], ['R / E / Y / U','Ripple trim / roll / slip / slide tool'], ['J / K / L','Play backward / stop / play forward (press again for 2×, 4×, 8×)'], ['K + J / K + L','Step one frame back / forward'], ['F','Match frame: show the clip’s media in the bin'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['M','Add marker at playhead'], ['Right-click ruler','Add marker here, paste markers'], ['Delete','Delete selected clip'], ['Shift + Delete','Ripple delete: delete and close the gap'] ];
+export const shortcuts = [ ['Space','Play / pause'], ['← / →','Previous / next frame'], ['⌘ / Ctrl + Z','Undo my eligible action'], ['⌘ / Ctrl + Shift + Z, Ctrl + Y','Redo what I undid'], ['⌘ / Ctrl + S','Save snapshot'], ['⌘ / Ctrl + B','Split selected at playhead'], ['⌘ / Ctrl + C','Copy selected clip'], ['⌘ / Ctrl + X','Cut selected clip'], ['⌘ / Ctrl + V','Paste clip at playhead'], ['⌘ / Ctrl + Shift + V','Paste and push later clips right (insert)'], ['⌘ / Ctrl + drop','Insert media instead of overwriting'], [', / .','Insert / overwrite the selected bin media at the playhead'], ['I / O','Mark In / Out'], ['V / B / A','Selection / blade / select forward tool'], ['R / E / Y / U','Ripple trim / roll / slip / slide tool'], ['J / K / L','Play backward / stop / play forward (press again for 2×, 4×, 8×)'], ['K + J / K + L','Step one frame back / forward'], ['F','Match frame: show the clip’s media in the bin'], ['T','Draw text box'], ['S / P','Shape / pen tool'], ['Shift + click / drag','Select clips or keyframes'], ['N','Toggle snapping'], ['M','Add marker at playhead'], ['Right-click ruler','Add marker here, paste markers'], ['Delete','Delete selected clip'], ['Shift + Delete','Ripple delete: delete and close the gap'], ['Enter','Script: next element'], ['Shift + Enter','Script: line break'], ['Tab / Shift + Tab','Script: change element'], ['Backspace at line start','Script: join with the line above'], ['Space + drag','Board: pan'], ['Shift + drag','Board: select an area'], ['⌘ / Ctrl + D','Board: duplicate the selected cards'], ['Arrows / Shift + arrows','Board: nudge cards 1 / 10 px'], ['⌘ / Ctrl + wheel or pinch','Board: zoom'] ];
 /** A click is an action, not a focus grab. Editing apps keep the keyboard on the app, so Space plays
  *  instead of replaying the last button touched — and nothing sits there wearing a focus ring. */
 export function useFocusRelease() {
@@ -10,7 +10,8 @@ export function useFocusRelease() {
       const target=event.target as Element|null;
       // A native dropdown owns its popup: blurring it closes the menu before you can pick.
       // Space is still safe over one — the handler below cancels the key before the popup opens.
-      if(typingSurface(target)||target?.closest('label,select,[role="combobox"],[aria-haspopup]'))return;
+      // [data-keep-focus]: toolbar buttons beside a text field (the script's element picker) act on it without taking its caret.
+      if(typingSurface(target)||target?.closest('label,select,[role="combobox"],[aria-haspopup],[data-keep-focus]'))return;
       const active=document.activeElement;
       // Keep timeline lanes focused so selected gaps receive Delete.
       if(active instanceof HTMLElement&&(typingSurface(active)||active.matches('button,input,select')))active.blur();
@@ -60,6 +61,8 @@ export function useEditorShortcuts(enabled: boolean) {
       if(e.defaultPrevented)return;
       if(fieldOwnsKey(target,e.key))return;
       const s=useEditorStore.getState();const command=e.metaKey||e.ctrlKey;
+      // Plan has no clips, bins or playhead on screen: only undo, redo and the snapshot stay, so Delete or Space never act out of sight.
+      if(s.workspace==='plan'&&!(command&&['s','z','y'].includes(e.key.toLowerCase())))return;
       if(s.workspace==='color'&&command&&['c','v'].includes(e.key.toLowerCase())){e.preventDefault();if(s.selectedClipId){if(e.key.toLowerCase()==='c')s.copyGrade(s.selectedClipId);else s.pasteGrade(s.selectedClipId);}return;}
       if(s.workspace==='color'&&((command&&e.key.toLowerCase()==='d')||e.key==='Backspace'||e.key==='Delete')){e.preventDefault();const node=s.nodes.find(n=>n.id===s.selectedNodeId&&n.clipId===s.selectedClipId);if(node){if(command)s.updateNode(node.id,{enabled:!node.enabled});else s.removeNode(node.id);}return;}
       // Selected markers own Delete and ⌘C; copied markers own ⌘V until a clip is copied.

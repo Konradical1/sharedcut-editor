@@ -130,3 +130,13 @@ test('at places the media on the timeline once ready, at the length the server p
   assert.deepEqual([placed?.trackId, placed?.start, placed?.duration], ['v1', 4, 12.5]);
   await assert.rejects(jobs.upload.start({ paths: [tmpdir()], at: -1 }), /at is seconds/);
 });
+
+test('a fixed bin is found by name before any media sits in it: link{bin:"Mood board"} files into board, no stray bin', async () => {
+  saved = { ...saved, media: saved.media.filter((m: any) => m.id !== ID) }; revision++;
+  const bins = saved.projects.find((p: any) => p.id === projectId).bins;
+  const started = await jobs.link.start({ url: 'https://youtu.be/dQw4w9WgXcQ', bin: 'Mood board' });
+  assert.ok(isPoller(started));
+  await started.poll();
+  assert.deepEqual(saved.projects.find((p: any) => p.id === projectId).bins, bins, 'no bin was created');
+  assert.equal(row().binId, 'board');
+});

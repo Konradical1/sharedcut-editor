@@ -11,9 +11,10 @@ import { isAdjustment } from '../src/services/adjustment.ts';
 import { isCaption } from '../src/services/captions.ts';
 import { transitionName, transitionDuration } from '../src/services/transitions.ts';
 import { markersOf } from '../src/services/timeline.ts';
+import { takesIndex } from '../src/services/shots.ts';
 import type { PersistedState } from '../src/services/index.ts';
 
-const COLLECTIONS = ['projects', 'media', 'timelines', 'tracks', 'clips', 'nodes', 'comments', 'snapshots', 'renderJobs', 'operations', 'users'] as const;
+const COLLECTIONS = ['projects', 'media', 'timelines', 'tracks', 'clips', 'nodes', 'comments', 'snapshots', 'renderJobs', 'operations', 'users', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const;
 
 const LONG = /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{16,}/i;
 /** An id's uuid (or long hash) prints as its first 8 characters plus whatever follows it: `clip-3fa9c1d2-…` is
@@ -72,7 +73,7 @@ export function clock(t: number) {
   const m = Math.floor(t / 60), s = t - m * 60;
   return `${m}:${s < 10 ? '0' : ''}${(Math.round(s * 100) / 100).toFixed(2)}`;
 }
-const quote = (text: string, max = 40) => JSON.stringify(text.length > max ? text.slice(0, max - 1) + '…' : text);
+export const quote = (text: string, max = 40) => JSON.stringify(text.length > max ? text.slice(0, max - 1) + '…' : text);
 const ago = (ms: number) => { const m = Math.round((Date.now() - ms) / 60_000); return m < 60 ? `${m}m` : m < 2880 ? `${Math.round(m / 60)}h` : `${Math.round(m / 1440)}d`; };
 
 export function projectsView(s: EditorStore) {
@@ -154,7 +155,10 @@ export function mediaView(s: EditorStore, filter = '') {
   if (!project) return 'No project open.';
   const bins = projectBins(project, s.media), want = filter.toLowerCase();
   const items = s.media.filter(m => m.projectId === project.id && (!want || m.name.toLowerCase().includes(want) || m.binId === filter || handle(m.binId) === filter));
-  const rows = items.map(m => `${handle(m.id)} ${m.kind} ${quote(m.name, 50)} ${clock(m.duration)}${m.kind !== 'audio' ? ` ${m.resolution.replace(/ /g, '')}` : ''}${m.fps ? ` ${m.fps}fps` : ''} bin:${handle(m.binId)}${m.status === 'ready' ? '' : ` [${m.status}${m.progress ? ` ${Math.round(m.progress)}%` : ''}${m.error ? `: ${m.error}` : ''}]`}${m.hasAudio === false && m.kind === 'video' ? ' no-audio' : ''}${m.camera ? ` · ${m.camera}` : ''}`);
+  // A take of a shot-list row (named for it or linked by hand) says which shot.
+  const shots = s.shots.filter(x => x.projectId === project.id), takes = shots.length ? takesIndex(shots, s.media) : new Map<string, string>();
+  const shotOf = (id: string) => { const shot = shots.find(x => x.id === takes.get(id)); return shot ? ` · shot ${shot.number} ${handle(shot.id)}` : ''; };
+  const rows = items.map(m => `${handle(m.id)} ${m.kind} ${quote(m.name, 50)} ${clock(m.duration)}${m.kind !== 'audio' ? ` ${m.resolution.replace(/ /g, '')}` : ''}${m.fps ? ` ${m.fps}fps` : ''} bin:${handle(m.binId)}${m.status === 'ready' ? '' : ` [${m.status}${m.progress ? ` ${Math.round(m.progress)}%` : ''}${m.error ? `: ${m.error}` : ''}]`}${m.hasAudio === false && m.kind === 'video' ? ' no-audio' : ''}${m.camera ? ` · ${m.camera}` : ''}${shotOf(m.id)}`);
   return `bins: ${bins.map(b => `${handle(b.id)}(${quote(b.name, 20)})`).join(' ')}\n${rows.join('\n') || 'No media in this project.'}`;
 }
 
@@ -183,16 +187,19 @@ export function entityView(id: string, s: EditorStore, path?: string, full = fal
 /** What one tool call changed, from the persisted state before and after. */
 export function changeSummary(before: PersistedState, after: PersistedState, s: EditorStore, own?: Set<string>) {
   const lines: string[] = [];
-  for (const key of ['projects', 'timelines', 'tracks', 'clips', 'nodes', 'comments', 'media', 'snapshots', 'renderJobs'] as const) {
+  for (const key of ['projects', 'timelines', 'tracks', 'clips', 'nodes', 'comments', 'media', 'snapshots', 'renderJobs', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const) {
     const was = new Map((before[key] as { id: string }[]).map(i => [i.id, i])), now = new Map((after[key] as { id: string }[]).map(i => [i.id, i]));
-    const label = key === 'renderJobs' ? 'export' : key.replace(/s$/, '');
+    const label = key === 'renderJobs' ? 'export' : key === 'scriptBlocks' ? 'script line' : key === 'boardItems' ? 'board card' : key.replace(/s$/, '');
+    // What names it: a script line by kind and text, a shot by number, a card by kind and its text or color.
+    const brief = (item: any) => key === 'scriptBlocks' ? `${item.kind.toUpperCase()} ${quote(item.text, 40)}` : key === 'shots' ? `${item.number}${item.text ? ` ${quote(item.text, 40)}` : ''}`
+      : key === 'boardItems' ? `${item.kind}${item.text ? ` ${quote(item.text, 40)}` : item.color ? ` ${item.color}` : item.mediaId ? ` ${handle(item.mediaId)}` : ''}` : quote(item.name ?? item.text ?? '', 40);
     const line = (item: any) => {
-      if (key !== 'clips') return `${handle(item.id)} ${quote(item.name ?? item.text ?? '', 40)}`;
+      if (key !== 'clips') return `${handle(item.id)} ${brief(item)}`;
       const track = s.tracks.find(t => t.id === item.trackId);
       return `${track ? `${trackName(track)} ` : ''}${clipLine(item, s)}`;
     };
     for (const [id, item] of now) if (!was.has(id)) lines.push(`+ ${label} ${line(item)}`);
-    for (const [id, item] of was) if (!now.has(id)) lines.push(`- ${label} ${handle(id)} ${quote((item as any).name ?? (item as any).text ?? '', 40)}`);
+    for (const [id, item] of was) if (!now.has(id)) lines.push(`- ${label} ${handle(id)} ${brief(item)}`);
     for (const [id, item] of now) {
       const old = was.get(id) as Record<string, unknown> | undefined;
       if (!old || old === item || JSON.stringify(old) === JSON.stringify(item)) continue;

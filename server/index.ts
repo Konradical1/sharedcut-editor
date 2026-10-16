@@ -25,6 +25,7 @@ import { flowWorker, flowEngineLabel, flowIdentity, renderOpticalFlow, trimFlowC
 import { normalizeSettings, pickStabilizeJob, stabilizeCapabilities, stabilizeSolve, trimStabilizeCache } from './stabilize.ts';
 import { stabilizeEffect, stabilizeRange, stabilizeSettings, type StabilizePreview } from '../src/services/stabilize.ts';
 import { presenceCursor } from '../src/services/presence.ts';
+import { BOARD_ITEM_KINDS, HEX_COLOR, PLAN_LIMITS, PLAN_TABS, SCRIPT_BLOCK_KINDS, SCRIPT_FORMATS } from '../src/services/plan.ts';
 import { fontLibrary } from './fonts.ts';
 import { transitionLibrary } from './transitions.ts';
 import { transitionPresetId, timelineTransitions, transitionDefinitions, isLeakMedia, leakIdOf, validateTransition } from '../src/services/transitions.ts';
@@ -63,7 +64,9 @@ type Collection = typeof COLLECTIONS[number];
 type Asset = MediaAsset & { sourceUrl?: string; proxyUrl?: string; waveform?: unknown; hasAudio?: boolean; error?: string };
 type Account = { user: User; hash: string; salt: string; settings: PersistedState['settings'] };
 type Entry = Record<string, any>;
-const emptyState = (): PersistedState => ({ projects: [], media: [], timelines: [], clips: [], tracks: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], users: [], currentUserId: '', settings: { ...DEFAULT_SETTINGS } });
+const emptyState = (): PersistedState => ({ projects: [], media: [], timelines: [], clips: [], tracks: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], scripts: [], scriptBlocks: [], shots: [], boardItems: [], users: [], currentUserId: '', settings: { ...DEFAULT_SETTINGS } });
+// Lists whose entries carry their own projectId: each account's view filters these, and a project's backup and removal cover them.
+const PROJECT_LISTS = ['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const;
 const idIsValid = (id: unknown): id is string => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id);
 const BIN_ID = /^[A-Za-z0-9 _-]{1,64}$/;
 // What a guest (the importer's name-only sign-in) may call, as "METHOD /path": import Final Cut projects and send their footage.
@@ -336,7 +339,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const lockable = (targetId: string, projectId: string) =>
     state.projects.some(item => item.id === targetId && item.id === projectId) ||
     state.tracks.some(item => item.id === targetId && state.timelines.some(timeline => timeline.id === item.timelineId && timeline.projectId === projectId)) ||
-    (['timelines', 'clips', 'nodes', 'comments', 'media'] as const).some(key => (state[key] as Entry[]).some(item => item.id === targetId && item.projectId === projectId));
+    (['timelines', 'clips', 'nodes', 'comments', 'media', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const).some(key => (state[key] as Entry[]).some(item => item.id === targetId && item.projectId === projectId));
   // An account's view keeps its filtered lists while the list and the visible projects are unchanged,
   // so views share arrays with the state and a delta skips every collection nobody touched.
   const viewLists = new Map<string, { scope: string; lists: Map<string, { source: readonly Entry[]; dependency?: unknown; list: readonly Entry[] }> }>();
@@ -358,7 +361,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const known = [...new Set([userId, ...projects.flatMap(project => project.members.map(member => member.userId))])].sort().join('\n');
     let shown = memo!.lists.get('users');
     if (shown?.source !== allUsers || shown.dependency !== known) { const keep = new Set(known.split('\n')); memo!.lists.set('users', shown = { source: allUsers, dependency: known, list: allUsers.filter(user => !user.guest || keep.has(user.id)).map(user => keep.has(user.id) && !user.guest ? user : { ...user, email: '' }) }); }
-    return { revision, lockRevision, serverStartedAt, state: { ...state, projects, timelines, tracks: pick('tracks', state.tracks, item => timelineIds.has(item.timelineId), timelines), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, pick(key, state[key as Collection] as Entry[], item => ids.has(item.projectId))])), users: shown.list as User[], currentUserId: userId, settings: account.settings }, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
+    return { revision, lockRevision, serverStartedAt, state: { ...state, projects, timelines, tracks: pick('tracks', state.tracks, item => timelineIds.has(item.timelineId), timelines), ...Object.fromEntries(PROJECT_LISTS.map(key => [key, pick(key, state[key] as Entry[], item => ids.has(item.projectId))])), users: shown.list as User[], currentUserId: userId, settings: account.settings }, presence: visiblePresence().filter(item => ids.has(item.projectId)), locks: [...locks.values()].filter(item => ids.has(item.projectId)) };
   };
   // ponytail: sixteen recent views per account, 32 accounts; older clients recover with a full snapshot.
   // The views share their entities with the state, so each costs a few arrays of references.
@@ -484,11 +487,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const maskPreviews = new Set<string>();
   const projectBundle = (project: Project) => {
     const timelines = state.timelines.filter(item => item.projectId === project.id), timelineIds = new Set(timelines.map(item => item.id));
-    return { projects: [project], timelines, tracks: state.tracks.filter(item => timelineIds.has(item.timelineId)), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, (state[key as Collection] as Entry[]).filter(item => item.projectId === project.id)])) } as unknown as Record<Collection, Entry[]>;
+    return { projects: [project], timelines, tracks: state.tracks.filter(item => timelineIds.has(item.timelineId)), ...Object.fromEntries(PROJECT_LISTS.map(key => [key, (state[key] as Entry[]).filter(item => item.projectId === project.id)])) } as unknown as Record<Collection, Entry[]>;
   };
   const removeProject = (projectId: string) => {
     const timelineIds = new Set(state.timelines.filter(item => item.projectId === projectId).map(item => item.id));
-    state = { ...state, projects: state.projects.filter(item => item.id !== projectId), timelines: state.timelines.filter(item => item.projectId !== projectId), tracks: state.tracks.filter(item => !timelineIds.has(item.timelineId)), ...Object.fromEntries(['media', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'].map(key => [key, (state[key as Collection] as Entry[]).filter(item => item.projectId !== projectId)])) };
+    state = { ...state, projects: state.projects.filter(item => item.id !== projectId), timelines: state.timelines.filter(item => item.projectId !== projectId), tracks: state.tracks.filter(item => !timelineIds.has(item.timelineId)), ...Object.fromEntries(PROJECT_LISTS.map(key => [key, (state[key] as Entry[]).filter(item => item.projectId !== projectId)])) };
   };
   const backupProject = (id: string, ownerId: string, expiresAt: number, backup: Record<Collection, Entry[]>) => db.prepare('INSERT INTO deleted_projects(id,ownerId,expiresAt,data) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET ownerId=excluded.ownerId,expiresAt=excluded.expiresAt,data=excluded.data').run(id, ownerId, expiresAt, JSON.stringify(backup));
   /** An id a deleted project still holds: reusing it would bring the deleted copy's media ids back. */
@@ -734,6 +737,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     comments: { id: 'string', projectId: 'string', userId: 'string', text: 'string', timestamp: 'number', time: 'number', resolved: 'boolean', replies: 'array' },
     operations: { id: 'string', projectId: 'string', userId: 'string', timestamp: 'number', targetId: 'string', type: 'string', description: 'string', oldState: 'array', newState: 'array' },
     snapshots: { id: 'string', projectId: 'string', name: 'string', note: 'string', userId: 'string', timestamp: 'number', state: 'object' },
+    scripts: { id: 'string', projectId: 'string', name: 'string', format: 'string', order: 'number', modifiedAt: 'number' },
+    scriptBlocks: { id: 'string', projectId: 'string', scriptId: 'string', kind: 'string', text: 'string', order: 'number', modifiedAt: 'number' },
+    shots: { id: 'string', projectId: 'string', number: 'string', text: 'string', order: 'number', modifiedAt: 'number' },
+    boardItems: { id: 'string', projectId: 'string', kind: 'string', x: 'number', y: 'number', w: 'number', h: 'number', z: 'number', modifiedAt: 'number' },
   };
   // Entities the server already holds arrive as its own frozen objects (a delta leaves them alone; a PUT
   // gets them back through shareState). They were validated when accepted, so only new ones are checked.
@@ -765,8 +772,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
       if (key === 'nodes') {for (const value of Object.values(item.parameters)) numberField(value);try{validateGradeNode(item);}catch(error){fail(400,(error as Error).message);}}
       if (key === 'comments') { textField(item.text, 5000, true); if (item.range !== undefined && (!Array.isArray(item.range) || item.range.length !== 2 || item.range.some((value: unknown) => typeof value !== 'number' || value < 0))) fail(400, 'Invalid comment range.'); for (const reply of item.replies) { object(reply); if (!idIsValid(reply.id) || !idIsValid(reply.userId)) fail(400, 'Invalid reply.'); textField(reply.text, 5000, true); numberField(reply.timestamp, 0, 1e15); } }
       if (key === 'operations' && item.gestureId !== undefined) textField(item.gestureId, 128, true);
-      if (key === 'operations') for (const change of [...item.oldState, ...item.newState]) { object(change); if (!['clips', 'tracks', 'nodes', 'comments', 'timelines'].includes(change.collection) || !idIsValid(change.id) || (change.value !== null && (!change.value || typeof change.value !== 'object' || Array.isArray(change.value)))) fail(400, 'Invalid history change.'); if (change.unset !== undefined && (!Array.isArray(change.unset) || change.unset.some((value: unknown) => typeof value !== 'string'))) fail(400, 'Invalid history field.'); }
+      if (key === 'operations') for (const change of [...item.oldState, ...item.newState]) { object(change); if (!['clips', 'tracks', 'nodes', 'comments', 'timelines', 'scripts', 'scriptBlocks', 'shots', 'boardItems'].includes(change.collection) || !idIsValid(change.id) || (change.value !== null && (!change.value || typeof change.value !== 'object' || Array.isArray(change.value)))) fail(400, 'Invalid history change.'); if (change.unset !== undefined && (!Array.isArray(change.unset) || change.unset.some((value: unknown) => typeof value !== 'string'))) fail(400, 'Invalid history field.'); }
       if (key === 'snapshots') for (const collection of ['clips', 'tracks', 'nodes', 'comments', ...(item.state.timelines?['timelines']:[])]) validateCollection(item.state[collection], collection);
+      // Plan caps come from PLAN_LIMITS, the same numbers the store clamps to, so an edit the editor allows is never refused here.
+      if (key === 'scripts') { if (!SCRIPT_FORMATS.includes(item.format)) fail(400, 'Invalid script format.'); for (const field of ['credit', 'author']) if (item[field] !== undefined) textField(item[field], PLAN_LIMITS.field); }
+      if (key === 'scriptBlocks') { if (!idIsValid(item.scriptId)) fail(400, 'Invalid script block script.'); if (!SCRIPT_BLOCK_KINDS.includes(item.kind)) fail(400, 'Invalid script block kind.'); textField(item.text, PLAN_LIMITS.blockText); }
+      if (key === 'shots') { textField(item.number, PLAN_LIMITS.shotNumber, true); if (item.sceneId !== undefined && !idIsValid(item.sceneId)) fail(400, 'Invalid shot scene.'); textField(item.text, PLAN_LIMITS.shotText); for (const field of ['size', 'movement', 'cast', 'location']) if (item[field] !== undefined) textField(item[field], PLAN_LIMITS.field); if (item.notes !== undefined) textField(item.notes, PLAN_LIMITS.shotNotes); if (item.mediaIds !== undefined && (!Array.isArray(item.mediaIds) || item.mediaIds.length > PLAN_LIMITS.mediaIds || !item.mediaIds.every(idIsValid))) fail(400, 'Invalid shot media.'); if (item.done !== undefined && typeof item.done !== 'boolean') fail(400, 'Invalid shot state.'); }
+      if (key === 'boardItems') { if (!BOARD_ITEM_KINDS.includes(item.kind)) fail(400, 'Invalid board item kind.'); numberField(item.x, -PLAN_LIMITS.coord, PLAN_LIMITS.coord); numberField(item.y, -PLAN_LIMITS.coord, PLAN_LIMITS.coord); numberField(item.w, PLAN_LIMITS.minSize, PLAN_LIMITS.maxSize); numberField(item.h, PLAN_LIMITS.minSize, PLAN_LIMITS.maxSize); if (item.mediaId !== undefined && !idIsValid(item.mediaId)) fail(400, 'Invalid board image.'); if (item.text !== undefined) textField(item.text, PLAN_LIMITS.boardText); if (item.color !== undefined && (typeof item.color !== 'string' || !HEX_COLOR.test(item.color))) fail(400, 'Invalid board color.'); }
     }
   }
   // A saved snapshot's relations depend on its own frozen content plus the timelines' and media's ids,
@@ -776,7 +788,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const projects = new Set(next.projects.map(project => project.id)); const timelines = new Map(next.timelines.map(item => [item.id, item.projectId])); const tracks = new Map(next.tracks.map(item => [item.id, item.timelineId])); const media = new Map(next.media.map(item => [item.id, item.projectId]));
     // While no stored project is removed, an entity the server already holds still has its project.
     const shrunk = (store.stored('projects') as Project[]).some(project => !projects.has(project.id));
-    for (const key of ['media', 'timelines', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'] as const) {
+    // Plan references (scriptId, sceneId, mediaIds, mediaId) stay soft: a strict check would refuse a collaborator's every save after a concurrent delete.
+    for (const key of ['media', 'timelines', 'clips', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const) {
       if (!shrunk && next[key] === store.stored(key)) continue;
       for (const item of next[key]) if ((shrunk || !store.holds(key, item)) && !projects.has(item.projectId)) fail(400, 'An item references a missing project.');
     }
@@ -832,7 +845,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const removedProject = currentView.projects.some(project => !nextProjectIds.has(project.id));
     const next = { ...state }; next.projects = mergeVisible(state.projects, project => !allowed.has(project.id), projects);
     const oldTimelines = new Map(state.timelines.map(item => [item.id, item.projectId])); const newTimelines = new Map(incoming.timelines.map(item => [item.id, item.projectId]));
-    for (const key of ['timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots'] as const) {
+    for (const key of ['timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const) {
       const oldItems = state[key] as unknown as Entry[]; const newItems = incoming[key] as unknown as Entry[];
       // A list the save left alone is the server's own: nothing to check, nothing to merge.
       if (untouched(key) && !removedProject) continue;
@@ -1131,7 +1144,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const previous = state, previousRevision = revision;
           try {
             transaction(() => {
-              state = { ...state, ...Object.fromEntries(COLLECTIONS.map(key => [key, [...state[key], ...bundle[key]]])) };
+              // A backup written before a list existed (the Plan lists) lacks it.
+              state = { ...state, ...Object.fromEntries(COLLECTIONS.map(key => [key, [...state[key], ...(bundle[key] ?? [])]])) };
               validateRelations(state); persist(); db.prepare('DELETE FROM deleted_projects WHERE id=?').run(restoreProjectRoute[1]);
             });
           } catch (error) { state = previous; revision = previousRevision; throw error; }
@@ -1226,7 +1240,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             }
 
             const selectedClipId = typeof body.selectedClipId === 'string' && state.clips.some(clip => clip.id === body.selectedClipId && clip.projectId === project.id) ? body.selectedClipId : undefined;
-            presence.set(key, { session, active: body.active ?? !!cursor, person: { preview, userId, projectId: project.id, cursor: body.active === false ? null : cursor, playhead: numberField(body.playhead ?? 0, 0, 86400 * 7), selectedClipId, mediaTab: ['Media','SFX','Captions','Effects','Transitions','Titles','Shapes'].includes(body.mediaTab) ? body.mediaTab : undefined, inspectorTab: selectedClipId && ['Video','Audio','Effects','Info','Caption','Text','Shape','Transition'].includes(body.inspectorTab) ? body.inspectorTab : undefined, focusedField: typeof body.focusedField === 'string' ? body.focusedField.slice(0, 100) : undefined, activity: typeof body.activity === 'string' ? body.activity.slice(0, 160) : 'Editing', online: true, updatedAt: Date.now(), ...(body.timelineId && state.timelines.some(timeline => timeline.id === body.timelineId && timeline.projectId === project.id) ? { timelineId: body.timelineId } : {}), presenting: body.presenting === true, playing: body.playing === true } });
+            presence.set(key, { session, active: body.active ?? !!cursor, person: { preview, userId, projectId: project.id, planTab: PLAN_TABS.includes(body.planTab) ? body.planTab : undefined, cursor: body.active === false ? null : cursor, playhead: numberField(body.playhead ?? 0, 0, 86400 * 7), selectedClipId, mediaTab: ['Media','SFX','Captions','Effects','Transitions','Titles','Shapes'].includes(body.mediaTab) ? body.mediaTab : undefined, inspectorTab: selectedClipId && ['Video','Audio','Effects','Info','Caption','Text','Shape','Transition'].includes(body.inspectorTab) ? body.inspectorTab : undefined, focusedField: typeof body.focusedField === 'string' ? body.focusedField.slice(0, 100) : undefined, activity: typeof body.activity === 'string' ? body.activity.slice(0, 160) : 'Editing', online: true, updatedAt: Date.now(), ...(body.timelineId && state.timelines.some(timeline => timeline.id === body.timelineId && timeline.projectId === project.id) ? { timelineId: body.timelineId } : {}), presenting: body.presenting === true, playing: body.playing === true } });
             takeReport({ userId, name: account.user.name, clientId, projectId: project.id }, body.health);
           }
           for (const subscriber of subscribers.values()) if (subscriber.session === session && subscriber.clientId === clientId) subscriber.projectId = body.online === false ? undefined : project.id;
@@ -1596,6 +1610,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             send(res, 200, { ok: true }); return;
           }
           if (method === 'DELETE' && !suffix) {
+            if (state.boardItems.some(item => item.mediaId === id && item.projectId === asset.projectId)) fail(409, 'That image is on the mood board.');
             if (state.clips.some(clip => clip.mediaId === id) || state.snapshots.some(snapshot => snapshot.state.clips.some(clip => clip.mediaId === id)) || state.renderJobs.some(job => job.projectId === asset.projectId && ['waiting', 'rendering'].includes(job.status)) || captionJobs().some(job=>job.projectId===asset.projectId&&['waiting','running'].includes(job.status))) fail(409, 'This media is used by a timeline, snapshot, or pending export.');
             aborters.get(id)?.abort(); state.media = state.media.filter(item => item.id !== id); persist();
             // Worker cleanup follows cancellation so an encoder cannot recreate deleted files.

@@ -14,8 +14,9 @@ import * as assets from './jobs/assets.ts';
 import * as projects from './jobs/projects.ts';
 import * as visual from './jobs/visual.ts';
 import * as showcase from './jobs/showcase.ts';
+import * as plan from './jobs/plan.ts';
 
-const MODULES = [media, captions, masks, depth, motion, denoise, tracker, color, exporting, assets, projects, visual, showcase];
+const MODULES = [media, captions, masks, depth, motion, denoise, tracker, color, exporting, assets, projects, visual, showcase, plan];
 export const JOBS: Record<string, JobDef> = Object.assign({}, ...MODULES.map(m => m.jobs));
 export const JOB_TOPICS: Record<string, string> = Object.assign({}, ...MODULES.map(m => m.topics ?? {}));
 export const JOB_KINDS = Object.keys(JOBS);

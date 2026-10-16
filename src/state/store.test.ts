@@ -12,6 +12,7 @@ import { forwardRoom } from '../services/selection.ts';
 import { depthUi, rememberDepth } from '../services/depthPreview.ts';
 import { nodeMaskId } from '../services/smartMask.ts';
 import { LOCK_TTL, mediaService, projectService, renderService, STORAGE_KEY } from '../services/index.ts';
+import { ordered, PLAN_LIMITS } from '../services/plan.ts';
 
 const baseline = store.getState();
 const state = () => store.getState();
@@ -392,13 +393,15 @@ test('render queue completes its active job and starts the next waiting job', ()
 test('local storage is versioned, excludes presence, and rejects corrupt caches', () => {
   const memory = new Map<string, string>();
   Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { getItem: (key: string) => memory.get(key) ?? null, setItem: (key: string, value: string) => memory.set(key, value) } });
-  const { projects, media, timelines, clips, tracks, nodes, comments, operations, snapshots, renderJobs, users, currentUserId, settings } = state();
-  projectService.save({ projects, media, timelines, clips, tracks, nodes, comments, operations, snapshots, renderJobs, users, currentUserId, settings });
+  state().addScript('Cached');
+  const { projects, media, timelines, clips, tracks, nodes, comments, operations, snapshots, renderJobs, users, currentUserId, settings, scripts, scriptBlocks, shots, boardItems } = state();
+  projectService.save({ projects, media, timelines, clips, tracks, nodes, comments, operations, snapshots, renderJobs, users, currentUserId, settings, scripts, scriptBlocks, shots, boardItems });
   const raw = JSON.parse(memory.get(STORAGE_KEY)!);
   assert.equal(raw.version, 1);
   assert.equal('presence' in raw.state, false);
   assert.equal('locks' in raw.state, false);
   assert.deepEqual(projectService.load()!.clips, clips);
+  assert.equal(projectService.load()!.scriptBlocks.length, 1, 'Plan history passes the cache check');
   memory.set(STORAGE_KEY, '{');
   assert.throws(() => projectService.load());
   memory.set(STORAGE_KEY, JSON.stringify({ version: 1, state: { clips: [] } }));
@@ -1931,4 +1934,196 @@ test('a pasted grouped clip takes its group values now; Normalize skips a shot r
   assert.equal(state().normalizeColorGroup({ shots: [{ ...measured('c5', { exposure: 2 }), input }] }), 0);
   assert.match(state().notifications.at(-1)!.detail!, /\(changed while it was measured: run Normalize again\)/);
   assert.equal(gradeOf('c5')[1].parameters.exposure, .3);
+});
+
+// Plan workspace: script, shot list and mood board.
+const lines = (scriptId: string) => ordered(state().scriptBlocks.filter(b => b.scriptId === scriptId));
+const shot = (id: string) => state().shots.find(s => s.id === id)!;
+const card = (id: string) => state().boardItems.find(i => i.id === id)!;
+
+test('addScript makes a script with one empty scene; lines go at the end, the start or after a line', () => {
+  const id = state().addScript()!;
+  assert.equal(state().scripts.find(s => s.id === id)!.name, 'City After Dark', 'the first script takes the project name');
+  assert.deepEqual(lines(id).map(b => [b.kind, b.text]), [['scene', '']]);
+  const second = state().addScript()!;
+  assert.equal(state().scripts.find(s => s.id === second)!.name, 'Untitled script');
+  const [scene] = lines(id);
+  const [end] = state().addScriptBlocks(id, [{ kind: 'action', text: 'end' }]);
+  const [start] = state().addScriptBlocks(id, [{ kind: 'note', text: 'start' }], null);
+  const after = state().addScriptBlocks(id, [{ kind: 'character', text: 'ELENA' }, { kind: 'dialogue', text: 'Hi.' }], scene.id);
+  assert.deepEqual(lines(id).map(b => b.id), [start, scene.id, ...after, end]);
+  assert.deepEqual([state().addScriptBlocks(id, [{ kind: 'bogus' as never, text: '' }]), state().addScriptBlocks(id, [{ kind: 'action', text: '' }], 'gone'), state().addScriptBlocks('gone', [{ kind: 'action', text: '' }])], [[], [], []]);
+  assert.equal(lines(id).length, 5);
+});
+
+test('split and merge are a round trip; typing in one gesture is one undo', () => {
+  const id = state().addScript('Night')!, [scene] = lines(id);
+  state().updateScriptBlock(scene.id, { text: 'INT. KITCHEN - NIGHT' });
+  const before = state().operations.length;
+  const right = state().splitScriptBlock(scene.id, 12, 'action')!;
+  assert.deepEqual(lines(id).map(b => [b.kind, b.text]), [['scene', 'INT. KITCHEN'], ['action', ' - NIGHT']]);
+  assert.equal(state().mergeScriptBlock(right), scene.id);
+  assert.deepEqual(lines(id).map(b => [b.kind, b.text]), [['scene', 'INT. KITCHEN - NIGHT']]);
+  assert.equal(state().mergeScriptBlock(scene.id), undefined, 'the first line has nothing above it');
+  assert.equal(state().operations.length, before + 2);
+  state().updateScriptBlock(scene.id, { text: 'INT. K' }, 'typing-1');
+  state().updateScriptBlock(scene.id, { text: 'INT. KITCHEN - DAY' }, 'typing-1');
+  state().updateScriptBlock(scene.id, { text: 'INT. KITCHEN - DAY' }, 'typing-1');
+  assert.equal(state().operations.length, before + 3, 'one typing session is one history row');
+  assert.equal(state().operations[0].description, 'edited scene 1');
+  state().undo();
+  assert.equal(lines(id)[0].text, 'INT. KITCHEN - NIGHT');
+});
+
+test('a Commenter cannot change the script, the shot list or the board', () => {
+  const id = state().addScript()!, [scene] = lines(id), shotId = state().addShot()!, [cardId] = state().addBoardItems([{ kind: 'note', text: 'mood' }]);
+  const before = structuredClone([state().scripts, state().scriptBlocks, state().shots, state().boardItems]);
+  state().setCurrentUser('maya');
+  state().updateScriptBlock(scene.id, { text: 'x' }); state().addScriptBlocks(id, [{ kind: 'action', text: 'x' }]); state().deleteScript(id);
+  state().updateShot(shotId, { text: 'x' }); state().addShot(); state().deleteShots([shotId]);
+  state().updateBoardItems([{ id: cardId, patch: { x: 500 } }]); state().addBoardItems([{ kind: 'note' }]); state().deleteBoardItems([cardId]);
+  assert.equal(state().addScript(), undefined);
+  assert.match(state().notifications.at(-1)!.title, /editor role/);
+  assert.deepEqual([state().scripts, state().scriptBlocks, state().shots, state().boardItems], before);
+});
+
+test('deleting a script takes its lines and unlinks its shots in one undo; deleting a scene unlinks too', () => {
+  const id = state().addScript()!, [scene] = lines(id), other = state().addScript('B')!;
+  const shotId = state().addShot({ sceneId: scene.id })!;
+  state().addScriptBlocks(id, [{ kind: 'action', text: 'a' }]);
+  state().deleteScript(id);
+  assert.deepEqual([state().scripts.map(s => s.id), lines(id), shot(shotId).sceneId], [[other], [], undefined]);
+  state().undo();
+  assert.deepEqual([lines(id).length, shot(shotId).sceneId], [2, scene.id]);
+  state().deleteScriptBlocks([scene.id]);
+  assert.deepEqual([lines(id).map(b => b.text), shot(shotId).sceneId], [['a'], undefined]);
+});
+
+test('shots number themselves: 1A, 1B under scene 1 and kept together, else 1, 2; fields clear and rows move', () => {
+  const id = state().addScript()!, [one] = lines(id), [two] = state().addScriptBlocks(id, [{ kind: 'scene', text: 'EXT. ROOF' }]);
+  const loose = state().addShot()!, a = state().addShot({ sceneId: one.id })!, twoA = state().addShot({ sceneId: two })!, b = state().addShot({ sceneId: one.id })!, loose2 = state().addShot()!;
+  assert.deepEqual([loose, a, twoA, b, loose2].map(i => shot(i).number), ['1', '1A', '2A', '1B', '2']);
+  assert.deepEqual(ordered(state().shots).map(s => s.id), [loose, a, b, twoA, loose2]);
+  assert.equal(state().operations[0].description, 'added shot 2');
+  const first = state().addShot({ number: '  9  ', size: 'Wide', cast: '  ' }, null)!;
+  assert.deepEqual([shot(first).number, shot(first).size, 'cast' in shot(first), ordered(state().shots)[0].id], ['9', 'Wide', false, first]);
+  state().updateShot(first, { size: '', sceneId: one.id, done: true });
+  assert.deepEqual([shot(first).size, shot(first).sceneId, shot(first).done], [undefined, one.id, true]);
+  state().updateShot(first, { number: ' ' });
+  assert.equal(shot(first).number, '9');
+  state().moveShot(first, loose2);
+  assert.equal(ordered(state().shots).at(-1)!.id, first);
+  state().deleteShots([first, loose]);
+  assert.equal(state().shots.length, 4);
+});
+
+test('linkShotMedia adds a take once, refuses media of another project, and unlinks', () => {
+  const id = state().addShot()!;
+  state().linkShotMedia(id, 'm1'); state().linkShotMedia(id, 'm1'); state().linkShotMedia(id, 'm2'); state().linkShotMedia(id, 'nope');
+  assert.deepEqual(shot(id).mediaIds, ['m1', 'm2']);
+  state().linkShotMedia(id, 'm1', false); state().linkShotMedia(id, 'm2', false);
+  assert.equal('mediaIds' in shot(id), false);
+});
+
+test('board cards: defaults and clamps, one undo for a multi-card drag, colors checked, delete', () => {
+  const ids = state().addBoardItems([{ kind: 'note', text: 'warm' }, { kind: 'swatch', color: '#ABCDEF', x: 5e6, w: 1 }, { kind: 'image', mediaId: 'm10' }, { kind: 'image', mediaId: 'm7' }]);
+  assert.equal(ids.length, 3, 'audio is not a picture');
+  assert.deepEqual(ids.map(i => [card(i).w, card(i).h, card(i).color, card(i).z]), [[220, 160, '#f2c878', 1], [8, 150, '#abcdef', 2], [320, 220, undefined, 3]]);
+  assert.equal(card(ids[1]).x, 1e6);
+  const before = state().operations.length;
+  for (const step of [10, 20, 30]) state().updateBoardItems(ids.slice(0, 2).map(id => ({ id, patch: { x: step, y: step } })), 'drag-1');
+  assert.deepEqual([state().operations.length, state().operations[0].description, card(ids[1]).x], [before + 1, 'moved 2 board cards', 30]);
+  state().undo();
+  assert.deepEqual([card(ids[0]).x, card(ids[1]).x], [0, 1e6]);
+  state().updateBoardItems([{ id: ids[0], patch: { color: 'red' } }]);
+  state().updateBoardItems([{ id: ids[0], patch: { text: '' } }]);
+  assert.deepEqual([card(ids[0]).color, 'text' in card(ids[0])], ['#f2c878', false]);
+  state().deleteBoardItems(ids);
+  assert.equal(state().boardItems.length, 0);
+});
+
+test('Plan edits never make a row the server refuses: whole-card locks, z and computed shot numbers are capped', () => {
+  const [id] = state().addBoardItems([{ kind: 'note', text: 'warm' }]);
+  store.setState({ locks: [{ id: 'remote', userId: 'ashley', projectId: 'city-after-dark', targetId: id, field: 'manipulation', expiresAt: Date.now() + LOCK_TTL }] });
+  state().updateBoardItems([{ id, patch: { text: 'cold' } }]);
+  assert.equal(card(id).text, 'warm', 'the server locks the whole card (423), so the store does too');
+  store.setState({ locks: [] });
+  state().updateBoardItems([{ id, patch: { z: 1e20 } }]);
+  assert.equal(card(id).z, PLAN_LIMITS.coord);
+  state().addShot({ number: '9999999999999999' });
+  assert.equal(shot(state().addShot()!).number.length, PLAN_LIMITS.shotNumber);
+});
+
+test('a line squeezed into a spent gap renumbers its script in the same commit', () => {
+  const id = state().addScript()!, [a] = lines(id), [b] = state().addScriptBlocks(id, [{ kind: 'action', text: 'b' }]);
+  store.setState({ scriptBlocks: state().scriptBlocks.map(x => x.id === b ? { ...x, order: 1 + 1e-12 } : x) });
+  const before = state().operations.length;
+  const [c] = state().addScriptBlocks(id, [{ kind: 'action', text: 'c' }], a.id);
+  assert.deepEqual(lines(id).map(x => [x.id, x.order]), [[a.id, 1], [c, 2], [b, 3]]);
+  assert.equal(state().operations.length, before + 1);
+  state().undo();
+  assert.deepEqual(lines(id).map(x => [x.id, x.order]), [[a.id, 1], [b, 1 + 1e-12]]);
+});
+
+test('a spent gap respreads only nearby lines nobody else holds; boxed in by held lines, nothing is placed', () => {
+  const id = state().addScript()!, [one] = lines(id), [ada, two, bo] = state().addScriptBlocks(id, [{ kind: 'action', text: 'Ada' }, { kind: 'scene', text: 'INT. TWO' }, { kind: 'action', text: 'Bo' }]);
+  const lock = (targetId: string) => ({ id: `remote-${targetId}`, userId: 'ashley', projectId: 'city-after-dark', targetId, field: 'text', expiresAt: Date.now() + LOCK_TTL });
+  store.setState({ locks: [lock(bo)] });
+  const held = structuredClone(lines(id).find(b => b.id === bo)!), typed: string[] = [];
+  for (let i = 0; i < 80; i++) typed.push(...state().addScriptBlocks(id, [{ kind: 'action', text: `${i}` }], typed.at(-1) ?? ada));
+  const all = lines(id);
+  assert.deepEqual(all.map(b => b.id), [one.id, ada, ...typed, two, bo], 'every line stays in its scene');
+  assert.deepEqual(all.find(b => b.id === bo), held, 'the held line is never rewritten (the server would refuse it)');
+  assert.equal(new Set(all.map(b => b.order)).size, all.length);
+  store.setState({ scriptBlocks: state().scriptBlocks.map(b => b.id === two ? { ...b, order: all.at(-3)!.order + 1e-13 } : b), locks: [lock(typed.at(-1)!), lock(two)], notifications: [] });
+  assert.deepEqual(state().addScriptBlocks(id, [{ kind: 'action', text: 'x' }], typed.at(-1)), []);
+  assert.equal(state().notifications.at(-1)!.title, 'A collaborator is editing nearby');
+});
+
+test('deleting a scene or its script leaves a shot a collaborator holds linked, so the delete still undoes', () => {
+  const id = state().addScript()!, [scene] = lines(id), held = state().addShot({ sceneId: scene.id })!, free = state().addShot({ sceneId: scene.id })!;
+  store.setState({ locks: [{ id: 'remote', userId: 'ashley', projectId: 'city-after-dark', targetId: held, field: 'row', expiresAt: Date.now() + LOCK_TTL }] });
+  const before = structuredClone(shot(held));
+  for (const remove of [() => state().deleteScriptBlocks([scene.id]), () => state().deleteScript(id)]) {
+    remove();
+    assert.deepEqual([shot(held), shot(free).sceneId], [before, undefined]);
+    state().undo();
+    assert.deepEqual([lines(id).map(b => b.id), shot(free).sceneId, state().notifications.some(n => /newer change/.test(n.title))], [[scene.id], scene.id, false]);
+  }
+});
+
+test('media on the mood board cannot be removed', () => {
+  store.setState({ media: [...state().media, { ...state().media.find(m => m.id === 'm10')!, id: 'still-1' }] });
+  const [id] = state().addBoardItems([{ kind: 'image', mediaId: 'still-1' }]);
+  state().removeMedia('still-1');
+  assert.ok(state().media.some(m => m.id === 'still-1'));
+  assert.equal(state().notifications.at(-1)!.title, 'That image is on the mood board');
+  state().deleteBoardItems([id]); state().removeMedia('still-1');
+  assert.ok(!state().media.some(m => m.id === 'still-1'));
+});
+
+test('openPlan and setColorReference switch the workspace; openProject clears focus and reference', () => {
+  state().openPlan('board', 'card-1');
+  assert.deepEqual([state().workspace, state().planTab, state().planFocus], ['plan', 'board', 'card-1']);
+  state().setColorReference('m7');
+  assert.deepEqual([state().workspace, state().colorReference], ['plan', null], 'audio is no picture');
+  state().setColorReference('m10');
+  assert.deepEqual([state().workspace, state().colorReference], ['color', 'm10']);
+  state().openProject('city-after-dark');
+  assert.deepEqual([state().planFocus, state().colorReference], [null, null]);
+});
+
+test('a script line a collaborator holds or changed since cannot be edited or undone over', () => {
+  const id = state().addScript()!, [scene] = lines(id);
+  state().updateScriptBlock(scene.id, { text: 'INT. HALL' });
+  state().setCurrentUser('ashley');
+  state().updateScriptBlock(scene.id, { text: 'INT. HALL - LATER' });
+  state().setCurrentUser('kyle');
+  state().undo();
+  assert.equal(lines(id)[0].text, 'INT. HALL - LATER');
+  assert.match(state().notifications.at(-1)!.title, /newer change/);
+  store.setState({ locks: [{ id: 'remote', userId: 'ashley', projectId: 'city-after-dark', targetId: scene.id, field: 'text', expiresAt: Date.now() + LOCK_TTL }] });
+  state().updateScriptBlock(scene.id, { text: 'mine' });
+  assert.equal(lines(id)[0].text, 'INT. HALL - LATER');
+  assert.match(state().notifications.at(-1)!.title, /is editing/);
 });

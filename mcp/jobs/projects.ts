@@ -202,7 +202,7 @@ export const topics: Record<string, string> = {
     'Pass handles back exactly as printed, at any depth in act/job/get/frame args. A unique prefix of 4+ characters works too; an unknown or ambiguous handle is an error: look again.',
     'Full ids work too. Strings without a leading @ pass through untouched: names, and ids you make up yourself (keyframe ids, gesture strings).',
     'New things get ids from the action: read them in the act reply (+ clip @…) or the return line (createProject → @…, addMarker → @…).',
-    'where: projects (projects) · timeline (tracks, clips, fx effects, markers, other timelines) · media (assets, bins) · job history (edits, snapshots, comments) · job project (people) · get{id} (effects, masks, trackers, keyframes, caption sets).',
+    'where: projects (projects) · timeline (tracks, clips, fx effects, markers, other timelines) · media (assets, bins) · job history (edits, snapshots, comments) · job project (people) · job plan (scripts, script lines, shots, board cards) · get{id} (effects, masks, trackers, keyframes, caption sets).',
     'Deleted projects are not loaded, so no handle resolves to them: job restore-project takes the bare code it prints (no @) or the name.',
   ].join('\n'),
   history: [

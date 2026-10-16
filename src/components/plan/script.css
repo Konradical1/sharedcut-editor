@@ -1,0 +1,97 @@
+/* Script tab: a calm page in a screenplay face. Indents are in ch, so they follow the font at any size or ui-scale.
+   Each line's box spans the page gutters (--gl/--gr), so scene numbers, the element picker and the shot buttons sit
+   inside it: content-visibility can then skip off-screen lines of a long script without clipping any of them. */
+.script-editor { height: 100%; min-height: 0; display: flex; position: relative; }
+.script-empty { align-items: center; justify-content: center; }
+.script-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 4px; }
+
+.script-switcher { display: inline-flex; align-items: center; gap: 6px; height: 28px; min-width: 0; max-width: 240px; padding: 0 8px 0 9px; border-radius: 6px; font-size: 11px; font-weight: 530; color: #c9d0d3; }
+.script-switcher:hover { background: #ffffff08; }
+.script-switcher > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.script-switcher > svg { flex-shrink: 0; color: var(--muted); }
+.script-menu-blank { width: 13px; flex-shrink: 0; }
+.script-menu-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.script-outline { width: 216px; flex-shrink: 0; display: flex; flex-direction: column; min-height: 0; border-right: 1px solid #ffffff07; }
+.script-outline.collapsed { width: 40px; }
+.script-outline-head { height: 36px; flex-shrink: 0; display: flex; align-items: center; padding: 0 6px 0 14px; }
+.script-outline.collapsed .script-outline-head { padding: 0 6px; }
+.script-outline-list { flex: 1; min-height: 0; overflow: auto; padding: 2px 6px 8px; display: flex; flex-direction: column; gap: 1px; }
+.script-outline-list > button { display: flex; align-items: center; gap: 8px; min-height: 27px; padding: 5px 8px; border-radius: 5px; text-align: left; font-size: 10px; color: #aab3b7; }
+.script-outline-list > button:hover { background: #ffffff07; color: var(--text); }
+.script-outline-list > button > .mono { min-width: 14px; font-size: 9px; color: #6f7a80; }
+.script-outline-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: uppercase; letter-spacing: .2px; }
+.script-outline-list .badge { font-size: 8px; padding: 3px 5px; }
+.script-outline-list > p { font-size: 10px; line-height: 1.6; padding: 6px 8px; }
+.script-outline-add { display: flex; align-items: center; gap: 6px; margin: 4px 12px 12px; padding: 6px 8px; border-radius: 5px; font-size: 10px; color: var(--muted); }
+.script-outline-add:hover { background: #ffffff07; color: var(--text); }
+
+.script-scroll { flex: 1; min-width: 0; overflow: auto; padding: 22px 18px 48px; }
+.script-column { --gl: 72px; --gr: 76px; max-width: calc(61ch + var(--gl) + var(--gr)); margin: 0 auto; font-family: 'Courier Prime', 'Courier New', Courier, monospace; font-size: 13.5px; }
+.script-page { --lh: 1.5em; --i-char: 22ch; --i-paren: 16ch; --w-paren: 25ch; --i-dial: 10ch; --w-dial: 35ch; --i-dir: 25ch;
+  position: relative; padding: 56px var(--gr) 72px var(--gl); background: var(--panel); border: 1px solid #ffffff08; border-radius: var(--radius); box-shadow: 0 18px 60px #0003; line-height: 1.5; color: #e1e5e6; }
+.script-footer { display: flex; justify-content: space-between; gap: 12px; padding: 10px 4px 0; font: 9px/1.5 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: .2px; color: var(--muted); }
+.script-keys { color: #6c767b; text-align: right; }
+.script-start { color: var(--muted); padding: 2px 0; }
+
+.script-block { position: relative; margin: 0 calc(-1 * var(--gr)) 0 calc(-1 * var(--gl)); padding: 0 var(--gr) 0 var(--gl); }
+/* Only where heights are CSS: the measured fallback must not read the size of a line the browser skipped. */
+@supports (field-sizing: content) {
+  .script-block { content-visibility: auto; contain-intrinsic-size: auto 20px; }
+  .script-block.focused, .script-block.owned, .script-block:hover { content-visibility: visible; }
+}
+.script-block textarea { display: block; width: 100%; max-width: calc(var(--ml, 0ch) + var(--mw, 100%)); min-height: var(--lh); padding: 0 0 0 var(--ml, 0ch); margin: 0; border: 0; border-radius: 0; background: none; color: inherit; font: inherit; line-height: inherit; resize: none; overflow: hidden; field-sizing: content; }
+.script-block textarea::placeholder { color: #5b6469; }
+.script-block textarea:focus-visible { outline: none; }
+.script-block.kind-scene, .script-block.kind-action, .script-block.kind-character, .script-block.kind-transition, .script-block.kind-shot, .script-block.kind-lyric, .script-block.kind-note { margin-top: var(--lh); }
+.script-page > .script-block:first-child { margin-top: 0; }
+
+/* Screenplay (Final Draft margins in a 61-character line). */
+.kind-scene textarea, .kind-shot textarea { font-weight: 700; text-transform: uppercase; }
+.kind-character textarea, .kind-transition textarea { text-transform: uppercase; }
+.kind-transition textarea { text-align: right; }
+.kind-lyric textarea { font-style: italic; }
+.format-screenplay .kind-character { --ml: var(--i-char); }
+.format-screenplay .kind-parenthetical { --ml: var(--i-paren); --mw: var(--w-paren); }
+.format-screenplay .kind-dialogue, .script-page .kind-lyric { --ml: var(--i-dial); --mw: var(--w-dial); }
+/* Stage play: names centred, speeches full width, stage directions in italics. */
+.format-stage .kind-scene textarea, .format-stage .kind-character textarea { text-align: center; }
+.format-stage .kind-action, .format-stage .kind-parenthetical { --ml: var(--i-dir); }
+.format-stage .kind-action textarea, .format-stage .kind-parenthetical textarea { font-style: italic; }
+/* Notes are the team's, never printed: quieter, in the interface face. */
+.script-block.kind-note textarea { padding: 4px 8px; border-radius: 4px; background: #bce8c70a; color: var(--muted); font: 11px/1.6 Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+
+.script-gutter { position: absolute; top: 0; right: calc(100% - var(--gl) + 12px); font-weight: 700; color: #6c767b; pointer-events: none; }
+.kind-note .script-gutter { top: 7px; font: 600 7.5px/1 Inter, -apple-system, "Segoe UI", sans-serif; letter-spacing: 1px; text-transform: uppercase; }
+.script-block.focused .script-gutter { visibility: hidden; }
+.script-kind { position: absolute; top: 2px; right: calc(100% - var(--gl) + 8px); padding: 4px 6px; border: 1px solid #ffffff0f; border-radius: 4px; background: #ffffff08; color: #9aa5aa; font: 600 7.5px/1 Inter, -apple-system, "Segoe UI", sans-serif; letter-spacing: .9px; text-transform: uppercase; }
+.script-kind:hover { color: var(--accent); border-color: #bce8c733; background: #bce8c70d; }
+
+.script-side { position: absolute; top: 1px; left: calc(100% - var(--gr) + 10px); max-width: calc(var(--gr) - 12px); display: flex; flex-direction: column; align-items: flex-start; gap: 3px; font: 500 9px/1 Inter, -apple-system, "Segoe UI", sans-serif; }
+.script-shots, .script-add-shot { display: inline-flex; align-items: center; gap: 3px; padding: 3px 6px; border: 1px solid transparent; border-radius: 4px; white-space: nowrap; color: #9aa5aa; }
+.script-shots { background: #ffffff07; border-color: #ffffff0d; }
+.script-shots:hover, .script-add-shot:hover { color: var(--accent); border-color: #bce8c733; background: #bce8c70d; }
+.script-add-shot { color: #7d888d; opacity: 0; transition: opacity .12s ease; }
+.script-block:hover .script-add-shot, .script-block.focused .script-add-shot, .script-add-shot:focus-visible { opacity: 1; }
+.script-owner { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--owner-color); font-size: 8px; }
+.script-owner i { width: 4px; height: 4px; flex-shrink: 0; border-radius: 50%; background: var(--owner-color); }
+.script-block.owned::before { content: ""; position: absolute; top: 0; bottom: 0; left: calc(var(--gl) - 9px); width: 2px; border-radius: 2px; background: var(--owner-color); }
+.script-block.owned textarea { color: #c3c9cc; }
+
+.script-suggest { position: absolute; z-index: 3; top: calc(100% + 2px); left: calc(var(--gl) + var(--ml, 0ch)); min-width: 18ch; display: flex; flex-direction: column; padding: 4px; background: #24292d; border: 1px solid #3c4348; border-radius: 7px; box-shadow: 0 10px 30px #0007; }
+.script-suggest > button { padding: 5px 8px; border-radius: 4px; text-align: left; text-transform: uppercase; color: #c2c9ce; }
+.script-suggest > button[aria-selected=true], .script-suggest > button:hover { background: #ffffff0c; color: var(--text); }
+
+.script-block.flash { animation: script-flash 1.3s ease-out; }
+@keyframes script-flash { 0%, 30% { background: #bce8c714; } 100% { background: transparent; } }
+
+@media (max-width: 900px) { .script-outline { display: none; } }
+@media (max-width: 600px) {
+  .script-scroll { padding: 10px 0 32px; }
+  .script-column { --gl: 44px; --gr: 40px; font-size: 12.5px; }
+  .script-page { --i-char: 12ch; --i-paren: 8ch; --w-paren: 22ch; --i-dial: 4ch; --w-dial: 30ch; --i-dir: 8ch; padding-top: 28px; padding-bottom: 40px; }
+  .script-shots > span, .script-add-shot > span, .script-export > span { display: none; }
+  .script-switcher { max-width: 150px; }
+  .script-footer { flex-direction: column; gap: 2px; }
+  .script-keys { text-align: left; }
+}

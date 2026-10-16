@@ -12,7 +12,7 @@ import { join } from 'node:path';
 // once edits pause. Anything else that writes that row (an older build after a rollback,
 // project-bundle.mjs) trips a trigger, and the next start imports the row instead of the items.
 // Production stops are hard kills, so before starting an older build run scripts/sync-legacy-row.mjs.
-export const COLLECTIONS = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'] as const;
+export const COLLECTIONS = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const;
 type State = Record<string, unknown>;
 type Row = { rowid: number; seq: number };
 type Table = { array: readonly unknown[]; rows: Map<unknown, Row> };

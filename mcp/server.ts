@@ -20,7 +20,7 @@ import { frame } from './frame.ts';
 const VERSION = '1.0.0';
 const PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 const INSTRUCTIONS = `SharedCut is a collaborative video editor. This server edits the user's real projects on the server; open editors see changes live and can undo them.
-Workflow: projects -> projects{open} -> timeline -> act / job -> timeline or frame to check. help{topic} has the catalogs (actions, effects, transitions, titles, shapes, color, properties, jobs).
+Workflow: projects -> projects{open} -> timeline -> act / job -> timeline or frame to check. help{topic} has the catalogs (actions, effects, transitions, titles, shapes, color, properties, plan, jobs).
 Ids print as @handles (e.g. @3fa9c1d2); pass them back as-is. Times are seconds. Prefer one act call with several steps over many calls.`;
 
 type Content = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string };

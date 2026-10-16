@@ -393,16 +393,16 @@ export async function connectSession() {
         return;
       }
       const active = typeof document === 'undefined' || (!document.hidden && document.hasFocus());
-      const cursor = active ? s.cursor : null, preview = active ? capPreview(s.dragPreview) : null;
+      const cursor = active ? s.cursor : null, preview = active ? capPreview(s.dragPreview) : null, planTab = s.workspace === 'plan' ? s.planTab : undefined;
       // Anything a collaborator can see goes in the signature, so a moving cursor still publishes every
       // tick; only genuinely idle repeats are held back, and a running playhead is sent at 4 Hz.
-      const signature = JSON.stringify([active, s.projectId, s.timelineId, cursor, s.playhead, s.selectedClipId, s.mediaPresenceTab, s.inspectorPresenceTab, s.workspace, s.liveMode === 'presenting', s.playing && !s.playbackBuffering, preview]);
+      const signature = JSON.stringify([active, s.projectId, s.timelineId, cursor, s.playhead, s.selectedClipId, s.mediaPresenceTab, s.inspectorPresenceTab, planTab, s.workspace, s.liveMode === 'presenting', s.playing && !s.playbackBuffering, preview]);
       // Starting and stopping go out at once; only a playhead already known to be running is held to 4 Hz.
       // The drag's first preview (nothing big published yet) and its end (preview null) are never held; only the updates between them are.
       const paced = (preview?.clips?.length ?? 0) > PACED_PREVIEW_CLIPS && publishedPaced;
       // With the live-update stream down presence is polled, and an idle tab slows to once per 2 s instead of 10 posts a second.
       if (!pacer.due({ signature, published: publishedSignature, sinceMs: Date.now() - lastPublished, playing: s.playing && publishedPlaying || paced, paced, streamUp: incremental && events?.readyState === 1, othersPresent: s.presence.length > 0 })) return;
-      const response = await api<{ presence: Presence[]; serverTime?: number }>('/presence', { method: 'POST', signal: AbortSignal.any([presenceAbort.signal, AbortSignal.timeout(5000)]), body: JSON.stringify({ clientId, active, projectId: s.projectId, timelineId: s.timelineId, cursor, playhead: s.playhead, selectedClipId: s.selectedClipId, mediaTab: s.mediaPresenceTab, inspectorTab: s.inspectorPresenceTab, activity: s.workspace, online: true, presenting: s.liveMode === 'presenting', playing: s.playing && !s.playbackBuffering, preview, health: takeHealthReport() }) });
+      const response = await api<{ presence: Presence[]; serverTime?: number }>('/presence', { method: 'POST', signal: AbortSignal.any([presenceAbort.signal, AbortSignal.timeout(5000)]), body: JSON.stringify({ clientId, active, projectId: s.projectId, timelineId: s.timelineId, cursor, playhead: s.playhead, selectedClipId: s.selectedClipId, mediaTab: s.mediaPresenceTab, inspectorTab: s.inspectorPresenceTab, planTab, activity: s.workspace, online: true, presenting: s.liveMode === 'presenting', playing: s.playing && !s.playbackBuffering, preview, health: takeHealthReport() }) });
       publishedProject = s.projectId; publishedCursor = !!cursor;
       publishedSignature = signature; lastPublished = Date.now(); publishedPlaying = s.playing; publishedPaced = (preview?.clips?.length ?? 0) > PACED_PREVIEW_CLIPS;
       presenceFailures = 0; presenceRetryAt = 0;

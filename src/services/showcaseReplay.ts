@@ -20,6 +20,8 @@ export interface ReplayPackage {
 export interface HistoryBundle extends ProjectState { project: Project; media: MediaAsset[]; operations: Operation[] }
 interface Change { collection: keyof ProjectState; id: string; value: Record<string, unknown> | null; replace?: boolean; unset?: string[] }
 const collections = ['clips', 'tracks', 'nodes', 'comments', 'timelines'] as const;
+// Plan rows (script, shot list, mood board) are not part of the cut a replay shows, so their history is skipped, not refused.
+const planCollections: readonly string[] = ['scripts', 'scriptBlocks', 'shots', 'boardItems'];
 const clone = <T>(v: T): T => structuredClone(v);
 const safeParts = (key: string) => { const parts=key.split('.'); if(parts.some(p=>['__proto__','constructor','prototype'].includes(p)))throw Error('Unsafe history field');return parts; };
 
@@ -27,6 +29,7 @@ const safeParts = (key: string) => { const parts=key.split('.'); if(parts.some(p
 export function applyReplayChanges(state: ProjectState, raw: unknown) {
   if(!Array.isArray(raw))throw Error('Invalid historical changes');
   for(const change of raw as Change[]) {
+    if(planCollections.includes(change.collection))continue;
     if(!collections.includes(change.collection)||typeof change.id!=='string')throw Error('Invalid historical collection');
     const items=(state[change.collection]??=[]) as unknown as Record<string, unknown>[];
     const index=items.findIndex(x=>x.id===change.id);

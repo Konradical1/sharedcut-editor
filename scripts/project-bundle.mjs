@@ -20,7 +20,7 @@ import { holdDataLock, readWorkspace, writeWorkspaceRow } from './workspace-db.m
 const DATA = resolve(process.env.FRAME_LINE_DATA ?? 'data');
 // Per-project slices of the workspace state. `operations` is machine-local undo history and
 // `renderJobs` are finished exports pointing at files that do not travel; neither is worth carrying.
-const BY_PROJECT = ['media', 'clips', 'nodes', 'comments', 'snapshots'];
+const BY_PROJECT = ['media', 'clips', 'nodes', 'comments', 'snapshots', 'scripts', 'scriptBlocks', 'shots', 'boardItems'];
 
 const open = () => {
   const file = join(DATA, 'frameline.sqlite');
@@ -42,7 +42,7 @@ function exportProject(needle, outDir) {
 
   const timelines = state.timelines.filter(item => item.projectId === project.id);
   const timelineIds = new Set(timelines.map(item => item.id));
-  const slice = Object.fromEntries(BY_PROJECT.map(key => [key, state[key].filter(item => item.projectId === project.id)]));
+  const slice = Object.fromEntries(BY_PROJECT.map(key => [key, (state[key] ?? []).filter(item => item.projectId === project.id)]));
   const bundle = { version: 1, exportedAt: Date.now(), project, timelines, tracks: state.tracks.filter(item => timelineIds.has(item.timelineId)), ...slice };
 
   mkdirSync(outDir, { recursive: true });
@@ -95,7 +95,8 @@ function importProject(inDir) {
     projects: [...state.projects, { ...bundle.project, members: [{ userId: ownerId, role: 'Owner' }] }],
     timelines: [...state.timelines, ...bundle.timelines],
     tracks: [...state.tracks, ...bundle.tracks],
-    ...Object.fromEntries(BY_PROJECT.map(key => [key, [...state[key], ...bundle[key]]])),
+    // Bundles made before a list existed (the Plan lists) lack it, and the workspace may too.
+    ...Object.fromEntries(BY_PROJECT.map(key => [key, [...(state[key] ?? []), ...(bundle[key] ?? [])]])),
   };
   writeWorkspaceRow(db, revision + 1, next, { fromItems });
 

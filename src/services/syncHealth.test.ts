@@ -16,7 +16,7 @@ async function inProject(run: (tab: { sent: Sent[]; store: typeof import('../sta
   define('localStorage', { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) });
   define('window', Object.assign(new EventTarget(), { location }));
   const alice: User = { id: 'alice', name: 'alice', email: 'alice@test.local', color: '#abcdef', initials: 'a' };
-  const remote: PersistedState = { projects: [{ id: 'p', name: 'P', description: '', members: [{ userId: 'alice', role: 'Owner' }] } as Project], media: [], timelines: [], tracks: [], clips: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], users: [alice], currentUserId: 'alice', settings: { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false } };
+  const remote: PersistedState = { projects: [{ id: 'p', name: 'P', description: '', members: [{ userId: 'alice', role: 'Owner' }] } as Project], media: [], timelines: [], tracks: [], clips: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], scripts: [], scriptBlocks: [], shots: [], boardItems: [], users: [alice], currentUserId: 'alice', settings: { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false } };
   const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } }));
   const sent: Sent[] = [];
   define('fetch', async (url: string, options: RequestInit = {}) => {

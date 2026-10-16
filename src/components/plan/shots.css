@@ -1,0 +1,74 @@
+/* Shot list (Plan → Shots). A quiet spreadsheet: cells read as text until hovered or focused. */
+.shot-list { display: flex; flex-direction: column; height: 100%; min-height: 0; min-width: 0; color: var(--text); }
+/* One row at every width (the header is one 40px row): the count gives way first, then the scene filter. */
+.shot-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; }
+.shot-actions .button { min-height: 28px; padding: 5px 10px; flex-shrink: 0; }
+.shot-filter { flex: 0 1 auto; min-width: 72px; max-width: 220px; min-height: 28px; padding: 4px 8px; font-size: 10px; text-overflow: ellipsis; }
+.shot-count { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 10px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+@media (max-width: 600px) { .shot-count, .shot-export > span { display: none; } }
+.shot-tip { margin: 0; padding: 7px 14px; font-size: 10px; color: var(--muted); border-bottom: 1px solid #ffffff07; }
+
+/* Wide by nature: the table scrolls in its own box, so the page never does (390px phones included). */
+.shot-scroll { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.shot-table { width: 100%; min-width: 1060px; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 11px; }
+.shot-table .c-done { width: 34px; } .shot-table .c-number { width: 62px; } .shot-table .c-size { width: 86px; } .shot-table .c-move { width: 96px; }
+.shot-table .c-cast { width: 120px; } .shot-table .c-location { width: 130px; } .shot-table .c-notes { width: 170px; } .shot-table .c-takes { width: 158px; } .shot-table .c-menu { width: 36px; }
+.shot-table thead th { position: sticky; top: 0; z-index: 2; background: var(--panel); text-align: left; font-size: 9px; font-weight: 600; letter-spacing: 1.2px; text-transform: uppercase; color: var(--muted); padding: 9px 9px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.shot-table td { padding: 3px; border-bottom: 1px solid #ffffff07; vertical-align: top; transition: background .6s; }
+
+.shot-group th { padding: 0; text-align: left; font-weight: inherit; background: #ffffff04; border-bottom: 1px solid #ffffff07; }
+/* The label stays in view while a phone scrolls the table sideways. */
+.shot-group th > div { position: sticky; left: 0; display: flex; align-items: center; gap: 10px; width: fit-content; max-width: min(100%, 92vw); padding: 13px 12px 7px; }
+.shot-group-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 600; letter-spacing: .5px; color: #c9cfd2; }
+.shot-group-count { font-size: 9px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.shot-group .text-button { display: inline-flex; align-items: center; gap: 4px; padding: 2px 0; font-size: 10px; white-space: nowrap; }
+
+.shot-table :is(input:not([type=checkbox]), textarea, select) { display: block; width: 100%; min-height: 26px; padding: 4px 6px; font-size: 11px; line-height: 1.45; color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 4px; }
+.shot-table textarea { resize: none; overflow: hidden; }
+.shot-table select { padding: 4px 2px; }
+.shot-table :is(input, textarea, select):hover:not(:disabled):not([readonly]):not(:focus) { background: #ffffff06; }
+.shot-table :is(input:not([type=checkbox]), textarea, select):focus { background: #141719; border-color: #bce8c740; }
+.shot-table :is(input:not([type=checkbox]), textarea, select):focus-visible { outline: none; }
+.shot-table select:disabled { opacity: 1; cursor: default; appearance: none; }
+.shot-table [readonly] { cursor: default; }
+.shot-number input { font-weight: 560; }
+.shot-done { text-align: center; }
+.shot-done input { margin: 7px auto 0; }
+.shot-row.done td:not(.shot-done) { opacity: .55; }
+.shot-row.flash td { background: #bce8c716; transition: none; }
+
+/* Someone else's row: edged and named in their color, read-only until they leave it. */
+.shot-owned td:first-child { box-shadow: inset 2px 0 var(--owner-color); }
+.shot-owned :is(input, textarea, select) { color: #c8bdd9; }
+.shot-owner { display: flex; align-items: center; gap: 4px; padding: 0 6px; font-size: 8px; color: var(--owner-color); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.shot-owner i { flex-shrink: 0; width: 4px; height: 4px; border-radius: 50%; background: var(--owner-color); }
+
+.shot-takes > div { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-height: 26px; }
+.shot-take { position: relative; display: block; }
+.shot-take > button:first-child { display: grid; place-items: center; width: 48px; aspect-ratio: 16 / 9; padding: 0; overflow: hidden; border-radius: 3px; border: 1px solid #ffffff12; background: #252c31; color: var(--muted); }
+.shot-take > button:first-child:hover { border-color: var(--accent); }
+.shot-take img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.shot-unlink { position: absolute; top: -4px; right: -4px; display: grid; place-items: center; width: 13px; height: 13px; padding: 0; border-radius: 50%; background: #2c3236; border: 1px solid #454c51; color: #cfd5d8; opacity: 0; }
+.shot-take:hover .shot-unlink, .shot-unlink:focus-visible { opacity: 1; }
+.shot-more { font-size: 9px; color: var(--muted); padding: 0 2px; font-variant-numeric: tabular-nums; }
+.shot-takes .icon-button { width: 22px; height: 22px; }
+.shot-in-edit { color: var(--accent); }
+.shot-link { opacity: 0; }
+.shot-row:hover .shot-link, .shot-row:focus-within .shot-link, .shot-link:focus-visible, .shot-takes > div:not(:has(.shot-take)) .shot-link { opacity: 1; }
+.shot-menu .icon-button { width: 24px; height: 24px; margin-top: 1px; }
+@media (hover: none) { .shot-link, .shot-unlink { opacity: 1; } }
+
+.shot-empty-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; }
+
+.shot-link-body { display: flex; flex-direction: column; gap: 10px; }
+.shot-link-search { position: relative; display: block; color: var(--muted); }
+.shot-link-search svg { position: absolute; left: 9px; top: 50%; translate: 0 -50%; pointer-events: none; }
+.shot-link-search input { width: 100%; padding-left: 28px; font-size: 11px; }
+.shot-link-list { display: flex; flex-direction: column; gap: 1px; max-height: min(50dvh, 420px); overflow: auto; margin: 0 -6px; }
+.shot-link-item { display: grid; grid-template-columns: auto 48px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 5px 6px; border-radius: 5px; font-size: 11px; cursor: pointer; }
+.shot-link-item:hover { background: #ffffff07; }
+.shot-link-item:has(input:disabled) { cursor: default; }
+.shot-link-thumb { display: grid; place-items: center; width: 48px; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 3px; background: #252c31; color: var(--muted); }
+.shot-link-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.shot-link-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shot-link-item small { font-size: 9px; color: var(--accent); white-space: nowrap; }

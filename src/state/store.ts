@@ -9,7 +9,8 @@ import { ADJUSTMENT_DURATION, ADJUSTMENT_MEDIA, isAdjustment } from '../services
 import { defaultShape, fitPenPoints, getShape, isShape, validateShape, type ShapeDocument } from '../services/shapes.ts';
 import { createTitleTemplate } from '../services/titleTemplates.ts';
 import { animationProperties, boundedAnimationValue, copyAnimatedNodes, evaluateClip, evaluateNodes, frameTime, retimedDuration, setAnimatedValue, trimAnimation, validateKeyframes } from '../services/animation.ts';
-import type { Keyframe, KeyframeValue } from './models.ts';
+import type { Keyframe, KeyframeValue, BoardItem, BoardItemKind, PlanTab, Script, ScriptBlock, ScriptBlockKind, ScriptFormat, Shot } from './models.ts';
+import { BOARD_ITEM_KINDS, crowded, HEX_COLOR, nextShotNumber, ordered, orderBetween, PLAN_LIMITS, PLAN_TABS, SCRIPT_BLOCK_KINDS, SCRIPT_FORMATS, sceneNumbers } from '../services/plan.ts';
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
 import type { Bin, Clip, CollaborativeLock, Comment, GradeNode, Marker, MediaAsset, Notification, Operation, OperationType, Presence, Project, ProjectState, RenderJob, Settings, Snapshot, Timeline, Track, User, Workspace } from './models.ts';
@@ -26,7 +27,9 @@ import { api, connection } from '../services/api.ts';
 import { enqueueUploads, uploadQueue } from '../services/upload.ts';
 import { forwardSelection } from '../services/selection.ts';
 
-type Collection = 'clips' | 'tracks' | 'nodes' | 'comments' | 'timelines';
+type Collection = 'clips' | 'tracks' | 'nodes' | 'comments' | 'timelines' | 'scripts' | 'scriptBlocks' | 'shots' | 'boardItems';
+/** What commit, undo and redo change: the snapshotted project state plus the Plan rows, which snapshots leave out. */
+type Collections = ProjectState & { scripts?: Script[]; scriptBlocks?: ScriptBlock[]; shots?: Shot[]; boardItems?: BoardItem[] };
 type Change = { collection: Collection; id: string; value: Record<string, unknown> | null; replace?: boolean; unset?: string[] };
 type SidePanel = 'inspector' | 'people' | 'history' | 'comments' | null;
 /** Edit tools that move a clip's edges: ripple (trim and shift what follows), roll (move a cut), slip (change source in/out in place), slide (move between neighbours). */
@@ -172,12 +175,50 @@ export interface EditorStore extends PersistedState {
   /** All-or-nothing lock on many items in one set() and one request (a multi-clip drag, also its renewal); false and nothing taken when any is held by someone else. */
   acquireLocks(targetIds: string[], field: string): boolean; releaseLocks(targetIds: string[], field: string): void;
   tick(now: number): void; setLiveMode(mode: LiveMode, userId?: string): void;
+  /** Plan workspace: the open tab, the line, shot or card it scrolls to, and the board picture shown on the Color page. */
+  planTab: PlanTab; planFocus: string | null; colorReference: string | null;
+  /** A new script (named after the project when it is the first) holding one empty scene heading; returns its id. */
+  addScript(name?: string, format?: ScriptFormat): string | undefined;
+  /** Renames a script, sets screenplay or stage play, or its title page's credit or author line ('' clears one; no author prints the exporter). */
+  updateScript(id: string, patch: { name?: string; format?: ScriptFormat; credit?: string; author?: string }): void;
+  /** Deletes a script and all its lines; shots of its scenes stay, unlinked. */
+  deleteScript(id: string): void;
+  /** Adds up to 5000 lines to a script: at the end, at the start (afterId null) or after line afterId; returns their ids. */
+  addScriptBlocks(scriptId: string, blocks: { kind: ScriptBlockKind; text: string }[], afterId?: string | null): string[];
+  /** Changes a script line's kind or text; one gesture per typing session undoes it as one step. */
+  updateScriptBlock(id: string, patch: { kind?: ScriptBlockKind; text?: string }, gesture?: string): void;
+  /** Splits a line at character `at`: the rest becomes a new line right after it (`kind`, default the same); returns the new id. */
+  splitScriptBlock(id: string, at: number, kind?: ScriptBlockKind): string | undefined;
+  /** Joins a line onto the line above it in its script; returns that line's id (undefined for the first line). */
+  mergeScriptBlock(id: string): string | undefined;
+  /** Deletes script lines; shots of a deleted scene heading are unlinked. */
+  deleteScriptBlocks(ids: string[]): void;
+  /** A new shot-list row, numbered on its own (1A, 1B under scene 1; else 1, 2); after afterId (null: first), else after its scene's last shot; returns its id. */
+  addShot(fields?: { number?: string; sceneId?: string; text?: string; size?: string; movement?: string; cast?: string; location?: string; notes?: string; done?: boolean }, afterId?: string | null): string | undefined;
+  /** Changes a shot's fields; '' (or sceneId null) clears one. */
+  updateShot(id: string, patch: { number?: string; sceneId?: string | null; text?: string; size?: string; movement?: string; cast?: string; location?: string; notes?: string; done?: boolean }, gesture?: string): void;
+  /** Deletes shot-list rows. */
+  deleteShots(ids: string[]): void;
+  /** Moves a shot to right after afterId (null: first). */
+  moveShot(id: string, afterId: string | null): void;
+  /** Links media to a shot as a take by hand, or unlinks it with linked false. */
+  linkShotMedia(shotId: string, mediaId: string, linked?: boolean): void;
+  /** Adds mood-board cards in one undo (image needs mediaId of an image or video in the project); returns their ids. */
+  addBoardItems(items: { kind: BoardItemKind; x?: number; y?: number; w?: number; h?: number; mediaId?: string; text?: string; color?: string }[]): string[];
+  /** Moves, resizes, restacks or edits board cards as one undo; one gesture per drag. */
+  updateBoardItems(patches: { id: string; patch: { x?: number; y?: number; w?: number; h?: number; z?: number; text?: string; color?: string } }[], gesture?: string): void;
+  /** Deletes board cards. */
+  deleteBoardItems(ids: string[]): void;
+  /** Opens the Plan workspace on a tab, scrolled to a line, shot or card. */
+  openPlan(tab: PlanTab, focusId?: string | null): void;
+  /** Opens the Color page with an image or video as a reference picture; null clears it. */
+  setColorReference(mediaId: string | null): void;
 }
 
 const demo = createDemoProject();
 const initial: PersistedState = {
   projects, users, media: demo.media, timelines: demo.timelines, clips: demo.clips, tracks: demo.tracks,
-  nodes: demo.nodes, comments: demo.comments, operations: demo.operations, snapshots: demo.snapshots,
+  nodes: demo.nodes, comments: demo.comments, operations: demo.operations, snapshots: demo.snapshots, scripts: [], scriptBlocks: [], shots: [], boardItems: [],
   renderJobs: [
     { id: 'render-demo-1', projectId: 'city-after-dark', name: 'City After Dark · Review', preset: 'YouTube', status: 'rendering', progress: 64, remaining: '0:29 remaining', settings: { resolution: '1920 × 1080', codec: 'H.264', fps: '24', audio: 'AAC · 320 kbps' } },
     { id: 'render-demo-2', projectId: 'city-after-dark', name: 'Class screening', preset: 'Quick Export', status: 'waiting', progress: 0, remaining: 'Waiting', settings: { resolution: '1920 × 1080', codec: 'H.264' } },
@@ -207,9 +248,9 @@ const patchRecord = (value: object, patch: Record<string, unknown>, unset: strin
   }
   return result;
 };
-const entity = (state: ProjectState, change: Change) => (state[change.collection] ?? []).find(item => item.id === change.id);
-function applyChanges(state: ProjectState, changes: Change[]): ProjectState & {timelines:Timeline[]} {
-  const next = { timelines: state.timelines ?? [], clips: state.clips, tracks: state.tracks, nodes: state.nodes, comments: state.comments };
+const entity = (state: Collections, change: Change) => (state[change.collection] ?? []).find(item => item.id === change.id);
+function applyChanges(state: Collections, changes: Change[]): Required<Collections> {
+  const next = { timelines: state.timelines ?? [], clips: state.clips, tracks: state.tracks, nodes: state.nodes, comments: state.comments, scripts: state.scripts ?? [], scriptBlocks: state.scriptBlocks ?? [], shots: state.shots ?? [], boardItems: state.boardItems ?? [] };
   for (const change of changes) {
     const collection = next[change.collection] as unknown as Record<string, unknown>[];
     const index = collection.findIndex(item => item.id === change.id);
@@ -243,7 +284,7 @@ const intact = (restored: ProjectState, timelines: Timeline[], current: ProjectS
   try { validateCompositions(restored.clips, restored.timelines ?? timelines); return true; } catch { return false; }
 };
 /** Applying `changes` would leave every entity they touch exactly as it is now. */
-const settled = (state: ProjectState, changes: Change[]) => { const next = applyChanges(state, changes); return changes.every(c => JSON.stringify(entity(next, c)) === JSON.stringify(entity(state, c))); };
+const settled = (state: Collections, changes: Change[]) => { const next = applyChanges(state, changes); return changes.every(c => JSON.stringify(entity(next, c)) === JSON.stringify(entity(state, c))); };
 const projectState = (state: EditorStore): ProjectState => ({ timelines: state.timelines.filter(t=>t.projectId===state.projectId), clips: state.clips.filter(item => item.projectId === state.projectId), tracks: state.tracks.filter(item => state.timelines.some(t => t.id === item.timelineId && t.projectId === state.projectId)), nodes: state.nodes.filter(item => item.projectId === state.projectId), comments: state.comments.filter(item => item.projectId === state.projectId) });
 const durationOf = (state: EditorStore) => state.timelines.find(t => t.id === state.timelineId)?.duration ?? 180;
 // Where playback stops: the end of the last clip on a server timeline. Remembered per clip list: the clock asks every tick.
@@ -273,6 +314,11 @@ const updatedProjects = (state: EditorStore, clips: Clip[]) => {
   return state.projects.map(project => project.id === state.projectId ? { ...project, duration, modifiedAt: Date.now() } : project);
 };
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+// Mood-board card sizes (and tints) a new card gets when it names none.
+const BOARD_DEFAULTS: Record<BoardItemKind, { w: number; h: number; color?: string }> = { note: { w: 220, h: 160, color: '#f2c878' }, text: { w: 360, h: 64 }, swatch: { w: 120, h: 150, color: '#bce8c7' }, image: { w: 320, h: 220 } };
+const boardCoord = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? clamp(value, -PLAN_LIMITS.coord, PLAN_LIMITS.coord) : undefined;
+const boardSize = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? clamp(value, PLAN_LIMITS.minSize, PLAN_LIMITS.maxSize) : undefined;
+const plural = (count: number, one: string, many: string) => count === 1 ? one : `${count} ${many}`;
 /** Where uploads land, so where a deleted bin's media go. These two cannot be deleted. */
 export const defaultBin = (media: Pick<MediaAsset, 'kind'>) => media.kind === 'audio' ? 'audio' : 'broll';
 /** A project's bins: its own list once an editor changed one, else the fixed set where media sits; plus any bin media name that neither lists (an import makes one per camera). */
@@ -362,6 +408,41 @@ export const useEditorStore = create<EditorStore>((set, get) => {
   const groupMembers=(groupId:string)=>{
     const state=get(),nodes=state.nodes.filter(n=>n.projectId===state.projectId&&n.group===groupId),open=nodes.filter(n=>editableClip(n.clipId,'grade')&&available(n.id,'*'));
     return {nodes,open,locked:nodes.filter(n=>!open.includes(n)).map(n=>state.clips.find(c=>c.id===n.clipId)?.name??n.clipId)};
+  };
+  // A row a collaborator holds, whatever the field: the server refuses (423) any change to a locked Plan row. Silent.
+  const heldByOther = (id: string) => { const st = get(); return st.locks.some(l => l.projectId === st.projectId && l.targetId === id && l.userId !== st.currentUserId && l.expiresAt > Date.now()); };
+  // Orders for `count` new rows between list[at-1] and list[at] (`list` in reading order), spread evenly. Once that gap is
+  // too narrow to split, it widens over neighbours nobody else holds and respreads just those, pushed onto `changes` for the
+  // same commit (a held row rewritten would be refused and land elsewhere). Undefined, with a notice, when held rows box it in.
+  const placeRows = (collection: 'scriptBlocks' | 'shots', list: { id: string; order: number }[], at: number, count: number, changes: Change[], now: number) => {
+    let lo = at, hi = at;
+    const fits = () => { const a = list[lo - 1]?.order, b = list[hi]?.order; return a === undefined || b === undefined || !crowded(a, a + (b - a) / (hi - lo + count + 1)); };
+    while (!fits()) {
+      const down = lo > 0 && !heldByOther(list[lo - 1].id), up = hi < list.length && !heldByOther(list[hi].id);
+      if (!down && !up) { get().notify('A collaborator is editing nearby', 'info'); return undefined; }
+      if (down) lo--; if (up) hi++;
+    }
+    const a = list[lo - 1]?.order, b = list[hi]?.order, n = hi - lo + count;
+    // orderBetween for one row; several split the gap evenly, or step by 1 past an open end.
+    const slot = (k: number) => a === undefined ? b === undefined ? k + 1 : b - (n - k) : b === undefined ? a + k + 1 : a + (b - a) * (k + 1) / (n + 1);
+    list.slice(lo, hi).forEach((item, j) => { const order = slot(j < at - lo ? j : j + count); if (item.order !== order) changes.push({ collection, id: item.id, value: { order, modifiedAt: now } }); });
+    return Array.from({ length: count }, (_, k) => slot(at - lo + k));
+  };
+  // Shots whose scene heading is going: they stay, unlinked (soft references, models.ts). One a collaborator holds keeps its
+  // dangling sceneId: rewriting it would be refused, and undo could then never restore the scene.
+  const unlinkScenes = (ids: Set<string>): Change[] => get().shots.filter(s => s.projectId === get().projectId && s.sceneId && ids.has(s.sceneId) && !heldByOther(s.id)).map(s => ({ collection: 'shots', id: s.id, value: { modifiedAt: Date.now() }, unset: ['sceneId'] }));
+  // "scene 3" for a line under its script's third scene heading, else the script's name: what history calls the edit.
+  const sceneOf = (block: ScriptBlock) => {
+    const state = get(), lines = ordered(state.scriptBlocks.filter(b => b.scriptId === block.scriptId && b.projectId === block.projectId));
+    const scene = lines.slice(0, lines.findIndex(b => b.id === block.id) + 1).reverse().find(b => b.kind === 'scene');
+    return scene ? `scene ${sceneNumbers(lines).get(scene.id)}` : `"${state.scripts.find(s => s.id === block.scriptId)?.name ?? 'script'}"`;
+  };
+  // A shot's optional text fields: set when they hold more than spaces, else to unset. Values keep their spaces: a cell types into them.
+  const shotFields = (fields: { size?: string; movement?: string; cast?: string; location?: string; notes?: string; done?: boolean }) => {
+    const value: Record<string, unknown> = {}, unset: string[] = [];
+    for (const key of ['size', 'movement', 'cast', 'location', 'notes'] as const) { const text = fields[key]; if (typeof text !== 'string') continue; if (text.trim()) value[key] = text.slice(0, key === 'notes' ? PLAN_LIMITS.shotNotes : PLAN_LIMITS.field); else unset.push(key); }
+    if (fields.done === true) value.done = true; else if (fields.done === false) unset.push('done');
+    return { value, unset };
   };
   let lastGesture: { token: string; operationId: string } | undefined;
   // Undo records, newest first: what Redo can re-apply. Any edit you commit clears yours.
@@ -614,7 +695,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     selectedClipId: saved ? saved.clips.find(clip => clip.id === 'c3')?.id ?? null : 'c3', selectedNodeId: demo.selectedNodeId,
     notifications: recoveryMessage ? [{ id: 'recovery', title: 'Recovered the demo project', detail: recoveryMessage, kind: 'error', timestamp: Date.now() }] : [],
     dragPreview: null, presence: demo.presence, locks: [{ id: 'demo-speed-lock', projectId: 'city-after-dark', targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }],
-    playhead: 42, rangeIn: 0, rangeOut: 180, revealedMediaId: null, playing: false, playbackBuffering: false, workspace: 'edit', sidePanel: 'inspector', modal: null,
+    playhead: 42, rangeIn: 0, rangeOut: 180, revealedMediaId: null, playing: false, playbackBuffering: false, workspace: 'edit', sidePanel: 'inspector', modal: null, planTab: 'script', planFocus: null, colorReference: null,
     selectedMarkerIds: [], selectedMediaIds: [], markerClipboard: null, clipPreview: null, draggingMediaId: null, pendingDrops: [], inspectorTab: 'Video', selectedTransition: null, draggingTransition: null, leaks: [], transitionPresets: [], transitionFavorites: [], saveStatus: 'Saved', liveMode: 'independent', followUserId: null, clipboard: null, clipboardClips: [], clipboardNodes: [], gradeClipboard: null,
     addTitle(preset = 0, box = {}, placement, animated = true) {
       const state=get();if(!writable())return;
@@ -844,7 +925,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (!timeline) return;
       const selected = next.clips.find(c => c.projectId === id && c.name === 'Neon crossing') ?? next.clips.find(c => c.timelineId === timeline.id);
       const memberIds = next.projects.find(p => p.id === id)!.members.map(member => member.userId);
-      set({ selectedClipIds:[],selectedMediaIds:[],compositionTrail:[],shapeTool:null, projectId: id, timelineId: timeline.id, selectedClipId: selected?.id ?? null, selectedNodeId: next.nodes.find(node => node.clipId === selected?.id && node.name === 'Balance')?.id ?? null, workspace: 'edit', selectedTextIds: selected && isTitle(selected) ? [selected.id] : [], textSelection: null, textTool: false, textPreview: [], playhead: selected?.start ?? 0, ...initialRange(next, timeline.id), revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, modal: null, presence: connection.enabled ? [] : createDemoProject(id).presence.filter(p => memberIds.includes(p.userId) && p.userId !== next.currentUserId), locks: !connection.enabled && id === 'city-after-dark' ? [{ id: createId('lock'), projectId: id, targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }] : [] });
+      set({ selectedClipIds:[],selectedMediaIds:[],compositionTrail:[],shapeTool:null, projectId: id, timelineId: timeline.id, selectedClipId: selected?.id ?? null, selectedNodeId: next.nodes.find(node => node.clipId === selected?.id && node.name === 'Balance')?.id ?? null, workspace: 'edit', selectedTextIds: selected && isTitle(selected) ? [selected.id] : [], textSelection: null, textTool: false, textPreview: [], playhead: selected?.start ?? 0, ...initialRange(next, timeline.id), revealedMediaId: null, playing: false, liveMode: 'independent', followUserId: null, modal: null, planFocus: null, colorReference: null, presence: connection.enabled ? [] : createDemoProject(id).presence.filter(p => memberIds.includes(p.userId) && p.userId !== next.currentUserId), locks: !connection.enabled && id === 'city-after-dark' ? [{ id: createId('lock'), projectId: id, targetId: 'c3', field: 'speed', userId: 'ashley', expiresAt: Date.now() + 12_000 }] : [] });
     },
     createProject(input) {
       const state = get();
@@ -1865,6 +1946,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     removeMedia(id) {
       const state = get(); if (!writable()) return;
       if (state.clips.some(clip => clip.mediaId === id) || state.snapshots.some(snapshot => snapshot.state.clips.some(clip => clip.mediaId === id))) { state.notify('This media is used in a timeline or snapshot', 'info', 'Keeping it prevents missing media when a snapshot is restored.'); return; }
+      if (state.boardItems.some(item => item.projectId === state.projectId && item.mediaId === id)) { state.notify('That image is on the mood board', 'info', 'Remove it from the board first.'); return; }
       if (connection.enabled) { void connection.flush().then(() => api(`/media/${encodeURIComponent(id)}`, { method: 'DELETE' })).then(() => connection.refresh()).catch(error => state.notify(error.message,'error')); return; }
       set({ media: state.media.filter(asset => asset.id !== id || asset.projectId !== state.projectId) });
     },
@@ -1967,6 +2049,184 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (mode === 'following') { followedMotion = null; followedUser = null; const person = state.presence.find(person => person.userId === userId && person.online); if (!person) { state.notify('This collaborator is not online', 'info'); return; } set({ liveMode: mode, followUserId: person.userId, playhead: person.playhead, playing: false }); }
       else { set({ liveMode: mode, followUserId: null }); if (mode === 'presenting') state.notify('You’re presenting to the class', 'success', 'Collaborators can now follow your playhead.'); }
     },
+    // Plan (docs/superpowers/specs/2026-10-15-plan-workspace-design.md): rows of the open project, ordered by `order`.
+    addScript(name, format = 'screenplay') {
+      const state = get(); if (!writable()) return;
+      if (!SCRIPT_FORMATS.includes(format)) { state.notify('Unknown script format', 'error'); return; }
+      const scripts = ordered(state.scripts.filter(s => s.projectId === state.projectId)), now = Date.now();
+      const title = name?.trim().slice(0, PLAN_LIMITS.field) || (scripts.length ? 'Untitled script' : state.projects.find(p => p.id === state.projectId)?.name.slice(0, PLAN_LIMITS.field) || 'Untitled script');
+      const script: Script = { id: createId('script'), projectId: state.projectId, name: title, format, order: orderBetween(scripts.at(-1)?.order), modifiedAt: now };
+      const scene: ScriptBlock = { id: createId('block'), projectId: state.projectId, scriptId: script.id, kind: 'scene', text: '', order: 1, modifiedAt: now };
+      commit('ScriptChanged', script.id, `added script "${title}"`, [{ collection: 'scripts', id: script.id, value: record(script), replace: true }, { collection: 'scriptBlocks', id: scene.id, value: record(scene), replace: true }]);
+      return script.id;
+    },
+    updateScript(id, patch) {
+      const state = get(), script = state.scripts.find(s => s.id === id && s.projectId === state.projectId);
+      if (!script || !writable() || !available(id, '*')) return;
+      const name = patch.name === undefined ? undefined : patch.name.trim().slice(0, PLAN_LIMITS.field);
+      // The title page's credit and author lines: '' clears one.
+      const titles = (['credit', 'author'] as const).map(key => [key, patch[key]?.trim().slice(0, PLAN_LIMITS.field)] as const);
+      if (name === '') { state.notify('A script needs a name', 'info'); return; }
+      if (patch.format !== undefined && !SCRIPT_FORMATS.includes(patch.format)) { state.notify('Unknown script format', 'error'); return; }
+      const value: Record<string, unknown> = { ...(name !== undefined && name !== script.name ? { name } : {}), ...(patch.format && patch.format !== script.format ? { format: patch.format } : {}), ...Object.fromEntries(titles.filter(([key, text]) => text && text !== script[key])) };
+      const unset = titles.filter(([key, text]) => text === '' && script[key] !== undefined).map(([key]) => key);
+      if (!Object.keys(value).length && !unset.length) return;
+      commit('ScriptChanged', id, `edited script "${name ?? script.name}"`, [{ collection: 'scripts', id, value: { ...value, modifiedAt: Date.now() }, ...(unset.length ? { unset } : {}) }]);
+    },
+    deleteScript(id) {
+      const state = get(), script = state.scripts.find(s => s.id === id && s.projectId === state.projectId);
+      if (!script || !writable()) return;
+      const blocks = state.scriptBlocks.filter(b => b.scriptId === id && b.projectId === state.projectId);
+      if (![script, ...blocks].every(item => available(item.id, '*'))) return;
+      commit('ScriptChanged', id, `deleted script "${script.name}"`, [{ collection: 'scripts', id, value: null }, ...blocks.map(b => ({ collection: 'scriptBlocks' as const, id: b.id, value: null })), ...unlinkScenes(new Set(blocks.map(b => b.id)))]);
+    },
+    addScriptBlocks(scriptId, blocks, afterId) {
+      const state = get(), script = state.scripts.find(s => s.id === scriptId && s.projectId === state.projectId);
+      if (!script) { state.notify('That script is gone', 'info'); return []; }
+      if (!writable() || !blocks.length) return [];
+      // ponytail: 5000 lines per call keeps one commit (and one save) bounded; an import of a longer script sends several.
+      if (blocks.length > 5000) { state.notify('Add at most 5000 lines at a time', 'error'); return []; }
+      if (blocks.some(b => !SCRIPT_BLOCK_KINDS.includes(b?.kind))) { state.notify('Unknown script line kind', 'error'); return []; }
+      const lines = ordered(state.scriptBlocks.filter(b => b.scriptId === scriptId && b.projectId === state.projectId)), at = afterId === undefined ? lines.length : afterId === null ? 0 : lines.findIndex(b => b.id === afterId) + 1;
+      if (!at && afterId) { state.notify('That line is gone', 'info'); return []; }
+      const now = Date.now(), changes: Change[] = [], orders = placeRows('scriptBlocks', lines, at, blocks.length, changes, now); if (!orders) return [];
+      const added: ScriptBlock[] = blocks.map((b, i) => ({ id: createId('block'), projectId: state.projectId, scriptId, kind: b.kind, text: typeof b.text === 'string' ? b.text.slice(0, PLAN_LIMITS.blockText) : '', order: orders[i], modifiedAt: now }));
+      commit('ScriptChanged', added[0].id, `added ${plural(added.length, 'a line', 'lines')} to "${script.name}"`, [...changes, ...added.map(b => ({ collection: 'scriptBlocks' as const, id: b.id, value: record(b), replace: true }))]);
+      return added.map(b => b.id);
+    },
+    updateScriptBlock(id, patch, gesture) {
+      const state = get(), block = state.scriptBlocks.find(b => b.id === id && b.projectId === state.projectId);
+      if (!block || !writable() || !available(id, 'text')) return;
+      if (patch.kind !== undefined && !SCRIPT_BLOCK_KINDS.includes(patch.kind)) { state.notify('Unknown script line kind', 'error'); return; }
+      const value: Record<string, unknown> = { ...(patch.kind !== undefined ? { kind: patch.kind } : {}), ...(typeof patch.text === 'string' ? { text: patch.text.slice(0, PLAN_LIMITS.blockText) } : {}) };
+      // Every given field goes out (a typing session keeps one key set, so it coalesces); nothing at all when none changes.
+      if (Object.entries(value).every(([key, next]) => block[key as 'kind' | 'text'] === next)) return;
+      commit('ScriptChanged', id, `edited ${sceneOf(block)}`, [{ collection: 'scriptBlocks', id, value: { ...value, modifiedAt: Date.now() } }], gesture);
+    },
+    splitScriptBlock(id, at, kind) {
+      const state = get(), block = state.scriptBlocks.find(b => b.id === id && b.projectId === state.projectId);
+      if (!block || !writable() || !available(id, 'text') || !Number.isFinite(at)) return;
+      if (kind !== undefined && !SCRIPT_BLOCK_KINDS.includes(kind)) { state.notify('Unknown script line kind', 'error'); return; }
+      const cut = clamp(Math.trunc(at), 0, block.text.length), lines = ordered(state.scriptBlocks.filter(b => b.scriptId === block.scriptId && b.projectId === state.projectId)), now = Date.now(), changes: Change[] = [];
+      const [order] = placeRows('scriptBlocks', lines, lines.findIndex(b => b.id === id) + 1, 1, changes, now) ?? []; if (order === undefined) return;
+      const added: ScriptBlock = { id: createId('block'), projectId: state.projectId, scriptId: block.scriptId, kind: kind ?? block.kind, text: block.text.slice(cut), order, modifiedAt: now };
+      if (cut < block.text.length) changes.push({ collection: 'scriptBlocks', id, value: { text: block.text.slice(0, cut), modifiedAt: now } });
+      commit('ScriptChanged', id, `split a line in ${sceneOf(block)}`, [...changes, { collection: 'scriptBlocks', id: added.id, value: record(added), replace: true }]);
+      return added.id;
+    },
+    mergeScriptBlock(id) {
+      const state = get(), block = state.scriptBlocks.find(b => b.id === id && b.projectId === state.projectId);
+      if (!block || !writable()) return;
+      const lines = ordered(state.scriptBlocks.filter(b => b.scriptId === block.scriptId && b.projectId === state.projectId)), previous = lines[lines.findIndex(b => b.id === id) - 1];
+      if (!previous || !available(id, '*') || !available(previous.id, 'text')) return;
+      commit('ScriptChanged', previous.id, `joined two lines in ${sceneOf(previous)}`, [{ collection: 'scriptBlocks', id: previous.id, value: { text: (previous.text + block.text).slice(0, PLAN_LIMITS.blockText), modifiedAt: Date.now() } }, { collection: 'scriptBlocks', id, value: null }, ...unlinkScenes(new Set([id]))]);
+      return previous.id;
+    },
+    deleteScriptBlocks(ids) {
+      const state = get(), blocks = state.scriptBlocks.filter(b => ids.includes(b.id) && b.projectId === state.projectId);
+      if (!blocks.length || !writable() || !blocks.every(b => available(b.id, '*'))) return;
+      commit('ScriptChanged', blocks[0].id, `deleted ${plural(blocks.length, 'a script line', 'script lines')}`, [...blocks.map(b => ({ collection: 'scriptBlocks' as const, id: b.id, value: null })), ...unlinkScenes(new Set(blocks.map(b => b.id)))]);
+    },
+    addShot(fields = {}, afterId) {
+      const state = get(); if (!writable()) return;
+      const scene = fields.sceneId === undefined ? undefined : state.scriptBlocks.find(b => b.id === fields.sceneId && b.projectId === state.projectId && b.kind === 'scene');
+      if (fields.sceneId !== undefined && !scene) { state.notify('That scene is gone', 'info'); return; }
+      const shots = ordered(state.shots.filter(s => s.projectId === state.projectId));
+      const sceneNumber = scene && sceneNumbers(state.scriptBlocks.filter(b => b.scriptId === scene.scriptId && b.projectId === state.projectId)).get(scene.id);
+      // The cap covers the computed number too: one past a 16-digit "9999999999999999" is 17 digits, which the server refuses.
+      const number = ((typeof fields.number === 'string' ? fields.number.trim() : '') || nextShotNumber(shots, sceneNumber)).slice(0, PLAN_LIMITS.shotNumber);
+      const ofScene = scene ? shots.map(s => s.sceneId).lastIndexOf(scene.id) + 1 : 0;
+      const at = afterId === null ? 0 : afterId !== undefined ? shots.findIndex(s => s.id === afterId) + 1 : ofScene || shots.length;
+      if (!at && afterId) { state.notify('That shot is gone', 'info'); return; }
+      const now = Date.now(), changes: Change[] = [], [order] = placeRows('shots', shots, at, 1, changes, now) ?? []; if (order === undefined) return;
+      const shot: Shot = { id: createId('shot'), projectId: state.projectId, number, ...(scene ? { sceneId: scene.id } : {}), text: typeof fields.text === 'string' ? fields.text.slice(0, PLAN_LIMITS.shotText) : '', ...shotFields(fields).value, order, modifiedAt: now };
+      commit('ShotChanged', shot.id, `added shot ${number}`, [...changes, { collection: 'shots', id: shot.id, value: record(shot), replace: true }]);
+      return shot.id;
+    },
+    updateShot(id, patch, gesture) {
+      const state = get(), shot = state.shots.find(s => s.id === id && s.projectId === state.projectId);
+      if (!shot || !writable() || !available(id, 'row')) return;
+      const number = typeof patch.number === 'string' ? patch.number.trim().slice(0, PLAN_LIMITS.shotNumber) : undefined;
+      if (number === '') { state.notify('A shot needs a number', 'info'); return; }
+      if (typeof patch.sceneId === 'string' && !state.scriptBlocks.some(b => b.id === patch.sceneId && b.projectId === state.projectId && b.kind === 'scene')) { state.notify('That scene is gone', 'info'); return; }
+      const fields = shotFields(patch), value: Record<string, unknown> = { ...(number !== undefined ? { number } : {}), ...(typeof patch.sceneId === 'string' ? { sceneId: patch.sceneId } : {}), ...(typeof patch.text === 'string' ? { text: patch.text.slice(0, PLAN_LIMITS.shotText) } : {}), ...fields.value };
+      const unset = [...fields.unset, ...(patch.sceneId === null ? ['sceneId'] : [])].filter(key => shot[key as keyof Shot] !== undefined);
+      if (Object.entries(value).every(([key, next]) => shot[key as keyof Shot] === next) && !unset.length) return;
+      commit('ShotChanged', id, `edited shot ${number ?? shot.number}`, [{ collection: 'shots', id, value: { ...value, modifiedAt: Date.now() }, ...(unset.length ? { unset } : {}) }], gesture);
+    },
+    deleteShots(ids) {
+      const state = get(), shots = state.shots.filter(s => ids.includes(s.id) && s.projectId === state.projectId);
+      if (!shots.length || !writable() || !shots.every(s => available(s.id, '*'))) return;
+      commit('ShotChanged', shots[0].id, shots.length === 1 ? `deleted shot ${shots[0].number}` : `deleted ${shots.length} shots`, shots.map(s => ({ collection: 'shots' as const, id: s.id, value: null })));
+    },
+    moveShot(id, afterId) {
+      const state = get(), all = ordered(state.shots.filter(s => s.projectId === state.projectId)), index = all.findIndex(s => s.id === id), shot = all[index];
+      if (!shot || afterId === id || (all[index - 1]?.id ?? null) === afterId || !writable() || !available(id, 'row')) return;
+      const rest = all.filter(s => s.id !== id), at = afterId === null ? 0 : rest.findIndex(s => s.id === afterId) + 1;
+      if (!at && afterId !== null) { state.notify('That shot is gone', 'info'); return; }
+      const now = Date.now(), changes: Change[] = [], [order] = placeRows('shots', rest, at, 1, changes, now) ?? []; if (order === undefined) return;
+      commit('ShotChanged', id, `moved shot ${shot.number}`, [...changes, { collection: 'shots', id, value: { order, modifiedAt: now } }]);
+    },
+    linkShotMedia(shotId, mediaId, linked = true) {
+      const state = get(), shot = state.shots.find(s => s.id === shotId && s.projectId === state.projectId);
+      if (!shot || !writable() || !available(shotId, 'row')) return;
+      const current = shot.mediaIds ?? [];
+      if (linked && current.includes(mediaId) || !linked && !current.includes(mediaId)) return;
+      if (linked && !state.media.some(m => m.id === mediaId && m.projectId === state.projectId)) { state.notify('That media is not in this project', 'info'); return; }
+      if (linked && current.length >= PLAN_LIMITS.mediaIds) { state.notify(`A shot holds at most ${PLAN_LIMITS.mediaIds} takes`, 'info'); return; }
+      const mediaIds = linked ? [...current, mediaId] : current.filter(m => m !== mediaId);
+      commit('ShotChanged', shotId, `${linked ? 'linked a take to' : 'unlinked a take from'} shot ${shot.number}`, [{ collection: 'shots', id: shotId, value: { ...(mediaIds.length ? { mediaIds } : {}), modifiedAt: Date.now() }, ...(mediaIds.length ? {} : { unset: ['mediaIds'] }) }]);
+    },
+    addBoardItems(items) {
+      const state = get(); if (!items.length || !writable()) return [];
+      const now = Date.now(), top = Math.max(0, ...state.boardItems.filter(i => i.projectId === state.projectId).map(i => i.z)), added: BoardItem[] = [];
+      for (const [index, item] of items.entries()) {
+        if (!BOARD_ITEM_KINDS.includes(item?.kind)) { state.notify('Unknown board card kind', 'error'); continue; }
+        const media = item.kind === 'image' ? state.media.find(m => m.id === item.mediaId && m.projectId === state.projectId && (m.kind === 'image' || m.kind === 'video')) : undefined;
+        if (item.kind === 'image' && !media) { state.notify('Pick an image or video from this project', 'info'); continue; }
+        if (item.color !== undefined && !HEX_COLOR.test(item.color)) { state.notify('Colors are #rrggbb', 'error'); continue; }
+        const defaults = BOARD_DEFAULTS[item.kind], color = item.color?.toLowerCase() ?? defaults.color, text = typeof item.text === 'string' ? item.text.slice(0, PLAN_LIMITS.boardText) : '';
+        added.push({ id: createId('board'), projectId: state.projectId, kind: item.kind, x: boardCoord(item.x) ?? index * 24, y: boardCoord(item.y) ?? index * 24, w: boardSize(item.w) ?? defaults.w, h: boardSize(item.h) ?? defaults.h, z: top + 1 + index, ...(media ? { mediaId: media.id } : {}), ...(text ? { text } : {}), ...(color ? { color } : {}), modifiedAt: now });
+      }
+      if (!added.length) return [];
+      commit('BoardChanged', added[0].id, `added ${plural(added.length, 'a board card', 'board cards')}`, added.map(item => ({ collection: 'boardItems' as const, id: item.id, value: record(item), replace: true })));
+      return added.map(item => item.id);
+    },
+    updateBoardItems(patches, gesture) {
+      const state = get(); if (!patches.length || !writable()) return;
+      const now = Date.now(), changes: Change[] = [];
+      let edited = false, resized = false;
+      for (const { id, patch } of patches) {
+        const item = state.boardItems.find(i => i.id === id && i.projectId === state.projectId); if (!item || !patch) continue;
+        if (patch.color !== undefined && !HEX_COLOR.test(patch.color)) { state.notify('Colors are #rrggbb', 'error'); return; }
+        // z clamps like x/y: the server refuses numbers past ±1e15, and a refused save stalls every later one.
+        const geometry = { x: boardCoord(patch.x), y: boardCoord(patch.y), w: boardSize(patch.w), h: boardSize(patch.h), z: boardCoord(patch.z) };
+        const value: Record<string, unknown> = Object.fromEntries(Object.entries({ ...geometry, color: patch.color?.toLowerCase() }).filter(([, v]) => v !== undefined)), unset: string[] = [];
+        if (typeof patch.text === 'string') { const text = patch.text.slice(0, PLAN_LIMITS.boardText); if (text) value.text = text; else if (item.text !== undefined) unset.push('text'); }
+        if (Object.entries(value).every(([key, next]) => item[key as keyof BoardItem] === next) && !unset.length) continue;
+        // A drag takes the card's manipulation lock, typing its text lock, but the server refuses (423) any change to a card
+        // someone else holds either way: whole-card, like undo.
+        if (!available(id, '*')) return;
+        edited ||= 'text' in value || 'color' in value || !!unset.length; resized ||= 'w' in value || 'h' in value;
+        changes.push({ collection: 'boardItems', id, value: { ...value, modifiedAt: now }, ...(unset.length ? { unset } : {}) });
+      }
+      if (!changes.length) return;
+      commit('BoardChanged', changes[0].id, `${edited ? 'edited' : resized ? 'resized' : 'moved'} ${plural(changes.length, 'a board card', 'board cards')}`, changes, gesture);
+    },
+    deleteBoardItems(ids) {
+      const state = get(), items = state.boardItems.filter(i => ids.includes(i.id) && i.projectId === state.projectId);
+      if (!items.length || !writable() || !items.every(i => available(i.id, '*'))) return;
+      commit('BoardChanged', items[0].id, `deleted ${plural(items.length, 'a board card', 'board cards')}`, items.map(i => ({ collection: 'boardItems' as const, id: i.id, value: null })));
+    },
+    openPlan(tab, focusId) {
+      if (!PLAN_TABS.includes(tab)) { get().notify('Unknown Plan tab', 'error'); return; }
+      set({ planTab: tab, planFocus: focusId ?? null }); get().setWorkspace('plan');
+    },
+    setColorReference(mediaId) {
+      const state = get(); if (mediaId === null) { set({ colorReference: null }); return; }
+      if (!state.media.some(m => m.id === mediaId && m.projectId === state.projectId && (m.kind === 'image' || m.kind === 'video'))) { state.notify('Pick an image or video from this project', 'info'); return; }
+      set({ colorReference: mediaId }); state.setWorkspace('color');
+    },
   };
 });
 
@@ -1982,7 +2242,7 @@ export const usePausedPlayhead = () => useEditorStore(s => s.playing ? -1 : s.pl
 export const useStoreWithoutPlayhead = (): Omit<EditorStore, 'playhead'> => useEditorStore(useShallow(({ playhead: _, ...rest }: EditorStore) => rest));
 
 // ponytail: localStorage has a small size ceiling; use the server database for large projects.
-export const persistedKeys = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs', 'users', 'currentUserId', 'settings'] as const;
+export const persistedKeys = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs', 'users', 'currentUserId', 'settings', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const;
 export const persistentState = (state: EditorStore): PersistedState => Object.fromEntries(persistedKeys.map(key => [key, state[key]])) as unknown as PersistedState;
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 const persist = () => {

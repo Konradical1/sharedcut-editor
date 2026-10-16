@@ -1,4 +1,5 @@
-export type Workspace = 'edit' | 'color' | 'audio' | 'deliver';
+/** `plan` is the tucked-away pre-production workspace (script, shot list, mood board); it is not in the workspace nav. */
+export type Workspace = 'edit' | 'color' | 'audio' | 'deliver' | 'plan';
 export type Role = 'Owner' | 'Editor' | 'Commenter' | 'Viewer';
 /** `guest`: a name-only sign-in from sharedcut.com/importer. It can import Final Cut projects and nothing else until it saves its account. */
 export interface User { id: string; name: string; email: string; initials: string; color: string; guest?: boolean }
@@ -36,10 +37,25 @@ export interface GradeNode { /** Color group id (`cg-…`): this node is the gro
 export interface Comment { id: string; projectId: string; userId: string; text: string; timestamp: number; time: number; timelineId?: string; clipId?: string; range?: [number, number]; resolved: boolean; replies: { id: string; userId: string; text: string; timestamp: number }[] }
 export interface PresenceCursor { x: number; y: number; surface?: string; anchor?: string; clipId?: string; context?: string; fallback?: string }
 export interface DragPreview { tracks?: { id: string; height: number }[]; clips?: { id: string; start: number; duration: number; trackId: string }[] }
-export interface Presence { mediaTab?: string; inspectorTab?: string; preview?: DragPreview | null; userId: string; projectId: string; cursor: PresenceCursor | null; playhead: number; selectedClipId?: string; focusedField?: string; activity: string; online: boolean; updatedAt: number; receivedAt?: number; playing?: boolean; presenting?: boolean; timelineId?: string }
+export interface Presence { planTab?: PlanTab; mediaTab?: string; inspectorTab?: string; preview?: DragPreview | null; userId: string; projectId: string; cursor: PresenceCursor | null; playhead: number; selectedClipId?: string; focusedField?: string; activity: string; online: boolean; updatedAt: number; receivedAt?: number; playing?: boolean; presenting?: boolean; timelineId?: string }
 export interface CollaborativeLock { id: string; projectId: string; targetId: string; field: string; userId: string; expiresAt: number }
-export type OperationType = 'ClipMoved' | 'ClipTrimmed' | 'ClipDeleted' | 'ClipAdded' | 'PropertyChanged' | 'EffectAdded' | 'GradeNodeAdded' | 'GradeNodeChanged' | 'TrackCreated' | 'TrackChanged' | 'CommentAdded' | 'CommentChanged' | 'SnapshotRestored' | 'MarkerChanged';
+export type OperationType = 'ClipMoved' | 'ClipTrimmed' | 'ClipDeleted' | 'ClipAdded' | 'PropertyChanged' | 'EffectAdded' | 'GradeNodeAdded' | 'GradeNodeChanged' | 'TrackCreated' | 'TrackChanged' | 'CommentAdded' | 'CommentChanged' | 'SnapshotRestored' | 'MarkerChanged' | 'ScriptChanged' | 'ShotChanged' | 'BoardChanged';
 export interface Operation { gestureId?: string; id: string; projectId: string; userId: string; timestamp: number; targetId: string; type: OperationType; oldState: unknown; newState: unknown; description: string; undone?: boolean }
+// Plan workspace (docs/superpowers/specs/2026-10-15-plan-workspace-design.md). Every one is its own top-level row so
+// collaborators save, merge, lock and undo per block / shot / card; `order` sorts them, never array position.
+// References (scriptId, sceneId, mediaIds, mediaId) are soft: a concurrent delete leaves them dangling and readers skip them.
+export type PlanTab = 'script' | 'shots' | 'board';
+export type ScriptFormat = 'screenplay' | 'stage';
+/** A script document. `name` is its title; its text lives in scriptBlocks. */
+export interface Script { id: string; projectId: string; name: string; format: ScriptFormat; credit?: string; author?: string; order: number; modifiedAt: number }
+export type ScriptBlockKind = 'scene' | 'action' | 'character' | 'parenthetical' | 'dialogue' | 'transition' | 'shot' | 'lyric' | 'note';
+/** One element (paragraph) of a script. */
+export interface ScriptBlock { id: string; projectId: string; scriptId: string; kind: ScriptBlockKind; text: string; order: number; modifiedAt: number }
+/** A shot-list row. `sceneId` is a scene block; takes are media named after `number` (services/shots.ts) plus `mediaIds` linked by hand. */
+export interface Shot { id: string; projectId: string; number: string; sceneId?: string; text: string; size?: string; movement?: string; cast?: string; location?: string; notes?: string; mediaIds?: string[]; done?: boolean; order: number; modifiedAt: number }
+export type BoardItemKind = 'image' | 'note' | 'text' | 'swatch';
+/** A mood-board card, in board pixels at 100% zoom. Images reference a MediaAsset; `color` is #rrggbb (note tint or swatch). */
+export interface BoardItem { id: string; projectId: string; kind: BoardItemKind; x: number; y: number; w: number; h: number; z: number; mediaId?: string; text?: string; color?: string; modifiedAt: number }
 export interface ProjectState { timelines?: Timeline[]; clips: Clip[]; tracks: Track[]; nodes: GradeNode[]; comments: Comment[] }
 export interface Snapshot { id: string; projectId: string; name: string; note: string; userId: string; timestamp: number; state: ProjectState }
 export interface RenderJob { id: string; projectId: string; name: string; preset: string; status: 'rendering' | 'waiting' | 'complete' | 'failed'; progress: number; remaining: string; settings: Record<string, string>; outputUrl?: string; error?: string }

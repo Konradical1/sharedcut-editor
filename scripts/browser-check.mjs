@@ -442,7 +442,7 @@ try {
   await other.close();
   for(const [width,height] of [[1440,900],[1280,720],[1024,768],[768,600],[390,844]]) {
     await page.setViewportSize({width,height});
-    for(const name of ['Edit','Color','Audio','Deliver']) {
+    for(const name of ['Edit','Color','Audio','Plan','Deliver']) {
       await page.getByRole('navigation',{name:'Editor workspaces'}).getByRole('button',{name,exact:true}).click();
       await page.waitForTimeout(120);
       const dims=await page.evaluate(()=>({w:innerWidth,h:innerHeight,scrollW:document.documentElement.scrollWidth,scrollH:document.documentElement.scrollHeight}));
@@ -451,7 +451,7 @@ try {
       if(width===1280)await page.screenshot({path:join(out,`${name.toLowerCase()}-${width}.png`)});
     }
   }
-  console.log('PASS all four workspaces stay inside viewport at five screen sizes');
+  console.log('PASS all four workspaces and Plan stay inside viewport at five screen sizes');
   await page.setViewportSize({width:1440,height:900});
   await page.getByRole('combobox',{name:'Export resolution'}).selectOption('1280 × 720');
   await page.getByRole('button',{name:'Add to render queue',exact:true}).click();

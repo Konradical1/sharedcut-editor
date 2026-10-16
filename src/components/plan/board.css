@@ -1,0 +1,59 @@
+/* Plan → Board. The world is one huge transformed plane (sized in MoodBoard.tsx), so pan and zoom move a single layer and
+   remote cursors anchored to it stay on the same board spot. Lengths divided by --zoom stay the same size on screen. */
+.mood-board{position:relative;display:flex;flex-direction:column;flex:1;width:100%;height:100%;min-width:0;min-height:0;isolation:isolate}
+.board-viewport{position:relative;flex:1;min-height:0;overflow:hidden;touch-action:none;cursor:default;background-color:#141719;background-image:radial-gradient(circle,#ffffff12 1px,transparent 1.4px);background-size:var(--grid) var(--grid);background-position:var(--grid-x) var(--grid-y)}
+.board-viewport:focus,.board-viewport:focus-visible{outline:none}
+.board-viewport.panning,.board-viewport.panning *{cursor:grab}
+.board-world,.board-origin{position:absolute}
+
+.board-card{position:absolute;left:0;top:0;border-radius:6px;contain:layout style}
+.board-card.selected{outline:calc(1.5px / var(--zoom)) solid var(--accent);outline-offset:calc(2px / var(--zoom))}
+.board-card.owned{outline:calc(1.5px / var(--zoom)) solid var(--owner-color);outline-offset:calc(2px / var(--zoom))}
+.board-owner{position:absolute;left:0;bottom:100%;margin-bottom:calc(5px / var(--zoom));display:flex;align-items:center;gap:calc(4px / var(--zoom));color:var(--owner-color);font-size:calc(9px / var(--zoom));font-weight:550;white-space:nowrap;pointer-events:none}
+.board-owner i{width:calc(4px / var(--zoom));height:calc(4px / var(--zoom));border-radius:50%;background:var(--owner-color)}
+
+.board-image{box-shadow:0 2px 14px #0007}
+.board-image img{display:block;width:100%;height:100%;object-fit:cover;border-radius:6px;background:#0d0f10;pointer-events:none}
+.board-caption{position:absolute;left:0;right:0;bottom:0;padding:calc(6px / var(--zoom)) calc(8px / var(--zoom));border-radius:0 0 6px 6px;background:linear-gradient(transparent,#000b);color:#eef0f1;font-size:calc(10px / var(--zoom));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:0;transition:opacity .12s;pointer-events:none}
+.board-image:hover .board-caption{opacity:1}
+.board-missing{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;width:100%;height:100%;padding:8px;border-radius:6px;border:1px dashed #ffffff1c;background:#ffffff05;color:var(--muted);font-size:11px;text-align:center;box-sizing:border-box}
+
+.board-words{display:block;box-sizing:border-box;margin:0;width:100%;height:100%;min-height:0;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;color:inherit}
+textarea.board-words{resize:none;border:0;border-radius:0;outline:none;background:transparent;overflow:auto;user-select:text}
+.board-placeholder{opacity:.45}
+.board-note{background:color-mix(in srgb,var(--tint,#f2c878) 72%,#fff);color:#1d1f21;box-shadow:0 2px 12px #0006}
+.board-note .board-words{padding:12px 14px;font-size:13px;line-height:1.45}
+.board-text .board-words{padding:2px 4px;font-size:28px;line-height:1.2;font-weight:560;letter-spacing:-.4px;color:var(--tint,var(--text))}
+.board-swatch{display:flex;flex-direction:column;box-shadow:0 2px 12px #0006}
+.board-swatch-color{flex:1;min-height:0;border-radius:6px 6px 0 0;box-shadow:inset 0 0 0 1px #ffffff12}
+.board-hex{flex:0 0 26px;display:flex;align-items:center;padding:0 9px;border-radius:0 0 6px 6px;background:#1d2124;color:#c3cacf;font-size:10px;letter-spacing:.3px;text-transform:uppercase;white-space:nowrap;overflow:hidden}
+.board-hex:hover{color:var(--accent)}
+
+.board-resize{position:absolute;right:calc(-6px / var(--zoom));bottom:calc(-6px / var(--zoom));width:calc(11px / var(--zoom));height:calc(11px / var(--zoom));box-sizing:border-box;border:calc(2px / var(--zoom)) solid var(--panel);border-radius:calc(3px / var(--zoom));background:var(--accent);cursor:nwse-resize}
+.board-resize::after{content:'';position:absolute;inset:calc(-7px / var(--zoom))}
+@media (pointer:coarse){.board-resize::after{inset:calc(-14px / var(--zoom))}}
+.board-marquee{position:absolute;border:1px solid var(--accent);border-radius:2px;background:#bce8c70c;pointer-events:none}
+.board-hint{position:absolute;inset:0;margin:auto;display:flex;align-items:center;justify-content:center;max-width:300px;padding:16px;color:var(--muted);font-size:11px;line-height:1.6;text-align:center;pointer-events:none}
+
+/* Header actions (portaled into the Plan header) */
+.board-actions{display:flex;align-items:center;gap:1px;flex-shrink:0}
+.board-divider{width:1px;height:16px;margin:0 6px;background:var(--line);flex-shrink:0}
+.board-zoom{min-width:42px;height:28px;padding:0 4px;border-radius:5px;color:#929aa0;font-size:10px;text-align:center;flex-shrink:0}
+.board-zoom:hover{background:#ffffff08;color:#dce0e2}
+/* Phones pinch to zoom; the step buttons give the header row back its room. */
+@media (max-width:600px){.board-actions .board-zoom-step{display:none}.board-divider{margin:0 3px}}
+
+/* Card menu tints */
+.board-tints{display:flex;gap:7px;padding:0 9px 8px}
+.context-menu .board-tints button{flex:none;width:20px;height:20px;min-height:0;padding:0;border-radius:50%;background:var(--tint);box-shadow:inset 0 0 0 1px #0005}
+.context-menu .board-tints button:hover,.context-menu .board-tints button:focus{background:var(--tint);box-shadow:0 0 0 2px #ffffff38}
+.context-menu .board-tints button.active{box-shadow:0 0 0 2px var(--accent)}
+
+/* From project */
+.board-picker{display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:8px;max-height:min(60vh,520px);overflow:auto;padding:2px}
+.board-pick{position:relative;display:flex;flex-direction:column;gap:5px;min-width:0;padding:5px;border:1px solid transparent;border-radius:7px;color:#c2c9ce;font-size:10px;text-align:left}
+.board-pick:hover{background:#ffffff08;border-color:#ffffff10}
+.board-pick-thumb{display:grid;place-items:center;aspect-ratio:16/10;border-radius:5px;overflow:hidden;background:#0d0f10;color:var(--muted)}
+.board-pick-thumb img{display:block;width:100%;height:100%;object-fit:cover}
+.board-pick-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.board-pick-on{position:absolute;top:9px;right:9px;padding:2px;border-radius:50%;background:var(--accent);color:#10261a}

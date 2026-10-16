@@ -13,6 +13,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { uploadQueue, pauseUpload, dismissUpload, type UploadJob } from '../../src/services/upload.ts';
 import { projectBins } from '../../src/state/store.ts';
+import { bins as fixedBins } from '../../src/state/demo.ts';
 import type { MediaAsset } from '../../src/state/models.ts';
 import { flush } from '../session.ts';
 import { clock, secs } from '../views.ts';
@@ -46,7 +47,8 @@ export async function localFiles(paths: string[]): Promise<Local[]> {
 
 /** A bin by id or name; a name no bin has becomes a new bin (saved before anything moves into it). */
 async function binFor(wanted: string) {
-  const want = wanted.toLowerCase(), found = projectBins(project(), store.getState().media).find(b => b.id === wanted || b.name.toLowerCase() === want);
+  // A fixed bin (Mood board…) is listed only once media sits in it; matching it here keeps upload{bin:"board"} from making a stray copy.
+  const want = wanted.toLowerCase(), found = [...projectBins(project(), store.getState().media), ...fixedBins.filter(b => b.id !== 'all')].find(b => b.id === wanted || b.name.toLowerCase() === want);
   if (found) return found;
   const id = (await edit(run => run('createBin', wanted))).value as string | undefined;
   if (!id) throw new Error(`Could not create the bin "${wanted}".`);

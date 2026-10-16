@@ -53,6 +53,12 @@ export const ACTIONS: Record<string, 'edit' | 'context' | 'hidden' | `job:${stri
   setSettings: 'edit', notify: 'hidden', dismissNotification: 'hidden',
   acquireLock: 'hidden', renewLock: 'hidden', releaseLock: 'hidden', releaseUserLocks: 'hidden', acquireLocks: 'hidden', releaseLocks: 'hidden',
   tick: 'hidden', setLiveMode: 'hidden',
+  // Plan workspace (help plan; job plan reads it, script-export/script-import move files).
+  addScript: 'edit', updateScript: 'edit', deleteScript: 'edit',
+  addScriptBlocks: 'edit', updateScriptBlock: 'edit', splitScriptBlock: 'edit', mergeScriptBlock: 'edit', deleteScriptBlocks: 'edit',
+  addShot: 'edit', updateShot: 'edit', deleteShots: 'edit', moveShot: 'edit', linkShotMedia: 'edit',
+  addBoardItems: 'edit', updateBoardItems: 'edit', deleteBoardItems: 'edit',
+  openPlan: 'context', setColorReference: 'context',
 };
 
 export interface StoreMember { name: string; signature: string; doc: string; method: boolean }

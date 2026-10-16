@@ -1,7 +1,8 @@
 # SharedCut MCP
 
 Lets Claude Code, Codex or any MCP client edit SharedCut projects: cut, trim, move, titles, shapes, effects,
-transitions, keyframes, color, captions, masks, depth, tracking, stabilize, uploads and exports.
+transitions, keyframes, color, captions, masks, depth, tracking, stabilize, uploads and exports, plus the
+Plan workspace (script, shot list, mood board).
 
 It runs the editor's own store headless and saves through the same API the browser uses. So an edit made
 here is the same edit the UI makes. It shows up live in open editors, lands in History, and the same
@@ -53,6 +54,7 @@ cd /tmp/sharedcut-mcp && git commit -am "SharedCut MCP <version>" && git push
 | `get` | full JSON of one clip, node, track, media, effect… |
 | `act` | run editor actions in order, saved as one batch (all or nothing) |
 | `job` | server work: uploads, captions, masks, depth, stabilize, noise reduction, tracking, color assistant, color normalize, exports, Resolve, sounds, fonts |
+| `job plan` | the Plan read (script lines, shots with their takes, board cards); `script-export` writes .docx/.fountain/.html, `script-import` reads Fountain |
 | `frame` | a small picture of the timeline or a source frame |
 | `help` | catalogs: actions, effects, transitions, titles, shapes, color, properties, jobs… |
 | `api` | escape hatch to any `/api` endpoint |

@@ -7,7 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const LISTS = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs'];
+const LISTS = ['projects', 'media', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'operations', 'snapshots', 'renderJobs', 'scripts', 'scriptBlocks', 'shots', 'boardItems'];
 const metaOf = db => db.prepare("SELECT 1 FROM sqlite_master WHERE name='workspace_meta'").get()
   ? Object.fromEntries(db.prepare('SELECT key,value FROM workspace_meta').all().map(row => [row.key, String(row.value)])) : {};
 

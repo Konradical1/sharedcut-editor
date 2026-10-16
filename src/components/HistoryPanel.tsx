@@ -14,7 +14,7 @@ function dateLabel(timestamp: number) {
   if (date.toDateString() === yesterday.toDateString()) return 'Yesterday';
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
-const operationLabels: Record<string, string> = { ClipMoved: 'Clip moves', ClipTrimmed: 'Trimming', ClipDeleted: 'Deletions', ClipAdded: 'Added media', PropertyChanged: 'Properties', EffectAdded: 'Effects', GradeNodeAdded: 'Color', GradeNodeChanged: 'Color', TrackCreated: 'Tracks', TrackChanged: 'Tracks', CommentAdded: 'Comments', CommentChanged: 'Comments', SnapshotRestored: 'Restores' };
+const operationLabels: Record<string, string> = { ClipMoved: 'Clip moves', ClipTrimmed: 'Trimming', ClipDeleted: 'Deletions', ClipAdded: 'Added media', PropertyChanged: 'Properties', EffectAdded: 'Effects', GradeNodeAdded: 'Color', GradeNodeChanged: 'Color', TrackCreated: 'Tracks', TrackChanged: 'Tracks', CommentAdded: 'Comments', CommentChanged: 'Comments', SnapshotRestored: 'Restores', ScriptChanged: 'Script', ShotChanged: 'Shot list', BoardChanged: 'Mood board' };
 
 export default function HistoryPanel() {
   // Named fields only: the whole store changes on every playback frame, and this panel lists thousands of operations.

@@ -15,7 +15,7 @@ test('sync preserves pending edits, resolves only conflicts, and isolates asynch
   const { connection } = await import('./api.ts');
   const { connectSession, flushChanges, refreshState, resolveSyncConflict, signOut } = await import('./sync.ts');
   const user = (id: string): User => ({ id, name: id, email: `${id}@test.local`, color: '#abcdef', initials: id[0] });
-  const state = (id: string): PersistedState => ({ projects: [{ id: `${id}-project`, name: `${id} private project`, description: '', members: [{ userId: id, role: 'Owner' }] } as Project], media: [], timelines: [], tracks: [], clips: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], users: [user(id)], currentUserId: id, settings: { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false } });
+  const state = (id: string): PersistedState => ({ projects: [{ id: `${id}-project`, name: `${id} private project`, description: '', members: [{ userId: id, role: 'Owner' }] } as Project], media: [], timelines: [], tracks: [], clips: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], scripts: [], scriptBlocks: [], shots: [], boardItems: [], users: [user(id)], currentUserId: id, settings: { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false } });
   let currentUser: User | null = user('alice'), remote = state('alice'), revision = 1;
   const json = (body: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
   const envelope = () => ({ revision, lockRevision: 0, state: structuredClone(remote), presence: [], locks: [] });
@@ -169,7 +169,7 @@ test('a change arriving mid-save is replayed, bulk edits retry quietly, and a lo
   const { useEditorStore } = await import('../state/store.ts');
   const { connectSession, flushChanges, refreshState, signOut } = await import('./sync.ts');
   const user = (id: string): User => ({ id, name: id, email: `${id}@test.local`, color: '#abcdef', initials: id[0] });
-  const base = (): PersistedState => ({ projects: [{ id: 'p', name: 'Server name', description: '', members: [{ userId: 'alice', role: 'Owner' }] } as Project], media: [], timelines: [], tracks: [], clips: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], users: [user('alice')], currentUserId: 'alice', settings: { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false } });
+  const base = (): PersistedState => ({ projects: [{ id: 'p', name: 'Server name', description: '', members: [{ userId: 'alice', role: 'Owner' }] } as Project], media: [], timelines: [], tracks: [], clips: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], scripts: [], scriptBlocks: [], shots: [], boardItems: [], users: [user('alice')], currentUserId: 'alice', settings: { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false } });
   let remote = base(), revision = 1, locks: unknown[] = [];
   const json = (body: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
   const envelope = () => ({ revision, lockRevision: 0, state: structuredClone(remote), presence: [], locks });
@@ -249,7 +249,7 @@ test('a drag preview larger than the server accepts is trimmed, a big drag is pa
   const { useEditorStore } = await import('../state/store.ts');
   const { connectSession, signOut } = await import('./sync.ts');
   const alice: User = { id: 'alice', name: 'alice', email: 'alice@test.local', color: '#abcdef', initials: 'a' };
-  const remote: PersistedState = { projects: [{ id: 'p', name: 'P', description: '', members: [{ userId: 'alice', role: 'Owner' }] } as Project], media: [], timelines: [], tracks: [], clips: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], users: [alice], currentUserId: 'alice', settings: { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false } };
+  const remote: PersistedState = { projects: [{ id: 'p', name: 'P', description: '', members: [{ userId: 'alice', role: 'Owner' }] } as Project], media: [], timelines: [], tracks: [], clips: [], nodes: [], comments: [], operations: [], snapshots: [], renderJobs: [], scripts: [], scriptBlocks: [], shots: [], boardItems: [], users: [alice], currentUserId: 'alice', settings: { uiScale: '100%', timelineDensity: 'comfortable', reducedMotion: false } };
   const json = (body: unknown, status = 200) => Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }));
   const sent: { preview: { clips?: { id: string; start: number }[]; tracks?: { id: string }[] } | null }[] = [];
   let answer: 'ok' | 'rejected' | 'unreachable' = 'ok';

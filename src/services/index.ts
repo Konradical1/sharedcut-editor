@@ -2,7 +2,7 @@ import { isShape, getShape, validateShape } from './shapes.ts';
 import { isComposition, validateCompositions } from './compositions.ts';
 import { isAdjustment } from './adjustment.ts';
 import { isTitle, getText, validateText } from './text.ts';
-import type { CollaborativeLock, GradeNode, MediaAsset, Operation, Presence, Project, RenderJob, Settings, Snapshot, Timeline, User, ProjectState } from '../state/models.ts';
+import type { BoardItem, CollaborativeLock, GradeNode, MediaAsset, Operation, Presence, Project, RenderJob, Script, ScriptBlock, Settings, Shot, Snapshot, Timeline, User, ProjectState } from '../state/models.ts';
 
 export const createId = (prefix: string) => `${prefix}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`}`;
 export const STORAGE_KEY = 'frameline.project-state.v1';
@@ -14,6 +14,7 @@ export const lockConflict = (a: string, b: string) => a === b || a === '*' || b 
 export interface PersistedState extends ProjectState {
   projects: Project[]; media: MediaAsset[]; timelines: Timeline[]; operations: Operation[];
   snapshots: Snapshot[]; renderJobs: RenderJob[]; users: User[]; currentUserId: string; settings: Settings;
+  scripts: Script[]; scriptBlocks: ScriptBlock[]; shots: Shot[]; boardItems: BoardItem[];
 }
 export interface ProjectService { load(): PersistedState | null; save(state: PersistedState): void }
 export interface MediaService {
@@ -68,7 +69,7 @@ export const projectService: ProjectService = {
     if (typed.operations.some(operation => [...operation.oldState as unknown[], ...operation.newState as unknown[]].some(item => {
       if (!item || typeof item !== 'object') return true;
       const change = item as { collection: string; id: string; value: unknown; replace?: boolean; unset?: unknown };
-      if (!['clips', 'tracks', 'nodes', 'comments', 'timelines'].includes(change.collection) || typeof change.id !== 'string' || (change.value !== null && (typeof change.value !== 'object' || Array.isArray(change.value)))) return true;
+      if (!['clips', 'tracks', 'nodes', 'comments', 'timelines', 'scripts', 'scriptBlocks', 'shots', 'boardItems'].includes(change.collection) || typeof change.id !== 'string' || (change.value !== null && (typeof change.value !== 'object' || Array.isArray(change.value)))) return true;
       if (change.unset !== undefined && (!Array.isArray(change.unset) || change.unset.some(key => typeof key !== 'string'))) return true;
       return [...Object.keys(change.value ?? {}), ...change.unset as string[] ?? []].some(key => key.split('.').some(part => ['__proto__', 'constructor', 'prototype'].includes(part)));
     }))) throw new Error('The local activity cache is damaged. The demo has been recovered.');

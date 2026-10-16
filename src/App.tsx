@@ -2,7 +2,7 @@ import './components/captions.css';
 import { loadCaptionFonts } from './services/fonts';
 import { lazy, useEffect, useRef, useState, type PointerEvent } from 'react';
 import { MotionConfig } from 'motion/react';
-import { ChevronLeft, ChevronDown, PanelLeft, SlidersHorizontal, Scissors, Palette, AudioLines, ArrowUpRight, History, Camera, Users, MessageSquare, Radio, Settings, Check, Cloud, X, MonitorPlay } from 'lucide-react';
+import { ChevronLeft, ChevronDown, PanelLeft, SlidersHorizontal, Scissors, Palette, AudioLines, ArrowUpRight, History, Camera, Users, MessageSquare, Radio, Settings, Check, Cloud, X, MonitorPlay, NotebookPen } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useEditorStore, initializeEditorServices } from './state/store';
 import type { Workspace } from './state/models';
@@ -21,6 +21,7 @@ import Inspector from './components/Inspector';
 const ColorWorkspace = lazy(() => import('./workspaces/ColorWorkspace'));
 const AudioWorkspace = lazy(() => import('./workspaces/AudioWorkspace'));
 const DeliverWorkspace = lazy(() => import('./workspaces/DeliverWorkspace'));
+const PlanWorkspace = lazy(() => import('./workspaces/PlanWorkspace'));
 import { useEditorShortcuts, useFocusRelease } from './shortcuts';
 import { connectSession, signOut, resolveSyncConflict } from './services/sync';
 import { startPlaybackReporting } from './services/playbackHealthStart';
@@ -71,10 +72,13 @@ function Editor({onHome}:{onHome:()=>void}) {
     window.addEventListener('pointermove',move);window.addEventListener('pointerup',end);window.addEventListener('pointercancel',end);
   }
   useEffect(()=>{const timer=setTimeout(()=>s().setSettings({mediaPanelWidth:leftWidth,inspectorPanelWidth:rightWidth,editorSplit:split}),300);return()=>clearTimeout(timer);},[leftWidth,rightWidth,split]);
+  const dots=(id:Workspace,name:string)=><span className="workspace-people">{people.map(p=>p.split('\n')).filter(([,activity])=>activity===id).map(([userId])=>{const user=users.find(u=>u.id===userId);return <i key={userId} style={{background:user?.color}} title={`${user?.name??'Collaborator'} is in ${name}`}/>;})}</span>;
   const rightPanel=sidePanel==='people'?<PeoplePanel/>:sidePanel==='history'?<HistoryPanel/>:sidePanel==='comments'?<CommentsPanel/>:<Inspector/>;
   return <div className="editor-app">
     <header className="app-toolbar"><div className="project-navigation"><IconButton label="Back to projects" onClick={onHome}><ChevronLeft size={17}/></IconButton><button className="brand-home" aria-label="SharedCut dashboard" onClick={onHome}><Brand compact/></button><span className="project-divider"/><div className="project-title"><b>{project?.name??'Project'}</b><span><i className="status-dot"/>{project?.shared?'Class project':(project?.members.length ?? 0)>1?'Shared project':'Private project'}</span></div></div>
-      <nav className="workspace-nav" aria-label="Editor workspaces">{workspaceItems.map(w=><button key={w.id} className={workspace===w.id?'active':''} aria-label={w.name} aria-current={workspace===w.id?'page':undefined} onClick={()=>s().setWorkspace(w.id)}><w.icon size={15}/>{w.name}<span className="workspace-people">{people.map(p=>p.split('\n')).filter(([,activity])=>activity===w.id).map(([userId])=>{const user=users.find(u=>u.id===userId);return <i key={userId} style={{background:user?.color}} title={`${user?.name??'Collaborator'} is in ${w.name}`}/>;})}</span></button>)}</nav>
+      <nav className="workspace-nav" aria-label="Editor workspaces">{workspaceItems.map(w=><button key={w.id} className={workspace===w.id?'active':''} aria-label={w.name} aria-current={workspace===w.id?'page':undefined} onClick={()=>s().setWorkspace(w.id)}><w.icon size={15}/>{w.name}{dots(w.id,w.name)}</button>)}
+        {/* Plan is pre-production, not a fifth editing stage: one quiet icon after the four, not another labelled tab. */}
+        <span className="workspace-nav-divider" aria-hidden="true"/><button className={`workspace-plan ${workspace==='plan'?'active':''}`} aria-label="Plan" title="Plan: script, shot list, mood board" aria-current={workspace==='plan'?'page':undefined} onClick={()=>s().openPlan(s().planTab)}><NotebookPen size={15}/>{dots('plan','Plan')}</button></nav>
       <div className="toolbar-right">
         <IconButton label={mediaVisible?'Hide media':'Show media'} className={mediaVisible?'active':''} onClick={()=>{if(window.innerWidth<=760)s().setSidePanel(null);setMediaVisible(!mediaVisible);s().setWorkspace('edit');}}><PanelLeft size={15}/></IconButton>
         <div className="live-controls">{liveMode==='independent'?<button className="live-join" aria-label="Join Live Playback" disabled={!presenter} title={presenter?'Follow the presenter':'No one is presenting'} onClick={()=>presenter&&s().setLiveMode('following',presenter)}><span className="live-pulse"/><Radio size={13}/><span>Join Live Playback</span><ChevronDown size={11}/></button>:<button className="live-join is-live" onClick={()=>s().setLiveMode('independent')}><Radio size={13}/><b>LIVE</b>{liveMode==='following'?`Following ${users.find(u=>u.id===followUserId)?.name??'Ashley'}`:`Presenting · ${online} online`}<X size={12}/></button>}<IconButton label={liveMode==='presenting'?'Stop presenting':'Present Project'} onClick={()=>s().setLiveMode(liveMode==='presenting'?'independent':'presenting')}><MonitorPlay size={15}/></IconButton></div>
@@ -90,7 +94,7 @@ function Editor({onHome}:{onHome:()=>void}) {
         <div className="edit-upper">{mediaVisible&&<><div className="edit-media" style={{width:leftWidth}}><MediaPanel onClose={()=>setMediaVisible(false)}/></div><div role="separator" aria-label="Resize media panel" aria-orientation="vertical" tabIndex={0} className="panel-resizer" onPointerDown={e=>resize(e,'left')} onKeyDown={e=>{if(e.key==='ArrowRight')setLeftWidth(Math.min(420,leftWidth+10));if(e.key==='ArrowLeft')setLeftWidth(Math.max(MIN_MEDIA_WIDTH,leftWidth-10));}}/></>}<Viewer/>{sidePanel&&<><div role="separator" aria-label="Resize side panel" aria-orientation="vertical" tabIndex={0} className="panel-resizer" onPointerDown={e=>resize(e,'right')} onKeyDown={e=>{if(e.key==='ArrowLeft')setRightWidth(Math.min(420,rightWidth+10));if(e.key==='ArrowRight')setRightWidth(Math.max(220,rightWidth-10));}}/><aside className="edit-inspector" style={{width:rightWidth}}>{rightPanel}</aside></>}</div>
         <div role="separator" aria-label="Resize timeline" aria-orientation="horizontal" tabIndex={0} className="panel-resizer horizontal" onPointerDown={e=>resize(e,'vertical')} onKeyDown={e=>{if(e.key==='ArrowUp')setSplit(Math.max(.35,split-.03));if(e.key==='ArrowDown')setSplit(Math.min(.7,split+.03));}}/>
         <Timeline/>
-      </div>:workspace==='color'?<ColorWorkspace/>:workspace==='audio'?<AudioWorkspace/>:<DeliverWorkspace/>}</LazySuspense>
+      </div>:workspace==='color'?<ColorWorkspace/>:workspace==='audio'?<AudioWorkspace/>:workspace==='plan'?<PlanWorkspace/>:<DeliverWorkspace/>}</LazySuspense>
       {workspace!=='edit'&&sidePanel&&sidePanel!=='inspector'&&<aside className="floating-side-panel">{rightPanel}</aside>}
       <RemoteCursors/>
     </main>

@@ -43,3 +43,14 @@
 .color-group-controls{display:flex;flex-direction:column;gap:9px;padding-top:9px;border-top:1px solid #454852}.color-group-controls small{line-height:1.6}.color-overhaul .color-group-controls .grade-parameter{grid-template-columns:72px minmax(20px,1fr) 52px}
 .color-groups-empty{font-size:10px;color:#929bab;margin:4px 0 0}
 .noise-state{float:right;font-size:9px;letter-spacing:.05em;text-transform:uppercase;color:#8d95a3}.noise-state.on{color:#79d8c0}.noise-settings .node-effect{border:0;padding:12px 0 0}.noise-settings .effect-heading{margin-bottom:6px}.noise-settings .effect-heading strong{font-size:10px;font-weight:500;color:#a8afbc}.noise-settings .node-effect.bypassed .depth-inspector{opacity:.45}.noise-settings .depth-status{margin:0}.noise-settings .property-row{font-size:10px;padding:0}.noise-settings .property-input-wrap input{padding:3px 22px 3px 7px}.noise-settings .inspector-note{margin:0;padding:0}
+
+/* Mood board reference picture over the viewer (Plan → Board → Compare on Color page). Only the box takes the pointer. */
+.color-overhaul .color-viewer{position:relative}
+.color-reference{position:absolute;right:10px;bottom:70px;z-index:5;width:28%;min-width:132px;max-width:360px;display:flex;flex-direction:column;background:#222327;border:1px solid var(--border);border-radius:4px;box-shadow:0 8px 28px #0009;overflow:hidden}
+.color-reference.large{width:52%;max-width:680px}
+.color-reference header{display:flex;align-items:center;gap:6px;height:24px;flex-shrink:0;padding:0 2px 0 8px;background:#292a2f;border-bottom:1px solid #17181c;font-size:10px;color:#c9ccd4}
+.color-reference header svg{color:var(--color-accent)}.color-reference header .icon-button svg{color:inherit}
+.color-overhaul .color-reference .icon-button{width:20px;height:20px}
+.color-reference img{display:block;width:100%;height:auto;max-height:min(40vh,300px);object-fit:contain;background:#111214}
+.color-reference.large img{max-height:min(62vh,560px)}
+.color-reference p{margin:0;padding:18px 8px;font-size:10px;color:var(--muted);text-align:center}
