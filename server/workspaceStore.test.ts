@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { cpSync, readdirSync, readFileSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cpSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -246,6 +246,33 @@ test('project-bundle exports the latest edits even when the legacy row is behind
     const moved = (await call('/state', bob.cookie) as Envelope).state;
     assert.deepEqual(moved.projects.map(item => item.id), ['film']); assert.deepEqual(moved.clips.map(item => item.id), ['latest']);
   } finally { await from.close(); await to?.close(); await Promise.all([source, target, bundle].map(dir => rm(dir, { recursive: true, force: true }))); }
+});
+test('a bundle without media links the footage the other machine already has, by name and exact size', { timeout: 60_000 }, async () => {
+  const [source, target, bundle, card] = await Promise.all(['bundle-from-', 'bundle-to-', 'bundle-', 'card-'].map(prefix => mkdtemp(join(tmpdir(), prefix))));
+  const bundleScript = async (...args: string[]) => { const run = await script('project-bundle.mjs', args[0] === 'export' ? source : target, ...args); assert.equal(run.code, 0, run.output); };
+  let from: App | undefined = createFrameLineServer({ dataDir: source, legacyEveryMs: 1e9 }), to: App | undefined, base = await listen(from);
+  const { call, signup } = client(() => base);
+  try {
+    const alice = await signup('alice');
+    const initial = await call('/state', alice.cookie) as Envelope;
+    initial.state.projects.push(project('trip', alice.id)); initial.state.timelines.push({ id: 'main', projectId: 'trip', name: 'Main', duration: 60 }); initial.state.tracks.push(track('v1', 'video', 1) as never);
+    await call('/state', alice.cookie, initial, 'PUT');
+    const media = (await call('/media?projectId=trip&name=C1088.MP4&placeholder=1', alice.cookie, {})).asset.id as string;
+    await from.close(); from = undefined;
+    const footage = 'the camera original';
+    await mkdir(join(source, 'media', media), { recursive: true }); await writeFile(join(source, 'media', media, 'original'), footage);
+    await bundleScript('export', 'trip', bundle, '--no-media');
+    assert.equal(existsSync(join(bundle, 'media')), false, 'no footage travels');
+
+    // The laptop's copy of the card: the same clip, and another take with the same name that must not be taken.
+    await mkdir(join(card, 'A')); await mkdir(join(card, 'B'));
+    await writeFile(join(card, 'A', 'C1088.MP4'), 'another take'); await writeFile(join(card, 'B', 'C1088.MP4'), footage);
+    to = createFrameLineServer({ dataDir: target, legacyEveryMs: 1e9 }); base = await listen(to);
+    await signup('bob'); await to.close(); to = undefined;
+    await bundleScript('import', bundle, '--originals', card);
+    assert.equal(statSync(join(target, 'media', media, 'original')).ino, statSync(join(card, 'B', 'C1088.MP4')).ino, 'linked, not copied');
+    assert.equal(legacyState(join(target, 'frameline.sqlite')).media.find((item: { id: string }) => item.id === media)?.status, 'processing', 'prepared on the next start');
+  } finally { await from?.close(); await to?.close(); await Promise.all([source, target, bundle, card].map(dir => rm(dir, { recursive: true, force: true }))); }
 });
 test('the legacy row catches up in the background while the server keeps running', { timeout: 30_000 }, async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'workspace-backup-')), file = join(dataDir, 'frameline.sqlite');

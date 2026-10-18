@@ -1,7 +1,7 @@
 {
   "name": "sharedcut-desktop",
   "productName": "SharedCut",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SharedCut for Mac and Windows",
   "author": "Konrad Fischer",
   "private": true,
@@ -24,7 +24,7 @@
     "copyright": "Copyright © 2026 Konrad Fischer",
     "directories": { "output": "release", "buildResources": "build" },
     "files": ["main.mjs"],
-    "extraResources": [{ "from": "stage/app", "to": "app" }, { "from": "stage/bin", "to": "bin" }],
+    "extraResources": [{ "from": "stage/app", "to": "app" }, { "from": "stage/app/node_modules", "to": "app/node_modules" }, { "from": "stage/bin", "to": "bin" }],
     "publish": [{ "provider": "generic", "url": "https://sharedcut.com/download" }],
     "mac": {
       "target": [{ "target": "dmg", "arch": ["arm64"] }, { "target": "zip", "arch": ["arm64"] }],

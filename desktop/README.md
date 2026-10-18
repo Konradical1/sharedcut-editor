@@ -45,6 +45,22 @@ scp release/latest-mac.yml <server>:SharedCut-data/downloads/
 
 A Mac update only installs when the installed build and the new build are signed by the same Developer ID.
 
+## Taking a sharedcut.com project offline
+
+When the laptop already has the footage, only the edit travels. On the Lenovo:
+
+```sh
+FRAME_LINE_DATA=~/SharedCut-data node scripts/project-bundle.mjs export "<project>" ~/bundle --no-media
+```
+
+Copy `~/bundle` to the laptop. Create an account in the app, quit it, then import with the app's own copy of the
+scripts. The app prepares the clips the next time it opens.
+
+```sh
+cd /Applications/SharedCut.app/Contents/Resources/app
+FRAME_LINE_DATA="$HOME/Library/Application Support/SharedCut/data" ../bin/node scripts/project-bundle.mjs import ~/bundle --originals ~/Desktop/<footage folder>
+```
+
 ## Moving an offline project to sharedcut.com
 
 Quit the app first. Then export the project from the app's data folder and import it on the Lenovo:

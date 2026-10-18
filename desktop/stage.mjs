@@ -1,6 +1,8 @@
 // Copies the SharedCut server, the built editor and the binaries they run on into stage/, which electron-builder ships
 // inside the app (package.json "extraResources"). Run `npm run build` at the repo root first. vendor/<platform>-<arch>/
 // holds node, ffmpeg and ffprobe for that platform (README.md says where they come from).
+// electron-builder never copies the top-level node_modules of a folder it ships, so package.json lists
+// stage/app/node_modules as its own entry. Without it the installed app has no server dependencies.
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';

@@ -3,16 +3,20 @@
 // project, and quitting stops the server. Run after `npm run dist`:  node offline-check.mjs
 import { _electron as electron } from 'playwright';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { cp, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { patchState } from '../scripts/state-patch.mjs';
 
 const desktop = dirname(fileURLToPath(import.meta.url)), root = join(desktop, '..');
-const bundle = join(desktop, 'release', 'mac-arm64', 'SharedCut.app'), bin = name => join(bundle, 'Contents', 'Resources', 'bin', name);
 const port = 41300 + Math.floor(Math.random() * 500), origin = `http://127.0.0.1:${port}`;
 const work = await mkdtemp(join(tmpdir(), 'sharedcut-offline-')), shots = join(desktop, 'release', 'offline-check');
+// A copy outside the checkout, the way it runs once installed: inside the repo, Node falls back on the checkout's own
+// node_modules and hides any dependency the app itself is missing.
+const bundle = join(work, 'SharedCut.app'), bin = name => join(bundle, 'Contents', 'Resources', 'bin', name);
+await cp(join(desktop, 'release', 'mac-arm64', 'SharedCut.app'), bundle, { recursive: true, verbatimSymlinks: true, mode: constants.COPYFILE_FICLONE });
 const step = message => console.log(`• ${message}`);
 const until = async (what, test, seconds) => { for (const end = Date.now() + seconds * 1000; Date.now() < end; await new Promise(r => setTimeout(r, 1000))) { const value = await test(); if (value) return value; } throw new Error(`Timed out waiting for ${what}.`); };
 

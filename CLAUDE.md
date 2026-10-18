@@ -101,6 +101,10 @@ node scripts/project-bundle.mjs export "Newspaper" ~/Desktop/newspaper-bundle
 node scripts/project-bundle.mjs import ~/Desktop/newspaper-bundle
 ```
 
+When the other machine already has the footage (the desktop app on a laptop holding the card), `export … --no-media`
+sends only the edit, and `import … --originals <folder>` hard-links each clip found there by name and exact size. The
+server prepares those clips on its next start.
+
 Stop the server on both ends first. The import refuses to run while a server holds `data/`
 (`data/frameline.lock`); the next server start picks the imported workspace row up.
 
