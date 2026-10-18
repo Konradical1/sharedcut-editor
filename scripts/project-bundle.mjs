@@ -10,6 +10,10 @@
  *   node scripts/project-bundle.mjs export "Konrad Trip" ~/Desktop/trip-bundle --no-media
  *   node scripts/project-bundle.mjs import ~/Desktop/trip-bundle --originals ~/Desktop/TRIP
  *
+ * Back home, the laptop's copy replaces the locked online one (same project id); clips already here keep their prepared files:
+ *
+ *   node scripts/project-bundle.mjs import ~/trip-back --originals ~/trip-originals --replace
+ *
  * Stop the server on BOTH ends first — import writes the JSON workspace row directly, which the
  * next server start picks up, and refuses to run while a server holds the data folder.
  *
@@ -73,21 +77,36 @@ function exportProject(needle, outDir, { media = true } = {}) {
   console.log(`  ${bundle.media.length} assets, ${bundle.clips.length} clips, ${bundle.timelines.length} timeline(s), ${bundle.tracks.length} tracks`);
 }
 
-function importProject(inDir, originalsDir) {
-  const bundle = JSON.parse(readFileSync(join(inDir, 'project.json'), 'utf8'));
+function importProject(inDir, originalsDir, replace = false) {
+  let bundle = JSON.parse(readFileSync(join(inDir, 'project.json'), 'utf8'));
   if (bundle.version !== 1) throw new Error(`Unsupported bundle version ${bundle.version}.`);
   // Ids become folder names under data/; the server's own id rule keeps a crafted bundle from writing outside them.
   const idIsValid = id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,160}$/.test(id);
   for (const item of [bundle.project, ...BY_PROJECT.flatMap(key => bundle[key] ?? []), ...(bundle.timelines ?? []), ...(bundle.tracks ?? [])]) if (!idIsValid(item?.id)) throw new Error(`The bundle has an invalid id ${JSON.stringify(item?.id)}; refusing to import it.`);
-  const { db, revision, state, fromItems } = open();
+  const { db, revision, state: found, fromItems } = open();
+  let state = found;
 
   // The owner's account id is per-install. Without a remap the project imports invisible: every
   // membership points at a user that does not exist on this machine.
   const owner = db.prepare('SELECT data FROM accounts ORDER BY rowid LIMIT 1').get();
   if (!owner) throw new Error('Create an account on this machine first — sign up in the browser, then import.');
-  const ownerId = JSON.parse(String(owner.data)).user.id;
-
-  if (state.projects.some(item => item.id === bundle.project.id)) throw new Error(`Project ${bundle.project.id} already exists here. Delete it in the app first.`);
+  const old = state.projects.find(item => item.id === bundle.project.id);
+  if (old && !replace) throw new Error(`Project ${bundle.project.id} already exists here. Delete it in the app first, or pass --replace.`);
+  const ownerId = old?.members.find(member => member.role === 'Owner')?.userId ?? JSON.parse(String(owner.data)).user.id;
+  // --replace: the copy edited on another computer takes the place of this one. Its owner's id (snapshots, comments) becomes
+  // this machine's owner; members, sharing and class role stay this machine's; the offline lock goes.
+  const keptMedia = new Map();
+  if (old) {
+    const from = bundle.project.members.find(member => member.role === 'Owner')?.userId;
+    if (from) bundle = JSON.parse(JSON.stringify(bundle).replaceAll(JSON.stringify(from), JSON.stringify(ownerId)));
+    const { lock: _, fcpImport: __, classRole: ___, ...edit } = bundle.project;
+    bundle.project = { ...edit, members: old.members, shared: old.shared, ...(old.classRole ? { classRole: old.classRole } : {}) };
+    // An asset whose original is already here at the same size keeps this machine's prepared files and record.
+    for (const asset of state.media) if (asset.projectId === old.id && bundle.originals?.[asset.id] !== undefined && existsSync(join(DATA, 'media', asset.id, 'original')) && statSync(join(DATA, 'media', asset.id, 'original')).size === bundle.originals[asset.id]) keptMedia.set(asset.id, asset);
+    const timelineIds = new Set(state.timelines.filter(item => item.projectId === old.id).map(item => item.id));
+    state = { ...state, projects: state.projects.filter(item => item.id !== old.id), timelines: state.timelines.filter(item => !timelineIds.has(item.id)), tracks: state.tracks.filter(item => !timelineIds.has(item.timelineId)),
+      ...Object.fromEntries(BY_PROJECT.map(key => [key, (state[key] ?? []).filter(item => item.projectId !== old.id)])) };
+  }
 
   // --originals: footage this machine already has, found by name and exact size anywhere in that folder. A hard link
   // takes no space and leaves the folder as it was; the server prepares each relinked file on its next start.
@@ -95,6 +114,7 @@ function importProject(inDir, originalsDir) {
   if (originalsDir) for (const path of readdirSync(originalsDir, { recursive: true })) { const key = basename(path).toLowerCase(); local.set(key, [...(local.get(key) ?? []), join(originalsDir, path)]); }
   for (const asset of bundle.media) {
     const from = join(inDir, 'media', asset.id), dir = join(DATA, 'media', asset.id), bytes = bundle.originals?.[asset.id];
+    if (keptMedia.has(asset.id)) continue;
     if (existsSync(from)) { cpSync(from, dir, { recursive: true }); continue; }
     const file = (local.get(asset.name.toLowerCase()) ?? []).find(path => { const stat = statSync(path); return stat.isFile() && (bytes === undefined || stat.size === bytes); });
     if (!file) { missing.set(asset.id, asset.name); continue; }
@@ -104,13 +124,13 @@ function importProject(inDir, originalsDir) {
   }
   if (missing.size) console.warn(`  ! no file for ${missing.size} asset(s), imported as offline: ${[...missing.values()].join(', ')}`);
   // An asset left 'ready' without its files would only 404; offline says what to do about it.
-  const media = bundle.media.map(asset => relinked.has(asset.id) ? { ...asset, status: 'processing', progress: 0, thumbnail: '', error: undefined } : missing.has(asset.id) ? { ...asset, status: 'failed', error: 'The original is not on this computer. Import the file again.' } : asset);
+  const media = bundle.media.map(asset => keptMedia.has(asset.id) ? { ...keptMedia.get(asset.id), name: asset.name, binId: asset.binId } : relinked.has(asset.id) ? { ...asset, status: 'processing', progress: 0, thumbnail: '', error: undefined } : missing.has(asset.id) ? { ...asset, status: 'failed', error: 'The original is not on this computer. Import the file again.' } : asset);
   if (existsSync(join(inDir, 'resolve'))) cpSync(join(inDir, 'resolve'), join(DATA, 'resolve', bundle.project.id), { recursive: true });
   if (existsSync(join(inDir, 'motion-trackers'))) cpSync(join(inDir, 'motion-trackers'), join(DATA, 'motion-trackers'), { recursive: true });
 
   const next = {
     ...state,
-    projects: [...state.projects, { ...bundle.project, members: [{ userId: ownerId, role: 'Owner' }] }],
+    projects: [...state.projects, old ? bundle.project : { ...bundle.project, members: [{ userId: ownerId, role: 'Owner' }] }],
     timelines: [...state.timelines, ...bundle.timelines],
     tracks: [...state.tracks, ...bundle.tracks],
     // Bundles made before a list existed (the Plan lists) lack it, and the workspace may too.
@@ -118,16 +138,16 @@ function importProject(inDir, originalsDir) {
   };
   writeWorkspaceRow(db, revision + 1, next, { fromItems });
 
-  console.log(`Imported ${JSON.stringify(bundle.project.name)} — ${bundle.media.length} assets, ${bundle.clips.length} clips.`);
+  console.log(`${old ? 'Replaced' : 'Imported'} ${JSON.stringify(bundle.project.name)} — ${bundle.media.length} assets (${keptMedia.size} kept), ${bundle.clips.length} clips.`);
   if (originalsDir) console.log(`  ${relinked.size} originals linked from ${originalsDir}; the server prepares them on its next start.`);
   console.log("Start the server and sign in; the project belongs to this machine's first account.");
 }
 
 const args = process.argv.slice(2), at = args.indexOf('--originals'), originals = at >= 0 ? args[at + 1] : undefined;
-const [mode, target, out] = args.filter((arg, i) => arg !== '--no-media' && (at < 0 || (i !== at && i !== at + 1)));
+const [mode, target, out] = args.filter((arg, i) => !['--no-media', '--replace'].includes(arg) && (at < 0 || (i !== at && i !== at + 1)));
 if (mode === 'export' && target) exportProject(target, resolve(out ?? `${target.toLowerCase().replace(/\W+/g, '-')}-bundle`), { media: !args.includes('--no-media') });
-else if (mode === 'import' && target && (at < 0 || originals)) { const lock = holdDataLock(DATA); try { importProject(resolve(target), originals && resolve(originals)); } finally { lock.close(); } }
+else if (mode === 'import' && target && (at < 0 || originals)) { const lock = holdDataLock(DATA); try { importProject(resolve(target), originals && resolve(originals), args.includes('--replace')); } finally { lock.close(); } }
 else {
-  console.error('Usage:\n  node scripts/project-bundle.mjs export <project name or id> [outDir] [--no-media]\n  node scripts/project-bundle.mjs import <bundleDir> [--originals <folder with the footage>]\n\nStop the server on both ends first.');
+  console.error('Usage:\n  node scripts/project-bundle.mjs export <project name or id> [outDir] [--no-media]\n  node scripts/project-bundle.mjs import <bundleDir> [--originals <folder with the footage>] [--replace]\n\nStop the server on both ends first.');
   process.exit(1);
 }

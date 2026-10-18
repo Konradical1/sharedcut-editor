@@ -268,10 +268,23 @@ test('a bundle without media links the footage the other machine already has, by
     await mkdir(join(card, 'A')); await mkdir(join(card, 'B'));
     await writeFile(join(card, 'A', 'C1088.MP4'), 'another take'); await writeFile(join(card, 'B', 'C1088.MP4'), footage);
     to = createFrameLineServer({ dataDir: target, legacyEveryMs: 1e9 }); base = await listen(to);
-    await signup('bob'); await to.close(); to = undefined;
+    const bob = await signup('bob'); await to.close(); to = undefined;
     await bundleScript('import', bundle, '--originals', card);
     assert.equal(statSync(join(target, 'media', media, 'original')).ino, statSync(join(card, 'B', 'C1088.MP4')).ino, 'linked, not copied');
     assert.equal(legacyState(join(target, 'frameline.sqlite')).media.find((item: { id: string }) => item.id === media)?.status, 'processing', 'prepared on the next start');
+
+    // Back from the trip: the laptop's copy replaces the locked one, keeps this machine's prepared footage and owner.
+    to = createFrameLineServer({ dataDir: target, legacyEveryMs: 1e9 }); base = await listen(to);
+    await call('/projects/trip/lock', bob.cookie, { note: 'Editing offline' }, 'PUT'); await to.close(); to = undefined;
+    const sent = JSON.parse(readFileSync(join(bundle, 'project.json'), 'utf8'));
+    sent.clips.push({ ...clip('offline', media, 1), projectId: 'trip' }); sent.comments.push({ id: 'note', projectId: 'trip', userId: alice.id, text: 'hi', timestamp: 1, time: 0, resolved: false, replies: [] });
+    Object.assign(sent.media[0], { name: 'Renamed.MP4', proxyUrl: 'from-laptop' }); await writeFile(join(bundle, 'project.json'), JSON.stringify(sent));
+    assert.notEqual((await script('project-bundle.mjs', target, 'import', bundle)).code, 0, 'never over an existing project without --replace');
+    await bundleScript('import', bundle, '--replace');
+    const back = legacyState(join(target, 'frameline.sqlite')), asset = back.media.find((item: { id: string }) => item.id === media);
+    assert.deepEqual(back.projects.map((item: { members: unknown; lock?: unknown }) => [item.members, item.lock]), [[[{ userId: bob.id, role: 'Owner' }], undefined]]);
+    assert.deepEqual(back.clips.map((item: { id: string }) => item.id), ['offline']); assert.equal(back.comments[0].userId, bob.id);
+    assert.equal(asset.name, 'Renamed.MP4'); assert.notEqual(asset.proxyUrl, 'from-laptop', "this machine's record");
   } finally { await from?.close(); await to?.close(); await Promise.all([source, target, bundle, card].map(dir => rm(dir, { recursive: true, force: true }))); }
 });
 test('the legacy row catches up in the background while the server keeps running', { timeout: 30_000 }, async () => {
