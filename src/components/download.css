@@ -1,0 +1,121 @@
+/* sharedcut.com/download. Its own scroll container: html, body and #root are overflow:hidden. Tokens from styles.css; the
+   accent here is the logo's mint. One authored motion, the install picture's loop, which holds still under reduced motion. */
+.download{--accent:#b5f0cd;--ink:#0d2116;--soft:#a3abb0;--faint:#80888d;--hair:#ffffff14;--gutter:clamp(16px,4vw,40px);display:flex;flex-direction:column;height:100dvh;overflow:auto;overscroll-behavior:contain;background:radial-gradient(60% 440px at 50% 0,#b5f0cd10,transparent) no-repeat local,var(--bg);color:var(--muted);font-size:15px;line-height:1.55}
+.download ::selection{background:#b5f0cd47;color:#fff}
+.download-top{display:flex;align-items:center;padding:18px var(--gutter)}
+.download-top .brand{gap:9px;font-size:18px;text-decoration:none;border-radius:6px}
+.download-top .brand-mark{width:26px;height:26px}
+.download-main{flex:1}
+
+/* The hero: the app's icon, which SharedCut this is, the button. Re-keyed per view, so each new view settles in. */
+.download-hero{display:flex;flex-direction:column;align-items:center;padding:clamp(24px,6vh,72px) var(--gutter) 0;text-align:center;animation:download-in .6s cubic-bezier(.16,1,.3,1) both}
+@keyframes download-in{from{opacity:0;transform:translateY(12px)}}
+.download-icon{display:grid;place-items:center;flex-shrink:0;width:88px;height:88px;border-radius:21px;background:linear-gradient(160deg,#262c30,#141719 72%);box-shadow:inset 0 1px 0 #ffffff1f,inset 0 0 0 1px #ffffff0f,0 2px 4px #00000080,0 18px 40px -16px #000}
+.download-icon img{width:56%;height:auto}
+.download-hero h1{margin-top:28px;font-size:clamp(36px,5.2vw,66px);line-height:1.03;font-weight:600;letter-spacing:-.035em;color:var(--text);text-wrap:balance;outline:none}
+.download-hero h1:focus-visible{outline:none}
+.download-lede{margin-top:18px;max-width:34em;font-size:clamp(16px,1.35vw,19px);line-height:1.5;color:var(--soft);text-wrap:balance}
+.download-lede span{display:block}
+
+.download-get{display:flex;flex-direction:column;align-items:center;gap:14px;margin-top:36px}
+.download-button{display:inline-flex;align-items:center;justify-content:center;gap:10px;min-height:56px;padding:0 30px 0 26px;border:1px solid var(--hair);border-radius:14px;background:#1e2326;color:var(--text);font-size:17px;font-weight:600;letter-spacing:-.01em;line-height:1;text-decoration:none;white-space:nowrap;transition:transform .25s cubic-bezier(.16,1,.3,1),background-color .2s,box-shadow .25s,opacity .2s}
+.download-button:hover{background:#262c30}
+.download-button.primary{border-color:transparent;background:var(--accent);color:var(--ink);box-shadow:inset 0 1px 0 #ffffffb3,inset 0 -1px 0 #0000001f,0 1px 2px #00000080,0 14px 34px -16px #b5f0cdb3}
+.download-button.primary:hover{background:#c6f6da;transform:translateY(-1px);box-shadow:inset 0 1px 0 #ffffffcc,inset 0 -1px 0 #0000001f,0 2px 4px #00000080,0 20px 44px -16px #b5f0cdd9}
+.download-button.primary:active{transform:translateY(1px);transition-duration:.06s}
+.download-button:disabled{opacity:1}
+.download-button:disabled:not([aria-busy=true]){border:1px dashed #ffffff29;background:transparent;color:var(--faint);box-shadow:none;cursor:default}
+.download-button[aria-busy=true]{opacity:.5;cursor:progress}
+.download-meta{font-size:13px;color:var(--faint);font-variant-numeric:tabular-nums;text-wrap:balance}
+.download-meta span{color:#50575c}
+.download-switch{display:inline-flex;align-items:center;gap:6px;margin-top:18px;padding:6px 8px;border-radius:6px;font-size:14px;color:var(--soft);text-decoration:underline;text-decoration-color:#ffffff33;text-underline-offset:4px}
+.download-switch:hover{text-decoration-color:currentColor}
+
+/* Phones and other systems: both platforms, side by side, then stacked. */
+.download-both{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:min(620px,100%);margin-top:36px;border:1px solid var(--hair);border-radius:18px;background:#15181a}
+.download-platform{padding:24px 22px 22px}
+.download-platform+.download-platform{border-left:1px solid var(--hair)}
+.download-platform h2{font-size:17px;font-weight:600;letter-spacing:-.01em;color:var(--text)}
+.download-platform .download-get{gap:12px;margin-top:16px}
+.download-platform .download-button{width:100%;min-height:48px;padding:0 18px;border-radius:12px;font-size:15px}
+.download-note{margin-top:18px;font-size:14px;color:var(--faint)}
+
+/* After the click: the install steps, under a picture of the one that needs showing. */
+.download-install h1{font-size:clamp(32px,4vw,52px)}
+.download-install .download-art{margin-top:40px}
+/* One column, as wide as the picture and on its left edge, so a file name never breaks. */
+.download-steps{display:grid;gap:14px;width:min(560px,100%);margin:32px 0 0;padding:0;list-style:none;counter-reset:step;text-align:left}
+.download-steps.windows{width:min(460px,100%)}
+.download-steps li{display:flex;gap:12px;counter-increment:step;font-size:15px;line-height:1.5;color:var(--soft)}
+.download-steps li::before{content:counter(step);display:grid;place-items:center;flex-shrink:0;width:26px;height:26px;margin-top:-1px;border:1px solid #b5f0cd4d;border-radius:50%;color:var(--accent);font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}
+.download-steps b{font-weight:600;color:var(--text);overflow-wrap:anywhere}
+.download-again{margin-top:32px;font-size:14px;color:var(--faint)}
+.download-again a,.download-foot a{color:var(--text);text-decoration-color:#ffffff40;text-underline-offset:4px}
+.download-again a:hover,.download-foot a:hover{text-decoration-color:currentColor}
+.download-install .download-switch{margin-top:6px}
+
+/* The pictures: a dark-mode Finder window for the .dmg, a Windows 11 setup window. */
+.download-art{width:min(560px,100%);overflow:hidden;border:1px solid #ffffff17;border-radius:12px;background:#1a1e21;text-align:left;box-shadow:inset 0 1px 0 #ffffff0d,0 2px 6px #00000073,0 40px 80px -30px #000}
+.dmg-bar{position:relative;display:flex;align-items:center;gap:8px;height:38px;padding:0 14px;border-bottom:1px solid #0000004d;background:#22272b}
+.dmg-bar i{width:12px;height:12px;border-radius:50%;background:#ff5f57;box-shadow:inset 0 0 0 .5px #0000002e}
+.dmg-bar i:nth-child(2){background:#febc2e}
+.dmg-bar i:nth-child(3){background:#28c840}
+.dmg-bar span{position:absolute;inset:0;display:grid;place-items:center;font-size:13px;font-weight:600;color:#b9c0c4}
+.dmg-body{position:relative;container-type:inline-size;aspect-ratio:560/250;background:radial-gradient(80% 90% at 50% 40%,#1f2427,#181b1e)}
+.dmg-item{position:absolute;top:44%;translate:-50% -50%}
+.dmg-item.app{left:26%}
+.dmg-item.folder{left:74%}
+.dmg-item>span:last-child{position:absolute;top:calc(100% + 10px);left:50%;translate:-50%;font-size:13px;color:#c8ced1;white-space:nowrap}
+.dmg-body .download-icon{width:clamp(54px,16cqw,90px);height:auto;aspect-ratio:1;border-radius:22.5%}
+.dmg-arrow{position:absolute;top:44%;left:41%;right:41%;height:2px;background:repeating-linear-gradient(90deg,#ffffff38 0 6px,transparent 6px 12px)}
+.dmg-arrow::after{content:'';position:absolute;top:50%;right:0;width:9px;height:9px;border-top:2px solid #ffffff38;border-right:2px solid #ffffff38;transform:translateY(-50%) rotate(45deg)}
+/* The Applications folder: back with its tab, front, and the A. */
+.dmg-folder{position:relative;display:block;width:clamp(58px,17cqw,96px);aspect-ratio:1.3;border-radius:9% / 11%;background:linear-gradient(#3f84cf,#3570b5);animation:dmg-take 4.8s ease-out infinite}
+.dmg-folder::before,.dmg-folder::after{content:'';position:absolute}
+.dmg-folder::before{top:-9%;left:0;width:42%;height:16%;border-radius:5px 5px 0 0;background:#3f84cf}
+.dmg-folder::after{inset:15% 0 0;border-radius:9% / 12%;background:linear-gradient(#8bc4f5,#5c9ee4);box-shadow:inset 0 1px 0 #ffffff66,0 6px 12px -6px #000000b3}
+.dmg-folder svg{position:absolute;z-index:1;top:58%;left:50%;width:42%;translate:-50% -50%;fill:none;stroke:#2f6db1;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;opacity:.7}
+/* The drag: a see-through copy of the icon and the pointer, across in an arc, into the folder. It exists only in motion;
+   at rest (reduced motion) the window is the classic one, icon, arrow, folder. */
+.dmg-ghost{position:absolute;top:44%;left:26%;translate:-50% -50%;animation:dmg-x 4.8s cubic-bezier(.55,0,.25,1) infinite}
+.dmg-ghost>span{position:relative;display:block;opacity:0;animation:dmg-y 4.8s ease-in-out infinite}
+.dmg-ghost .download-icon{opacity:.72;box-shadow:inset 0 1px 0 #ffffff1f,0 22px 34px -14px #000}
+.dmg-cursor{position:absolute;top:56%;left:58%;width:clamp(11px,2.7cqw,15px);fill:#000;stroke:#fff;stroke-width:1.1;stroke-linejoin:round;filter:drop-shadow(0 1px 2px #0009)}
+@keyframes dmg-x{0%,18%{transform:none}52%,100%{transform:translateX(48cqw)}}
+@keyframes dmg-y{0%,8%{opacity:0;transform:none}16%{opacity:1;transform:translateY(-4px) scale(1.04)}35%{opacity:1;transform:translateY(-22px) scale(1.04)}52%{opacity:1;transform:translateY(-6px) scale(1.04)}62%,100%{opacity:0;transform:translateY(4px) scale(.5)}}
+@keyframes dmg-take{0%,50%,74%,100%{transform:none;filter:none}57%,64%{transform:scale(1.08);filter:brightness(1.18)}}
+
+.download-art.setup{width:min(460px,100%);border-radius:9px}
+.setup-bar{display:flex;align-items:center;gap:9px;height:34px;padding-left:12px;background:#202427;font-size:12px;color:#c3c9cc}
+.setup-bar img{width:15px;height:15px}
+.setup-bar i{position:relative;width:44px;height:100%}
+.setup-bar i:first-of-type{margin-left:auto}
+.setup-bar i::before,.setup-bar i::after{content:'';position:absolute;top:50%;left:50%;translate:-50% -50%;background:#aeb5b9}
+.setup-bar i:nth-of-type(1)::before{width:10px;height:1px}
+.setup-bar i:nth-of-type(2)::before{width:9px;height:9px;border:1px solid #aeb5b9;border-radius:2px;background:none}
+.setup-bar i:nth-of-type(3)::before,.setup-bar i:nth-of-type(3)::after{width:13px;height:1px;rotate:45deg}
+.setup-bar i:nth-of-type(3)::after{rotate:-45deg}
+.setup-body{display:flex;align-items:center;gap:22px;padding:30px 30px 34px}
+.setup-body .download-icon{width:68px;height:68px;border-radius:15px}
+.setup-status{display:flex;flex:1;flex-direction:column;gap:14px;min-width:0}
+.setup-label{display:grid;font-size:15px;font-weight:500;color:var(--text)}
+.setup-label span{grid-area:1/1;animation:setup-first 4.8s infinite}
+.setup-label span+span{opacity:0;animation-name:setup-then}
+.setup-progress{height:4px;overflow:hidden;border-radius:4px;background:#ffffff14}
+.setup-progress i{display:block;height:100%;border-radius:inherit;background:var(--accent);transform:scaleX(.7);transform-origin:left;animation:setup-fill 4.8s cubic-bezier(.4,0,.2,1) infinite}
+@keyframes setup-fill{0%,6%{transform:scaleX(0)}60%,100%{transform:scaleX(1)}}
+@keyframes setup-first{0%,60%{opacity:1}66%,94%{opacity:0}}
+@keyframes setup-then{0%,60%{opacity:0}66%,94%{opacity:1}100%{opacity:0}}
+
+/* The editor itself, fading into the page, and what the app adds. */
+.download-shot{display:block;width:min(1200px,calc(100% - 2 * var(--gutter)));height:auto;margin:clamp(48px,9vh,96px) auto 0;border:1px solid var(--hair);border-radius:clamp(12px,1.6vw,20px);-webkit-mask-image:linear-gradient(#000 40%,transparent 91%);mask-image:linear-gradient(#000 40%,transparent 91%)}
+.download-points{position:relative;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:28px clamp(24px,4vw,56px);width:min(1080px,calc(100% - 2 * var(--gutter)));margin:clamp(-64px,-4vw,-24px) auto 0;padding:0;list-style:none}
+.download-points li{padding-top:20px;border-top:1px solid var(--hair)}
+.download-points b{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:600;color:var(--text)}
+.download-points svg{color:var(--accent)}
+.download-points p{margin-top:8px;font-size:14px;line-height:1.55;color:var(--muted);text-wrap:pretty}
+.download-foot{padding:clamp(56px,10vh,112px) var(--gutter) 40px;text-align:center;font-size:14px;color:var(--faint)}
+
+@media (max-width:760px){.download-points{grid-template-columns:1fr;gap:20px;margin-top:8px}}
+@media (max-width:540px){.download-hero>.download-icon{width:72px;height:72px;border-radius:17px}.download-hero h1{margin-top:22px}.download-get{width:100%}.download-hero>.download-get .download-button{width:100%}.download-both{grid-template-columns:1fr}.download-platform+.download-platform{border-top:1px solid var(--hair);border-left:0}}
+@media (prefers-reduced-motion:reduce){.download *,.download *::before,.download *::after{animation:none!important;transition:none!important}}
