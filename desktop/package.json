@@ -1,0 +1,45 @@
+{
+  "name": "sharedcut-desktop",
+  "productName": "SharedCut",
+  "version": "1.0.0",
+  "description": "SharedCut for Mac and Windows",
+  "author": "Konrad Fischer",
+  "private": true,
+  "main": "main.mjs",
+  "scripts": {
+    "start": "electron .",
+    "stage": "node stage.mjs",
+    "dist": "node stage.mjs && electron-builder --mac --arm64"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9"
+  },
+  "devDependencies": {
+    "electron": "44.9.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.sharedcut.desktop",
+    "productName": "SharedCut",
+    "copyright": "Copyright © 2026 Konrad Fischer",
+    "directories": { "output": "release", "buildResources": "build" },
+    "files": ["main.mjs"],
+    "extraResources": [{ "from": "stage/app", "to": "app" }, { "from": "stage/bin", "to": "bin" }],
+    "publish": [{ "provider": "generic", "url": "https://sharedcut.com/download" }],
+    "mac": {
+      "target": [{ "target": "dmg", "arch": ["arm64"] }, { "target": "zip", "arch": ["arm64"] }],
+      "artifactName": "SharedCut-${version}-${arch}.${ext}",
+      "category": "public.app-category.video",
+      "minimumSystemVersion": "13.5",
+      "hardenedRuntime": true
+    },
+    "dmg": {
+      "title": "SharedCut",
+      "iconSize": 112,
+      "window": { "width": 600, "height": 400 },
+      "contents": [{ "x": 170, "y": 205 }, { "x": 430, "y": 205, "type": "link", "path": "/Applications" }]
+    },
+    "win": { "target": [{ "target": "nsis", "arch": ["x64"] }] },
+    "nsis": { "oneClick": true, "perMachine": false, "artifactName": "SharedCut-Setup-${version}.${ext}" }
+  }
+}

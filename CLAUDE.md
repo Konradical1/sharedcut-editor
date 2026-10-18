@@ -129,3 +129,12 @@ Only one server may open a data folder: a second `npm start` beside the live one
   refuses any export that has one: do not roll back past it, fix forward.
 - `node scripts/remote-playback-check.mjs` plays a timeline on sharedcut.com as a signed-in user and
   reports pictures/s, freezes and loading time; run it before and after any playback change.
+
+## Desktop app (`desktop/`)
+
+SharedCut Desktop runs this same server and `dist/` on the user's own computer, with bundled Node and FFmpeg and data
+in the app's userData folder, so it works with no connection. A server or editor change ships in the next app build
+too, and it must still run that way: no hard dependency on the Lenovo, the network or a Python venv for core editing.
+The app starts `server/index.ts` on 127.0.0.1:41237 with `FRAME_LINE_STOP_WITH_STDIN`, so the server stops when the
+app's pipe closes. Installers and update feeds are served from `<data>/downloads` at `/download/<file>`. The page is
+sharedcut.com/download. Build, sign, check and publish: `desktop/README.md`.

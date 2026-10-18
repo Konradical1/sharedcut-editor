@@ -170,7 +170,7 @@ function send(res: ServerResponse, status: number, body: unknown) {
   const stream = createGzip({ level: 1 });
   res.on('close', () => stream.destroy()); stream.on('error', () => res.destroy()); stream.pipe(res); stream.end(json);
 }
-const contentTypes: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon', '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.m4a': 'audio/mp4', '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.woff2': 'font/woff2' };
+const contentTypes: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon', '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm', '.m4a': 'audio/mp4', '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.woff2': 'font/woff2', '.yml': 'text/yaml; charset=utf-8', '.dmg': 'application/x-apple-diskimage', '.zip': 'application/zip', '.exe': 'application/vnd.microsoft.portable-executable' };
 export function streamFile(req: IncomingMessage, res: ServerResponse, path: string, type?: string, download?: string, immutable?: boolean) {
   let size = 0, modified = 0; try { const file = statSync(path); size = file.size; modified = file.mtimeMs; } catch { fail(404, 'File not found.'); }
   // Prepared media, overlays and hashed bundles are written once under a versioned name and never
@@ -2035,6 +2035,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         fail(404, 'API endpoint not found.');
       }
       if (!['GET', 'HEAD'].includes(method)) fail(405, 'Method not allowed.');
+      // The desktop app's installers and the update feeds it checks (desktop/package.json "publish"), from <data>/downloads.
+      const installer = /^\/download\/(\w[\w.-]*)$/.exec(path);
+      if (installer) { streamFile(req, res, join(dataDir, 'downloads', installer[1]), undefined, /\.(dmg|exe)$/.test(installer[1]) ? installer[1] : undefined); return; }
       let decoded: string; try { decoded = decodeURIComponent(path); } catch { fail(400, 'Invalid URL.'); }
       const requested = resolve(distDir, `.${decoded!}`); if (!requested.startsWith(`${distDir}${sep}`) && requested !== distDir) fail(404, 'File not found.');
       const file = existsSync(requested) && statSync(requested).isFile() ? requested : extname(decoded!) ? fail(404, 'File not found.') : join(distDir, 'index.html');
@@ -2206,5 +2209,9 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const app = createFrameLineServer({ hostMonitor: true }); const port = Number(process.env.PORT ?? 4310); const host = process.env.HOST ?? '127.0.0.1';
   app.server.listen(port, host, () => console.log(`SharedCut server listening at http://${host}:${port}`));
   // SIGBREAK is Ctrl+Break and SIGHUP a closed console window on Windows; both still get a clean close.
-  let stopping = false; for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP'] as const) process.on(signal, () => { if (!stopping) { stopping = true; void app.close().then(() => process.exit(0), error => { console.error('Shutdown failed:', error); process.exit(1); }); } });
+  let stopping = false; const stop = () => { if (!stopping) { stopping = true; void app.close().then(() => process.exit(0), error => { console.error('Shutdown failed:', error); process.exit(1); }); } };
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP'] as const) process.on(signal, stop);
+  // The desktop app (desktop/main.mjs) holds this server's stdin. When the app quits, or even crashes, the pipe
+  // closes and the server closes with it, on Windows too, where a parent cannot send SIGTERM.
+  if (process.env.FRAME_LINE_STOP_WITH_STDIN) process.stdin.on('end', stop).resume();
 }

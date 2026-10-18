@@ -62,7 +62,9 @@
     "test:optical-flow:browser": "node --experimental-strip-types scripts/optical-flow-check.mjs",
     "setup:windows": "node scripts/setup-windows.mjs",
     "doctor": "node --env-file-if-exists=.env --experimental-strip-types scripts/doctor.mjs",
-    "test:masks:inference": "node --experimental-strip-types scripts/smart-mask-inference-check.mjs"
+    "test:masks:inference": "node --experimental-strip-types scripts/smart-mask-inference-check.mjs",
+    "desktop": "npm --prefix desktop start",
+    "desktop:dist": "npm run build && npm --prefix desktop run dist"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.133.0",
