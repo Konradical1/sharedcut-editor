@@ -42,6 +42,19 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     });
     if (restarted) await alert(`${url} failed three checks; restarted the Cloudflare tunnel.`);
     else if (unhealthy) await alert(unhealthy);
+  } else if (process.platform === 'linux') {
+    // The Lenovo's cron runs this every 2 minutes. Both systemd units run as this user and restart themselves,
+    // so a SIGKILL is a restart: it catches a server or tunnel that is alive but no longer answering.
+    const answers = async (url, ok) => { try { const response = await fetch(url, { signal: AbortSignal.timeout(10000) }); return ok(response, await response.json()); } catch { return false; } };
+    const kill = unit => {
+      const pid = Number(execFileSync('systemctl', ['show', '-p', 'MainPID', '--value', unit], { encoding: 'utf8', timeout: 20000 }).trim());
+      if (pid > 0) process.kill(pid, 'SIGKILL'); else console.log(`${new Date().toISOString()} ${unit} is not running; systemd has to start it`);
+    };
+    // Any JSON answer means the server is up; a 503 (low disk, database) is not fixed by a restart.
+    if (await recoverTunnel(() => answers(`http://127.0.0.1:${process.env.PORT || 4310}/api/health`, (_, health) => typeof health.status === 'string'), () => kill('sharedcut')))
+      await alert('The server did not answer three health checks and was restarted.');
+    else if (await recoverTunnel(() => answers('http://127.0.0.1:20241/ready', (response, health) => response.ok && health.readyConnections > 0), () => kill('sharedcut-tunnel')))
+      await alert('The tunnel was unready after three checks and was restarted.');
   } else {
     const restarted = await recoverTunnel(async () => {
       try {
