@@ -6,7 +6,7 @@ import { ArrowRight, Bell, ChevronDown, Film, FolderOpen, Globe2, LockKeyhole, M
 import { useEditorStore } from '../state/store';
 import type { Project, ProjectMember, User } from '../state/models';
 import { api, connection } from '../services/api';
-import { flushChanges, refreshState } from '../services/sync';
+import { flushChanges, refreshState, setProjectLock } from '../services/sync';
 import { Avatar, Brand, Button, IconButton, Modal, NumberInput } from './ui';
 import SettingsDialog from './SettingsDialog';
 import './dashboard.css';
@@ -36,6 +36,11 @@ function ProjectSettings({ project, users, currentUserId, deleting = false, shar
     try { await flushChanges(); await api(`/projects/${project.id}`, { method: 'PATCH', body: JSON.stringify(panel === 'share' ? { access: access.shared ? 'class' : access.members.length ? 'people' : 'private', members: access.members, classRole: access.classRole } : { name, description, status, resolution, fps }) }); await refreshState(); if (panel === 'share' && !sharing) { setSavedAccess(access); setPanel('properties'); } else onClose(); }
     catch (failure) { setError((failure as Error).message); } finally { setBusy(false); }
   };
+  const toggleLock = async () => {
+    setBusy(true); setError('');
+    try { await setProjectLock(project.id, !project.lock); onClose(); }
+    catch (failure) { setError((failure as Error).message); } finally { setBusy(false); }
+  };
   const remove = async () => {
     setBusy(true); setError('');
     try { await flushChanges(); const backup = await api<{ projectId: string; expiresAt: number }>(`/projects/${project.id}`, { method: 'DELETE' }); await refreshState(); onDeleted(backup); onClose(); }
@@ -45,7 +50,7 @@ function ProjectSettings({ project, users, currentUserId, deleting = false, shar
     {panel === 'properties' && <><label className="form-field">Project name<input required maxLength={100} value={name} disabled={!owner || busy} onChange={e => setName(e.target.value)}/></label><label className="form-field">Description<textarea rows={2} maxLength={5000} value={description} disabled={!owner || busy} onChange={e => setDescription(e.target.value)}/></label><label className="form-field">Status<select value={status} disabled={!owner || busy} onChange={e => setStatus(e.target.value as Project['status'])}><option>In progress</option><option>In review</option><option>Complete</option></select></label><div className="project-format-row"><label className="form-field">Resolution<input maxLength={80} value={resolution} disabled={!owner || busy} onChange={e => setResolution(e.target.value)}/></label><label className="form-field">Frame rate<NumberInput aria-label="Frame rate" min={1} max={240} value={fps} disabled={!owner || busy} onCommit={setFps}/></label></div><button className="project-sharing-link" disabled={busy} onClick={() => setPanel('share')}><Users size={18}/><span><strong>Sharing & access</strong><small>{access.shared ? 'Entire class' : access.members.length ? `${access.members.length + 1} people` : inherited.length ? 'Includes folder access' : 'Restricted'}</small></span><ArrowRight size={16}/></button></>}
     {panel === 'share' && <SharingFields users={users} userId={currentUserId} ownerId={ownerId} value={access} onChange={setAccess} disabled={!owner || busy} inherited={inherited} allowCommenter/>}
     {panel === 'delete' && <p className="sharing-note">Delete “{project.name}”? You can restore it, media included, for 7 days.</p>}
-    {error && <p className="dash-form-error" role="alert">{error}</p>}<div className="sharing-actions">{owner && panel === 'properties' && <Button variant="ghost" disabled={busy} onClick={() => setPanel('delete')}><Trash2 size={14}/> Delete</Button>}{panel !== 'properties' && !sharing && !deleting && <Button variant="ghost" disabled={busy} onClick={() => { setAccess(savedAccess); setPanel('properties'); }}>Back</Button>}<span className="spacer"/><Button variant="ghost" disabled={busy} onClick={onClose}>{owner ? 'Cancel' : 'Close'}</Button>{owner && <Button variant={panel === 'delete' ? 'danger' : 'primary'} disabled={busy || panel === 'properties' && (!name.trim() || !resolution.trim() || !Number.isFinite(fps))} onClick={panel === 'delete' ? remove : save}>{busy ? 'Saving…' : panel === 'share' ? 'Done' : panel === 'delete' ? 'Delete project' : 'Save changes'}</Button>}</div>
+    {error && <p className="dash-form-error" role="alert">{error}</p>}<div className="sharing-actions">{owner && panel === 'properties' && <Button variant="ghost" disabled={busy} onClick={() => setPanel('delete')}><Trash2 size={14}/> Delete</Button>}{(owner || project.lock?.userId === currentUserId) && panel === 'properties' && <Button variant="ghost" disabled={busy} title={project.lock ? undefined : 'Read-only for everyone, you included, until you unlock it'} onClick={() => void toggleLock()}><LockKeyhole size={14}/> {project.lock ? 'Unlock' : 'Lock'}</Button>}{panel !== 'properties' && !sharing && !deleting && <Button variant="ghost" disabled={busy} onClick={() => { setAccess(savedAccess); setPanel('properties'); }}>Back</Button>}<span className="spacer"/><Button variant="ghost" disabled={busy} onClick={onClose}>{owner ? 'Cancel' : 'Close'}</Button>{owner && <Button variant={panel === 'delete' ? 'danger' : 'primary'} disabled={busy || panel === 'properties' && (!name.trim() || !resolution.trim() || !Number.isFinite(fps))} onClick={panel === 'delete' ? remove : save}>{busy ? 'Saving…' : panel === 'share' ? 'Done' : panel === 'delete' ? 'Delete project' : 'Save changes'}</Button>}</div>
   </div></Modal>;
 }
 

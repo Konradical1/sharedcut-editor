@@ -45,6 +45,7 @@ function describe(p: Project, full = false) {
     `${handle(p.id)} ${quote(p.name)} · ${p.status} · ${p.resolution.replace(/ /g, '')} ${p.fps}fps · access ${access(p)}`,
     `members: ${shown.map(m => `${name(m.userId)} ${handle(m.userId)} ${m.role}`).join(', ')}`,
   ];
+  if (p.lock) lines.push(`locked${p.lock.note ? ` (${quote(p.lock.note)})` : ''} by ${name(p.lock.userId)}: read-only for everyone until unlocked (lock-project{unlock:true})`);
   if (full) {
     if (p.description) lines.push(`description: ${quote(p.description, 200)}`);
     const others = s.users.filter(u => !p.members.some(m => m.userId === u.id));
@@ -110,6 +111,14 @@ export const jobs: Record<string, JobDef> = {
       if (params.confirm !== true) throw new Error(`Deleting ${handle(p.id)} ${quote(p.name)} removes it for every member. Repeat with confirm:true if the user asked for it.`);
       const backup = await direct<{ projectId: string; expiresAt: number }>(path(p.id), { method: 'DELETE' });
       return done(`deleted ${quote(p.name)} · restorable until ${day(backup.expiresAt)}: job restore-project{id:"${handle(p.id).slice(1)}"}`);
+    },
+  },
+  'lock-project': {
+    doc: '{project?, unlock?:true, note?} owner only: read-only for everyone, you included, until unlocked (e.g. while it is edited offline)',
+    async start(params) {
+      const p = target(params);
+      await direct(`${path(p.id)}/lock`, params.unlock === true ? { method: 'DELETE' } : { method: 'PUT', json: { note: String(params.note ?? '') } });
+      return done(describe(fresh(p.id) ?? p));
     },
   },
   'restore-project': {

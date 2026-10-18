@@ -2,7 +2,7 @@ import './components/captions.css';
 import { loadCaptionFonts } from './services/fonts';
 import { lazy, useEffect, useRef, useState, type PointerEvent } from 'react';
 import { MotionConfig } from 'motion/react';
-import { ChevronLeft, ChevronDown, PanelLeft, SlidersHorizontal, Scissors, Palette, AudioLines, ArrowUpRight, History, Camera, Users, MessageSquare, Radio, Settings, Check, Cloud, X, MonitorPlay, NotebookPen, WandSparkles } from 'lucide-react';
+import { ChevronLeft, ChevronDown, PanelLeft, SlidersHorizontal, Scissors, Palette, AudioLines, ArrowUpRight, History, Camera, Users, MessageSquare, Radio, Settings, Check, Cloud, X, MonitorPlay, NotebookPen, WandSparkles, Lock } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useEditorStore, initializeEditorServices } from './state/store';
 import type { Workspace } from './state/models';
@@ -24,7 +24,7 @@ const DeliverWorkspace = lazy(() => import('./workspaces/DeliverWorkspace'));
 const PlanWorkspace = lazy(() => import('./workspaces/PlanWorkspace'));
 const DenoiseWorkspace = lazy(() => import('./workspaces/DenoiseWorkspace'));
 import { useEditorShortcuts, useFocusRelease } from './shortcuts';
-import { connectSession, signOut, resolveSyncConflict } from './services/sync';
+import { connectSession, signOut, resolveSyncConflict, setProjectLock } from './services/sync';
 import { startPlaybackReporting } from './services/playbackHealthStart';
 // keep the media panel wide enough for every icon tab to stay visible (see .edit-media in styles.css)
 const MIN_MEDIA_WIDTH=232;
@@ -45,7 +45,7 @@ function Editor({onHome}:{onHome:()=>void}) {
   const online=useEditorStore(s=>s.presence.filter(p=>p.online).length);
   const presenter=useEditorStore(s=>s.presence.find(p=>p.online&&p.presenting)?.userId);
   const syncConflict=useEditorStore(s=>s.syncConflict);
-  const project=useEditorStore(s=>s.projects.find(p=>p.id===s.projectId));
+  const project=useEditorStore(s=>s.projects.find(p=>p.id===s.projectId)), currentUserId=useEditorStore(s=>s.currentUserId);
   const workspace=useEditorStore(s=>s.workspace);
   const sidePanel=useEditorStore(s=>s.sidePanel);
   const saveStatus=useEditorStore(s=>s.saveStatus);
@@ -76,7 +76,7 @@ function Editor({onHome}:{onHome:()=>void}) {
   const dots=(id:Workspace,name:string)=><span className="workspace-people">{people.map(p=>p.split('\n')).filter(([,activity])=>activity===id).map(([userId])=>{const user=users.find(u=>u.id===userId);return <i key={userId} style={{background:user?.color}} title={`${user?.name??'Collaborator'} is in ${name}`}/>;})}</span>;
   const rightPanel=sidePanel==='people'?<PeoplePanel/>:sidePanel==='history'?<HistoryPanel/>:sidePanel==='comments'?<CommentsPanel/>:<Inspector/>;
   return <div className="editor-app">
-    <header className="app-toolbar"><div className="project-navigation"><IconButton label="Back to projects" onClick={onHome}><ChevronLeft size={17}/></IconButton><button className="brand-home" aria-label="SharedCut dashboard" onClick={onHome}><Brand compact/></button><span className="project-divider"/><div className="project-title"><b>{project?.name??'Project'}</b><span><i className="status-dot"/>{project?.shared?'Class project':(project?.members.length ?? 0)>1?'Shared project':'Private project'}</span></div></div>
+    <header className="app-toolbar"><div className="project-navigation"><IconButton label="Back to projects" onClick={onHome}><ChevronLeft size={17}/></IconButton><button className="brand-home" aria-label="SharedCut dashboard" onClick={onHome}><Brand compact/></button><span className="project-divider"/><div className="project-title"><b>{project?.name??'Project'}</b>{project?.lock?<span className="project-locked" title="Read-only for everyone until its owner unlocks it"><Lock size={9}/>Locked{project.lock.note?` · ${project.lock.note}`:''}{project.lock.userId===currentUserId&&<button onClick={()=>void setProjectLock(project.id,false).catch(error=>s().notify(error.message,'error'))}>Unlock</button>}</span>:<span><i className="status-dot"/>{project?.shared?'Class project':(project?.members.length ?? 0)>1?'Shared project':'Private project'}</span>}</div></div>
       <nav className="workspace-nav" aria-label="Editor workspaces">{workspaceItems.map(w=><button key={w.id} className={workspace===w.id?'active':''} aria-label={w.name} aria-current={workspace===w.id?'page':undefined} onClick={()=>s().setWorkspace(w.id)}><w.icon size={15}/>{w.name}{dots(w.id,w.name)}</button>)}
         {/* Plan is pre-production, not a fifth editing stage: one quiet icon after the four, not another labelled tab. */}
         <span className="workspace-nav-divider" aria-hidden="true"/><button className={`workspace-plan ${workspace==='plan'?'active':''}`} aria-label="Plan" title="Plan: script, shot list, mood board" aria-current={workspace==='plan'?'page':undefined} onClick={()=>s().openPlan(s().planTab)}><NotebookPen size={15}/>{dots('plan','Plan')}</button></nav>

@@ -47,6 +47,7 @@ export const ROUTES: Record<string, string> = {
   '/api/projects/([a-zA-Z0-9_-]+)/members/([a-zA-Z0-9_-]+)': 'job:member',
   '/api/projects/deleted': 'job:restore-project',
   '/api/projects/([a-zA-Z0-9_-]+)/restore': 'job:restore-project',
+  '/api/projects/([a-zA-Z0-9_-]+)/lock': 'job:lock-project',
   '/api/library': 'job:folder',
   // Captions, masks, depth, motion, tracking, color
   '/api/captions': 'job:captions',

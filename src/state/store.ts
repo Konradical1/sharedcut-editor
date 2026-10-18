@@ -451,6 +451,9 @@ export const useEditorStore = create<EditorStore>((set, get) => {
   let redoable: Operation[] = [];
   const commit =(type: OperationType, targetId: string, description: string, changes: Change[], gesture?: string) => {
     const state = get();
+    // A locked project takes no edits (the server refuses them too): say so instead of queuing saves that can only fail.
+    const lock = state.projects.find(project => project.id === state.projectId)?.lock;
+    if (lock) { state.notify('This project is locked', 'info', lock.note || 'Its owner can unlock it from the toolbar.'); return; }
     // Deleting an entity must retain its whole record so undo can recreate it.
     changes=changes.map(change=>change.value===null?{...change,replace:true}:change);
     // Keep set registration and its last line in the same undoable edit, including overwrites.

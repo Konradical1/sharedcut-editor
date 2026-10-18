@@ -5,8 +5,10 @@ export type Role = 'Owner' | 'Editor' | 'Commenter' | 'Viewer';
 export interface User { id: string; name: string; email: string; initials: string; color: string; guest?: boolean }
 export interface Group { id: string; name: string; userIds: string[] }
 export interface ProjectMember { userId: string; role: Role }
+/** While set, the project is read-only for everyone until its owner unlocks it, e.g. while it is edited offline elsewhere. */
+export interface ProjectLock { userId: string; at: number; note: string }
 /** `bins` is the project's own folder list once an editor changed one; without it the panel shows the fixed set. */
-export interface Project { bins?: Bin[]; classRole?: 'Editor' | 'Viewer'; id: string; name: string; description: string; shared: boolean; thumbnail: string; modifiedAt: number; duration: number; resolution: string; fps: number; status: 'In progress' | 'In review' | 'Complete'; members: ProjectMember[]; fcpImport?: FcpImport }
+export interface Project { bins?: Bin[]; classRole?: 'Editor' | 'Viewer'; id: string; name: string; description: string; shared: boolean; thumbnail: string; modifiedAt: number; duration: number; resolution: string; fps: number; status: 'In progress' | 'In review' | 'Complete'; members: ProjectMember[]; fcpImport?: FcpImport; lock?: ProjectLock }
 /** A Final Cut import in flight. Only the server writes it (plan, chunks, media status); every Projects screen that can see the project reads it. */
 export interface FcpImport {
   by: string;                                                     // user id of the importer

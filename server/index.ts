@@ -334,7 +334,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const sessionHash = (req: IncomingMessage) => { const token = req.headers.cookie?.split(';').map(part => part.trim()).find(part => part.startsWith('frameline_session='))?.slice(18); return token ? createHash('sha256').update(token).digest('hex') : ''; };
   const authenticated = (req: IncomingMessage) => { const row = db.prepare('SELECT userId FROM sessions WHERE token=? AND expiresAt>?').get(sessionHash(req), Date.now()) as { userId: string } | undefined; return row ? accountById(row.userId) : undefined; };
   const requireAccount = (req: IncomingMessage) => authenticated(req) ?? fail(401, 'Sign in to continue.');
-  const requireProject = (id: string, userId: string, write = false) => { const project = state.projects.find(project => project.id === id && visibleTo(project, userId)) ?? fail(404, 'Project not found.'); if (write && !['Owner', 'Editor'].includes(roleFor(project, userId) ?? '')) fail(403, 'An editor role is required.'); return project; };
+  const requireProject = (id: string, userId: string, write = false) => { const project = state.projects.find(project => project.id === id && visibleTo(project, userId)) ?? fail(404, 'Project not found.'); if (write && project.lock) fail(423, lockedMessage(project)); if (write && !['Owner', 'Editor'].includes(roleFor(project, userId) ?? '')) fail(403, 'An editor role is required.'); return project; };
   // Every item a collaborator can edit is lockable, not just clips and grades. A lock that cannot be
   // taken on a track, timeline, comment or project is a control two machines can edit at once.
   const lockable = (targetId: string, projectId: string) =>
@@ -466,7 +466,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const library = projectLibrary(db, () => state.projects, users, () => revision, write => transaction(() => { write(); persist(); }));
   // Guests get no class or folder role: a class-shared project is never theirs to rebuild or upload into.
   const isGuest = (userId: string) => (accountCache ?? accountMap()).byId.get(userId)?.user.guest === true;
-  const roleFor = (project: Project, userId: string) => isGuest(userId) ? project.members.find(m => m.userId === userId)?.role : library.projectRole(project, userId);
+  const ownRole = (project: Project, userId: string) => isGuest(userId) ? project.members.find(m => m.userId === userId)?.role : library.projectRole(project, userId);
+  // A locked project is read-only for everyone, its owner included, until the owner unlocks it (/api/projects/:id/lock),
+  // so a copy being edited offline on another computer cannot drift from this one.
+  const roleFor = (project: Project, userId: string) => { const role = ownRole(project, userId); return role && project.lock ? 'Viewer' as const : role; };
+  const lockedMessage = (project: Project) => `“${project.name}” is locked${project.lock?.note ? `: ${project.lock.note}` : ''}. Its owner can unlock it.`;
   const visibleTo = (project: Project, userId: string) => Boolean(roleFor(project, userId));
   const uploadLocks = new Set<string>();
   // Last time an asset's transient progress was written. Each write once serialised the whole
@@ -826,9 +830,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     object(incoming.settings); for (const value of Object.values(incoming.settings)) if (!['string', 'number', 'boolean'].includes(typeof value)) fail(400, 'Invalid setting.');
     const existing = new Map(state.projects.map(project => [project.id, project])); const allowed = new Set(currentView.projects.map(project => project.id)); const nextProjectIds = new Set(incoming.projects.map(project => project.id));
     const projects = incoming.projects.map(sent => {
-      // The import card is the server's. A client's copy, stale or forged, is dropped before any role or lock comparison.
-      const { fcpImport: _, ...rest } = sent, card = existing.get(sent.id)?.fcpImport, project: Project = card ? { ...rest, fcpImport: card } : rest;
+      // The import card and the project lock are the server's. A client's copy, stale or forged, is dropped before any role or lock comparison.
+      const { fcpImport: _, lock: _lock, ...rest } = sent, held = existing.get(sent.id), project: Project = { ...rest, ...(held?.fcpImport ? { fcpImport: held.fcpImport } : {}), ...(held?.lock ? { lock: held.lock } : {}) };
       const old = existing.get(project.id);
+      if (old?.lock && !same({ ...old, members: [], modifiedAt: 0 }, { ...project, members: [], modifiedAt: 0 })) fail(423, lockedMessage(old));
       if (!old && library.hasLocation(project.id)) fail(400, 'This project ID is reserved by a deleted project. Create a new project instead.');
       if (old && !allowed.has(project.id)) fail(403, 'Project is inaccessible.');
       if (old && !same(project.members, currentView.projects.find(item => item.id === project.id)?.members)) fail(403, 'Project roles cannot be changed through project state.');
@@ -861,6 +866,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         const oldItem = (oldById ??= new Map(oldItems.map(entry => [entry.id, entry]))).get(item.id); if (oldItem && itemProject(oldItem, false) !== projectId) fail(403, 'Items cannot be moved between projects.');
         if (!same(oldItem, item)) {
           const project = existing.get(projectId); const role = project ? roleFor(project, userId) : 'Owner';
+          if (project?.lock) fail(423, lockedMessage(project));
           if (!['Owner', 'Editor'].includes(role ?? '') && !(role === 'Commenter' && ['comments', 'operations'].includes(key))) fail(403, 'Editing this project is not allowed.');
           const restoredComment = key === 'comments' && state.snapshots.some(snapshot => snapshot.projectId === projectId && snapshot.state.comments.some(comment => same(comment, item)));
           if (['comments', 'operations', 'snapshots'].includes(key) && !restoredComment && (!oldItem ? item.userId !== userId : item.userId !== oldItem.userId)) fail(403, 'The author cannot be impersonated.');
@@ -890,7 +896,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         const newIds = new Set(newItems.map(item => item.id));
         for (const oldItem of oldItems) if (allowed.has(itemProject(oldItem, false)) && nextProjectIds.has(itemProject(oldItem, false)) && !newIds.has(oldItem.id)) {
           if (key === 'operations') fail(403, 'History cannot be deleted.');
-          const role = roleFor(existing.get(itemProject(oldItem, false))!, userId); if (!['Owner', 'Editor'].includes(role ?? '') && !(role === 'Commenter' && key === 'comments' && oldItem.userId === userId)) fail(403, 'Deleting this item is not allowed.');
+          const owner = existing.get(itemProject(oldItem, false))!; if (owner.lock) fail(423, lockedMessage(owner));
+          const role = roleFor(owner, userId); if (!['Owner', 'Editor'].includes(role ?? '') && !(role === 'Commenter' && key === 'comments' && oldItem.userId === userId)) fail(403, 'Deleting this item is not allowed.');
           if ([...locks.values()].some(lock => lock.targetId === oldItem.id && lock.projectId === itemProject(oldItem, false) && lock.userId !== userId && lock.expiresAt > Date.now())) fail(423, 'A collaborator has locked this item.');
         }
       }
@@ -1151,6 +1158,16 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             });
           } catch (error) { state = previous; revision = previousRevision; throw error; }
           send(res, 200, { projectId: restoreProjectRoute[1] }); return;
+        }
+        const lockRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)\/lock$/.exec(path);
+        if (lockRoute && (method === 'PUT' || method === 'DELETE')) {
+          // ownRole: while locked, roleFor makes the owner a Viewer too.
+          const project = requireProject(lockRoute[1], userId); if (ownRole(project, userId) !== 'Owner') fail(403, 'Only the project owner can lock or unlock it.');
+          const note = method === 'PUT' ? textField((await jsonBody(req)).note ?? '', 200).trim() : '';
+          const { lock: _, ...open } = project, updated: Project = method === 'PUT' ? { ...open, lock: { userId, at: Date.now(), note } } : open;
+          const previous = state.projects; state.projects = state.projects.map(item => item.id === updated.id ? updated : item);
+          try { persist(); } catch (error) { state.projects = previous; throw error; }
+          send(res, 200, { project: updated }); return;
         }
         const projectRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)$/.exec(path);
         if (projectRoute && method === 'PATCH') {

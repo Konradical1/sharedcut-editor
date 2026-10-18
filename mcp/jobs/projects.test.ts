@@ -31,6 +31,8 @@ globalThis.fetch = (async (input: string, init: RequestInit = {}) => {
     p.members = [...p.members.filter((m: any) => m.userId !== member[2]), { userId: member[2], role: body.role }]; revision++;
     return json({ project: p });
   }
+  const lock = /^\/api\/projects\/([\w-]+)\/lock$/.exec(path);
+  if (lock) { const p = project(lock[1]); if (method === 'PUT') p.lock = { userId: saved.currentUserId, at: 1, note: body.note }; else delete p.lock; revision++; return json({ project: p }); }
   const route = /^\/api\/projects\/([\w-]+)$/.exec(path);
   if (route && method === 'DELETE') { const p = project(route[1]); saved.projects = saved.projects.filter((x: any) => x !== p); deleted.push(p); revision++; return json({ projectId: p.id, expiresAt: Date.parse('2026-10-12T10:00:00Z') }); }
   if (route && method === 'PATCH') {
@@ -116,4 +118,13 @@ test('history lists edits, snapshots and open comments with handles; topics are 
   assert.match(topics.properties, /^opacity=100 \(0–100\) %$/m);
   assert.match(topics.properties, /^motionBlurStrength=50 \(0–100\) .* · not animatable$/m);
   for (const job of Object.values(jobs)) assert.ok(!job.doc.includes('\n') && job.doc.length < 220, job.doc);
+});
+
+test('lock-project locks with a note and unlocks', async () => {
+  const locked = await run('lock-project', { ...T, note: 'Editing offline on the MacBook Air' });
+  assert.deepEqual(last(), { method: 'PUT', path: '/api/projects/above-the-treeline/lock', body: { note: 'Editing offline on the MacBook Air' } });
+  assert.match(locked, /locked \("Editing offline on the MacBook Air"\) by .+: read-only for everyone until unlocked/);
+  const open = await run('lock-project', { ...T, unlock: true });
+  assert.deepEqual(last(), { method: 'DELETE', path: '/api/projects/above-the-treeline/lock', body: undefined });
+  assert.doesNotMatch(open, /locked/);
 });

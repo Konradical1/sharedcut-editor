@@ -274,6 +274,13 @@ export function resolveSyncConflict(keepLocal: boolean) {
   drainRefresh();
 }
 
+/** Owner only: locks the project for everyone (the note says why, e.g. "Editing offline on the MacBook Air"), or unlocks it. */
+export async function setProjectLock(projectId: string, locked: boolean, note = '') {
+  await flushChanges();
+  await api(`/projects/${encodeURIComponent(projectId)}/lock`, locked ? { method: 'PUT', body: JSON.stringify({ note }) } : { method: 'DELETE' });
+  await refreshState();
+}
+
 export function refreshState(): Promise<void> {
   if (refreshing) { refreshAgain = true; return refreshing; }
   const session = generation;
