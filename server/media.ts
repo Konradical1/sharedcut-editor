@@ -736,7 +736,7 @@ export interface RenderRequest {
   leakSound?: boolean;
   /** Internal: thread budget when several FFmpeg passes share the export. */
   threads?: number;
-  /** A timeline preview: render as one FFmpeg pass or refuse, never split into parallel passes that take export threads. */
+  /** A timeline preview: its own few threads and no export admission. A range that splits renders its parts one after another, never in parallel. */
   singlePass?: boolean;
   /** Process priority of the final encode (nice 19 is Idle on Windows); a preview must never outrank the editor. */
   nice?: number;
@@ -923,8 +923,6 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
     const passes = renderPasses(spans, transitions.map(record => ({ from: frame(record.start), to: frame(record.end) })), total, PASS_INPUTS, Math.round(PASS_SECONDS * fps));
     const sounds = audio === 'Disabled' ? [] : clips.filter(clip => { const track = tracks.find(t => t.id === clip.trackId); return track && !track.muted && (!solo || track.solo) && inRange(clip.start, clip.start + clip.duration); });
     if (passes.length > 1 || sounds.length > PASS_SOUNDS) {
-      // A preview is one pass or nothing: parallel passes would each take export threads and a decoder per clip.
-      if (request.singlePass) throw new Error('This part stacks too many clips for a quick preview. It plays live in the editor.');
       return renderSplit(request, { passes, sounds, fps, total, duration });
     }
   }
@@ -1318,10 +1316,20 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         filters.push(`[clipv${index}]split=${branches.length + 1}[body${index}]${branches.map(name => `[${name}]`).join('')}`);
         const outside = touching.map(record => `(1-${onScreen(Math.max(0, record.start - rangeIn), Math.min(duration, record.end - rangeIn))})`).join('*');
         place(`body${index}`, `${visible}*${outside}`);
+        // A window blends whole frames. A side that is not one (a vertical shot, a zoom, a move, a rotation) is put on a
+        // transparent frame where it sits on screen, only over the window: blending it raw failed on mismatched sizes
+        // and drew a moved clip centred.
+        const whole = motion || streamed || !rotation && scaledWidth === width && scaledHeight === height && !shiftedX && !shiftedY;
         touching.forEach((record, n) => {
+          let side = branches[n];
+          if (!whole) {
+            const from = Math.max(0, record.start - rangeIn - 1 / fps), to = Math.min(duration, record.end - rangeIn) + 1 / fps;
+            filters.push(`color=c=black@0:s=${width}x${height}:r=${fps}:d=${(to - from).toFixed(6)},format=yuva444p10le,setpts=PTS-STARTPTS+round(${from.toFixed(6)}/TB)[${side}c]`, `[${side}c][${side}]${overlayPlace(shiftedX, shiftedY)}[${side}p]`);
+            side = `${side}p`;
+          }
           const sides = windowSides.get(record) ?? {};
-          if (record.outgoingId === clip.id) sides.out = branches[n];
-          if (record.incomingId === clip.id) sides.in = branches[n];
+          if (record.outgoingId === clip.id) sides.out = side;
+          if (record.incomingId === clip.id) sides.in = side;
           windowSides.set(record, sides);
         });
       }
@@ -1408,7 +1416,9 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
 async function renderSplit(request: RenderRequest, plan: { passes: { from: number; to: number }[]; sounds: Clip[]; fps: number; total: number; duration: number }) {
   const { settings, signal, onProgress, outputPath } = request, { fps, duration } = plan;
   const rangeIn = Number(settings.rangeIn ?? 0), codec = settings.codec || 'H.264', audio = settings.audio || 'AAC · 320 kb/s · 48 kHz';
-  const internal = Boolean(request.transparent || request.sampledFrame), threads = Math.max(2, Math.floor(Number(exportThreads) / EXPORT_PASSES));
+  const internal = Boolean(request.transparent || request.sampledFrame);
+  // A preview renders its parts one at a time on its own threads: in parallel each would take export threads and a decoder per clip.
+  const threads = request.singlePass ? Number(request.threads ?? 2) : Math.max(2, Math.floor(Number(exportThreads) / EXPORT_PASSES));
   const directory = await mkdtemp(path.join(tmpdir(), 'frameline-passes-'));
   try {
     const pictures = plan.passes.map((pass, index) => ({ ...pass, file: path.join(directory, `picture-${index}${codec.includes('ProRes') ? '.mov' : '.mp4'}`) }));
@@ -1420,7 +1430,7 @@ async function renderSplit(request: RenderRequest, plan: { passes: { from: numbe
     let joined = 0;
     request.onStage?.(`Rendering video · 0/${pictures.length} parts`);
     // `threads` stays computed from the ceiling: fewer passes under memory pressure must never mean more decoder threads each.
-    const passes = exportPassCount(EXPORT_PASSES, JOB_COST_BYTES.renderPass);
+    const passes = request.singlePass ? 1 : exportPassCount(EXPORT_PASSES, JOB_COST_BYTES.renderPass);
     const onWait = request.onWait ?? ((text: string | null) => request.onStage?.(text ?? `Rendering video · ${joined}/${pictures.length} parts`));
     await inParallel(work, passes, signal, async (item, index, passSignal) => {
       const pass = { ...request, signal: passSignal, threads, onStage: undefined, onWait, onProgress: (value: number) => { progress[index] = value; report(); } };

@@ -73,6 +73,12 @@ const SCRUB_POOL = 6;
 const MAX_AHEAD_COPIES = 2;
 /** Longest side of a phone's preview picture, in pixels. */
 const PHONE_PREVIEW_EDGE = 640;
+/**
+ * Smooth playback: a device that cannot composite live plays the server's rendered preview. Chunks asked for ahead of a
+ * playing playhead, the longest wait for one before the live picture takes over, and the longest side rendered.
+ */
+const SMOOTH_AHEAD = 4, SMOOTH_HOLD_MS = 8000, SMOOTH_EDGE = 960;
+const SMOOTH_REASON = 'Smooth playback · buffering rendered preview';
 
 export function efficientPlayback(mode: Settings['performanceMode'] | undefined, device: { hardwareConcurrency?: number; deviceMemory?: number } = typeof navigator === 'undefined' ? {} : navigator) {
   if (mode === 'On') return true;
@@ -284,6 +290,9 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   let motion:ReturnType<typeof createMotionPreview>|undefined;
   const timelinePreview=createTimelinePreview(()=>{dirty=true;});
   let expensiveFrames=0, expensiveUntil=-Infinity;
+  // A phone always plays smooth; a computer once it has twice running shown it cannot keep up live (for this page's life).
+  let slowDevice=false, strikes=0, paceFrom=0, paceCount=0, holdSince:number|undefined;
+  const strike=(bad:boolean)=>{if(!bad){strikes=0;return;}if(++strikes>=2)slowDevice=true;};
   const layer = document.createElement('canvas'), reference = document.createElement('canvas');
   const layerContext = layer.getContext('2d')!, referenceContext = reference.getContext('2d')!;
   // Each side of a cut is rendered whole before the transition composites them, so a transition
@@ -315,7 +324,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     context.filter = 'none';
     context.clearRect(0, 0, blend.width, blend.height);
   };
-  const leaks = new Map<string, { element: HTMLMediaElement; frames?: ReturnType<typeof createVideoFrames>; canvas?: HTMLCanvasElement; source?: MediaElementAudioSourceNode; gain?: GainNode; lastUsed: number }>();
+  const leaks = new Map<string, { element: HTMLMediaElement; decoded: boolean; frames?: ReturnType<typeof createVideoFrames>; canvas?: HTMLCanvasElement; source?: MediaElementAudioSourceNode; gain?: GainNode; lastUsed: number }>();
   const decoders = new Map<string, Decoder>();
   // Paused only: 480 px stand-ins (the 1/4 file) while a playback decoder seeks. Dropped the moment playback starts.
   const scrubs = new Map<string, { frames: ReturnType<typeof createScrubFrames>; media: HTMLVideoElement }>();
@@ -628,16 +637,18 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         if(element instanceof HTMLVideoElement)element.playsInline=true;
         element.addEventListener('loadeddata',()=>{dirty=true;});
         element.addEventListener('seeked',()=>{dirty=true;});
-        entry={element,frames:decoded?createVideoFrames(leak.url,leak.fps||30,()=>{dirty=true;}):undefined,lastUsed:0};leaks.set(id,entry);
+        entry={element,decoded,lastUsed:0};leaks.set(id,entry);
       }
       entry.lastUsed=performance.now();
-      return {entry,leak,range:leakRange(record.params,leak.duration||record.duration)};
+      // The picture decoder opens on the first picture asked for: smooth playback only plays a leak's sound.
+      const frames=()=>entry.decoded?entry.frames??=createVideoFrames(leak.url,leak.fps||30,()=>{dirty=true;}):undefined;
+      return {entry,leak,frames,range:leakRange(record.params,leak.duration||record.duration)};
     };
     /**
      * The overlay picture for a light-leak transition. Its sound rides the master bus, so a
      * muted master silences it, and expanding the sound to a track mutes this copy instead.
      */
-    const leakFrame = (record:TransitionRecord,raw:number,_time:number,wantAudio:boolean):CanvasImageSource|null => {
+    const leakFrame = (record:TransitionRecord,raw:number,_time:number,wantAudio:boolean,picture=true):CanvasImageSource|null => {
       const found=leakEntry(record);
       if(!found)return null;
       const {entry,leak,range}=found,element=entry.element;
@@ -656,13 +667,15 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         else if((!state.playing||element.currentTime>=range.end)&&!element.paused)element.pause();
         if(!element.seeking&&(element.currentTime<range.start||element.currentTime>=range.end||Math.abs(element.currentTime-wanted)>(state.playing?.3:.02)))element.currentTime=wanted;
       };
-      if(entry.frames&&!entry.frames.failed){
+      if(!picture){if(silent){if(!element.paused)element.pause();}else if(element.readyState>=2)follow();return null;}
+      const frames=found.frames();
+      if(frames&&!frames.failed){
         // The sound never holds the picture: it joins when it is ready.
         if(silent){if(!element.paused)element.pause();}else if(element.readyState>=2)follow();
-        entry.frames.update(wanted);
+        frames.update(wanted);
         // A file's first picture can start a frame in and its last end early: there the overlay is left out, never waited for.
-        const frame=entry.frames.frame(wanted)??entry.frames.frame(wanted+1/(leak.fps||30));
-        if(!frame){if(!entry.frames.ahead&&!entry.frames.ended)loading=true;return null;}
+        const frame=frames.frame(wanted)??frames.frame(wanted+1/(leak.fps||30));
+        if(!frame){if(!frames.ahead&&!frames.ended)loading=true;return null;}
         // Safari ignores the blend mode when it draws a VideoFrame (Screen comes out as Normal): the transition gets a canvas.
         const scale=Math.min(1,width/frame.displayWidth),w=Math.max(1,Math.round(frame.displayWidth*scale)),h=Math.max(1,Math.round(frame.displayHeight*scale));
         const copy=entry.canvas??=document.createElement('canvas');
@@ -999,6 +1012,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip,stampAt,denoised);
     }
     flush(Infinity);
+    // Without the picture (smooth playback shows the server's render) a light leak's own sound still plays.
+    if(!show&&hear&&state.playing)for(const record of records)if(transitionDefinitions[record.name]?.overlay){const progress=transitionProgress(record,time);if(progress)leakFrame(record,progress.raw,time,true,false);}
     };
     type LayerWarp = { solve:StabilizeSolve; time:number; sourceWidth:number; sourceHeight:number; blend:boolean };
     /** The stabilize warp in this layer's pixels. Picture and matte take the same one, which is what puts the
@@ -1156,7 +1171,16 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       if(focusing)target.drawImage(layer,0,0);
       else {if(flip)mirrorLayer();draw(target,clip,width,height,projectWidth,projectHeight,time,project?.fps??24);}
     };
-    const prepared=!focused&&state.renderPreviewAllowed!==false&&!options.compare&&!options.original&&options.quality==='Stream'?timelinePreview.get(state,state.playhead,width,height,performance.now()<expensiveUntil):undefined;
+    const smooth=isPhone()||slowDevice,shrink=smooth?Math.min(1,SMOOTH_EDGE/Math.max(width,height)):1;
+    const preview=!focused&&state.renderPreviewAllowed!==false&&!options.compare&&!options.original&&options.quality==='Stream'
+      ?timelinePreview.get(state,state.playhead,Math.round(width*shrink/2)*2,Math.round(height*shrink/2)*2,smooth||performance.now()<expensiveUntil,smooth&&state.playing?SMOOTH_AHEAD:1):undefined;
+    const prepared=preview?.frame?preview:undefined;
+    // Smooth playback waits for its chunk, as a video site buffers, rather than composite live at a few pictures a second.
+    // A chunk that takes longer than SMOOTH_HOLD_MS (a busy server) gives way to the live picture.
+    holdSince=smooth&&state.playing&&preview&&!prepared?holdSince??performance.now():undefined;
+    const renderHold=holdSince!==undefined&&performance.now()-holdSince<SMOOTH_HOLD_MS;
+    // Its pictures come from the server: only the sound of the next cuts is made ready here.
+    const skipPictures=smooth&&(!!prepared||renderHold);
     if(focused){
       // The timeline's sound keeps playing under a frame editor; the picture is the focused clip's source alone,
       // through the same decoders, stand-ins and colour pipeline as timeline playback.
@@ -1175,25 +1199,44 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     }else if(prepared){
       renderLayers(state.timelineId,state.playhead,context,referenceContext,false,true);
       context.drawImage(prepared.frame,0,0,width,height);picture=true;engine='render-cache';warning='Rendered preview · ready';sourceClip=`preview:${prepared.key}`;sourceTimestamp=String(state.playhead);pictureStamps.push(`${sourceClip}@${sourceTimestamp}`);
-    }else renderLayers(state.timelineId,state.playhead,context,referenceContext);
+    }else if(renderHold){renderLayers(state.timelineId,state.playhead,context,referenceContext,false,true);loading=true;}
+    else renderLayers(state.timelineId,state.playhead,context,referenceContext);
     // Every drawn Noise Reduction clip asked for its chunk above; the rest stop preparing, so the one on screen never queues.
     denoisePreview.sweep();
     if(!prepared&&!loading&&state.playing&&performance.now()-renderStarted>1000/previewFps*.7){
-      if(++expensiveFrames>=6){expensiveUntil=performance.now()+15000;expensiveFrames=0;}
+      if(++expensiveFrames>=6){expensiveUntil=performance.now()+15000;expensiveFrames=0;strike(true);}
     }else if(!loading)expensiveFrames=Math.max(0,expensiveFrames-1);
+    // Pictures shown per 3 s of unhindered live playback: under 70% of the frame rate is a strike against this computer.
+    if(!smooth&&state.playing&&!prepared&&!loading){
+      if(!paceFrom){paceFrom=performance.now();paceCount=0;}
+      else if(performance.now()-paceFrom>=3000){strike(paceCount/((performance.now()-paceFrom)/1000)<previewFps*.7);paceFrom=performance.now();paceCount=0;}
+      paceCount++;
+    }else paceFrom=0;
     // Warm upcoming pictures and their looks independently of the audio clips.
     const upcoming=transitionsOf(state.clips,state.timelineId,state.media).filter(record=>record.start>state.playhead&&record.start-state.playhead<1.5);
     // A light leak's first picture is decoded before its transition starts.
-    for(const record of upcoming)if(transitionDefinitions[record.name]?.overlay){const found=leakEntry(record);found?.entry.frames?.update(found.range.start);}
+    if(!skipPictures)for(const record of upcoming)if(transitionDefinitions[record.name]?.overlay){const found=leakEntry(record);found?.frames()?.update(found.range.start);}
     // Every warmed decoder is another preload="auto" stream competing for the same link, so nothing past the
     // horizon is opened (upcomingClips). Warming carries on through a stall: the cuts after a slow one are the
     // next thing to stall on.
     // A frame editor stays on one clip: warming the next cuts would only compete with it for the link.
     const nearby=focused?[]:upcomingClips(state,activeIds,efficient,new Set(upcoming.flatMap(record=>[record.incomingId,record.outgoingId]).filter((id):id is string=>!!id)),loading);
     const mediaById=byId(state.media),trackById=byId(state.tracks);
+    /** Linked camera sound plays from its own sound-layer clip (playbackLayers' separateAudio), never from the picture's clip. */
+    const linkedSound=(clip:Clip)=>timelineClips(state.clips,state.projectId,state.timelineId).some(other=>other.mediaId===clip.mediaId&&other.start===clip.start&&other.sourceIn===clip.sourceIn&&other.duration===clip.duration&&trackById.get(other.trackId)?.kind==='audio');
     for (const clip of nearby) {
       const asset = mediaById.get(clip.mediaId), track = trackById.get(clip.trackId);
       if (!asset || !track) continue;
+      if(skipPictures&&track.kind==='video'&&asset.kind!=='audio'){
+        const id=`${clip.id}:audio`;
+        if(!asset.hasAudio||clip.properties.audioDetached||track.muted||linkedSound(clip))continue;
+        const sound=decoderFor({...clip,id},asset,false,options);
+        if(!sound||failedDecoder(id,sound))continue;
+        warmIds.add(id);
+        const element=sound.element as HTMLMediaElement,time=sourceTime(clip,Math.max(state.playhead,clip.start),asset.fps||project?.fps||24,asset.duration||Infinity);
+        element.pause();if(element.readyState>=1&&!element.seeking&&Math.abs(element.currentTime-time)>.05)seeks.push([element,time]);
+        continue;
+      }
       if(track.kind==='video'&&(clip.properties.resolveLookUrl||nodesOf(state.nodes,clip.id).some(node=>node.enabled)||Number(clip.properties.inputExposure)||Number(clip.properties.inputTemperature)||clip.properties.yuvMatrix||clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto')) {try{color??=createColorPreview(()=>{dirty=true;});color.preload(clip,asset);}catch{/* The active clip reports an invalid transform. */}}
       // Under the id renderLayers plays it by: camera sound on a sound layer is `${clip.id}:audio`.
       const visual = track.kind==='video' && asset.kind !== 'audio', id = !visual && asset.kind === 'video' ? `${clip.id}:audio` : clip.id;
@@ -1210,8 +1253,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         const frames=track.kind==='video'?buffered(decoder,clip,asset.fps||24,state.settings.footageCache!==false):undefined;
         if(frames){
           // Linked camera sound plays from its own sound-layer clip (playbackLayers' separateAudio), never from the picture.
-          const linked=asset.hasAudio&&timelineClips(state.clips,state.projectId,state.timelineId).some(other=>other.mediaId===clip.mediaId&&other.start===clip.start&&other.sourceIn===clip.sourceIn&&other.duration===clip.duration&&trackById.get(other.trackId)?.kind==='audio');
-          if(asset.hasAudio&&!clip.properties.audioDetached&&!track.muted&&!linked){
+          if(asset.hasAudio&&!clip.properties.audioDetached&&!track.muted&&!linkedSound(clip)){
             const sound=decoderFor({...clip,id:`${clip.id}:audio`},asset,false,options);
             if(sound){warmIds.add(`${clip.id}:audio`);const element=sound.element as HTMLMediaElement;element.pause();element.muted=true;if(element.readyState>=1&&!element.seeking&&Math.abs(element.currentTime-time)>.05)seeks.push([element,time]);}
           }
@@ -1265,7 +1307,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     stalled = loading;
     canvas.dataset.playbackEngine=engine;canvas.dataset.decodedAhead=String(Number.isFinite(decodedAhead)?decodedAhead:0);canvas.dataset.buffering=String(loading);
     const skippedLayers = [...skipped.values()], error = skippedLayers.join('; ');
-    window.dispatchEvent(new CustomEvent('frameline:playback-health',{detail:{playing:state.playing,playhead:state.playhead,loading,error,engine,reason:loading?[...activeIds].map(id=>footageCache.clipFootageStatus(id).playback?.detail).filter(Boolean).join('; '):'',decodedAhead:Number.isFinite(decodedAhead)?decodedAhead:0}}));
+    window.dispatchEvent(new CustomEvent('frameline:playback-health',{detail:{playing:state.playing,playhead:state.playhead,loading,error,engine,reason:loading?[...activeIds].map(id=>footageCache.clipFootageStatus(id).playback?.detail).filter(Boolean).join('; ')||(renderHold?SMOOTH_REASON:''):'',decodedAhead:Number.isFinite(decodedAhead)?decodedAhead:0}}));
 
 
     if (performance.now() - meterTime > 80) {
@@ -1294,7 +1336,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     loadingSince = loading ? loadingSince ?? performance.now() : undefined;
     // A paused seek that lands within a moment is a scrub, not buffering: hold the last picture quietly.
     // A failed layer never blocks: it is named, with Retry, while the playhead keeps moving.
-    if (!loading || state.playing || performance.now() - loadingSince! > QUIET_SEEK_MS) status(loading ? { title: 'Loading picture…', detail: blocker?.detail ?? 'Preparing required layers', loading: true } : skippedLayers.length ? { title: `${state.playing ? 'Playing' : 'Showing'} without ${skippedLayers.length} layer${skippedLayers.length === 1 ? '' : 's'}`, detail: skippedLayers.join(' · '), skipped: true } : missing ? { title: 'Original media offline', detail: 'Import the source files to play this timeline.' } : !picture && !playbackLayers(state, project?.fps || 24).some(l => l.audible) ? { title: 'No picture at playhead' } : autoplayBlocked ? { title: 'Click anywhere to hear playback', detail: 'The browser blocked sound until you interact with the page.' } : fallbackActive ? { title: 'Stream fallback', detail: 'The selected source could not play smoothly. Showing the compatible Stream preview with reduced precision; exports still use originals.', fallback: true } : automaticLow ? { title: 'Auto preview · reduced bandwidth', detail: 'Using the smaller streaming preview to keep playback moving. Originals and export quality are unchanged.' } : warning ? { title: warning } : null);
+    if (!loading || state.playing || performance.now() - loadingSince! > QUIET_SEEK_MS) status(loading ? { title: 'Loading picture…', detail: blocker?.detail ?? (renderHold ? SMOOTH_REASON : 'Preparing required layers'), loading: true } : skippedLayers.length ? { title: `${state.playing ? 'Playing' : 'Showing'} without ${skippedLayers.length} layer${skippedLayers.length === 1 ? '' : 's'}`, detail: skippedLayers.join(' · '), skipped: true } : missing ? { title: 'Original media offline', detail: 'Import the source files to play this timeline.' } : !picture && !playbackLayers(state, project?.fps || 24).some(l => l.audible) ? { title: 'No picture at playhead' } : autoplayBlocked ? { title: 'Click anywhere to hear playback', detail: 'The browser blocked sound until you interact with the page.' } : fallbackActive ? { title: 'Stream fallback', detail: 'The selected source could not play smoothly. Showing the compatible Stream preview with reduced precision; exports still use originals.', fallback: true } : automaticLow ? { title: 'Auto preview · reduced bandwidth', detail: 'Using the smaller streaming preview to keep playback moving. Originals and export quality are unchanged.' } : warning ? { title: warning } : null);
   };
   frame = requestAnimationFrame(tick);
   return {

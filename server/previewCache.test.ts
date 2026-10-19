@@ -4,7 +4,7 @@ import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { createPreviewCache, previewRenderRequest, previewSlice, PreviewBusyError, PREVIEW_NICE, PREVIEW_THREADS, type PreviewAdmission } from './previewCache.ts';
+import { createPreviewCache, previewRenderRequest, previewSlice, PreviewBusyError, PREVIEW_NICE, PREVIEW_SLOTS, PREVIEW_THREADS, type PreviewAdmission } from './previewCache.ts';
 import type { RenderRequest } from './media.ts';
 import type { Clip, GradeNode, MediaAsset, Project, Track } from '../src/state/models.ts';
 import { defaultProperties } from '../src/state/demo.ts';
@@ -180,14 +180,15 @@ test('every browser poll renews the lease, and a preview nobody asks about is ab
   });
 });
 
-test('a request sweeps abandoned previews first, so two stuck jobs never mean minutes of busy', () => {
+test('a request sweeps abandoned previews first, so stuck jobs never mean minutes of busy', () => {
   let time = 1_000; const { works, schedule } = manual();
   const cache = createPreviewCache(MISSING, schedule, async () => {}, { now: () => time });
-  cache.request(snapshot(0, [clip('a', 0)])); cache.request(snapshot(4, [clip('b', 4)]));
-  assert.throws(() => cache.request(snapshot(8, [clip('c', 8)])), (error: unknown) => error instanceof PreviewBusyError && error.message === 'Preview queue busy' && error.retryAfterSeconds > 0, 'a third at once is refused');
+  for (let i = 0; i < PREVIEW_SLOTS; i++) cache.request(snapshot(i * 4, [clip(`c${i}`, i * 4)]));
+  const extra = PREVIEW_SLOTS * 4;
+  assert.throws(() => cache.request(snapshot(extra, [clip('x', extra)])), (error: unknown) => error instanceof PreviewBusyError && error.message === 'Preview queue busy' && error.retryAfterSeconds > 0, 'one more than the slots is refused');
   time += 7_000;
-  assert.equal(cache.request(snapshot(8, [clip('c', 8)])).status, 'preparing', 'seven seconds on, the other two are abandoned and the slot is free');
-  assert.equal(works.length, 3);
+  assert.equal(cache.request(snapshot(extra, [clip('x', extra)])).status, 'preparing', 'seven seconds on, the others are abandoned and a slot is free');
+  assert.equal(works.length, PREVIEW_SLOTS + 1);
 });
 
 test('a preview still waiting for a media slot after 30 s is dropped even while its viewer keeps asking', { timeout: 5000 }, async () => {

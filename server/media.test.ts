@@ -595,16 +595,21 @@ test('bakesWholeClips names the clips renderTimeline sends to a whole-clip bake,
   assert.equal(bakes(clip({ mediaId: 'frameline-title', keyframes: keys, properties: { ...defaultProperties, blendMode: 'Screen' } })), true, 'a blended one keeps the per-frame bake');
 });
 
-test('a single-pass render refuses a range that would split, before it starts anything', async () => {
-  const track: Track = { id: 'v1', timelineId: 't', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
-  const source: MediaAsset = { id: 'm', projectId: 'p', name: 'm.mp4', kind: 'video', binId: 'all', duration: 20, fps: 24, resolution: '320 × 180', size: '', status: 'ready', progress: 100, thumbnail: '' };
-  // Eight half-second shots in four seconds: more than six decoders for one pass, the exporter's own limit.
-  const clips = Array.from({ length: 8 }, (_, i): Clip => ({ id: `c${i}`, projectId: 'p', timelineId: 't', trackId: 'v1', mediaId: 'm', name: `c${i}`, start: i / 2, duration: .5, sourceIn: 0, color: '', disabled: false, properties: { ...defaultProperties }, effects: [] }));
-  assert.ok(renderPasses(clips.map((_, i) => ({ from: i * 12, to: i * 12 + 12 })), [], 96).length > 1, 'an export of these shots splits into passes');
-  const request: RenderRequest = { project: { id: 'p', resolution: '320 × 180', fps: 24 } as Project, timeline: { id: 't', projectId: 'p', name: 't', duration: 10 }, tracks: [track], nodes: [], clips,
-    assets: [{ asset: source, path: path.join(tmpdir(), 'frameline-never-opened.mp4') }], settings: { resolution: '320 × 180', fps: '24', codec: 'H.264', audio: 'Disabled', rangeIn: '0', rangeOut: '4' }, outputPath: path.join(tmpdir(), 'frameline-never-written.mp4'), singlePass: true, threads: 4 };
-  await assert.rejects(renderTimeline(request), /too many clips for a quick preview/);
-  assert.equal(existsSync(request.outputPath), false);
+test('a preview range that would split renders its parts one after another, every frame in place', { timeout: 120000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-preview-parts-'));
+  try {
+    const file = path.join(dir, 'source.mp4'), outputPath = path.join(dir, 'preview.mp4');
+    await ff(['-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24:duration=5', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', file]);
+    const track: Track = { id: 'v1', timelineId: 't', number: 1, kind: 'video', name: 'V1', muted: false, solo: false, hidden: false, locked: false, gain: 0, pan: 0 };
+    const source: MediaAsset = { id: 'm', projectId: 'p', name: 'm.mp4', kind: 'video', binId: 'all', duration: 5, fps: 24, resolution: '320 × 180', size: '', status: 'ready', progress: 100, thumbnail: '' };
+    // Eight half-second shots in four seconds: more than six decoders for one pass, the exporter's own limit.
+    const clips = Array.from({ length: 8 }, (_, i): Clip => ({ id: `c${i}`, projectId: 'p', timelineId: 't', trackId: 'v1', mediaId: 'm', name: `c${i}`, start: i / 2, duration: .5, sourceIn: i / 2, color: '', disabled: false, properties: { ...defaultProperties }, effects: [] }));
+    assert.ok(renderPasses(clips.map((_, i) => ({ from: i * 12, to: i * 12 + 12 })), [], 96).length > 1, 'these shots split into parts');
+    await renderTimeline({ project: { id: 'p', resolution: '320 × 180', fps: 24 } as Project, timeline: { id: 't', projectId: 'p', name: 't', duration: 4 }, tracks: [track], nodes: [], clips,
+      assets: [{ asset: source, path: file }], settings: { resolution: '320 × 180', fps: '24', codec: 'H.264', audio: 'Disabled', rangeIn: '0', rangeOut: '4' }, outputPath, singlePass: true, threads: 2 });
+    const frames = (await exec(process.env.FFPROBE_PATH || 'ffprobe', ['-v', 'error', '-count_frames', '-select_streams', 'v:0', '-show_entries', 'stream=nb_read_frames', '-of', 'csv=p=0', outputPath])).stdout.trim();
+    assert.equal(Number(frames), 96, 'four seconds at 24 fps, nothing lost at the joins');
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test('an aborted signal ends run() and its child promptly, at any priority: the end of a cancelled preview\'s chain', { timeout: 10000 }, async () => {

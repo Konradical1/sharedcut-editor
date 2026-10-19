@@ -23,10 +23,15 @@ export const PREVIEW_LEASE_MS = 6_000;
 export const PREVIEW_START_MS = 30_000;
 /** A failed preview answers "failed" this long, then the next request tries again. */
 export const PREVIEW_RETRY_MS = 60_000;
-/** A preview is one FFmpeg pass on four threads at Idle priority, however many cores the host has. */
+/** A preview renders on four threads at Idle priority, however many cores the host has (a busy range in parts, one at a time). */
 export const PREVIEW_THREADS = 4;
 export const PREVIEW_NICE = 19;
-const MAX_PREPARING = 2, BUSY_RETRY_SECONDS = 3, RECORDS_KEPT = 64, CACHE_BYTES = 512 * 1024 ** 2, MAX_PREVIEW_SECONDS = 4.1;
+/**
+ * Previews (and stills) rendering at once. A phone or a slow computer plays from these, rendering a few chunks ahead of
+ * its playhead, so two left a second viewer waiting; four use 16 of a 20-thread host at Idle priority.
+ */
+export const PREVIEW_SLOTS = 4;
+const BUSY_RETRY_SECONDS = 3, RECORDS_KEPT = 64, CACHE_BYTES = 512 * 1024 ** 2, MAX_PREVIEW_SECONDS = 4.1;
 /** The renderer's own tolerance for "this clip is inside the range" (media.ts inRange). */
 const EDGE = 1e-6;
 const PREVIEW_FAILED = 'Preview failed; it plays live in the editor.';
@@ -142,7 +147,7 @@ export function createPreviewCache(directory: string, schedule: (id: string, wor
       const value: TimelinePreview = { key, from, duration, fps, progress: 0, status: 'preparing' };
       const record = (release: () => void): Job => ({ projectId, value, controller: new AbortController(), createdAt: at, lastAsked: at, started: false, failedAt: 0, release });
       if (existsSync(file)) { value.status = 'ready'; value.url = url; value.progress = 100; jobs.set(key, record(() => {})); return value; }
-      if ([...jobs.values()].filter(job => job.value.status === 'preparing').length >= MAX_PREPARING) throw new PreviewBusyError('Two previews are already rendering.');
+      if ([...jobs.values()].filter(job => job.value.status === 'preparing').length >= PREVIEW_SLOTS) throw new PreviewBusyError(`${PREVIEW_SLOTS} previews are already rendering.`);
       const admission = admit?.('preview') ?? { ok: true as const, release: () => {} };
       if (!admission.ok) throw new PreviewBusyError(admission.reason);
       let released = false;
@@ -231,7 +236,7 @@ export function createStillCache(directory: string, render: (request: RenderRequ
       const key = sha([STILL_VERSION, previewKey(slice!)]), file = join(directory, `${key}.${format}`);
       if (existsSync(file)) { const at = new Date(); await utimes(file, at, at).catch(() => {}); return file; }
       const running = rendering.get(file); if (running) return running;
-      if (rendering.size >= MAX_PREPARING) throw new PreviewBusyError('Two frames are already rendering.');
+      if (rendering.size >= PREVIEW_SLOTS) throw new PreviewBusyError(`${PREVIEW_SLOTS} frames are already rendering.`);
       const admission = admit?.('preview') ?? { ok: true as const, release: () => {} };
       if (!admission.ok) throw new PreviewBusyError(admission.reason);
       const n = ++temporaries, movie = join(directory, `${key}.${n}.pending.mov`), picture = join(directory, `${key}.${n}.pending.${format}`);

@@ -1,4 +1,4 @@
-import { createPreviewCache, createStillCache, mediaStill, stillSettings, StillSkipped, PreviewBusyError, type PreviewAdmission } from './previewCache.ts';
+import { createPreviewCache, createStillCache, mediaStill, stillSettings, StillSkipped, PreviewBusyError, PREVIEW_SLOTS, type PreviewAdmission } from './previewCache.ts';
 import { createHostGuard, JOB_COST_BYTES, VICTIM_ORDER, type HostGuard } from './hostGuard.ts';
 import { showcaseFile } from './showcase.ts';
 import { createHostHealthLog } from './hostHealthLog.ts';
@@ -286,6 +286,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   // (the importer issues them automatically) prepares them from the originals already on disk.
   const DEFER_PREP = process.env.FRAME_LINE_DEFER_PREP === '1';
   const queue = workQueue(MEDIA_CONCURRENCY); let closed = false;
+  // Timeline previews are what a phone or a slow computer plays: they never wait behind an export or a shoot's media preparation.
+  const previewQueue = workQueue(PREVIEW_SLOTS);
   // Host guard: heavy starts (render passes, media encodes, Python workers) ask it before they spawn, and previews are refused
   // while memory is short. data/host-guard.mode holds off, observe (the default: log what it would do) or enforce, and is re-read
   // every second, so the mode changes without a restart. See docs/WINDOWS_NATIVE.md.
@@ -586,7 +588,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const controller = new AbortController(); aborters.set(id, controller);
     let ended!: () => void; const job = new Promise<void>(resolve => { ended = resolve; }); queued.set(job, id);
     const kind = victimKind(id);
-    queue.add(async () => { let forget: (() => void) | undefined;
+    (id.startsWith('preview-') ? previewQueue : queue).add(async () => { let forget: (() => void) | undefined;
       try { if (!closed && !controller.signal.aborted) { forget = kind ? guard.registerVictim(kind, () => controller.abort()) : undefined; await work(controller.signal); } }
       finally { forget?.(); if (aborters.get(id) === controller) aborters.delete(id); queued.delete(job); ended(); done?.(); } }, render, prepare && (() => prepare(controller.signal)));
   };
@@ -2236,7 +2238,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     await Promise.all([...services, flowQueue]);
     // The guard and the health log stop with the server; the minute of reports still open is written, since a restart is exactly when the next one is wanted.
     guard.stop(); hostHealth.stop(); removeStartGate(); await reports.flushMinute(Date.now() + REPORT_FLUSH_MS);
-    clearInterval(housekeeping); clearInterval(uploadSweep); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
+    clearInterval(housekeeping); clearInterval(uploadSweep); clearTimeout(presenceTimer); clearTimeout(broadcastTimer); for (const response of subscribers.keys()) response.end(); await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); await queue.drain(); await previewQueue.drain(); saveBeforeExit(); await store.close(); db.close(); lock.close(); } };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

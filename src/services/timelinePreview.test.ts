@@ -1,7 +1,7 @@
 import test, { afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { connection } from './api.ts';
-import { createTimelinePreview, isHostBrowser, PREVIEW_BUSY_BASE_MS, PREVIEW_BUSY_MAX_MS } from './timelinePreview.ts';
+import { createTimelinePreview, isHostBrowser, PREVIEW_BUSY_BASE_MS, PREVIEW_BUSY_MAX_MS, PREVIEW_IN_FLIGHT } from './timelinePreview.ts';
 
 const settle = async () => { for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve)); };
 const globals = ['fetch', 'Worker', 'VideoDecoder', 'location'] as const;
@@ -17,23 +17,23 @@ afterEach(() => {
 type Answer = { status?: number; body?: unknown; drop?: boolean };
 const preparing = { key: 'k', status: 'preparing', progress: 10, from: 0, duration: 4, fps: 24 };
 /** A browser at `hostname` talking to a fake server that answers each preview request from `script`. */
-function rig(hostname: string, script: (call: number) => Answer) {
+function rig(hostname: string, script: (call: number, chunk: number) => Answer, duration = 3) {
   const requests: { chunk: number }[] = [], workers: string[] = [];
   define('location', { hostname, href: `https://${hostname}/` });
   define('VideoDecoder', class {});
   define('Worker', class { onmessage = null; onerror = null; postMessage(message: { type: string; url?: string }) { if (message.type === 'open') workers.push(String(message.url)); } terminate() {} });
   define('fetch', async (_url: string, init: RequestInit) => {
     const call = requests.push(JSON.parse(String(init.body)));
-    const { status = 200, body, drop } = script(call);
+    const { status = 200, body, drop } = script(call, requests[call - 1].chunk);
     if (drop) throw new TypeError('Failed to fetch');
     return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
   });
   connection.enabled = true;
   mock.timers.enable({ apis: ['setTimeout'] });
   // A one-chunk timeline, so a single request is in play and its schedule can be read off the clock.
-  const state = { projectId: 'p', timelineId: 't', projects: [{ id: 'p', fps: 24 }], timelines: [{ id: 't', projectId: 'p', duration: 3 }], clips: [], tracks: [], media: [], nodes: [], settings: {} } as never;
+  const state = { projectId: 'p', timelineId: 't', projects: [{ id: 'p', fps: 24 }], timelines: [{ id: 't', projectId: 'p', duration }], clips: [], tracks: [], media: [], nodes: [], settings: {} } as never;
   const preview = createTimelinePreview(() => {});
-  return { requests, workers, preview, ask: (enable = true) => preview.get(state, 0, 960, 540, enable), tick: async (ms: number) => { mock.timers.tick(ms); await settle(); } };
+  return { requests, workers, preview, ask: (enable = true, ahead = 1) => preview.get(state, 0, 960, 540, enable, ahead), tick: async (ms: number) => { mock.timers.tick(ms); await settle(); } };
 }
 
 test('only the server\'s own computer is recognised as the host, and exactly', () => {
@@ -149,4 +149,27 @@ test('disposing the preview cancels a pending retry', async () => {
   preview.dispose();
   await tick(60_000);
   assert.equal(requests.length, 1);
+});
+
+test('smooth playback renders ahead nearest first, never more than two chunks at once', async () => {
+  const ready = new Set<number>();
+  const answer = (chunk: number) => ready.has(chunk) ? { key: `k${chunk}`, status: 'ready', progress: 100, from: chunk * 4, duration: 4, fps: 24, url: `/api/timeline-previews/k${chunk}/video.mp4?projectId=p` } : { ...preparing, key: `k${chunk}`, from: chunk * 4 };
+  const { requests, ask, tick } = rig('sharedcut.com', (_call, chunk) => ({ body: answer(chunk) }), 40);
+  const asked = () => [...new Set(requests.map(r => r.chunk))].sort((a, b) => a - b);
+  ask(true, 4); await tick(750);
+  assert.deepEqual(asked(), [0, 1], `${PREVIEW_IN_FLIGHT} at once, the playhead's chunk first`);
+  assert.deepEqual(ask(true, 4), { waiting: true }, 'the chunk at the playhead is on its way');
+  ready.add(0); ready.add(1); await tick(1000);
+  ask(true, 4); await tick(750);
+  assert.deepEqual(asked(), [0, 1, 2, 3], 'two more once those are rendered');
+  ready.add(2); ready.add(3); await tick(1000);
+  ask(true, 4); await tick(750);
+  assert.deepEqual(asked(), [0, 1, 2, 3, 4], 'never past the playhead plus the look-ahead');
+});
+
+test('a chunk the server refuses plays live: it is not waited for', async () => {
+  const { ask, tick } = rig('sharedcut.com', () => ({ status: 400, body: { error: 'Invalid preview range.' } }));
+  assert.deepEqual(ask(true), { waiting: true }, 'asked: on its way');
+  await tick(750);
+  assert.equal(ask(true), undefined, 'a final refusal hands the chunk to the live compositor');
 });

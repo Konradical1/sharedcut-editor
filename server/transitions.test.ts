@@ -175,6 +175,17 @@ test('transitions render real blended frames through FFmpeg', { timeout: 300000 
       assert.ok((await pixel(0))[0] > 200 && (await pixel(.125))[2] > 200, 'A partial export retains the same edit point.');
     }
 
+    // A side that is not a whole frame (a vertical shot, a zoom, a move) blends where it sits on screen. Blending it raw
+    // failed on mismatched sizes ("First input link top ... do not match") and drew a moved clip centred.
+    const quarter = async (seconds: number) => [...(await ff(['-ss', String(seconds), '-i', outputPath, '-frames:v', '1', '-vf', 'crop=80:180:240:0,scale=1:1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1'])).stdout];
+    for (const name of ['Light leak', 'Cross dissolve']) {
+      const moved = base(name, { zoom: 50, x: 80, transitionParams: JSON.stringify({ leak: 'demo', leakOpacity: 0, blendPoint: 50 }) });
+      await renderTimeline(moved);
+      const settled = await quarter(2.9), inside = await quarter(name === 'Light leak' ? 2.2 : 2.45);
+      assert.ok(settled[2] > 100, `${name}: the moved shot sits in the right quarter after the window, saw ${settled}`);
+      assert.ok(inside[2] > 60, `${name}: inside the window it is still drawn where it sits, not centred, saw ${inside}`);
+    }
+
     const bursts = path.join(dir, 'bursts.mp4');
     await ff(['-f', 'lavfi', '-i', "color=c=red:s=320x100:r=24:d=1[a];color=c=lime:s=320x100:r=24:d=1[b];color=c=blue:s=320x100:r=24:d=1[c];[a][b][c]concat=n=3:v=1:a=0", '-c:v', 'libx264', '-pix_fmt', 'yuv420p', bursts]);
     const trimmed = base('Light leak', { transitionParams: JSON.stringify({ leak: 'demo', leakIn: 1, leakOut: 2 }) });
