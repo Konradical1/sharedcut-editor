@@ -1,7 +1,7 @@
 {
   "name": "sharedcut-desktop",
   "productName": "SharedCut",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "SharedCut for Mac and Windows",
   "author": "Konrad Fischer",
   "private": true,
