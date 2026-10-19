@@ -84,12 +84,13 @@ export function opaqueBackdrop(element: Element): string | undefined {
  * paused text holds the box, and the canvas's fallback content keeps textContent and screen readers current; neither
  * is laid out again while playing.
  */
-export function LiveTimecode({ fps, className, style }: { fps?: number; className: string; style?: CSSProperties }) {
+export function LiveTimecode({ fps, className, style, format }: { fps?: number; className: string; style?: CSSProperties; format?: (seconds: number) => string }) {
+  const text = (seconds: number) => format ? format(seconds) : timecode(seconds, fps);
   const playing = useEditorStore(s => s.playing);
-  const label = useEditorStore(s => s.playing ? '' : timecode(s.playhead, fps));
+  const label = useEditorStore(s => s.playing ? '' : text(s.playhead));
   const box = useRef<HTMLSpanElement>(null), canvas = useRef<HTMLCanvasElement>(null), held = useRef(label);
   // Mounted mid-playback (a workspace switch), any timecode holds the same box: every label is one fixed-width shape.
-  if (!playing || !held.current) held.current = label || timecode(useEditorStore.getState().playhead, fps);
+  if (!playing || !held.current) held.current = label || text(useEditorStore.getState().playhead);
   useLayoutEffect(() => {
     const element = box.current, surface = canvas.current;
     if (!playing || !element || !surface) return;
@@ -121,14 +122,14 @@ export function LiveTimecode({ fps, className, style }: { fps?: number; classNam
       // Layout's own pen position: an empty inline-block sits on the held text's baseline, right where its first glyph starts.
       const origin = element.querySelector('.live-timecode-origin')?.getBoundingClientRect() ?? rect;
       x = origin.left * dpr - left; y = Math.round((origin.bottom - rect.top) * dpr);
-      const last = shown; shown = ''; draw(last || timecode(useEditorStore.getState().playhead, fps));
+      const last = shown; shown = ''; draw(last || text(useEditorStore.getState().playhead));
     };
     place();
     // A breakpoint can resize the box mid-playback (the window crossing 1250 px changes the font).
     let size = `${element.offsetWidth}x${element.offsetHeight}`;
     const resize = new ResizeObserver(() => { const now = `${element.offsetWidth}x${element.offsetHeight}`; if (now !== size) { size = now; place(); } });
     resize.observe(element);
-    const unsubscribe = onPicture(playhead => draw(timecode(playhead, fps)));
+    const unsubscribe = onPicture(playhead => draw(text(playhead)));
     return () => { unsubscribe(); resize.disconnect(); };
   }, [playing, fps]);
   return <span ref={box} className={`${className} live-timecode`} style={style}>{playing ? <><span className="live-timecode-held" data-text={held.current} aria-hidden="true"><i className="live-timecode-origin"/></span><canvas ref={canvas} className="live-timecode-canvas"/></> : label}</span>;

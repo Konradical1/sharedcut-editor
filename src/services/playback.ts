@@ -28,6 +28,7 @@ import { flowChunkSeconds, type FlowPreview } from './opticalFlow.ts';
 import { shownSourceTime, sourceSize } from './motionTracker.ts';
 import { denoiseEffect, type DenoisePreview } from './denoise.ts';
 import { createDenoisePreview, denoiseStatus, denoiseStatusText, noiseUi, subscribeDenoise } from './denoisePreview.ts';
+import { isPhone } from './device.ts';
 
 export function sourceTime(clip: Clip, playhead: number, fps = 24, duration = Infinity) {
   const elapsed = Math.max(0, Math.min(clip.duration, playhead - clip.start));
@@ -70,6 +71,8 @@ const LAYER_RETRY_MS = 2000, LAYER_RETRY_MAX_MS = 30000;
 const SCRUB_POOL = 6;
 /** New look-ahead colour copies a tick may start beyond the next three pictures, across all layers (a burst of GPU readbacks would stall the tick). */
 const MAX_AHEAD_COPIES = 2;
+/** Longest side of a phone's preview picture, in pixels. */
+const PHONE_PREVIEW_EDGE = 640;
 
 export function efficientPlayback(mode: Settings['performanceMode'] | undefined, device: { hardwareConcurrency?: number; deviceMemory?: number } = typeof navigator === 'undefined' ? {} : navigator) {
   if (mode === 'On') return true;
@@ -542,8 +545,10 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     if (focused && options.compare) options = { ...options, compare: false };
     // A frame editor draws in source pixels, so the picture takes the source's shape instead of the sequence's.
     const [frameWidth, frameHeight] = focused ? sourceSize(focused.asset) : [projectWidth, projectHeight];
-    // Browser proxy preview is capped at 1920px; original-media exports retain the chosen resolution.
-    const ratio = Math.min(1 / divisor, 1920 / frameWidth);
+    // Browser proxy preview is capped at 1920px; original-media exports retain the chosen resolution. A phone shows the
+    // picture a few hundred points wide: 640 px on the long side is sharp there, and every composite, grade and
+    // server-rendered chunk costs under half of Stream's 960.
+    const ratio = Math.min(1 / divisor, isPhone() ? PHONE_PREVIEW_EDGE / Math.max(frameWidth, frameHeight) : 1920 / frameWidth);
     const width = Math.max(2, Math.round(frameWidth * ratio)), height = Math.max(2, Math.round(frameHeight * ratio));
     if (canvas.width !== width || canvas.height !== height) { canvas.width = composite.width = layer.width = reference.width = blend.width = width; canvas.height = composite.height = layer.height = reference.height = blend.height = height; }
     context.fillStyle = '#000'; context.fillRect(0, 0, width, height); referenceContext.clearRect(0, 0, width, height);

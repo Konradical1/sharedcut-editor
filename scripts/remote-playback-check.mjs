@@ -20,7 +20,9 @@
 //        DIST assets are served locally and skip the link; compare `firstPictureAfterTabS` across builds.
 //      CPU_RATE: Emulation.setCPUThrottlingRate on the page, e.g. 4 for a weak laptop. Slows the page's main thread,
 //        where compositing runs; decoder workers are not targeted.
-import { chromium } from 'playwright';
+//      MOBILE=1: an iPhone 14 (touch, 390x844 at 3x), so the phone editor (or, for an older client, the desktop one squeezed
+//        onto a phone) is what plays. Pair with CPU_RATE=4 for a phone's main thread.
+import { chromium, devices } from 'playwright';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { connect } from 'node:net';
@@ -85,7 +87,7 @@ async function shapedLink(mbps, rtt) {
 const link = DOWN_MBPS || RTT_MS ? await shapedLink(DOWN_MBPS, RTT_MS) : undefined;
 
 const browser = await chromium.launch({ channel: 'chrome', headless: true, ...(link ? { proxy: { server: link.server } } : {}), args: ['--enable-gpu', '--ignore-gpu-blocklist', '--use-angle=d3d11', '--autoplay-policy=no-user-gesture-required'] });
-const context = await browser.newContext({ viewport: { width: 1600, height: 1000 } });
+const context = await browser.newContext(process.env.MOBILE ? devices['iPhone 14'] : { viewport: { width: 1600, height: 1000 } });
 await context.addCookies([{ name: 'frameline_session', value: token, url: ORIGIN }]);
 if (process.env.DIST) {
   const dist = resolve(process.env.DIST);
@@ -132,7 +134,13 @@ page.on('pageerror', (e) => consoleErrors.push(`${stamp()} pageerror: ${e.messag
 page.on('response', (r) => { if (r.status() >= 400 && r.url().includes('/api/media/')) failed.push(`${stamp()} ${r.status()} ${r.url().replace(ORIGIN, '').slice(0, 120)}`); });
 
 await page.goto(`${ORIGIN}/project/${PROJECT}`);
-await page.locator('.timeline-tabs button', { hasText: TIMELINE }).first().click({ timeout: 120000 });
+/** The phone editor picks a timeline from a select, shown only when there are several. */
+const openTimeline = async () => {
+  await page.waitForSelector('.timeline-tabs button, .ph', { timeout: 120000 });
+  if (!(await page.locator('.ph').count())) return page.locator('.timeline-tabs button', { hasText: TIMELINE }).first().click({ timeout: 120000 });
+  if (await page.locator('.ph-timeline select').count()) await page.locator('.ph-timeline select').selectOption({ label: TIMELINE });
+};
+await openTimeline();
 const report = { origin: ORIGIN, timeline: TIMELINE, dist: process.env.DIST ?? null, network: { downMbps: DOWN_MBPS || null, rttMs: RTT_MS || null, cpuRate: CPU_RATE }, tabAt: stamp() };
 report.firstPictureAt = await page.waitForFunction(() => document.querySelector('.viewer canvas')?.dataset.hasPicture === 'true', null, { timeout: 60000 }).then(stamp, () => null);
 report.firstPictureAfterTabS = report.firstPictureAt === null ? null : +(report.firstPictureAt - report.tabAt).toFixed(1);
@@ -141,30 +149,34 @@ report.canvasSize = await page.evaluate(() => { const c = document.querySelector
 report.gpu = await page.evaluate(() => { const gl = document.createElement('canvas').getContext('webgl2'), ext = gl?.getExtension('WEBGL_debug_renderer_info'); return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'no webgl2'; });
 if (process.env.QUALITY) await page.getByRole('combobox', { name: 'Preview quality', exact: true }).selectOption(process.env.QUALITY);
 
-const timecode = (t) => { const [h, m, s, f] = String(t).split(':').map(Number); return h * 3600 + m * 60 + s + f / FPS; };
+// HH:MM:SS:FF on the desktop transport, MM:SS (H:MM:SS) on the phone's.
+const timecode = (t) => { const parts = String(t).split(':').map(Number); if (parts.length < 4) return parts.reduce((total, n) => total * 60 + n, 0); const [h, m, s, f] = parts; return h * 3600 + m * 60 + s + f / FPS; };
+const clock = () => page.evaluate(() => (document.querySelector('.transport-time') ?? document.querySelector('.ph-time-now'))?.textContent ?? '');
 report.passes = [];
 for (let pass = 0; pass < PASSES; pass++) {
   if (pass && process.env.RELOAD) {
     await page.reload();
-    await page.locator('.timeline-tabs button', { hasText: TIMELINE }).first().click({ timeout: 120000 });
+    await openTimeline();
     await page.waitForFunction(() => document.querySelector('.viewer canvas')?.dataset.hasPicture === 'true', null, { timeout: 60000 }).catch(() => {});
     if (process.env.QUALITY) await page.getByRole('combobox', { name: 'Preview quality', exact: true }).selectOption(process.env.QUALITY);
   }
   // The editor has no Home shortcut: step back edit by edit so every pass plays the same opening seconds.
-  for (let i = 0; i < 500 && timecode(await page.locator('.transport-time').textContent()) > 0; i++) await page.getByRole('button', { name: /^(Previous edit|First frame)$/ }).first().click();
+  // The phone editor has no edit buttons: scrolling its timeline to the start is how a finger gets there.
+  if (await page.locator('.ph').count()) { await page.locator('.pt-scroll').evaluate((el) => { el.scrollLeft = 0; }); await page.waitForTimeout(500); }
+  for (let i = 0; i < 500 && timecode(await clock()) > 0 && !(await page.locator('.ph').count()); i++) await page.getByRole('button', { name: /^(Previous edit|First frame)$/ }).first().click();
   // START_SECONDS=N plays from the first edit point at or after N seconds instead of the opening (later stretches are not the graded opening).
-  for (let i = 0; i < 1500 && START_SECONDS > 0 && timecode(await page.locator('.transport-time').textContent()) < START_SECONDS; i++) await page.getByRole('button', { name: 'Next edit', exact: true }).first().click();
+  for (let i = 0; i < 1500 && START_SECONDS > 0 && timecode(await clock()) < START_SECONDS; i++) await page.getByRole('button', { name: 'Next edit', exact: true }).first().click();
   await page.evaluate(() => window.qaReset());
   const cdp = process.env.PROFILE && pass === PASSES - 1 ? await context.newCDPSession(page) : undefined;
   if (cdp) { await cdp.send('Profiler.enable'); await cdp.send('Profiler.setSamplingInterval', { interval: 500 }); await cdp.send('Profiler.start'); }
-  const startTime = await page.locator('.transport-time').textContent();
+  const startTime = await clock();
   if (link) report[`linkBeforePass${pass}`] = link.stats(pass ? report.passes.at(-1).endedAt : t0, Date.now());
   const startedAt = Date.now(), pageStart = await page.evaluate(() => performance.now());
   await page.getByRole('button', { name: 'Play playback', exact: true }).first().click();
   await page.waitForTimeout(SECONDS * 1000);
   // Read without waiting, then pause at once: a locator waits 30 s for the status line, which only exists while something
   // loads, and playback ran on meanwhile, so passes covered 30 or 60 s depending on what was loading.
-  const { endTime, statusText, footage } = await page.evaluate(() => ({ endTime: document.querySelector('.transport-time')?.textContent ?? '', statusText: document.querySelector('.viewer-playback-status')?.textContent ?? '', footage: document.querySelector('.footage-loading summary')?.textContent ?? '' }));
+  const { endTime, statusText, footage } = await page.evaluate(() => ({ endTime: (document.querySelector('.transport-time') ?? document.querySelector('.ph-time-now'))?.textContent ?? '', statusText: document.querySelector('.viewer-playback-status')?.textContent ?? '', footage: document.querySelector('.footage-loading summary')?.textContent ?? '' }));
   await page.getByRole('button', { name: 'Pause playback', exact: true }).first().click().catch(() => {});
   await page.getByRole('button', { name: 'Play playback', exact: true }).first().waitFor({ timeout: 5000 }).catch(() => page.keyboard.press('Space'));
   const endedAt = Date.now();

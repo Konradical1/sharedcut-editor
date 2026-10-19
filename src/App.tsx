@@ -1,4 +1,5 @@
 import './components/captions.css';
+import './components/phone.css';
 import { loadCaptionFonts } from './services/fonts';
 import { lazy, useEffect, useRef, useState, type PointerEvent } from 'react';
 import { MotionConfig } from 'motion/react';
@@ -26,6 +27,8 @@ const DenoiseWorkspace = lazy(() => import('./workspaces/DenoiseWorkspace'));
 import { useEditorShortcuts, useFocusRelease } from './shortcuts';
 import { connectSession, signOut, resolveSyncConflict, setProjectLock } from './services/sync';
 import { startPlaybackReporting } from './services/playbackHealthStart';
+import { usePhoneLayout } from './services/device';
+const PhoneEditor = lazy(() => import('./components/PhoneEditor'));
 // keep the media panel wide enough for every icon tab to stay visible (see .edit-media in styles.css)
 const MIN_MEDIA_WIDTH=232;
 void loadCaptionFonts();
@@ -57,6 +60,9 @@ function Editor({onHome}:{onHome:()=>void}) {
   const liveMode=useEditorStore(s=>s.liveMode);
   const followUserId=useEditorStore(s=>s.followUserId);
   const settings=useEditorStore(s=>s.settings);
+  // Phones get their own editor, one page: the other workspaces need a desk.
+  const phone=usePhoneLayout();
+  useEffect(()=>{if(phone&&workspace!=='edit')useEditorStore.getState().setWorkspace('edit');},[phone,workspace]);
   const [mediaVisible,setMediaVisible]=useState(window.innerWidth >= 1000);
   const [leftWidth,setLeftWidth]=useState(Math.max(MIN_MEDIA_WIDTH,Number(settings.mediaPanelWidth)||270));
   const [rightWidth,setRightWidth]=useState(Number(settings.inspectorPanelWidth)||284);
@@ -74,6 +80,7 @@ function Editor({onHome}:{onHome:()=>void}) {
   }
   useEffect(()=>{const timer=setTimeout(()=>s().setSettings({mediaPanelWidth:leftWidth,inspectorPanelWidth:rightWidth,editorSplit:split}),300);return()=>clearTimeout(timer);},[leftWidth,rightWidth,split]);
   const dots=(id:Workspace,name:string)=><span className="workspace-people">{people.map(p=>p.split('\n')).filter(([,activity])=>activity===id).map(([userId])=>{const user=users.find(u=>u.id===userId);return <i key={userId} style={{background:user?.color}} title={`${user?.name??'Collaborator'} is in ${name}`}/>;})}</span>;
+  if(phone)return <LazySuspense fallback={<div className="workspace-loading page-loading"><Brand/><span>Loading…</span></div>}><PhoneEditor onHome={onHome} landscape={phone==='landscape'}/></LazySuspense>;
   const rightPanel=sidePanel==='people'?<PeoplePanel/>:sidePanel==='history'?<HistoryPanel/>:sidePanel==='comments'?<CommentsPanel/>:<Inspector/>;
   return <div className="editor-app">
     <header className="app-toolbar"><div className="project-navigation"><IconButton label="Back to projects" onClick={onHome}><ChevronLeft size={17}/></IconButton><button className="brand-home" aria-label="SharedCut dashboard" onClick={onHome}><Brand compact/></button><span className="project-divider"/><div className="project-title"><b>{project?.name??'Project'}</b>{project?.lock?<span className="project-locked" title="Read-only for everyone until its owner unlocks it"><Lock size={9}/>Locked{project.lock.note?` · ${project.lock.note}`:''}{project.lock.userId===currentUserId&&<button onClick={()=>void setProjectLock(project.id,false).catch(error=>s().notify(error.message,'error'))}>Unlock</button>}</span>:<span><i className="status-dot"/>{project?.shared?'Class project':(project?.members.length ?? 0)>1?'Shared project':'Private project'}</span>}</div></div>
