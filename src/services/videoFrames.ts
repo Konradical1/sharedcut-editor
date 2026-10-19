@@ -66,6 +66,8 @@ export function createVideoFrames(url: string, fps: number, changed: () => void,
     cacheEnabled,
     get failed() { return !!error; },
     get error() { return error; },
+    /** The decoder read past the last picture since the latest seek. */
+    get ended() { return ended; },
     get ahead() { return frames.length ? Math.max(0, end(frames.at(-1)!) - target) : 0; },
     update(time: number) {
       if (disposed || error) return;

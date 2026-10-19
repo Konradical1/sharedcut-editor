@@ -315,7 +315,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     context.filter = 'none';
     context.clearRect(0, 0, blend.width, blend.height);
   };
-  const leaks = new Map<string, { element: HTMLVideoElement; source?: MediaElementAudioSourceNode; gain?: GainNode; lastUsed: number }>();
+  const leaks = new Map<string, { element: HTMLMediaElement; frames?: ReturnType<typeof createVideoFrames>; canvas?: HTMLCanvasElement; source?: MediaElementAudioSourceNode; gain?: GainNode; lastUsed: number }>();
   const decoders = new Map<string, Decoder>();
   // Paused only: 480 px stand-ins (the 1/4 file) while a playback decoder seeks. Dropped the moment playback starts.
   const scrubs = new Map<string, { frames: ReturnType<typeof createScrubFrames>; media: HTMLVideoElement }>();
@@ -614,23 +614,33 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       trackLevels[track.id]=Math.max(trackLevels[track.id]||0,rms*gain);
     };
     /**
-     * Decode the overlay clip for a light-leak transition. Its sound rides the master bus, so a
-     * muted master silences it, and expanding the sound to a track mutes this copy instead.
+     * A light leak's picture is decoded by WebCodecs, as clips are; the element only plays its sound. Drawing a fresh
+     * <video> onto a canvas blocks Safari for a whole second until its first frame, at every leak.
      */
-    const leakFrame = (record:TransitionRecord,raw:number,_time:number,wantAudio:boolean):CanvasImageSource|null => {
-      const id=String(record.params.leak??'');
-      const leak=state.leaks?.find(item=>item.id===id);
+    const leakEntry = (record:TransitionRecord) => {
+      const id=String(record.params.leak??''),leak=state.leaks?.find(item=>item.id===id);
       if(!id||!leak)return null;
       let entry=leaks.get(id);
       if(!entry) {
-        const element=document.createElement('video');
-        element.preload='auto';element.playsInline=true;element.muted=true;element.src=leak.url;
+        const decoded=typeof VideoDecoder!=='undefined'&&typeof Worker!=='undefined';
+        const element=document.createElement(decoded?'audio':'video');
+        element.preload='auto';element.muted=true;element.src=leak.url;
+        if(element instanceof HTMLVideoElement)element.playsInline=true;
         element.addEventListener('loadeddata',()=>{dirty=true;});
         element.addEventListener('seeked',()=>{dirty=true;});
-        entry={element,lastUsed:0};leaks.set(id,entry);
+        entry={element,frames:decoded?createVideoFrames(leak.url,leak.fps||30,()=>{dirty=true;}):undefined,lastUsed:0};leaks.set(id,entry);
       }
       entry.lastUsed=performance.now();
-      const element=entry.element,range=leakRange(record.params,leak.duration||record.duration);
+      return {entry,leak,range:leakRange(record.params,leak.duration||record.duration)};
+    };
+    /**
+     * The overlay picture for a light-leak transition. Its sound rides the master bus, so a
+     * muted master silences it, and expanding the sound to a track mutes this copy instead.
+     */
+    const leakFrame = (record:TransitionRecord,raw:number,_time:number,wantAudio:boolean):CanvasImageSource|null => {
+      const found=leakEntry(record);
+      if(!found)return null;
+      const {entry,leak,range}=found,element=entry.element;
       const wanted=Math.max(range.start,Math.min(range.end-1e-3,range.start+raw*range.duration));
       const silent=!!record.audioClipId||!wantAudio||!leak.hasAudio;
       const level=silent?0:10**(Math.max(-60,Math.min(12,Number(record.params.leakGain??-6)))/20);
@@ -640,11 +650,29 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       }
       if(audio&&entry.gain)entry.gain.gain.setTargetAtTime(level,audio.currentTime,.02);
       element.muted=!entry.gain;
+      const follow=()=>{
+        element.playbackRate=Math.max(.0625,Math.min(16,range.duration/record.duration));
+        if(state.playing&&element.currentTime<range.end&&element.paused)void element.play().catch(()=>{/* Autoplay needs a gesture. */});
+        else if((!state.playing||element.currentTime>=range.end)&&!element.paused)element.pause();
+        if(!element.seeking&&(element.currentTime<range.start||element.currentTime>=range.end||Math.abs(element.currentTime-wanted)>(state.playing?.3:.02)))element.currentTime=wanted;
+      };
+      if(entry.frames&&!entry.frames.failed){
+        // The sound never holds the picture: it joins when it is ready.
+        if(silent){if(!element.paused)element.pause();}else if(element.readyState>=2)follow();
+        entry.frames.update(wanted);
+        // A file's first picture can start a frame in and its last end early: there the overlay is left out, never waited for.
+        const frame=entry.frames.frame(wanted)??entry.frames.frame(wanted+1/(leak.fps||30));
+        if(!frame){if(!entry.frames.ahead&&!entry.frames.ended)loading=true;return null;}
+        // Safari ignores the blend mode when it draws a VideoFrame (Screen comes out as Normal): the transition gets a canvas.
+        const scale=Math.min(1,width/frame.displayWidth),w=Math.max(1,Math.round(frame.displayWidth*scale)),h=Math.max(1,Math.round(frame.displayHeight*scale));
+        const copy=entry.canvas??=document.createElement('canvas');
+        if(copy.width!==w||copy.height!==h){copy.width=w;copy.height=h;}
+        copy.getContext('2d')!.drawImage(frame,0,0,w,h);
+        return copy;
+      }
+      if(!(element instanceof HTMLVideoElement))return null;
       if(element.readyState<2){loading=true;return null;}
-      element.playbackRate=Math.max(.0625,Math.min(16,range.duration/record.duration));
-      if(state.playing&&element.currentTime<range.end&&element.paused)void element.play().catch(()=>{/* Autoplay needs a gesture. */});
-      else if((!state.playing||element.currentTime>=range.end)&&!element.paused)element.pause();
-      if(!element.seeking&&(element.currentTime<range.start||element.currentTime>=range.end||Math.abs(element.currentTime-wanted)>(state.playing?.3:.02)))element.currentTime=wanted;
+      follow();
       if(element.seeking){loading=true;return null;}
       return element;
     };
@@ -1155,6 +1183,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     }else if(!loading)expensiveFrames=Math.max(0,expensiveFrames-1);
     // Warm upcoming pictures and their looks independently of the audio clips.
     const upcoming=transitionsOf(state.clips,state.timelineId,state.media).filter(record=>record.start>state.playhead&&record.start-state.playhead<1.5);
+    // A light leak's first picture is decoded before its transition starts.
+    for(const record of upcoming)if(transitionDefinitions[record.name]?.overlay){const found=leakEntry(record);found?.entry.frames?.update(found.range.start);}
     // Every warmed decoder is another preload="auto" stream competing for the same link, so nothing past the
     // horizon is opened (upcomingClips). Warming carries on through a stall: the cuts after a slow one are the
     // next thing to stall on.
@@ -1211,7 +1241,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // Recently scrubbed files stay open while paused, so crossing back over a cut is instant.
     for (const [url, scrub] of scrubs) if (state.playing && !focused || scrubs.size > SCRUB_POOL && !scrubIds.has(url)) { scrub.frames.dispose(); scrubs.delete(url); }
     for(const [key,entry] of sideCanvases)if(performance.now()-entry.lastUsed>5000)sideCanvases.delete(key);
-    for(const [id,entry] of leaks)if(performance.now()-entry.lastUsed>8000){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();leaks.delete(id);}
+    for(const [id,entry] of leaks)if(performance.now()-entry.lastUsed>8000){entry.frames?.dispose();entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();leaks.delete(id);}
     for(const [id,group] of groups)if(!activeGroups.has(id)){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();groups.delete(id);}
     for (const [id, decoder] of [...decoders].filter(([id]) => !activeIds.has(id) && !warmIds.has(id)).sort((a, b) => a[1].lastUsed - b[1].lastUsed)) {
       // Every retained decoder is a live hardware decode session and a buffer competing for the

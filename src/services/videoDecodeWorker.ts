@@ -12,6 +12,8 @@ let generation = 0, from = 0, credit = 0, restart = false, busy = false;
  */
 let gop = false, runKey = NaN, runEnd = -Infinity, shown = -Infinity;
 const send = (data: unknown, transfer: Transferable[] = []) => postMessage(data, { transfer });
+/** Bytes are fetched in whole blocks of the footage worker's chunk size (public/footage-worker.js CHUNK); the latest few are kept. */
+const BLOCK = 1 << 20, KEEP_BLOCKS = 2;
 async function pump() {
   if (busy || !sink) return;
   busy = true;
@@ -56,25 +58,46 @@ onmessage = event => {
   if (message.type === 'open') {
     const controller = new AbortController();
     let size = 0;
-    // Timeline caching owns lookahead. An open-ended network prefetch would read beyond
-    // the saved clip and turn an unrelated cache miss into a decoder failure.
-    const read = async (start: number, end: number) => {
+    /** One aligned block, cut short at the end of the file. */
+    const fetchBlock = async (index: number) => {
+      const start = index * BLOCK, end = start + BLOCK;
       const response = await fetch(message.url, {
         credentials: 'same-origin', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]),
         headers: { Range: `bytes=${start}-${end - 1}`, ...(message.cacheEnabled === false ? {'X-Footage-Cache':'off'} : {}) },
       });
       const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get('Content-Range') ?? '');
-      if (response.status !== 206 || !range || +range[1] !== start || +range[2] !== end - 1) {
+      const last = range ? Math.min(end, +range[3]) - 1 : -1;
+      if (response.status !== 206 || !range || +range[1] !== start || +range[2] !== last) {
         await response.body?.cancel();
         throw new Error(`Preview byte range unavailable (${response.status}).`);
       }
       size = +range[3];
       const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.length !== end - start) throw new Error('Incomplete preview byte range.');
+      if (bytes.length !== last + 1 - start) throw new Error('Incomplete preview byte range.');
+      return bytes;
+    };
+    // The decoder reads ~64 KiB at a time, and each read is a round trip through the footage worker or the network:
+    // 50-400 ms apiece in Safari, ten of them before a cut's first picture. Whole aligned blocks are fetched instead and
+    // sliced here. A block is exactly the footage worker's chunk, so no byte is read that a small read would not have
+    // pulled into the cache anyway (timeline caching still owns lookahead).
+    const blocks = new Map<number, Promise<Uint8Array>>();
+    const block = (index: number) => {
+      const job = blocks.get(index) ?? fetchBlock(index);
+      blocks.delete(index); blocks.set(index, job);
+      job.catch(() => { if (blocks.get(index) === job) blocks.delete(index); });
+      for (const oldest of blocks.keys()) { if (blocks.size <= KEEP_BLOCKS) break; blocks.delete(oldest); }
+      return job;
+    };
+    const read = async (start: number, end: number) => {
+      const first = Math.floor(start / BLOCK), parts = await Promise.all(Array.from({ length: Math.floor((end - 1) / BLOCK) - first + 1 }, (_, i) => block(first + i)));
+      const bytes = new Uint8Array(end - start);
+      let at = 0;
+      parts.forEach((part, i) => { const piece = part.subarray(i ? 0 : start - first * BLOCK, Math.min(part.length, end - (first + i) * BLOCK)); bytes.set(piece, at); at += piece.length; });
+      if (at !== bytes.length) throw new Error('Incomplete preview byte range.');
       return bytes;
     };
     input = new Input({ formats: [MP4], source: new CustomSource({
-      getSize: async () => { await read(0, 1); return size; }, read,
+      getSize: async () => { await block(0); return size; }, read,
       maxCacheSize: 4 * 1024 ** 2, prefetchProfile: 'fileSystem',
       dispose: () => controller.abort(),
       handleUnhandledError: error => send({ type: 'error', generation, error: String(error) }),

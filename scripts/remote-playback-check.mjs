@@ -22,7 +22,8 @@
 //        where compositing runs; decoder workers are not targeted.
 //      MOBILE=1: an iPhone 14 (touch, 390x844 at 3x), so the phone editor (or, for an older client, the desktop one squeezed
 //        onto a phone) is what plays. Pair with CPU_RATE=4 for a phone's main thread.
-import { chromium, devices } from 'playwright';
+//      BROWSER=webkit: Safari's engine instead of Chrome (iPhone playback). CPU_RATE and PROFILE need Chrome and are ignored.
+import { chromium, devices, webkit } from 'playwright';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { connect } from 'node:net';
@@ -86,7 +87,9 @@ async function shapedLink(mbps, rtt) {
 }
 const link = DOWN_MBPS || RTT_MS ? await shapedLink(DOWN_MBPS, RTT_MS) : undefined;
 
-const browser = await chromium.launch({ channel: 'chrome', headless: true, ...(link ? { proxy: { server: link.server } } : {}), args: ['--enable-gpu', '--ignore-gpu-blocklist', '--use-angle=d3d11', '--autoplay-policy=no-user-gesture-required'] });
+const WEBKIT = process.env.BROWSER === 'webkit';
+const proxy = link ? { proxy: { server: link.server } } : {};
+const browser = WEBKIT ? await webkit.launch({ headless: true, ...proxy }) : await chromium.launch({ channel: 'chrome', headless: true, ...proxy, args: ['--enable-gpu', '--ignore-gpu-blocklist', '--use-angle=d3d11', '--autoplay-policy=no-user-gesture-required'] });
 const context = await browser.newContext(process.env.MOBILE ? devices['iPhone 14'] : { viewport: { width: 1600, height: 1000 } });
 await context.addCookies([{ name: 'frameline_session', value: token, url: ORIGIN }]);
 if (process.env.DIST) {
@@ -104,7 +107,10 @@ await context.addInitScript(({ hw, mem }) => {
   // HW_THREADS / HW_MEMORY: report a Chromebook-class machine (2-4 cores, 4 GB) so Efficient playback Auto switches on as it does there.
   if (hw) Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: () => hw });
   if (mem) Object.defineProperty(Navigator.prototype, 'deviceMemory', { get: () => mem });
-  window.qaReset = () => { window.qa = { frames: [], health: [] }; document.querySelector('.viewer canvas')?.colorProbe?.(true); };
+  window.qaReset = () => { window.qa = { frames: [], health: [], ticks: [], slowTicks: [] }; document.querySelector('.viewer canvas')?.colorProbe?.(true); };
+  // Main-thread time of every animation-frame callback (the player's tick among them): works in WebKit, where PROFILE does not.
+  const raf = window.requestAnimationFrame.bind(window);
+  window.requestAnimationFrame = (callback) => raf((time) => { const start = performance.now(); try { callback(time); } finally { const ms = performance.now() - start; window.qa.ticks.push(ms); if (ms > 100) window.qa.slowTicks.push([Math.round(start), Math.round(ms)]); } });
   window.qaReset();
   // pictureStamp names every footage layer's picture; sourceTimestamp is only the layer drawn last, which a logo on top pins
   // (the live OLD client has no pictureStamp, so it falls back to the old stamp).
@@ -126,10 +132,12 @@ await context.addInitScript(({ hw, mem }) => {
   };
 }, { hw: HW_THREADS, mem: HW_MEMORY });
 const page = await context.newPage();
-if (CPU_RATE > 1) await (await context.newCDPSession(page)).send('Emulation.setCPUThrottlingRate', { rate: CPU_RATE });
+if (CPU_RATE > 1 && !WEBKIT) await (await context.newCDPSession(page)).send('Emulation.setCPUThrottlingRate', { rate: CPU_RATE });
 const t0 = Date.now(), consoleErrors = [], failed = [];
 const stamp = () => +((Date.now() - t0) / 1000).toFixed(1);
 page.on('console', (m) => { if (m.type() === 'error' && !m.text().includes('cloudflareinsights')) consoleErrors.push(`${stamp()} ${m.text().slice(0, 240)}`); });
+// LOG=<regex>: echo matching console lines (debug logging in a DIST build) as they happen.
+if (process.env.LOG) page.on('console', (m) => { if (new RegExp(process.env.LOG).test(m.text())) console.log(`${stamp()} ${m.text().slice(0, 300)}`); });
 page.on('pageerror', (e) => consoleErrors.push(`${stamp()} pageerror: ${e.message.slice(0, 240)}`));
 page.on('response', (r) => { if (r.status() >= 400 && r.url().includes('/api/media/')) failed.push(`${stamp()} ${r.status()} ${r.url().replace(ORIGIN, '').slice(0, 120)}`); });
 
@@ -167,7 +175,7 @@ for (let pass = 0; pass < PASSES; pass++) {
   // START_SECONDS=N plays from the first edit point at or after N seconds instead of the opening (later stretches are not the graded opening).
   for (let i = 0; i < 1500 && START_SECONDS > 0 && timecode(await clock()) < START_SECONDS; i++) await page.getByRole('button', { name: 'Next edit', exact: true }).first().click();
   await page.evaluate(() => window.qaReset());
-  const cdp = process.env.PROFILE && pass === PASSES - 1 ? await context.newCDPSession(page) : undefined;
+  const cdp = process.env.PROFILE && !WEBKIT && pass === PASSES - 1 ? await context.newCDPSession(page) : undefined;
   if (cdp) { await cdp.send('Profiler.enable'); await cdp.send('Profiler.setSamplingInterval', { interval: 500 }); await cdp.send('Profiler.start'); }
   const startTime = await clock();
   if (link) report[`linkBeforePass${pass}`] = link.stats(pass ? report.passes.at(-1).endedAt : t0, Date.now());
@@ -197,7 +205,9 @@ for (let pass = 0; pass < PASSES; pass++) {
     }
     if (run) runs.push(run);
     const span = h.length > 1 ? h.at(-1)[0] - h[0][0] : 1;
+    const ticks = [...window.qa.ticks].sort((a, b) => a - b), tickAt = (q) => +(ticks[Math.floor(q * (ticks.length - 1))] ?? 0).toFixed(1);
     return { renderedPerSec: +(f.length / (span / 1000)).toFixed(1), picturesPerSec: +(distinct / (span / 1000)).toFixed(1), worstFreezesMs: gaps.slice(0, 5).map(([ms]) => Math.round(ms)), freezesAt,
+      frameCallbackMs: { p50: tickAt(.5), p95: tickAt(.95), max: tickAt(1), busyPct: +(100 * ticks.reduce((a, b) => a + b, 0) / span).toFixed(1), slow: window.qa.slowTicks.slice(0, 8).map(([at, ms]) => `${ms}ms@${Number(h.find((x) => x[0] >= at)?.[5]).toFixed(2)}s`) },
       loadingRuns: runs.length, meanLoadingRunMs: runs.length ? Math.round(runs.reduce((a, b) => a + b, 0) / runs.length) : 0,
       colorProbe: document.querySelector('.viewer canvas')?.colorProbe?.() ?? null,
       loadingPct: +(100 * loadingMs / span).toFixed(1), lowStreamPct: +(100 * lowMs / span).toFixed(1), longestLoadingMs: Math.round(Math.max(0, ...runs)), engines: [...new Set(h.map((x) => x[2]).filter(Boolean))], errors: [...errors].slice(0, 5),
