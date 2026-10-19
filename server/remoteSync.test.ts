@@ -63,6 +63,16 @@ test('a desktop copy stays live with sharedcut.com, keeps editing offline and me
     }
     assert.equal((await request(deskUrl, '/remote', 'GET', undefined, konrad.cookie)).data.projects[0].status, 'synced');
 
+    // Locked on sharedcut.com: nothing moves either way until it is unlocked.
+    assert.equal((await request(liveUrl, '/projects/trip/lock', 'PUT', { note: 'Being replaced' }, alice.cookie)).status, 200);
+    await put(deskUrl, konrad, state => { state.clips = state.clips.map(c => c.id === 'c1' ? { ...c, name: 'While locked' } : c); });
+    await desk.remote!.tick();
+    assert.match((await request(deskUrl, '/remote', 'GET', undefined, konrad.cookie)).data.projects[0].error, /Locked on sharedcut\.com \(Being replaced\)/);
+    assert.equal(tripOf(await read(deskUrl, konrad)).clips[0].name, 'While locked');
+    assert.equal((await request(liveUrl, '/projects/trip/lock', 'DELETE', undefined, alice.cookie)).status, 200);
+    await desk.remote!.tick();
+    assert.equal(tripOf(await read(liveUrl, alice)).clips[0].name, 'While locked');
+
     // Offline: sharedcut.com goes away, edits keep landing here, and merge when it is back.
     await live.close();
     await put(deskUrl, konrad, state => { state.clips.push(clip('c2', 'm1', 6)); state.comments.push({ id: 'k2', projectId: 'trip', userId: konrad.id, text: 'Cut here', timestamp: 2, time: 6, resolved: false, replies: [] }); });

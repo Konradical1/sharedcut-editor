@@ -110,6 +110,8 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
     const me = config.user!.id, localUser = config.localUserId!;
     const view = remote!.state, there = view.projects.find(p => p.id === id);
     if (!there) throw new Error('This project is no longer on sharedcut.com for your account.');
+    // Locked there (an offline copy being put back by hand): its copy is not the one to merge with until it is unlocked.
+    if (there.lock) throw new Error(`Locked on sharedcut.com${there.lock.note ? ` (${there.lock.note})` : ''}. It syncs once its owner unlocks it.`);
     const now = host.state(), L = sliceOf(now, id), B = readBase(id), theirs = sliceOf(view, id)!, R = canon(swap(theirs, me, localUser));
     // Deleted on this computer after it was kept: it stops syncing; sharedcut.com keeps its copy.
     if (!L && B) { keep(id, false); return; }
