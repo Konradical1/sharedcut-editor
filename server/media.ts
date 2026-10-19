@@ -736,7 +736,7 @@ export interface RenderRequest {
   leakSound?: boolean;
   /** Internal: thread budget when several FFmpeg passes share the export. */
   threads?: number;
-  /** A timeline preview: its own few threads and no export admission. A range that splits renders its parts one after another, never in parallel. */
+  /** A timeline preview: its own few threads and no export admission. A range that splits renders two parts at a time on those threads. */
   singlePass?: boolean;
   /** Process priority of the final encode (nice 19 is Idle on Windows); a preview must never outrank the editor. */
   nice?: number;
@@ -794,6 +794,8 @@ function framedTransitions(records: TransitionRecord[], rangeIn: number, fps: nu
 // Pictures a pass may decode at once, the longest stretch it takes, and clips per sound pass (bounded by
 // Windows' command line: each input spends ~380 characters on its path and whitelists).
 const PASS_INPUTS = 6, PASS_SECONDS = 20, PASS_SOUNDS = 48;
+/** Parts of a busy preview range rendered at once, sharing the preview's threads: one at a time took 7 s for 4 s of picture. */
+const PREVIEW_PARTS = 2;
 const ADJUSTMENT_LABELS = 100_000;
 
 /**
@@ -1417,8 +1419,8 @@ async function renderSplit(request: RenderRequest, plan: { passes: { from: numbe
   const { settings, signal, onProgress, outputPath } = request, { fps, duration } = plan;
   const rangeIn = Number(settings.rangeIn ?? 0), codec = settings.codec || 'H.264', audio = settings.audio || 'AAC · 320 kb/s · 48 kHz';
   const internal = Boolean(request.transparent || request.sampledFrame);
-  // A preview renders its parts one at a time on its own threads: in parallel each would take export threads and a decoder per clip.
-  const threads = request.singlePass ? Number(request.threads ?? 2) : Math.max(2, Math.floor(Number(exportThreads) / EXPORT_PASSES));
+  // A preview renders its parts two at a time on its own threads, never on export threads (each part opens a decoder per clip).
+  const threads = request.singlePass ? Math.max(1, Math.floor(Number(request.threads ?? 2) / PREVIEW_PARTS)) : Math.max(2, Math.floor(Number(exportThreads) / EXPORT_PASSES));
   const directory = await mkdtemp(path.join(tmpdir(), 'frameline-passes-'));
   try {
     const pictures = plan.passes.map((pass, index) => ({ ...pass, file: path.join(directory, `picture-${index}${codec.includes('ProRes') ? '.mov' : '.mp4'}`) }));
@@ -1430,7 +1432,7 @@ async function renderSplit(request: RenderRequest, plan: { passes: { from: numbe
     let joined = 0;
     request.onStage?.(`Rendering video · 0/${pictures.length} parts`);
     // `threads` stays computed from the ceiling: fewer passes under memory pressure must never mean more decoder threads each.
-    const passes = request.singlePass ? 1 : exportPassCount(EXPORT_PASSES, JOB_COST_BYTES.renderPass);
+    const passes = request.singlePass ? PREVIEW_PARTS : exportPassCount(EXPORT_PASSES, JOB_COST_BYTES.renderPass);
     const onWait = request.onWait ?? ((text: string | null) => request.onStage?.(text ?? `Rendering video · ${joined}/${pictures.length} parts`));
     await inParallel(work, passes, signal, async (item, index, passSignal) => {
       const pass = { ...request, signal: passSignal, threads, onStage: undefined, onWait, onProgress: (value: number) => { progress[index] = value; report(); } };

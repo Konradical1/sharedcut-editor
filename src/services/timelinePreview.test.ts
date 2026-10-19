@@ -1,7 +1,7 @@
 import test, { afterEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { connection } from './api.ts';
-import { createTimelinePreview, isHostBrowser, PREVIEW_BUSY_BASE_MS, PREVIEW_BUSY_MAX_MS, PREVIEW_IN_FLIGHT } from './timelinePreview.ts';
+import { createTimelinePreview, isHostBrowser, PREVIEW_BUSY_BASE_MS, PREVIEW_BUSY_MAX_MS, PREVIEW_IN_FLIGHT, PREVIEW_POLL_MS } from './timelinePreview.ts';
 
 const settle = async () => { for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve)); };
 const globals = ['fetch', 'Worker', 'VideoDecoder', 'location'] as const;
@@ -132,13 +132,13 @@ test('a skipped chunk is final: no polling, and the picture stays live', async (
   assert.equal(requests.length, 1, 'still one request however long playback continues over it');
 });
 
-test('a preparing chunk is polled every second until it is ready, then decoded once', async () => {
+test('a preparing chunk is polled every half second until it is ready, then decoded once', async () => {
   const ready = { key: 'k', status: 'ready', progress: 100, from: 0, duration: 4, fps: 24, url: '/api/timeline-previews/k/video.mp4?projectId=p' };
   const { requests, workers, ask, tick } = rig('sharedcut.com', call => ({ body: call < 3 ? preparing : ready }));
   ask(true); await tick(750); assert.equal(requests.length, 1);
-  await tick(999); assert.equal(requests.length, 1);
+  await tick(PREVIEW_POLL_MS - 1); assert.equal(requests.length, 1);
   await tick(1); assert.equal(requests.length, 2);
-  await tick(1000); assert.equal(requests.length, 3);
+  await tick(PREVIEW_POLL_MS); assert.equal(requests.length, 3);
   assert.equal(workers.length, 1);
   await tick(30_000); assert.equal(requests.length, 3, 'a ready chunk is not polled again');
 });

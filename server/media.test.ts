@@ -595,7 +595,7 @@ test('bakesWholeClips names the clips renderTimeline sends to a whole-clip bake,
   assert.equal(bakes(clip({ mediaId: 'frameline-title', keyframes: keys, properties: { ...defaultProperties, blendMode: 'Screen' } })), true, 'a blended one keeps the per-frame bake');
 });
 
-test('a preview range that would split renders its parts one after another, every frame in place', { timeout: 120000 }, async () => {
+test('a preview range that would split renders in parts on the preview threads, every frame in place', { timeout: 120000 }, async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'frameline-preview-parts-'));
   try {
     const file = path.join(dir, 'source.mp4'), outputPath = path.join(dir, 'preview.mp4');

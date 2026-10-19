@@ -291,7 +291,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   const timelinePreview=createTimelinePreview(()=>{dirty=true;});
   let expensiveFrames=0, expensiveUntil=-Infinity;
   // A phone always plays smooth; a computer once it has twice running shown it cannot keep up live (for this page's life).
-  let slowDevice=false, strikes=0, paceFrom=0, paceCount=0, holdSince:number|undefined;
+  // `pace`: the share of the frame rate the last measured stretch of live playback reached.
+  let slowDevice=false, strikes=0, paceFrom=0, paceCount=0, pace=1, holdSince:number|undefined;
   const strike=(bad:boolean)=>{if(!bad){strikes=0;return;}if(++strikes>=2)slowDevice=true;};
   const layer = document.createElement('canvas'), reference = document.createElement('canvas');
   const layerContext = layer.getContext('2d')!, referenceContext = reference.getContext('2d')!;
@@ -1175,9 +1176,10 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     const preview=!focused&&state.renderPreviewAllowed!==false&&!options.compare&&!options.original&&options.quality==='Stream'
       ?timelinePreview.get(state,state.playhead,Math.round(width*shrink/2)*2,Math.round(height*shrink/2)*2,smooth||performance.now()<expensiveUntil,smooth&&state.playing?SMOOTH_AHEAD:1):undefined;
     const prepared=preview?.frame?preview:undefined;
-    // Smooth playback waits for its chunk, as a video site buffers, rather than composite live at a few pictures a second.
-    // A chunk that takes longer than SMOOTH_HOLD_MS (a busy server) gives way to the live picture.
-    holdSince=smooth&&state.playing&&preview&&!prepared?holdSince??performance.now():undefined;
+    // Smooth playback waits for its chunk, as a video site buffers, where the live picture is a few frames a second (a phone,
+    // a computer under half the frame rate); elsewhere live plays on until it is ready. A chunk that takes longer than
+    // SMOOTH_HOLD_MS (a busy server) gives way to the live picture.
+    holdSince=smooth&&state.playing&&preview&&!prepared&&(isPhone()||pace<.5)?holdSince??performance.now():undefined;
     const renderHold=holdSince!==undefined&&performance.now()-holdSince<SMOOTH_HOLD_MS;
     // Its pictures come from the server: only the sound of the next cuts is made ready here.
     const skipPictures=smooth&&(!!prepared||renderHold);
@@ -1209,7 +1211,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     // Pictures shown per 3 s of unhindered live playback: under 70% of the frame rate is a strike against this computer.
     if(!smooth&&state.playing&&!prepared&&!loading){
       if(!paceFrom){paceFrom=performance.now();paceCount=0;}
-      else if(performance.now()-paceFrom>=3000){strike(paceCount/((performance.now()-paceFrom)/1000)<previewFps*.7);paceFrom=performance.now();paceCount=0;}
+      else if(performance.now()-paceFrom>=3000){pace=paceCount/((performance.now()-paceFrom)/1000)/previewFps;strike(pace<.7);paceFrom=performance.now();paceCount=0;}
       paceCount++;
     }else paceFrom=0;
     // Warm upcoming pictures and their looks independently of the audio clips.

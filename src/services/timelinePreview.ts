@@ -17,6 +17,8 @@ const isTransient = (error: unknown) => !(error instanceof ApiError) || error.st
 const PREVIEW_MAX_RETRIES = 6;
 /** Chunks being rendered for one viewer at once: rendering ahead never takes every one of the server's slots. */
 export const PREVIEW_IN_FLIGHT = 2;
+/** A chunk the server is rendering is asked about this often (and its job is kept alive for PREVIEW_LEASE_MS by it). */
+export const PREVIEW_POLL_MS = 500;
 export type PreviewPicture = { frame: VideoFrame; key: string } | { frame?: undefined; waiting: true };
 /** Background render cache: sections that exceed the browser's frame budget, and everything a smooth-playback device plays. */
 export function createTimelinePreview(changed: () => void) {
@@ -40,6 +42,8 @@ export function createTimelinePreview(changed: () => void) {
       }
       const fps=state.projects.find(p=>p.id===state.projectId)?.fps||24, span=Math.round(fps*4)/fps, chunk=Math.floor((time+1e-7)/span);
       for(const [id,entry] of entries)if(id<chunk-1||id>chunk+Math.max(2,ahead)){clearTimeout(entry.timer);entry.controller.abort();entry.frames?.dispose();entries.delete(id);}
+      // A single chunk (paused, or a heavy stretch) is asked for after 750 ms, so a scrub does not ask for every chunk it
+      // crosses; playing with a look-ahead, at once.
       const request=(id:number)=>{
         if(entries.has(id))return;
         const entry:Entry={controller:new AbortController(),busy:0,failures:0};entries.set(id,entry);
@@ -52,7 +56,7 @@ export function createTimelinePreview(changed: () => void) {
             if(entry.controller.signal.aborted)return;
             entry.busy=0;entry.failures=0;
             if(entry.value.status==='ready'&&entry.value.url){entry.frames=createVideoFrames(entry.value.url,fps,changed,state.settings.footageCache!==false);entry.frames.update(Math.max(0,time-entry.value.from));}
-            else if(entry.value.status==='preparing')entry.timer=setTimeout(poll,1000);
+            else if(entry.value.status==='preparing')entry.timer=setTimeout(poll,PREVIEW_POLL_MS);
             // 'skipped' (the server will not render this range) and 'failed' are final for the chunk: nothing polls it and the live compositor keeps drawing.
             else entry.final=true;
             changed();
@@ -63,7 +67,7 @@ export function createTimelinePreview(changed: () => void) {
             else{entry.final=true;changed();}
           }
         };
-        entry.timer=setTimeout(poll,750);
+        entry.timer=setTimeout(poll,ahead>1?0:750);
       };
       // The host's own browser plays live: a render it asked for would take the memory and processor its own playback needs.
       if(enable&&!(typeof location!=='undefined'&&isHostBrowser(location.hostname))){
