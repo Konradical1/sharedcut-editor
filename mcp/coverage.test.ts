@@ -48,6 +48,12 @@ export const ROUTES: Record<string, string> = {
   '/api/projects/deleted': 'job:restore-project',
   '/api/projects/([a-zA-Z0-9_-]+)/restore': 'job:restore-project',
   '/api/projects/([a-zA-Z0-9_-]+)/lock': 'job:lock-project',
+  // SharedCut Desktop's link to sharedcut.com (server/remoteSync.ts)
+  '/api/remote*': 'job:keep-offline',
+  '/api/remote': 'job:keep-offline',
+  '/api/remote/projects/([a-zA-Z0-9_-]+)': 'job:keep-offline',
+  '/api/remote/login': 'no: a person types their sharedcut.com password into the desktop app; the MCP never handles passwords',
+  '/api/remote/logout': 'no: signing the desktop app out of sharedcut.com stops its sync; that is the person\'s call',
   '/api/library': 'job:folder',
   // Captions, masks, depth, motion, tracking, color
   '/api/captions': 'job:captions',

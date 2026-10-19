@@ -45,6 +45,14 @@ scp release/latest-mac.yml <server>:SharedCut-data/downloads/
 
 A Mac update only installs when the installed build and the new build are signed by the same Developer ID.
 
+## Syncing with sharedcut.com
+
+On the Projects screen, sign in to sharedcut.com and choose **Keep on this computer** for a project. The app downloads its
+footage and keeps the project live with sharedcut.com every few seconds while online. Edits made offline stay on the
+computer and merge in when it is back online; when both sides changed the same thing, the computer's edit wins. New
+footage imported in the app uploads by itself. `server/remoteSync.ts` does this; `SHAREDCUT_REMOTE` points the app at
+another server. The bundle steps below are the manual route.
+
 ## Taking a sharedcut.com project offline
 
 When the laptop already has the footage, only the edit travels. On the Lenovo:

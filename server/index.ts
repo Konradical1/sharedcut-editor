@@ -9,6 +9,7 @@ import { validateMotionBlur } from '../src/services/motionBlur.ts';
 import { workQueue, heavyJob } from './workQueue.ts';
 import { stateDelta, applyStateDelta, stateEqual, shareState } from '../src/services/stateDelta.ts';
 import { COLLECTIONS, holdDataLock, workspaceStore } from './workspaceStore.ts';
+import { remoteSync } from './remoteSync.ts';
 import { parseImportLink, downloadLink, youtubeThumbnail } from './linkImport.ts';
 import { soundLibrary } from './sfx.ts';
 import { projectLibrary } from './library.ts';
@@ -216,7 +217,7 @@ export function streamFile(req: IncomingMessage, res: ServerResponse, path: stri
 
 // hostMonitor: write data/host-health.log. Only the real server asks for it; a test server would launch PowerShell and nvidia-smi for nothing.
 // hostGuard: a test hands in a guard with a made-up memory reading.
-export function createFrameLineServer(options: { dataDir?: string; distDir?: string; maxUploadBytes?: number; legacyEveryMs?: number; hostMonitor?: boolean; hostGuard?: HostGuard; uploadIdleMs?: number } = {}) {
+export function createFrameLineServer(options: { dataDir?: string; distDir?: string; maxUploadBytes?: number; legacyEveryMs?: number; hostMonitor?: boolean; hostGuard?: HostGuard; uploadIdleMs?: number; remote?: string; remoteEveryMs?: number } = {}) {
   const dataDir = resolve(options.dataDir ?? process.env.FRAME_LINE_DATA ?? 'data');
   const distDir = resolve(options.distDir ?? 'dist');
   const maxUploadBytes = options.maxUploadBytes ?? Number(process.env.FRAME_LINE_MAX_UPLOAD_BYTES ?? 10 * 1024 ** 3), uploadIdleMs = options.uploadIdleMs ?? 30_000;
@@ -1168,6 +1169,18 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const previous = state.projects; state.projects = state.projects.map(item => item.id === updated.id ? updated : item);
           try { persist(); } catch (error) { state.projects = previous; throw error; }
           send(res, 200, { project: updated }); return;
+        }
+        // SharedCut Desktop's link to sharedcut.com (remoteSync.ts); a server started without FRAME_LINE_REMOTE has none.
+        if (path.startsWith('/api/remote')) {
+          if (!remote) fail(404, 'API endpoint not found.');
+          const keepRoute = /^\/api\/remote\/projects\/([a-zA-Z0-9_-]+)$/.exec(path);
+          try {
+            if (path === '/api/remote' && method === 'GET') { send(res, 200, remote!.status()); return; }
+            if (path === '/api/remote/login' && method === 'POST') { const body = await jsonBody(req, 4096); await remote!.login(userId, textField(body.email, 320, true).trim(), textField(body.password, 1000, true)); send(res, 200, remote!.status()); return; }
+            if (path === '/api/remote/logout' && method === 'POST') { remote!.logout(); send(res, 200, remote!.status()); return; }
+            if (keepRoute && (method === 'PUT' || method === 'DELETE')) { remote!.keep(keepRoute[1], method === 'PUT'); send(res, 200, remote!.status()); return; }
+          } catch (error) { if (error instanceof Error && !('status' in error)) fail(503, error.message); throw error; }
+          fail(404, 'API endpoint not found.');
         }
         const projectRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)$/.exec(path);
         if (projectRoute && method === 'PATCH') {
@@ -2208,8 +2221,12 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   // What changed only in memory (render progress, a held-back progress value) is saved on the way out,
   // first thing, in case Windows ends the process before the slower shutdown steps finish.
   const saveBeforeExit = () => { try { flushProgress(); if (store.dirty(state)) persist(); } catch (error) { console.error('Could not save the workspace on shutdown:', error); } };
-  return { server, dataDir, async close() {
-    closed = true; saveBeforeExit();
+  const remoteUrl = options.remote ?? process.env.FRAME_LINE_REMOTE;
+  const remote = remoteUrl ? remoteSync({ dataDir, state: () => state, revision: () => revision, updateAsset, originalPath, prepare: id => processAsset(id),
+    write: next => { if (closed) fail(503, 'The server is stopping.'); const previous = state; try { validateRelations(next); state = next; persist(); } catch (error) { state = previous; throw error; } },
+    dropFiles: id => { aborters.get(id)?.abort(); void assetJobs(id).then(() => rmSync(mediaDir(id), { recursive: true, force: true })).catch(error => console.error('File cleanup failed:', error)); } }, { url: remoteUrl.replace(/\/$/, ''), everyMs: options.remoteEveryMs }) : undefined;
+  return { server, dataDir, remote, async close() {
+    closed = true; await remote?.close(); saveBeforeExit();
     // Abort everything before awaiting anything: a job queued for the GPU or a heavy slot behind work that is only
     // aborted later would otherwise hold the shutdown (and frameline.lock) for the rest of a long depth run.
     const services = [masks.close(), depth.close(), denoise.close(), motionTrackers.close(), colorAssistant.close(), colorNormalize.close()];

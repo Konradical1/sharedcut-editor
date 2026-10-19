@@ -192,6 +192,10 @@ input.dash-switch[type=checkbox] { appearance: none; padding: 0; cursor: pointer
 .dash-deleted > div > span { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .dash-deleted strong { color: #dfe5e1; font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dash-deleted small { font-size: 10px; color: #848f88; }
+.dash-remote form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 10px 8px 13px; border: 1px solid #2d3830; border-radius: 7px; background: #161a18; color: #7f8a83; }
+.dash-remote form > span { flex: 1 1 200px; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.dash-remote form .input { width: 170px; }
+.dash-remote-actions { display: flex; gap: 6px; }
 /* Account entry is intentionally a clearly labeled local demonstration. */
 .auth-screen { height: 100%; min-height: 0; overflow: auto; overscroll-behavior: contain; display: grid; grid-template-columns: 1fr 1fr; background: #141917; }
 .auth-art { position: relative; min-height: 100%; background-size: cover; background-position: center; padding: 39px 44px; isolation: isolate; }

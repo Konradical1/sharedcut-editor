@@ -1,5 +1,6 @@
 // SharedCut Desktop. The app runs its own SharedCut server on this computer (bundled Node and FFmpeg, projects in
 // the app's data folder) and opens the editor on it, so new projects, imports, editing and exports need no connection.
+// Projects kept from sharedcut.com (FRAME_LINE_REMOTE, server/remoteSync.ts) stay live with it whenever it can be reached.
 import { app, BrowserWindow, Menu, Notification, dialog, nativeTheme, shell } from 'electron';
 import updater from 'electron-updater';
 import { spawn } from 'node:child_process';
@@ -26,7 +27,7 @@ function startServer() {
   const log = createWriteStream(logPath, { flags: 'a' });
   server = spawn(bin('node'), ['--experimental-strip-types', '--disable-warning=ExperimentalWarning', join('server', 'index.ts')], {
     cwd: join(resources, 'app'), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
-    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', FRAME_LINE_DATA: dataDir, FRAME_LINE_STOP_WITH_STDIN: '1', FFMPEG_PATH: bin('ffmpeg'), FFPROBE_PATH: bin('ffprobe') },
+    env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', FRAME_LINE_DATA: dataDir, FRAME_LINE_STOP_WITH_STDIN: '1', FRAME_LINE_REMOTE: process.env.SHAREDCUT_REMOTE || 'https://sharedcut.com', FFMPEG_PATH: bin('ffmpeg'), FFPROBE_PATH: bin('ffprobe') },
   });
   server.stdout.pipe(log); server.stderr.pipe(log);
   server.on('exit', code => {

@@ -10,6 +10,8 @@ process.env.FRAME_LINE_URL = 'http://fake.local';
 process.env.FRAME_LINE_COOKIE = 'frameline_session=test';
 let saved: any = structuredClone(persistentState(store.getState()));
 let revision = 1;
+// SharedCut Desktop's /api/remote: signed in to sharedcut.com, one project there not kept yet.
+let remoteLink: { user: { email: string }; online: boolean; projects: { id: string; name: string; kept: boolean; status?: string; uploading: number; downloading: number }[] } = { user: { email: 'konrad@example.com' }, online: true, projects: [{ id: 'trip-1', name: 'Konrad Trip', kept: false, uploading: 0, downloading: 0 }] };
 const deleted: any[] = [], calls: { method: string; path: string; body?: any }[] = [];
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 const project = (id: string) => saved.projects.find((p: any) => p.id === id);
@@ -22,6 +24,9 @@ globalThis.fetch = (async (input: string, init: RequestInit = {}) => {
   if (path === '/api/state' && method === 'PATCH') { saved = applyStateDelta(saved, body.delta); return json({ revision: ++revision }); }
   if (path === '/api/library') return json({ revision: 1, folders: [], locations: {}, directMembers: Object.fromEntries(saved.projects.map((p: any) => [p.id, p.members])) });
   if (path === '/api/projects/deleted') return json({ projects: deleted.map(p => ({ id: p.id, name: p.name, expiresAt: Date.parse('2026-10-12T10:00:00Z') })) });
+  if (path === '/api/remote') return json(remoteLink);
+  const keep = /^\/api\/remote\/projects\/([\w-]+)$/.exec(path);
+  if (keep) { remoteLink.projects = remoteLink.projects.map(p => p.id === keep[1] ? { ...p, kept: method === 'PUT', status: method === 'PUT' ? 'synced' : undefined } : p); return json(remoteLink); }
   const restore = /^\/api\/projects\/([\w-]+)\/restore$/.exec(path);
   if (restore) { const i = deleted.findIndex(p => p.id === restore[1]); saved.projects.push(...deleted.splice(i, 1)); revision++; return json({ projectId: restore[1] }); }
   const member = /^\/api\/projects\/([\w-]+)\/members\/([\w-]+)$/.exec(path);
@@ -127,4 +132,12 @@ test('lock-project locks with a note and unlocks', async () => {
   const open = await run('lock-project', { ...T, unlock: true });
   assert.deepEqual(last(), { method: 'DELETE', path: '/api/projects/above-the-treeline/lock', body: undefined });
   assert.doesNotMatch(open, /locked/);
+});
+
+test('keep-offline keeps a sharedcut.com project on this computer, lists what is kept and stops', async () => {
+  assert.match(await run('keep-offline', { project: 'Konrad Trip' }), /"Konrad Trip" synced/);
+  assert.deepEqual(last(), { method: 'PUT', path: '/api/remote/projects/trip-1', body: undefined });
+  assert.match(await run('keep-offline', {}), /^konrad@example\.com\n.*"Konrad Trip" synced$/);
+  assert.match(await run('keep-offline', { project: 'trip-1', stop: true }), /only online/);
+  assert.equal(last().method, 'DELETE');
 });

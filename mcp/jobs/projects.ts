@@ -121,6 +121,21 @@ export const jobs: Record<string, JobDef> = {
       return done(describe(fresh(p.id) ?? p));
     },
   },
+  'keep-offline': {
+    doc: '{project?, stop?:true} SharedCut Desktop only: keep a sharedcut.com project (name or id) on this computer, live online, merged after offline edits; no project = what is kept',
+    async start(params) {
+      type Kept = { id: string; name: string; kept: boolean; status?: string; error?: string; uploading: number; downloading: number };
+      const link = await call<{ user: { email: string } | null; online: boolean; projects: Kept[] }>('/remote').catch(() => { throw new Error('Only SharedCut Desktop syncs with sharedcut.com; this server does not.'); });
+      if (!link.user) throw new Error('Sign in to sharedcut.com first: the Projects screen of SharedCut Desktop.');
+      const line = (p: Kept) => `${handle(p.id)} ${quote(p.name)} ${p.kept ? p.error ?? p.status ?? 'syncing' : 'only online'}${p.uploading ? ` · ${p.uploading} up` : ''}${p.downloading ? ` · ${p.downloading} down` : ''}`;
+      if (params.project === undefined) return done([`${link.user.email}${link.online ? '' : ' (offline)'}`, ...link.projects.filter(p => p.kept).map(line)].join('\n'));
+      const want = String(params.project).replace(/^@/, ''), low = want.toLowerCase();
+      const hits = link.projects.filter(p => p.id === want || handle(p.id).slice(1) === want || p.name.toLowerCase() === low);
+      if (hits.length !== 1) throw new Error(hits.length ? `"${want}" matches ${hits.length} projects; use the code.` : `No sharedcut.com project "${want}".`);
+      const after = await direct<{ projects: Kept[] }>(`/remote/projects/${encodeURIComponent(hits[0].id)}`, { method: params.stop === true ? 'DELETE' : 'PUT' });
+      return done(line(after.projects.find(p => p.id === hits[0].id) ?? hits[0]));
+    },
+  },
   'restore-project': {
     doc: '{id?} no id = your deleted projects (7 days); id (code or name) restores one, media included',
     async start(params) {
