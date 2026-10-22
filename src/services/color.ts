@@ -2,11 +2,15 @@ import { nodeMaskId, validateNodeMask } from './smartMask.ts';
 import type { Clip, GradeNode, MediaAsset, ColorCurve, ColorEffect, ColorTransformEffect } from '../state/models.ts';
 import { acesMatrices } from './aces.generated.ts';
 import { gradeValues } from './grade.ts';
+import { identityCurve, curveSlope, sampleCurve, tonal, chroma, hslCurves, mixer, qualifierAlpha, hasWindow, hasQualifier, filmActive, filmParams, validateGradeParameters, V3_KEYS, CURVE_KEYS, HUE_CURVES } from './grading.ts';
+export { identityCurve, curveSlope, sampleCurve };
 
 export const profiles = ['Rec.709', 'S-Log3', 'Canon Log', 'Canon Log 2', 'Canon Log 3', 'S-Log2', 'S-Log', 'DaVinci Intermediate', 'Linear', 'Gamma 2.4'] as const;
 export const gamuts = ['Rec.709', 'S-Gamut3.Cine', 'S-Gamut3', 'Cinema Gamut', 'Rec.2020', 'DaVinci Wide Gamut', 'S-Gamut'] as const;
 export type Cube = { size: number; data: Float32Array; min: number[]; max: number[] };
 const clamp = (v: number, min = 0, max = 1) => Math.max(min, Math.min(max, v));
+/** Legacy (Gamma 2.4 / Rec.709) nodes grade on these luma weights. */
+const W709 = [.2126, .7152, .0722];
 
 /** Normalized full-range RGB after YCbCr decoding (v = code/1023). Canon curves are IRE formulas; Canon places 0 IRE at code 64 and 100 IRE at 940 in every container, so black sits at 128/1023 (ACES IDT convention), reflection scale. */
 export function decodeLog(v: number, profile: string): number {
@@ -109,11 +113,12 @@ export function rangeSaturation(rgb:number[],weights:number[],p:Record<string,nu
 export function colorStages(clip: Clip, nodes: GradeNode[]) {
   const enabled=nodes.filter(n=>n.enabled && n.clipId===clip.id).sort((a,b)=>(a.order??0)-(b.order??0));
   return enabled.map(node=>{
-    const extra=Object.fromEntries(Object.entries(node.parameters).filter(([k])=>/^(lift|gamma|gain|offset)[RGB]$|^curve(25|50|75)$|^saturation(Shadows|Midtones|Highlights)$/.test(k)));
+    const extra=Object.fromEntries(Object.entries(node.parameters).filter(([k])=>/^(lift|gamma|gain|offset)[RGB]$|^curve(25|50|75)$|^saturation(Shadows|Midtones|Highlights)$/.test(k)||V3_KEYS.has(k)));
     const g=gradeValues([{...node,parameters:Object.fromEntries(Object.entries(node.parameters).filter(([k])=>!(k in extra)))}]);
     const limits:Record<string,number>={exposure:16,contrast:8,pivot:2,saturation:4,temperature:10000,tint:200,lift:4,gamma:8,gain:8,offset:4};
     for(const [k,v] of Object.entries(g))if(!Number.isFinite(v)||Math.abs(v)>limits[k])throw new Error(`${node.name}: ${k} is outside the supported range.`);
-    for(const [k,v] of Object.entries(extra)){const [min,max]=k.startsWith('curve')?[0,1]:k.startsWith('saturation')?[0,400]:[-2,2];if(!Number.isFinite(v)||v<min||v>max)throw new Error(`${node.name}: ${k} is outside the supported range.`);}
+    validateGradeParameters(node.name,extra);
+    for(const [k,v] of Object.entries(extra)){if(V3_KEYS.has(k))continue;const [min,max]=k.startsWith('curve')?[0,1]:k.startsWith('saturation')?[0,400]:[-2,2];if(!Number.isFinite(v)||v<min||v>max)throw new Error(`${node.name}: ${k} is outside the supported range.`);}
     return {g,extra,node};
   });
 }
@@ -128,21 +133,23 @@ export function colorTransform(clip: Clip, asset: MediaAsset | undefined, nodes:
     if(stops||temperature)rgb=rgb.map((v,c)=>encodeLog(decodeLog(v,profile)*2**stops*[1+temperature/10000,1,1-temperature/10000][c],profile));
     // Ungraded footage is shown as recorded, log included; a grade or an imported look does the converting.
     if(base && clip.properties.bypassResolveLook!==true) rgb=sampleCube(base,rgb);
-    let nodeInput=rgb;
+    let nodeInput=rgb,keyed=1;
     for(const stage of stages) {
-      if(stage.nodeStart)nodeInput=rgb;
+      if(stage.type==='film')continue;
+      if(stage.nodeStart){nodeInput=rgb;keyed=stage.type==='correction'?qualifierAlpha(rgb,W709,stage.extra):1;}
       if(stage.type==='cst'){rgb=transformSpace(rgb,stage.effect);continue;}
-      if(stage.type==='lut'){rgb=blendNode(applyLut(rgb,stage.effect),nodeInput,stage,maskAt);continue;}
+      if(stage.type==='lut'){rgb=blendNode(applyLut(rgb,stage.effect),nodeInput,stage,maskAt,keyed);continue;}
       const {g,extra:p,node}=stage;
       rgb=rgb.map((value,c)=>{
         const channel='RGB'[c], v=Math.max(0,value*2**g.exposure);
         return Math.max(0,(v-g.pivot)*g.contrast+g.pivot+g.offset+(p['offset'+channel]??0))**(1/2**(g.gamma+(p['gamma'+channel]??0)))*(g.gain+(p['gain'+channel]??0))+(g.lift+(p['lift'+channel]??0))*(1-Math.min(1,v));
       });
+      rgb=tonal(rgb,W709,p,g.pivot);
       const y=.2126*rgb[0]+.7152*rgb[1]+.0722*rgb[2], warm=clamp(g.temperature/10000,-.5,.5), tint=clamp(g.tint/200,-.5,.5);
-      rgb=rangeSaturation(rgb.map(v=>y+(v-y)*g.saturation),[.2126,.7152,.0722],p).map((v,c)=>v*[1+warm,1-tint,1-warm][c]);
+      rgb=chroma(rangeSaturation(rgb.map(v=>y+(v-y)*g.saturation),W709,p),W709,p).map((v,c)=>v*[1+warm,1-tint,1-warm][c]);
       if(node.curves)rgb=applyCurves(rgb,node);
       else if(Object.keys(p).some(k=>k.startsWith('curve'))) rgb=rgb.map(v=>curveValue(v,p));
-      rgb=blendNode(rgb,nodeInput,stage,maskAt);
+      rgb=blendNode(mixer(hslCurves(rgb,W709,node.curves),p),nodeInput,stage,maskAt,keyed);
     }
     return rgb.map(v=>clamp(v));
   };
@@ -211,26 +218,10 @@ export function acesOutputUpgrade(clip:Clip,nodes:GradeNode[]):{node:GradeNode;e
   const node=[...own].reverse().find(n=>n.enabled&&n.effects?.some(unmapped));
   return node&&{node,effects:node.effects!.map(e=>unmapped(e)?{...e,toneMapping:'aces2' as const,gamutMapping:'none' as const}:e)};
 }
-export function identityCurve():ColorCurve{return {mode:'smooth',points:[{id:'black',x:0,y:0},{id:'white',x:1,y:1}]};}
-export function curveSlope(curve:ColorCurve,i:number){
-  const points=curve.points,p=points[i];if(p.slope!==undefined)return p.slope;
-  const sec=(a:number,b:number)=>(points[b].y-points[a].y)/(points[b].x-points[a].x);
-  if(i===0)return sec(0,1);if(i===points.length-1)return sec(i-1,i);
-  const a=sec(i-1,i),b=sec(i,i+1);return a*b<=0?0:2*a*b/(a+b);
-}
-export function sampleCurve(v:number,curve:ColorCurve){
-  const p=curve.points,first=p[0],last=p[p.length-1];
-  // Extrapolate rather than destroying working-space highlight/negative values.
-  if(v<first.x)return first.y+(v-first.x)*curveSlope(curve,0);
-  if(v>last.x)return last.y+(v-last.x)*curveSlope(curve,p.length-1);
-  const i=Math.max(0,p.findIndex((point,index)=>index<p.length-1&&v<=p[index+1].x));
-  const a=p[i],b=p[i+1],h=b.x-a.x,t=(v-a.x)/h;
-  if(curve.mode==='linear')return a.y+(b.y-a.y)*t;
-  return (2*t**3-3*t*t+1)*a.y+(t**3-2*t*t+t)*h*curveSlope(curve,i)+(-2*t**3+3*t*t)*b.y+(t**3-t*t)*h*curveSlope(curve,i+1);
-}
 function applyCurves(rgb:number[],node:GradeNode){return rgb.map((v,c)=>{const master=node.curves?.RGB,channel=node.curves?.[['R','G','B'][c] as 'R'];return channel?sampleCurve(master?sampleCurve(v,master):v,channel):master?sampleCurve(v,master):v;});}
 export function validateGradeNode(node:Partial<GradeNode>){
   if(node.mask){validateNodeMask(node.mask);if(node.mask.enabled&&node.effects?.some(e=>e.enabled&&e.type==='cst'))throw Error('Keep color-space transforms on an unmasked node.');}
+  if((hasWindow(node.parameters)||hasQualifier(node.parameters))&&node.effects?.some(e=>e.enabled&&e.type==='cst'))throw Error('Keep color-space transforms on a node without windows or a qualifier.');
   const finite=(v:unknown,min=-1e4,max=1e4)=>typeof v==='number'&&Number.isFinite(v)&&v>=min&&v<=max;
   if(node.position&&(!finite(node.position.x,-1e5,1e5)||!finite(node.position.y,-1e5,1e5)))throw Error('Invalid node position.');
   if(node.order!==undefined&&!finite(node.order,-1e6,1e6))throw Error('Invalid node order.');
@@ -239,10 +230,12 @@ export function validateGradeNode(node:Partial<GradeNode>){
   if(node.curves!==undefined){
     if(!node.curves||typeof node.curves!=='object'||Array.isArray(node.curves))throw Error('Invalid curves.');
     for(const [key,curve]of Object.entries(node.curves)){
-      if(!['RGB','R','G','B'].includes(key)||!curve||!['smooth','linear'].includes(curve.mode)||!Array.isArray(curve.points)||curve.points.length<2||curve.points.length>64)throw Error('Use 2–64 points per curve.');
+      if(!CURVE_KEYS.includes(key))throw Error(`Unknown curve "${key}": use ${CURVE_KEYS.join(', ')}.`);
+      if(!curve||!['smooth','linear'].includes(curve.mode)||!Array.isArray(curve.points)||curve.points.length<2||curve.points.length>64)throw Error('Use 2–64 points per curve.');
       const ids=new Set<string>();
       curve.points.forEach((p,i)=>{if(!p||typeof p.id!=='string'||!p.id.length||p.id.length>100||ids.has(p.id)||!finite(p.x,0,1)||!finite(p.y,0,1)||i>0&&p.x-curve.points[i-1].x<.0001||p.slope!==undefined&&!finite(p.slope,-20,20))throw Error('Invalid curve point.');ids.add(p.id);});
       if(curve.points[0].x!==0||curve.points.at(-1)!.x!==1)throw Error('Curve endpoints must stay at 0 and 1.');
+      if(HUE_CURVES.includes(key)&&Math.abs(curve.points[0].y-curve.points.at(-1)!.y)>1e-6)throw Error('A hue curve wraps around: its last point must have the same y as its first.');
     }
   }
   if(node.effects!==undefined){
@@ -277,47 +270,63 @@ export function transformSpace(rgb:number[],effect:ColorTransformEffect,matrix=g
 function applyLut(rgb:number[],e:Extract<ColorEffect,{type:'lut'}>){const out=sampleCube({...e.cube,data:e.cube.data as unknown as Float32Array},rgb);return rgb.map((v,c)=>v+(out[c]-v)*e.amount);}
 export function processingStages(clip:Clip,nodes:GradeNode[]){
   type Correction=ReturnType<typeof colorStages>[number]&{type:'correction';gamma:string;gamut:string;weights:number[]};
-  type Stage=Correction|{type:'cst';node:GradeNode;effect:ColorTransformEffect;matrix:number[][];weights:number[]}|{type:'lut';node:GradeNode;effect:Extract<ColorEffect,{type:'lut'}>};
-  const stages:Stage[]=[];let gamma=String(clip.properties.inputProfile||'Gamma 2.4'),gamut=String(clip.properties.inputGamut||'Rec.709');
-  if(clip.properties.colorPipeline!=='nodes-v2'){gamma='Gamma 2.4';gamut='Rec.709';}
+  /** Film runs on whole frames after its node's blend (docs/color-grading-v3.md); `p` holds every film key. */
+  type Film={type:'film';node:GradeNode;p:Record<string,number>;gamma:string;gamut:string;weights:number[]};
+  type Stage=Correction|{type:'cst';node:GradeNode;effect:ColorTransformEffect;matrix:number[][];weights:number[]}|{type:'lut';node:GradeNode;effect:Extract<ColorEffect,{type:'lut'}>}|Film;
+  const stages:Stage[]=[],managed=clip.properties.colorPipeline==='nodes-v2';let gamma=String(clip.properties.inputProfile||'Gamma 2.4'),gamut=String(clip.properties.inputGamut||'Rec.709');
+  if(!managed){gamma='Gamma 2.4';gamut='Rec.709';}
+  const weightsOf=(name:string)=>managed?luminanceWeights(name):W709;
   for(const correction of colorStages(clip,nodes)){
     validateGradeNode(correction.node);
-    stages.push({...correction,type:'correction',gamma,gamut,weights:luminanceWeights(gamut)});
+    stages.push({...correction,type:'correction',gamma,gamut,weights:weightsOf(gamut)});
     for(const effect of correction.node.effects??[]){if(!effect.enabled)continue;
       if(effect.type==='cst'){stages.push({type:'cst',node:correction.node,effect,matrix:hasACES(nodes,clip.id)?acesGamutMatrix(effect.inputGamut,effect.outputGamut):gamutMatrix(effect.inputGamut,effect.outputGamut),weights:luminanceWeights(effect.outputGamut)});gamma=effect.outputGamma;gamut=effect.outputGamut;}
       else stages.push({type:'lut',node:correction.node,effect});
     }
+    if(filmActive(correction.node.parameters))stages.push({type:'film',node:correction.node,p:filmParams(correction.node.parameters),gamma,gamut,weights:weightsOf(gamut)});
   }
   if(stages.some(s=>s.type==='cst'&&s.effect.toneMapping==='aces2')){
     if(clip.properties.colorPipeline!=='nodes-v2')throw Error('Start a wide-gamut grade before using ACES output.');
     if(gamma!=='Gamma 2.4'||gamut!=='Rec.709')throw Error('ACES SDR output must finish in Rec.709 / Gamma 2.4.');
     if(stages.filter(s=>s.type==='cst'&&s.effect.toneMapping==='aces2').length>1)throw Error('Use one ACES output transform per grade.');
   }
-  return stages.map((stage,i)=>({...stage,nodeStart:i===0||stages[i-1].node!==stage.node,nodeEnd:i===stages.length-1||stages[i+1].node!==stage.node}));
+  // A node's start and end ignore its film stage: the blend comes before film, and film never restarts a node.
+  const graded=stages.filter(s=>s.type!=='film');
+  return stages.map(stage=>{if(stage.type==='film')return {...stage,nodeStart:false,nodeEnd:false};const i=graded.indexOf(stage);return {...stage,nodeStart:i===0||graded[i-1].node!==stage.node,nodeEnd:i===graded.length-1||graded[i+1].node!==stage.node};});
 }
-function blendNode(rgb:number[],input:number[],stage:{node:GradeNode;nodeEnd:boolean},maskAt?: (id:string)=>number){
-  const mask=stage.node.mask;if(!stage.nodeEnd||!mask?.enabled)return rgb;
-  if(!mask.amount)return input;
-  if(!maskAt)throw Error('A spatial node mask requires per-pixel alpha; it cannot be baked into an RGB LUT.');
-  const alpha=maskAt(nodeMaskId(stage.node)!);if(!Number.isFinite(alpha))throw Error('Invalid spatial mask alpha.');
-  const amount=(mask.invert?1-clamp(alpha):clamp(alpha))*mask.amount/100;
+/** The node's output blended over its input by mask × windows × qualifier (`keyed`, from the node input). */
+function blendNode(rgb:number[],input:number[],stage:{node:GradeNode;nodeEnd:boolean},maskAt?: (id:string)=>number,keyed=1){
+  const node=stage.node,mask=node.mask,windows=hasWindow(node.parameters);if(!stage.nodeEnd||!mask?.enabled&&!windows&&keyed===1)return rgb;
+  let amount=keyed;
+  if(mask?.enabled){
+    if(!mask.amount)return input;
+    if(!maskAt)throw Error('A spatial node mask requires per-pixel alpha; it cannot be baked into an RGB LUT.');
+    const alpha=maskAt(nodeMaskId(node)!);if(!Number.isFinite(alpha))throw Error('Invalid spatial mask alpha.');
+    amount*=(mask.invert?1-clamp(alpha):clamp(alpha))*mask.amount/100;
+  }
+  if(windows){
+    if(!maskAt)throw Error('A window needs pixel positions; it cannot be baked into an RGB LUT.');
+    const alpha=maskAt(`window:${node.id}`);if(!Number.isFinite(alpha))throw Error('Invalid window alpha.');amount*=clamp(alpha);
+  }
   return input.map((v,c)=>v+(rgb[c]-v)*amount);
 }
 function managedColorTransform(clip:Clip,asset:MediaAsset|undefined,nodes:GradeNode[],maskAt?: (id:string)=>number){
   const source=interpretation(clip,asset),stages=processingStages({...clip,properties:{...clip.properties,inputProfile:source.profile,inputGamut:source.gamut}},nodes);
   return(input:number[])=>{
-    let rgb=input,nodeInput=input;
+    let rgb=input,nodeInput=input,keyed=1;
     for(const stage of stages){
-      if(stage.nodeStart)nodeInput=rgb;
+      if(stage.type==='film')continue;
+      if(stage.nodeStart){nodeInput=rgb;keyed=stage.type==='correction'?qualifierAlpha(rgb,stage.weights,stage.extra):1;}
       if(stage.type==='cst'){rgb=transformSpace(rgb,stage.effect,stage.matrix,stage.weights);continue;}
-      if(stage.type==='lut'){rgb=blendNode(applyLut(rgb,stage.effect),nodeInput,stage,maskAt);continue;}
-      const {g,extra:p,node,gamma,gamut}=stage;
+      if(stage.type==='lut'){rgb=blendNode(applyLut(rgb,stage.effect),nodeInput,stage,maskAt,keyed);continue;}
+      const {g,extra:p,node,gamma}=stage,w=stage.weights;
       if(g.exposure||g.temperature||g.tint)rgb=rgb.map((v,c)=>encodeLog(decodeLog(v,gamma)*2**g.exposure*[1+g.temperature/10000,1-g.tint/200,1-g.temperature/10000][c],gamma));
       rgb=rgb.map((v,c)=>{const ch='RGB'[c],x=(v-g.pivot)*g.contrast+g.pivot+g.offset+(p['offset'+ch]??0);return Math.sign(x)*Math.abs(x)**(1/2**(g.gamma+(p['gamma'+ch]??0)))*(g.gain+(p['gain'+ch]??0))+(g.lift+(p['lift'+ch]??0))*(1-v);});
-      const y=multiply([stage.weights],rgb)[0];rgb=rangeSaturation(rgb.map(v=>y+(v-y)*g.saturation),stage.weights,p);
+      rgb=tonal(rgb,w,p,g.pivot);
+      const y=multiply([w],rgb)[0];rgb=chroma(rangeSaturation(rgb.map(v=>y+(v-y)*g.saturation),w,p),w,p);
       if(node.curves)rgb=applyCurves(rgb,node);
       else if(Object.keys(p).some(k=>k.startsWith('curve')))rgb=rgb.map(v=>curveValue(v,p));
-      rgb=blendNode(rgb,nodeInput,stage,maskAt);
+      rgb=blendNode(mixer(hslCurves(rgb,w,node.curves),p),nodeInput,stage,maskAt,keyed);
     }
     return rgb.map(v=>clamp(v));
   };

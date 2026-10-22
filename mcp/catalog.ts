@@ -41,7 +41,7 @@ export const ACTIONS: Record<string, 'edit' | 'context' | 'hidden' | `job:${stri
   addEffect: 'edit', updateEffect: 'edit', reorderEffect: 'edit', denoiseAll: 'job:denoise-all', addNode: 'edit', removeNode: 'edit', reorderNode: 'edit',
   copyGrade: 'context', pasteGrade: 'edit', applyColorAssistant: 'edit', useAcesOutput: 'edit',
   normalizeColorGroup: 'edit', setColorGroup: 'edit', updateColorGroup: 'edit', renameColorGroup: 'edit',
-  restoreResolveGrade: 'edit', initializeColorGrade: 'edit', arrangeColorNodes: 'edit', moveColorNode: 'edit', updateNode: 'edit',
+  restoreResolveGrade: 'edit', initializeColorGrade: 'edit', arrangeColorNodes: 'edit', moveColorNode: 'edit', updateNode: 'edit', applyColorLook: 'edit',
   // applyGrade is the old rule-based path with no UI caller: it appends nodes after the Output CST.
   applyGrade: 'hidden',
   undo: 'edit', redo: 'edit', saveSnapshot: 'edit', restoreSnapshot: 'edit',

@@ -31,7 +31,7 @@ export interface Keyframe { id: string; time: number; value: KeyframeValue; inte
 export interface Clip { smartMasks?: import('../services/smartMask.ts').SmartMaskDocument[]; motionTrackers?: import('../services/motionTracker.ts').MotionTracker[]; keyframes?: Record<string, Keyframe[]>; id: string; projectId: string; timelineId: string; trackId: string; mediaId: string; name: string; start: number; duration: number; sourceIn: number; color: string; disabled: boolean; transition?: string; properties: Record<string, number | string | boolean>; effects: Effect[] }
 export interface CurvePoint { id: string; x: number; y: number; slope?: number }
 export interface ColorCurve { mode: "smooth" | "linear"; points: CurvePoint[] }
-export type ColorCurves = Partial<Record<"RGB" | "R" | "G" | "B", ColorCurve>>;
+export type ColorCurves = Partial<Record<"RGB" | "R" | "G" | "B" | "HueHue" | "HueSat" | "HueLum" | "LumSat" | "SatSat" | "SatLum", ColorCurve>>;
 export interface ColorTransformEffect { id: string; type: "cst"; enabled: boolean; inputGamma: string; inputGamut: string; outputGamma: string; outputGamut: string; toneMapping: "none" | "shoulder" | "aces2"; gamutMapping: "none" | "compress" }
 export interface ColorLutEffect { id: string; type: "lut"; enabled: boolean; name: string; amount: number; inputGamma: string; inputGamut: string; cube: {size: number; data: number[]; min: number[]; max: number[]} }
 export type ColorEffect = ColorTransformEffect | ColorLutEffect;

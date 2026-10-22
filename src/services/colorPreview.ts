@@ -280,7 +280,7 @@ export function packStages(clip:Clip,stages:ReturnType<typeof processingStages>,
       stage.matrix.forEach((r,j)=>data.set([...r,j===0&&e.gamutMapping==='compress'?1:0],row+32+j*4));data.set(luminanceWeights(e.outputGamut),row+44);
     }else if(stage.type==='lut'){
       const e=stage.effect;data.set([lutOffset,e.cube.size,e.amount,0,...e.cube.min,0,...e.cube.max,0],row);data[row+28]=2;lutOffset+=e.cube.size**3;lutEffects.push(stage);
-    }else{
+    }else if(stage.type==='correction'){
       const {g,extra:p,node}=stage;
       data.set([(p.saturationShadows??100)/100-1,(p.saturationMidtones??100)/100-1,(p.saturationHighlights??100)/100-1],row+32);
       data.set([g.exposure,g.contrast,g.pivot,g.saturation,g.lift,g.gamma,g.gain,g.offset,p.gammaR??0,p.gammaG??0,p.gammaB??0,clip.properties.colorPipeline==='nodes-v2'?g.temperature/10000:Math.max(-.5,Math.min(.5,g.temperature/10000)),p.gainR??0,p.gainG??0,p.gainB??0,clip.properties.colorPipeline==='nodes-v2'?g.tint/200:Math.max(-.5,Math.min(.5,g.tint/200)),p.offsetR??0,p.offsetG??0,p.offsetB??0,0,p.liftR??0,p.liftG??0,p.liftB??0,0,p.curve25??.25,p.curve50??.5,p.curve75??.75,node.curves?2:Object.keys(p).some(k=>k.startsWith('curve'))?1:0,0,profiles.indexOf(stage.gamma as typeof profiles[number]),0,0],row);

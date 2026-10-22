@@ -1,6 +1,7 @@
 import { createSmartMask, isDepthKey, validateSmartMask, smartMaskSignature, type SmartMaskDocument } from '../services/smartMask.ts';
 import { createMotionTracker, MAX_TRACKERS, validateMotionTracker, type MotionTracker, type MotionTrackerLink } from '../services/motionTracker.ts';
 import { primaryDefaults, interpretation, validateGradeNode, acesOutputUpgrade } from '../services/color.ts';
+import { lookPatch, neutralValue } from '../services/colorPresets.ts';
 import { eligibility, findGradeNodes, proposedNodes, type AssistantMode, type BalanceValues, type LookOption, type ShotNote } from '../services/colorAssistant.ts';
 import { colorGroupOf, colorGroups, GROUP_ID, groupNodeOf, groupTemplate, isGroupNode, nextGroupName, normalizedGrade, validAutoBalance, type GroupTemplate, type NormalizeResult } from '../services/colorGroups.ts';
 import { captionDocument, captionPreset, groupCaptionWords, isCaption, restyleCaption, validateCaption, type CaptionJob, type CaptionSet, type CaptionWord } from '../services/captions.ts';
@@ -154,6 +155,8 @@ export interface EditorStore extends PersistedState {
   useAcesOutput(clipId:string):void;
   restoreResolveGrade(clipId:string):void; initializeColorGrade(clipId:string):void; arrangeColorNodes(clipId:string):void; moveColorNode(id:string,beforeId:string|null,position?:{x:number;y:number}):void;
   updateNode(id: string, patch: Partial<GradeNode>, gesture?: string): void; applyGrade(nodes: { name: string; parameters: Record<string, number> }[]): void;
+  /** Puts a library look (services/colorPresets.ts COLOR_LOOKS: id, 0–1 strength) on a grade node: replaces its primaries, wheels, log wheels, mixer and curves, and its film settings when the look has film; exposure, white balance, windows, qualifier, mask and effects stay. One undo step. */
+  applyColorLook(nodeId: string, lookId: string, strength?: number): void;
   /** Takes back your most recent edit in this project (never a collaborator's). */
   undo(): void;
   /** Re-applies your most recent undo; any new edit of yours clears what can be redone. */
@@ -1862,6 +1865,14 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const keyframes={...clip.keyframes};
       for(const [field,next] of Object.entries(value))if(keyframes[`nodes.${id}.${field}`]) { const fps=get().projects.find(p=>p.id===clip.projectId)?.fps||24,time=frameTime(clamp(get().playhead-clip.start,0,clip.duration-1/fps),fps),path=`nodes.${id}.${field}`;keyframes[path]=[...keyframes[path].filter(k=>Math.abs(k.time-time)>.5/fps),{id:createId('key'),time,value:next as KeyframeValue,interpolation:typeof next==='number'?'linear' as const:'hold' as const}].sort((a,b)=>a.time-b.time);delete value[field]; }
       if (Object.keys(value).length || unset.length || JSON.stringify(keyframes)!==JSON.stringify(clip.keyframes??{})) commit('GradeNodeChanged', id, `adjusted ${node.name}`, [{ collection: 'nodes', id, value,unset },...(clip.keyframes?[{collection:'clips' as const,id:clip.id,value:{keyframes}}]:[])], gesture);
+    },
+    applyColorLook(nodeId, lookId, strength = 1) {
+      const state = get(), node = state.nodes.find(n => n.id === nodeId && n.projectId === state.projectId), clip = node && state.clips.find(c => c.id === node.clipId);
+      if (!node || !clip) return;
+      let look: ReturnType<typeof lookPatch>;
+      try { look = lookPatch(lookId, strength, clip.properties.colorPipeline === 'nodes-v2'); } catch (error) { state.notify((error as Error).message, 'error'); return; }
+      const reset = Object.fromEntries(Object.keys(node.parameters).filter(look.replaces).map(key => [key, neutralValue(key)]));
+      state.updateNode(nodeId, { parameters: { ...reset, ...look.parameters }, curves: look.curves });
     },
     applyGrade(proposal) {
       const state = get(); if (!state.selectedClipId || !editableClip(state.selectedClipId, 'grade')) return;
