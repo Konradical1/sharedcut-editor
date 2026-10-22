@@ -389,6 +389,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
   const fontsChanged = () => { dirty = true; textDocuments = new WeakMap(); };
   const scopeRequested = () => { dirty = true; };
   window.addEventListener('frameline:request-scope',scopeRequested);
+  // The Color page key view (setColorView) changes the graded picture without touching the store.
+  window.addEventListener('frameline:color-view',scopeRequested);
   document.fonts.addEventListener('loadingdone', fontsChanged);
   const status = (value: PlaybackStatus) => { const key = JSON.stringify(value); if (key !== statusKey) { statusKey = key; onStatus(value); } };
   const cleanup = (decoder: Decoder) => {
@@ -1061,7 +1063,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         if(!denoised?.noise && (maskCount || nodes.length || clip.properties.resolveLookUrl || Number(clip.properties.inputExposure) || Number(clip.properties.inputTemperature) || clip.properties.yuvMatrix || clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto')) {
           color ??= createColorPreview(()=>{dirty=true;});
           const previewAsset=element?.src.includes('/files/')?{...asset,colorMatrix:'bt709'}:asset;
-          const result = color.draw(layer,clip,previewAsset,nodes,element,sampleTime=>loadMasks(element?sampleTime+offset:sourceTime(clip,time,asset.fps||24,asset.duration)),snapshot);
+          // Film grain on a picture without a source clock counts timeline frames from the clip's in point, as export does.
+          const result = color.draw(layer,clip,previewAsset,nodes,element,sampleTime=>loadMasks(element?sampleTime+offset:sourceTime(clip,time,asset.fps||24,asset.duration)),snapshot,asset.kind==='video'&&element?undefined:Math.round((clip.sourceIn+time-clip.start)*(project?.fps||24)));
           // The copy shown can lag the element (native path): the picture counters follow what was drawn, so re-stamp this layer's entry.
           if(element){const drawn=result.dataset.sourceTimestamp;sourceTimestamp=drawn?String(+drawn+offset):'';if(stampAt>=0)pictureStamps[stampAt]=`${clip.id}@${sourceTimestamp}`;}
           canvas.dataset.colorPrecision=result.dataset.colorPrecision??'8-bit RGB fallback';
@@ -1369,6 +1372,6 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       for (const decoder of decoders.values()) decoder.blocked = false;
       dirty = true;
     },
-    dispose() { disposed = true; for (const scrub of scrubs.values()) scrub.frames.dispose(); scrubs.clear(); timelinePreview.dispose();maskPreview.dispose();depthFrames.dispose();depthFx?.dispose();unsubscribeDepth();fittedMasks.clear();maskCuts.clear();motion?.dispose(); flowPreview.dispose(); stabilizePreview.dispose(); denoisePreview.dispose(); unsubscribeDenoise(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',scopeRequested); color?.dispose(); cancelAnimationFrame(frame); for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); } decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
+    dispose() { disposed = true; for (const scrub of scrubs.values()) scrub.frames.dispose(); scrubs.clear(); timelinePreview.dispose();maskPreview.dispose();depthFrames.dispose();depthFx?.dispose();unsubscribeDepth();fittedMasks.clear();maskCuts.clear();motion?.dispose(); flowPreview.dispose(); stabilizePreview.dispose(); denoisePreview.dispose(); unsubscribeDenoise(); document.fonts.removeEventListener('loadingdone', fontsChanged);window.removeEventListener('frameline:request-scope',scopeRequested);window.removeEventListener('frameline:color-view',scopeRequested); color?.dispose(); cancelAnimationFrame(frame); for (const [id, decoder] of decoders) { cleanup(decoder); footageCache.setDecoderStatus(id, decoder.url); } decoders.clear(); for(const entry of leaks.values()){entry.gain?.disconnect();entry.source?.disconnect();entry.element.pause();entry.element.removeAttribute('src');entry.element.load();}leaks.clear(); for(const group of groups.values()){group.audio.source?.disconnect();group.audio.filters.forEach(n=>n.disconnect());group.audio.analyser?.disconnect();group.audio.gain?.disconnect();group.audio.pan?.disconnect();}groups.clear(); if (audio) void audio.close(); },
   };
 }

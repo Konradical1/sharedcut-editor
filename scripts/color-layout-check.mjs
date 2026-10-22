@@ -60,12 +60,12 @@ try{
  assert.notEqual(await canvas.evaluate(el=>getComputedStyle(el).backgroundPosition),gridBefore);
  for(let i=0;i<8;i++){await page.mouse.move(box.x+anchor.x,box.y+anchor.y);await page.mouse.wheel(0,100);}
  await page.waitForTimeout(100);const spacing=await canvas.evaluate(el=>parseFloat(getComputedStyle(el).backgroundSize));assert.ok(spacing>=12&&spacing<=48,String(spacing));
- const wheel=page.getByRole('group',{name:'Lift color balance; use RGB fields for keyboard control'}),w=await wheel.boundingBox();
- await wheel.dblclick();const read=async()=>Number(await page.getByLabel('Lift R',{exact:true}).inputValue());
+ const wheel=page.getByRole('group',{name:'Shadows color balance; use RGB fields for keyboard control'}),w=await wheel.boundingBox();
+ await wheel.dblclick();const read=async()=>Number(await page.getByLabel('Shadows B',{exact:true}).inputValue());
  await page.mouse.move(w.x+w.width/2,w.y+w.height/2);await page.mouse.down();await page.mouse.move(w.x+w.width/2+20,w.y+w.height/2);const normal=await read();assert.ok(normal>0);
  await page.keyboard.down('Shift');await page.mouse.move(w.x+w.width/2+21,w.y+w.height/2);const fine=await read();assert.ok(Math.abs(fine-normal)<.002);
  await page.keyboard.up('Shift');await page.mouse.move(w.x+w.width/2+22,w.y+w.height/2);assert.ok(Math.abs(await read()-fine)<.003);await page.mouse.up();
  await page.keyboard.press('Control+z');assert.equal(await read(),0);
- await wheel.focus();await wheel.press('ArrowRight');assert.equal(await read(),.001);await wheel.press('Home');assert.equal(await read(),0);
+ await wheel.focus();await wheel.press('ArrowRight');assert.ok(await read()>0);await wheel.press('Home');assert.equal(await read(),0);
  await page.screenshot({path:join(out,'final.png')});assert.deepEqual(errors,[]);console.log('PASS fixed viewport, inspector, frame scrub, anchored zoom, adaptive panning grid, precise wheels and undo');
 }finally{await browser.close();await app.close();await rm(temp,{recursive:true,force:true});}

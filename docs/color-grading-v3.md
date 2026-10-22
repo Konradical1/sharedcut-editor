@@ -107,8 +107,9 @@ signal's own encoding (`gamma`/`gamut` of that point). `f` = source frame number
 2. Aberration: `s = .004·filmAberration/100`; red samples `c + (p − c)(1 + s)`, blue `c + (p − c)(1 − s)` (c = centre).
    The picture is resampled bilinearly (clamped) at `p − (ox/A, oy)` after the aberration scale.
 3. `lin = decode(rgb, gamma)`, `Y = w·lin`.
-4. Halation: `src = max(0, Y − .18·2^thrH)`, blurred with σ = `filmHalationRadius`% of H; `lin += filmHalation/100 · blur · tint`
-   where tint is the full-saturation HSV hue `filmHalationHue`, mixed toward white by `1 − filmHalationSat/100`, then scaled so `w·tint = 1`.
+4. Halation: `src = max(0, Y − .18·2^thrH)`, blurred with σ = `filmHalationRadius`% of H; `lin += .25·filmHalation/100 · blur · tint`
+   where tint is the full-value HSV hue `filmHalationHue` mixed toward white by `1 − filmHalationSat/100` (brightest channel 1).
+   Tuned on the Newspaper S-Log3 stage footage: luma-normalised tint at full strength drew neon outlines on bright skin.
 5. Bloom: `src = lin·max(0, Y − .18·2^thrB)/max(Y, 1e-4)`, σ = `filmBloomRadius`% of H;
    `lin += filmBloom/100 · .5 · blur · (1 + k, 1, 1 − k)`, `k = .3·filmBloomWarmth/100`. Both sources come from step 3's `lin`.
 6. Breath: `lin *= 2^(.08·filmBreath/100·(2n₁(f/3) − 1))`.

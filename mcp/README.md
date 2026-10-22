@@ -55,6 +55,7 @@ cd /tmp/sharedcut-mcp && git commit -am "SharedCut MCP <version>" && git push
 | `act` | run editor actions in order, saved as one batch (all or nothing) |
 | `job` | server work: uploads, captions, masks, depth, stabilize, noise reduction, tracking, color assistant, color normalize, exports, Resolve, sounds, fonts |
 | `job plan` | the Plan read (script lines, shots with their takes, board cards); `script-export` writes .docx/.fountain/.html, `script-import` reads Fountain |
+| `job color-*` | `color-grade` (a clip's nodes: wheels, windows, qualifier, HSL curves, mixer, film), `color-measure` (the graded frame as scope numbers against a reference picture, with hints naming the controls), `color-lut`, `color-looks`, `color-normalize`; the grading itself is `act` (`help color`) |
 | `frame` | a small picture of the timeline or a source frame |
 | `help` | catalogs: actions, effects, transitions, titles, shapes, color, properties, jobs… |
 | `api` | escape hatch to any `/api` endpoint |

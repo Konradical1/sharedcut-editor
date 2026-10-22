@@ -1,15 +1,19 @@
 // The color jobs against a fake SharedCut server (the Color Assistant needs OpenColorIO and an AI login, which a test
 // machine lacks): the real store and save loop run, only fetch is answered here. Walks grade view → assistant start,
-// poll, stills, apply → LUT add and rewrite, and the help topic generated from the app's own tables.
+// poll, stills, apply → LUT add and rewrite → the v3 tools in the grade view → color-measure on a stubbed /api/frames
+// picture against a reference PNG, a media item and another clip, and the help topic generated from the registry.
 import '../env.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createCanvas, loadImage } from '@napi-rs/canvas';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { useEditorStore as store, persistentState } from '../../src/state/store.ts';
 import { applyStateDelta } from '../../src/services/stateDelta.ts';
 import { neutralLook, type LookOption } from '../../src/services/colorAssistant.ts';
+import { GRADE_PARAMS } from '../../src/services/grading.ts';
+import { COLOR_LOOKS } from '../../src/services/colorPresets.ts';
 import type { PersistedState } from '../../src/services/index.ts';
 
 process.env.FRAME_LINE_URL = 'http://color.test';
@@ -41,6 +45,9 @@ const normalized = () => { const body = normalizePosted.at(-1); return { id: nor
   result: { shots: [...body.clipIds, ...(body.contextIds ?? [])].map((clipId: string) => ({ clipId, balance: phone ? { exposure: 0, temperature: 0, tint: 0, lift: 0, gamma: .5, gain: .8 } : { exposure: .3, temperature: -500, tint: 2, lift: -.01 }, confidence: .9, warnings: [{ code: 'clipping', text: 'sky' }],
     ...(clipId === stale && { input: { profile: 'Rec.709', gamut: 'Rec.709' } }) })), level: { group: .18, target: .18 } } }; };
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
+// /api/frames: the rendered frame (a timeline) or a file's own picture (mediaId); `refuse` answers as the server does for a frame it cannot render alone.
+const frames: Record<string, string>[] = [];
+let frameJpeg = Buffer.alloc(0), mediaJpeg = Buffer.alloc(0), refuse: { live: string; error: string } | null = null;
 globalThis.fetch = (async (input: string | URL, init: RequestInit = {}) => {
   const url = new URL(String(input)), path = url.pathname, method = init.method ?? 'GET';
   if (path === '/api/auth/me') return json({ user: server.users.find(u => u.id === server.currentUserId) });
@@ -54,11 +61,18 @@ globalThis.fetch = (async (input: string | URL, init: RequestInit = {}) => {
   if (path === nbase && method === 'POST') { normalizePosted.push(JSON.parse(String(init.body))); return json({ jobId: normalizeId }, 202); }
   if (path === `${nbase}/${normalizeId}`) return json(normalized());
   if (path.startsWith(`${base}/${jobId}/stills/`)) return new Response(Buffer.from(path), { headers: { 'content-type': 'image/jpeg' } });
+  if (path === '/api/frames') {
+    frames.push(Object.fromEntries(url.searchParams));
+    if (refuse) return json(refuse, 409);
+    return new Response(url.searchParams.has('mediaId') ? mediaJpeg : frameJpeg, { headers: { 'content-type': 'image/jpeg' } });
+  }
   return json({ error: `not faked: ${method} ${path}` }, 404);
 }) as typeof fetch;
 
 const { ready } = await import('../edit.ts');
-const { jobs, topics, primaryTable } = await import('./color.ts');
+const { jobs, topics, gradeModel } = await import('./color.ts');
+const { edit } = await import('../edit.ts');
+const { help } = await import('../catalog.ts');
 const { isPoller } = await import('./kit.ts');
 const short = (id: string) => '@' + id.slice(0, 8);
 const nodes = (clipId: string) => server.nodes.filter(n => n.clipId === clipId).sort((x, y) => (x.order ?? 0) - (y.order ?? 0));
@@ -182,13 +196,132 @@ test('color-normalize names the group the shots moved into, measures a grouped s
   assert.match(own.text, /\nbalance: @\w+ gamma 0\.5 gain 0\.8 90% clipping/);
 });
 
-test('the help topic carries the app\'s slider ranges, render limits and color spaces', () => {
-  const table = primaryTable();
-  assert.equal(table.length, 6, 'all six Primaries sliders parsed from ColorWorkspace.tsx');
-  assert.match(topics.color, /^Color grading/);
-  assert.match(topics.color, /exposure 0 \(-6\.\.6, stops; render ±16\)/);
-  assert.match(topics.color, /saturation 100 \(0\.\.200, 100 = unchanged; render ≤400\)/);
-  assert.match(topics.color, /saturationShadows saturationMidtones saturationHighlights 100 \(0\.\.400/);
-  assert.match(topics.color, /gammas: Rec\.709, S-Log3, .*Gamma 2\.4/);
+test('color-grade summarizes windows, the qualifier, HSL curves, the mixer and film, marks keyframes and an unset pivot', async () => {
+  const look = nodes(a.id).find(n => n.name === 'Look')!, flat = (id: string, ys: number[]) => ({ mode: 'smooth' as const, points: ys.map((y, i) => ({ id: `${id}${i}`, x: i / (ys.length - 1), y })) });
+  await edit(run => run('updateNode', look.id, {
+    parameters: { circOn: 1, circX: .5, circY: .4, circW: .3, circH: .2, circSoft: .1, circInvert: 1, gradOn: 1, gradY: .3, qualOn: 1, qualHue: 25, qualHueWidth: 30, qualHueSoft: 10, qualSatLow: 20, qualSatHigh: 80, qualLumLow: 10, qualLumHigh: 90, qualSatSoft: 5,
+      mixRR: .4, mixRG: .5, mixRB: .1, mixMono: 1, filmGrain: 20, filmHalation: 15, filmBloom: 8, filmVignette: 10, filmGrainSize: 1.3, logShadowB: .01, pivot: .336 },
+    curves: { ...look.curves, HueSat: flat('hs', [.5, .5, .3, .5, .5]), LumSat: flat('ls', [.5, .6, .5]) },
+  }));
+  await edit(run => run('setKeyframes', a.id, `nodes.${look.id}.parameters.circX`, [{ id: 'k1', time: 0, value: .3, interpolation: 'linear' }, { id: 'k2', time: a.duration, value: .7, interpolation: 'linear' }]));
+  const { text } = await run('color-grade', { clip: a.id, at: a.start + a.duration / 2 });
+  const line = text.split('\n').find(l => l.includes('"Look"'))!;
+  assert.match(line, / logShadowB=0\.01 /);
+  assert.match(line, / qualSatSoft=5 /, 'the rarely used softness stays a plain value');
+  assert.match(line, / filmGrainSize=1\.3 /);
+  assert.ok(!/pivot=/.test(line), 'a stored .336 is the default pivot');
+  assert.match(line, / curves RGB3 hsl HueSat5,LumSat3 /);
+  assert.match(line, / circ\(\.5~,\.4 r\.3x\.2 soft \.1 inv\) /, 'a keyframed field is marked ~');
+  assert.match(line, / grad\(\.5,\.3 angle 0 soft \.3\) /);
+  assert.match(line, / qual\(hue 25 w30 soft 10, sat 20-80, lum 10-90\) /);
+  assert.match(line, / mix\(R \.4\/\.5\/\.1 mono\) /);
+  assert.match(line, / film\(hal 15 bloom 8 grain 20 vig 10, unmasked\)$/);
+  assert.ok(!/circX=|gradOn=|qualOn=|qualHue=|mixRR=|mixMono=|filmGrain=|filmHalation=/.test(line), `summarized keys are not repeated: ${line}`);
+  assert.match(text, /render check: ok/);
+  // A node without pivot contrasts around .5, not the .336 a nodes-v2 grade expects.
+  await edit(async run => { await run('selectClip', b.id); await run('selectNode', null); await run('addNode', 'Punch', { contrast: 1.2 }); });
+  assert.match((await run('color-grade', { clip: b.id })).text, /"Punch" contrast=1\.2 pivot=\.5\(unset\)/);
+  await edit(run => run('updateNode', look.id, { parameters: { circOn: 0 } }));
+  assert.match((await run('color-grade', { clip: a.id })).text.split('\n').find(l => l.includes('"Look"'))!, / circ\(off\) grad\(/);
+});
+
+/** A 512×288 frame: cool left half, neutral right half, a skin patch, and (frame only) 24 px letterbox bars. */
+async function scene(cool: number[], plain: number[], skin: number[], bars: number, type: 'jpeg' | 'png') {
+  const canvas = createCanvas(512, 288), g = canvas.getContext('2d'), paint = (rgb: number[], x: number, y: number, w: number, h: number) => { g.fillStyle = `rgb(${rgb.join(',')})`; g.fillRect(x, y, w, h); };
+  paint([0, 0, 0], 0, 0, 512, 288); paint(cool, 0, bars, 256, 288 - 2 * bars); paint(plain, 256, bars, 256, 288 - 2 * bars); paint(skin, 205, 86, 77, 86);
+  return Buffer.from(type === 'png' ? await canvas.encode('png') : await canvas.encode('jpeg', 95));
+}
+
+test('color-measure renders the graded frame, measures it against a reference picture and says what to change', async () => {
+  frameJpeg = await scene([70, 80, 110], [130, 130, 130], [190, 140, 120], 24, 'jpeg');
+  const file = join(dir, 'ref.png');
+  await writeFile(file, await scene([105, 100, 95], [165, 158, 145], [215, 160, 125], 0, 'png'));
+  frames.length = 0;
+  const step = await run('color-measure', { clip: a.id, ref: file, regions: [{ name: 'face', x: .4, y: .3, w: .15, h: .3 }], images: true });
+  // The frame under the playhead when it is over the clip, else the clip's middle.
+  const fps = server.projects.find(p => p.id === projectId)!.fps, last = a.start + a.duration - 1 / fps, playhead = s().playhead;
+  const t = Math.floor((playhead >= a.start && playhead <= last ? playhead : a.start + a.duration / 2) * fps + 1e-6) / fps;
+  assert.deepEqual(frames, [{ projectId, timelineId: a.timelineId, t: String(t), w: '512' }], 'one graded frame of the clip\'s timeline');
+  const lines = step.text.split('\n');
+  assert.match(lines[0], new RegExp(`^${short(a.id)} "[^"]+" \\d\\d:\\d\\d:\\d\\d:\\d\\d \\([\\d.]+s\\) graded frame 512×288 bars trimmed \\(picture 0,\\.083 1x\\.833\\) · ref "ref\\.png" 512×288$`));
+  assert.match(step.text, /\nluma p1\/5\/25\/50\/75\/95\/99: [\d ]+ \| ref [\d ]+\n/);
+  assert.match(step.text, /\ncrushed black\/clipped white: 0\.0% 0\.0% \| ref 0\.0% 0\.0%\n/, 'the bars are not counted as crushed blacks');
+  assert.match(step.text, /\nmids: \d+% rgb \d+\/\d+\/\d+ warm -\d\.\d mag \+\d\.\d sat \d+ \| ref \d+% rgb/);
+  assert.match(step.text, /\nregion face \(\.4,\.3 \.15x\.3\): luma \d+ rgb \d+\/\d+\/\d+ warm \+\d+\.\d mag [-+]\d\.\d sat \d+ hue \d+° (red|orange) \| ref luma \d+ .*hue \d+° (red|orange) → luma \+\d+\.\d/);
+  // The amounts come from the clip's own grade (nodes-v2, S-Log3 through ACES 2) on the CPU reference.
+  assert.match(step.text, /\nto match the ref \(\+\/− add to the current value, × multiplies it; amounts from this grade, damped; change, frame, measure again\):\n- darker than ref \(median 51 vs 62\): exposure \+\.\d\d stops \(Balance\)/);
+  assert.match(step.text, /\n- overall cooler than ref \(warm -2\.9 vs \+3\.6, mag \+2\.3 vs -0\.4 after the saturation change\): temperature \+\d+, tint -\d+ \(Balance\)/);
+  assert.match(step.text, /\n- more saturated than ref \(colour spread 8 vs 5, mean 8 vs 6, p90 14 vs 7\): saturation ×0\.\d\d/);
+  assert.equal(step.content?.length, 1, 'frame and ref side by side in one picture');
+  const shown = await loadImage(Buffer.from((step.content![0] as { data: string }).data, 'base64'));
+  assert.deepEqual([shown.width, shown.height], [772, 216]);
+
+  // Without a reference: the numbers only, at the asked time.
+  frames.length = 0;
+  const alone = await run('color-measure', { clip: a.id, at: a.start });
+  assert.equal(frames[0].t, String(Math.floor(a.start * fps + 1e-6) / fps));
+  assert.ok(!alone.text.includes('| ref') && !alone.text.includes('to match') && !alone.content, alone.text);
+});
+
+test('color-measure takes a media item or another clip as the reference, and says why a frame cannot be measured', async () => {
+  mediaJpeg = await scene([105, 100, 95], [165, 158, 145], [215, 160, 125], 0, 'jpeg');
+  const asset = server.media.find(m => m.projectId === projectId && m.kind === 'video')!;
+  frames.length = 0;
+  const media = await run('color-measure', { clip: a.id, ref: asset.id });
+  assert.equal(frames[1].mediaId, asset.id);
+  assert.match(media.text.split('\n')[0], new RegExp(`· ref ${short(asset.id)} "[^"]+" @[\\d.]+s ungraded 512×288$`));
+  assert.match(media.text, /\n- darker than ref/);
+  frames.length = 0;
+  const other = await run('color-measure', { clip: a.id, ref: b.id });
+  assert.deepEqual(frames.map(f => f.timelineId), [a.timelineId, b.timelineId]);
+  assert.match(other.text.split('\n')[0], new RegExp(`· ref ${short(b.id)} "[^"]+" @[\\d.]+s graded 512×288 bars trimmed`));
+  assert.match(other.text, /matches the ref within the hint thresholds\./, 'the same picture needs nothing');
+
+  await assert.rejects(run('color-measure', { clip: a.id, ref: 'ref.png' }), /absolute path to an image file, or a media or clip @id/);
+  await assert.rejects(run('color-measure', { clip: a.id, ref: join(dir, 'missing.png') }), /No file at/);
+  const text = join(dir, 'notes.txt'); await writeFile(text, 'not a picture');
+  await assert.rejects(run('color-measure', { clip: a.id, ref: text }), /"notes\.txt" is not a picture|notes\.txt is not a picture/);
+  await assert.rejects(run('color-measure', { clip: a.id, regions: [{ x: .9, y: 0, w: .2, h: .5 }] }), /params\.regions: up to 8 boxes/);
+  refuse = { live: 'denoise', error: 'Noise Reduction bakes whole clips; this frame shows live in the editor.' };
+  await assert.rejects(run('color-measure', { clip: a.id }), /cannot render the graded frame at [\d.]+s on its own \(Noise Reduction bakes whole clips.*\); bypass Noise Reduction while grading, measure, then turn it back on\./);
+  refuse = null;
+});
+
+test('the grade model answers exactly where the grade is linear, and stays finite through a log grade', () => {
+  // A legacy clip without nodes: changes multiply the display signal, so every answer has a closed form.
+  const plain = { ...legacy, id: 'no-nodes', keyframes: {}, properties: {} } as typeof legacy, model = gradeModel(plain, plain.start)!;
+  const near = (actual: number, expected: number, tolerance = 1e-3) => assert.ok(Math.abs(actual - expected) <= tolerance, `${actual} is not ${expected}`);
+  near(model.exposure(25, 50), 1);
+  const [temperature, tint] = model.balance(50, 2, 1);
+  near(temperature, 400, .05); near(tint, 4, .01);
+  near(model.saturation(50, 1.5), 150, .01);
+  model.channels(['liftR', 'liftG', 'liftB'], 50, [1, 0, -1]).forEach((v, i) => near(v, [.02, 0, -.02][i], 1e-5));
+  near(model.contrast(25, 75, 75), 1.5, 1e-3);
+  // nodes-v2 S-Log3 with ACES 2 (stood in for by the shoulder curve): monotone, finite answers.
+  const log = gradeModel(s().clips.find(c => c.id === b.id)!, b.start + b.duration / 2)!;
+  const up = log.exposure(30, 45), down = log.exposure(45, 30);
+  assert.ok(up > .1 && up < 3 && down < -.1, `exposure ${up} ${down}`);
+  assert.ok(log.balance(40, 2, 0).every(Number.isFinite) && log.balance(40, 2, 0)[0] > 0, 'warmer needs a higher temperature');
+  assert.ok(log.channels(['gainR', 'gainG', 'gainB'], 60, [1, 0, -1]).every(Number.isFinite));
+});
+
+test('the help topic is the parameter registry, the look library and the grading recipes', () => {
+  const text = topics.color, lines = text.split('\n');
+  assert.match(text, /^Color grading/);
+  for (const q of GRADE_PARAMS) assert.ok(lines.some(line => line.split(' ').slice(0, 9).includes(q.key)), `${q.key} has a parameter line`);
+  assert.ok(lines.includes('exposure 0 (-6..6 stops; render -16..16) Exposure in stops (linear light on nodes-v2).'));
+  assert.ok(lines.includes('saturation 100 (0..200%; render 0..400) 100 = unchanged.'));
+  assert.ok(lines.includes('liftR liftG liftB 0 (-1..1; render -2..2) Shadows wheel, R/G/B channel (added to the master).'));
+  assert.ok(lines.includes('## Wheels: Shadows/Midtones/Highlights/Offset = DaVinci Lift/Gamma/Gain/Offset, stored as lift/gamma/gain/offset'));
+  assert.ok(lines.some(line => line.startsWith('qualOn 0|1 ')));
+  for (const look of COLOR_LOOKS) assert.ok(lines.some(line => line.startsWith(`- ${look.id}: `) || line.startsWith(`- ${look.id} (`)), look.id);
+  for (const topic of ['Log wheels:', 'HSL curves', 'Qualifier (qualOn 1)', 'Windows (', 'Film:', 'color-measure{', 'Looks: act applyColorLook', '- match a reference picture: 1) job color-measure', '- sky:', '- skin:', '- black and white:']) assert.ok(text.includes(topic), topic);
+  assert.match(text, /gammas: Rec\.709, S-Log3, .*Gamma 2\.4/);
+  assert.ok(!text.includes('hue≠0'), 'hue renders now');
+  // help{topic:"color", filter} keeps whole lines: the windows prose and every circle key.
+  const circle = help('color', 'circ');
+  assert.match(circle, /^Color grading/);
+  assert.match(circle, /\nWindows \(circOn\/rectOn\/gradOn 1/);
+  assert.match(circle, /\ncircX \.5 \(-1\.\.2\) Centre/);
   for (const line of Object.values(jobs).map(j => j.doc)) assert.ok(!line.includes('\n') && line.length < 200, line);
 });

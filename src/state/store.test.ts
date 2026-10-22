@@ -2127,3 +2127,22 @@ test('a script line a collaborator holds or changed since cannot be edited or un
   assert.equal(lines(id)[0].text, 'INT. HALL - LATER');
   assert.match(state().notifications.at(-1)!.title, /is editing/);
 });
+
+test('a library look replaces a node\'s look tools in one undo step; exposure, windows and the qualifier stay; New Node before the output makes room', () => {
+  state().initializeColorGrade('c3');
+  const nodes = () => state().nodes.filter(n => n.clipId === 'c3').sort((a, b) => a.order! - b.order!), look = nodes()[2];
+  state().updateNode(look.id, { parameters: { ...look.parameters, exposure: .4, logShadowB: .05, mixRR: .8, circOn: 1, qualOn: 1, filmGrain: 40 }, curves: { SatSat: { mode: 'smooth', points: [{ id: 'a', x: 0, y: .3 }, { id: 'b', x: 1, y: .6 }] } } });
+  state().applyColorLook(look.id, 'kodak-2383', .5);
+  const p = state().nodes.find(n => n.id === look.id)!.parameters;
+  assert.equal(p.contrast, 1.08); assert.equal(p.filmHalation, 9); assert.equal(p.filmHalationThreshold, 2, 'sizes and thresholds are set outright');
+  assert.equal(p.exposure, .4); assert.equal(p.circOn, 1); assert.equal(p.qualOn, 1, 'balance, windows and the key stay');
+  assert.equal(p.logShadowB, .003); assert.equal(p.mixRR, 1, 'look tools the look does not set go neutral');
+  assert.equal(state().nodes.find(n => n.id === look.id)!.curves?.SatSat, undefined, 'curves are the look\'s');
+  state().undo(); const back = state().nodes.find(n => n.id === look.id)!;
+  assert.equal(back.parameters.mixRR, .8); assert.equal(back.parameters.filmGrain, 40); assert.ok(back.curves?.SatSat);
+  state().applyColorLook(look.id, 'no-such-look'); assert.ok(state().notifications.some(n => /Unknown look/.test(n.title)));
+  const output = nodes()[3], before = output.position!.x;
+  state().selectNode(null); state().addNode('Film', { filmGrain: 20 });
+  const added = nodes()[3]; assert.equal(added.name, 'Film'); assert.equal(nodes()[4].id, output.id);
+  assert.ok(nodes()[4].position!.x - added.position!.x >= 150 && nodes()[4].position!.x === before + 170, 'the output CST moved over instead of sitting under the new node');
+});

@@ -1,6 +1,7 @@
 import { colorStages, interpretation, primaryDefaults, processingStages, validateGradeNode } from './color.ts';
 import type { Clip, ColorCurve, GradeNode, MediaAsset } from '../state/models.ts';
 import { recipeLook, RECIPES } from './colorLooks.ts';
+import { hasQualifier, hasWindow } from './grading.ts';
 
 /** Shared by server and client: the model only proposes these numbers; SharedCut's engine renders and applies them. */
 export type AssistantMode = 'looks' | 'balance' | 'match';
@@ -156,7 +157,8 @@ export function eligibility(clip: Clip, asset: MediaAsset | undefined, nodes: Gr
   if ((balance.order ?? 0) >= (look.order ?? 0)) return no('missing-nodes', 'Put Balance before Look, both before the ACES 2 output.');
   const inWorkingSpace = (order: number) => { try { const source = interpretation(clip, asset), s = processingStages({ ...clip, properties: { ...clip.properties, inputProfile: source.profile, inputGamut: source.gamut } }, nodes).find(stage => (stage.node.order ?? 0) >= order); return s?.type === 'correction' && s.gamma === 'DaVinci Intermediate' && s.gamut === 'DaVinci Wide Gamut'; } catch { return false; } };
   if (!inWorkingSpace(balance.order ?? 0) || !inWorkingSpace(look.order ?? 0)) return no('missing-nodes', 'Balance and Look must come after the Input CST into DaVinci Wide Gamut / Intermediate.');
-  if (enabled.some(n => n.mask?.enabled)) return no('masked-node', 'A node on this shot uses a mask.');
+  // The assistant renders stills from cached working-space frames with static, whole-picture node values.
+  if (enabled.some(n => n.mask?.enabled || hasWindow(n.parameters) || hasQualifier(n.parameters))) return no('masked-node', 'A node on this shot uses a mask, window or qualifier.');
   // Stills and measurements use static node values, so any animated node on the shot would make them lie.
   const prefixes = ordered(clip, nodes).map(n => `nodes.${n.id}.`);
   if (Object.entries(clip.keyframes ?? {}).some(([path, keys]) => keys?.length && prefixes.some(p => path.startsWith(p)))) return no('keyframed', 'A grade node on this shot is keyframed.');

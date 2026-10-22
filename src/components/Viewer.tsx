@@ -7,6 +7,7 @@ import { DepthFocusPicker } from './DepthInspector';
 import TextOverlay from './TextOverlay';
 import ShapeOverlay from './ShapeOverlay';
 import TransformOverlay from './TransformOverlay';
+import ColorWindowOverlay from './ColorWindowOverlay';
 import { refreshFonts, useFonts, detectLocalFonts } from '../services/fonts';
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react';
 import { SkipBack, SkipForward, Play, Pause, ChevronLeft, ChevronRight, Volume2, VolumeX, Maximize, Scan, Settings2, Columns2, Radio, Aperture, LoaderCircle } from 'lucide-react';
@@ -166,6 +167,7 @@ function Viewer({ compact = false, colorAccurate=false, onNavigateEdit, bare = f
           {focusKind === 'mask' && <SmartMaskEditor bar={focusBar} strip={focusStrip}/>}
         </> : <>
           <TransformOverlay/>
+          <ColorWindowOverlay/>
           <TextOverlay/>
           <ShapeOverlay/>
           <MotionTrackerOverlay/>

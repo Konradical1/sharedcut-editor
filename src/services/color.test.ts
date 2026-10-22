@@ -94,7 +94,7 @@ test('ungraded log footage is shown as recorded; only a grade or an imported loo
 });
 
 test('range saturation: identity when absent or 100, smoothstep luma weights, legacy and nodes-v2 alike, preview packing matches',async()=>{
-  const {rangeSaturation,colorStages,luminanceWeights,processingStages}=await import('./color.ts'),{packStages}=await import('./colorPreview.ts');
+  const {rangeSaturation,colorStages,luminanceWeights,processingStages}=await import('./color.ts'),{packStages,STAGE_TEXELS}=await import('./colorPreview.ts');
   const node=(parameters:Record<string,number>)=>({id:'n',clipId:'r',enabled:true,order:1,name:'Range',parameters} as GradeNode);
   const legacy={id:'r',properties:{}} as Clip,managed={id:'r',properties:{colorPipeline:'nodes-v2',inputProfile:'Linear',inputGamut:'Rec.2020'}} as unknown as Clip;
   const colors=[[.02,.05,.01],[.3,.5,.2],[.6,.4,.7],[.95,.9,.6]],near=(a:number,b:number,m:string,e=1e-12)=>assert.ok(Math.abs(a-b)<e,`${m}: ${a} vs ${b}`);
@@ -125,9 +125,41 @@ test('range saturation: identity when absent or 100, smoothstep luma weights, le
   // The shader reads texel 8 of a correction row as factor − 1 (0 = identity) and runs the same formula on it.
   for(const clip of [legacy,managed]){
     const stages=processingStages(clip,[node(range),{...node(base),id:'m',order:2}]),{data}=packStages(clip,stages,[]);
-    assert.deepEqual([...data.slice(32,35)],[.5,-.5,2]);assert.deepEqual([...data.slice(52+32,52+35)],[0,0,0],'a node without the keys packs identity');
+    assert.deepEqual([...data.slice(32,35)],[.5,-.5,2]);assert.deepEqual([...data.slice(STAGE_TEXELS*4+32,STAGE_TEXELS*4+35)],[0,0,0],'a node without the keys packs identity');
     const weights=clip===legacy?w:[...data.slice(44,47)];
     for(const rgb of colors)expect(rgb,weights,[...data.slice(32,35)]).forEach((v,c)=>near(v,colorTransform(clip,undefined,[node(range)])(rgb)[c],'packed row drives the same pixels',1e-6));
+  }
+});
+
+test('preview packing of the v3 tools: flags skip identity exactly where the CPU does; values and curve rows follow grading.ts',async()=>{
+  const {packStages,STAGE_TEXELS,CURVE_ROWS}=await import('./colorPreview.ts'),{PARAM,sampleHueCurve}=await import('./grading.ts'),{luminanceWeights}=await import('./color.ts');
+  const S=STAGE_TEXELS*4,texel=(data:Float32Array,stage:number,t:number)=>[...data.slice(stage*S+t*4,stage*S+t*4+4)],near=(a:number[],b:number[],m:string)=>a.forEach((v,i)=>assert.ok(Math.abs(v-b[i])<1e-6,`${m}[${i}]: ${v} vs ${b[i]}`));
+  const managed={id:'k',properties:{colorPipeline:'nodes-v2',inputProfile:'DaVinci Intermediate',inputGamut:'DaVinci Wide Gamut'}} as unknown as Clip,legacy={id:'k',properties:{}} as Clip;
+  const curve=(points:[number,number][])=>({mode:'smooth' as const,points:points.map(([x,y],i)=>({id:'p'+i,x,y}))});
+  const tools={logShadow:.02,logShadowB:.01,logMidR:-.03,logHighlight:.04,logLowRange:.3,shadows:50,highlights:-40,hue:30,boost:20,density:40,mixRG:.2,mixMono:1,qualOn:1,qualInvert:1,qualHue:120,circOn:1,circAngle:90,rectOn:1,rectW:.5,rectH:.2,rectRound:.5,gradOn:1,gradInvert:1,gradAngle:30};
+  const hue=curve([[0,.6],[.4,.3],[1,.6]]),lum=curve([[0,.3],[1,.7]]),lut={id:'l',type:'lut' as const,enabled:true,name:'L',amount:1,inputGamma:'Linear',inputGamut:'Rec.709',cube:{size:2,data:[0,0,0,1,0,0,0,1,0,1,1,0,0,0,1,1,0,1,0,1,1,1,1,1],min:[0,0,0],max:[1,1,1]}};
+  const nodes=[{id:'a',clipId:'k',enabled:true,order:1,name:'All',parameters:tools,curves:{HueSat:hue,LumSat:lum},effects:[lut]},{id:'b',clipId:'k',enabled:true,order:2,name:'Plain',parameters:{exposure:.1,filmGrain:20}}] as unknown as GradeNode[];
+  for(const clip of [managed,legacy]){
+    const stages=processingStages(clip,nodes),{data,curveData}=packStages(clip,stages,[]),w=clip===legacy?[.2126,.7152,.0722]:luminanceWeights('DaVinci Wide Gamut');
+    assert.deepEqual(stages.map(s=>s.type),['correction','lut','correction','film']);
+    assert.equal(texel(data,0,7)[2],1|2|4|8|16,'every tool on');assert.equal(texel(data,2,7)[2],0,'a plain node skips every v3 step');
+    assert.deepEqual([texel(data,0,12)[3],texel(data,1,12)[3],texel(data,2,12)[3]],[1+4,2+4,1+2],'the LUT ends the keyed node and carries the key bit');
+    assert.equal(texel(data,3,7)[0],3,'film rows are skipped by the stage loop');
+    near(texel(data,0,11).slice(0,3),w,'stage weights');
+    near([...texel(data,0,13),...texel(data,0,14),...texel(data,0,15)],[.02,.02,.03,.3,-.03,0,0,PARAM.logHighRange.initial,.04,.04,.04,0],'log wheels: master + channel, ranges');
+    near(texel(data,0,16),[1,-.8,Math.cos(Math.PI/6),Math.sin(Math.PI/6)],'tone gains (negative highlights double) and hue rotation');
+    near(texel(data,0,17),[.2,.08,Math.atan2(.5,-w[0]/(2*(1-w[2]))),2|8],'boost, density, hue of red, HSL curve mask');
+    near([...texel(data,0,18),...texel(data,0,19),...texel(data,0,20)],[1,.2,0,1,0,1,0,0,0,0,1,0],'mixer rows, monochrome');
+    near(texel(data,0,21),[2,120,360,20],'qualifier on + inverted, defaults filled');
+    near([...texel(data,0,24),...texel(data,0,25)],[1,.5,.5,.1,.3,.3,Math.cos(Math.PI/2),1],'circle');
+    near([...texel(data,0,26),...texel(data,0,27)],[1,.5,.5,.05,.25,.1,1,0],'rectangle half sizes');
+    near([...texel(data,0,28),...texel(data,0,29)],[.05,2,.5,.5,.5,Math.cos(Math.PI/6),.3,0],'round radius, gradient inverted');
+    const row=(stage:number,c:number,x:number)=>curveData[(stage*CURVE_ROWS+c)*1024+x];
+    for(const x of [0,100,511,1022,1023]){
+      assert.ok(Math.abs(row(0,5,x)-sampleHueCurve(x/1023,hue))<1e-6,'Hue vs Sat samples the periodic curve');assert.ok(Math.abs(row(0,7,x)-lum.points[0].y-(lum.points[1].y-lum.points[0].y)*x/1023)<1e-3,'Lum vs Sat');
+      assert.ok(Math.abs(row(0,0,x)-x/1023)<1e-6,'custom curves stay identity');assert.equal(row(0,4,x),0,'an absent HSL curve leaves its row unused');
+    }
+    assert.ok(Math.abs(row(0,5,1023)-row(0,5,0))<1e-6,'the hue row wraps');
   }
 });
 

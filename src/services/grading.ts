@@ -287,9 +287,8 @@ export function filmMotion(p: Params, frame: number) {
     breath: .08 * val(p, 'filmBreath') / 100 * (2 * valueNoise1(frame / 3, (s ^ 0x165667B1) >>> 0) - 1),
   };
 }
-/** Halation tint: the HSV hue at full value, toward white by 1 − sat, scaled to unit luma. */
-export function halationTint(p: Params, w: number[]) {
+/** Halation tint: the HSV hue at full value, toward white by 1 − sat (brightest channel 1). */
+export function halationTint(p: Params) {
   const h = (val(p, 'filmHalationHue') % 360 + 360) % 360 / 60, sat = val(p, 'filmHalationSat') / 100;
-  const hsv = [Math.abs(h - 3) - 1, 2 - Math.abs(h - 2), 2 - Math.abs(h - 4)].map(v => clamp(v)), rgb = hsv.map(v => 1 - sat + sat * v), y = dot(w, rgb);
-  return rgb.map(v => v / y);
+  return [Math.abs(h - 3) - 1, 2 - Math.abs(h - 2), 2 - Math.abs(h - 4)].map(v => 1 - sat + sat * clamp(v));
 }

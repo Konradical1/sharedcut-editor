@@ -131,6 +131,10 @@ Only one server may open a data folder: a second `npm start` beside the live one
   past Plan: fix forward.
 - Picture Noise Reduction renamed the audio effect to 'Audio Noise Reduction'. A build without it saves such clips but
   refuses any export that has one: do not roll back past it, fix forward.
+- Color page v3 (`docs/color-grading-v3.md`) stores qualifier, window, log wheel, mixer and film keys in node parameters
+  and HSL curves (`HueHue`…`SatLum`) in node curves. A build without v3 refuses to render those nodes and its save check
+  rejects the curves: do not roll back past it, fix forward. Preview, export and `grading.ts` must stay identical: change
+  all three (and the pinned vectors in `src/services/grading.test.ts`) together.
 - `node scripts/remote-playback-check.mjs` plays a timeline on sharedcut.com as a signed-in user and
   reports pictures/s, freezes and loading time; run it before and after any playback change.
 

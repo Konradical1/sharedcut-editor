@@ -53,7 +53,7 @@ try {
   await writeFile('artifacts/qa/newspaper-browser-color.json',JSON.stringify(comparisons,null,2));console.log('PASS all 25 proxy / Resolve reference frames', {worstMeanRGBError:Math.max(...comparisons.map(c=>c.meanError))});
   await page.getByRole('button',{name:'Shot 18: C0973.MP4',exact:true}).click();await page.waitForTimeout(500);await page.screenshot({path:'artifacts/qa/newspaper-color.png'});
   // A real pointer gesture crosses a server save before its final value. One Ctrl-Z must undo all of it.
-  const wheel=page.getByRole('group',{name:'Lift color balance; use RGB fields for keyboard control'}),box=await wheel.boundingBox();
+  const wheel=page.getByRole('group',{name:'Shadows color balance; use RGB fields for keyboard control'}),box=await wheel.boundingBox();
   await page.mouse.move(box.x+box.width/2,box.y+box.height/2);await page.mouse.down();await page.mouse.move(box.x+box.width*.6,box.y+box.height*.4);await page.waitForTimeout(700);
   await page.evaluate(()=>{window.gradeFrames=[];window.gradeDurations=[];window.gradeListener=()=>window.gradeFrames.push(performance.now());window.addEventListener('frameline:frame',window.gradeListener);});
   const timings=[];
@@ -61,7 +61,7 @@ try {
   await page.mouse.up();await page.waitForTimeout(500);
   const performanceResult=await page.evaluate(()=>{window.removeEventListener('frameline:frame',window.gradeListener);const t=window.gradeFrames;return {frames:t.length,duration:t.at(-1)-t[0],intervals:t.slice(1).map((v,i)=>v-t[i])};});
   const sorted=timings.sort((a,b)=>a-b);console.log('Color pointer performance',{p95InputMs:sorted[Math.floor(sorted.length*.95)],updates:performanceResult.frames,measuredFps:1000*(performanceResult.frames-1)/performanceResult.duration});assert.ok(sorted[Math.floor(sorted.length*.95)]<100,'Color drag must not block each input for a LUT rebuild.');
-  await page.keyboard.press('Control+z');await page.waitForTimeout(500);assert.equal(await page.getByLabel('Lift R',{exact:true}).inputValue(),'0');assert.equal(await page.getByLabel('Lift G',{exact:true}).inputValue(),'0');console.log('PASS pointer drag undo across sync saves');
+  await page.keyboard.press('Control+z');await page.waitForTimeout(500);assert.equal(await page.getByLabel('Shadows R',{exact:true}).inputValue(),'0');assert.equal(await page.getByLabel('Shadows G',{exact:true}).inputValue(),'0');console.log('PASS pointer drag undo across sync saves');
   await page.mouse.move(box.x+box.width/2,box.y+box.height/2);await page.mouse.down();
   const gpuTiming=await page.evaluate(async()=>{
     const wheel=document.querySelector('.color-wheel'),box=wheel.getBoundingClientRect(),costs=[],latencies=[],times=[];let lastInput=0;
@@ -81,8 +81,8 @@ try {
   const id=imported.clips.filter(c=>c.properties.resolveLookUrl)[17].id;
   await page.waitForTimeout(1600);const saved=(await(await a.request.get(url+'/api/state')).json()).state.nodes.find(n=>n.clipId===id);assert.equal(saved.parameters.exposure,.4);assert.equal(saved.parameters.contrast,1.15);
   assert.equal(await page.getByLabel('Contrast value',{exact:true}).inputValue(),'1.15');assert.equal(await second.getByLabel('Exposure value',{exact:true}).inputValue(),'0.4');console.log('PASS two clients preserve simultaneous grade fields');
-  await page.getByRole('button',{name:'Add correction node',exact:true}).click();await page.getByLabel('Offset R',{exact:true}).fill('0.05');await page.getByLabel('Shadows value',{exact:true}).fill('0.2');await page.getByRole('button',{name:'Move node earlier',exact:true}).click();await page.waitForTimeout(800);
-  const changed=(await(await a.request.get(url+'/api/state')).json()).state.nodes.filter(n=>n.clipId===id).sort((a,b)=>a.order-b.order);assert.equal(changed[0].parameters.offsetR,.05);assert.equal(changed[0].parameters.curve25,.2);console.log('PASS RGB wheel channels, curve and node order persist');
+  await page.getByRole('button',{name:'Add correction node',exact:true}).click();await page.getByLabel('Offset R',{exact:true}).fill('0.05');await page.getByLabel('Shadows value',{exact:true}).fill('20');await page.getByRole('button',{name:'Move node earlier',exact:true}).click();await page.waitForTimeout(800);
+  const changed=(await(await a.request.get(url+'/api/state')).json()).state.nodes.filter(n=>n.clipId===id).sort((a,b)=>a.order-b.order);assert.equal(changed[0].parameters.offsetR,.05);assert.equal(changed[0].parameters.shadows,20);console.log('PASS RGB wheel channels, curve and node order persist');
   await page.setViewportSize({width:1100,height:800});await page.screenshot({path:'artifacts/qa/newspaper-color-1100.png'});
   const fit=await page.evaluate(()=>{const root=document.querySelector('.resolve-color'),viewer=document.querySelector('.color-viewer');return {overflow:document.documentElement.scrollWidth>innerWidth,viewerWidth:viewer.getBoundingClientRect().width,rootWidth:root.getBoundingClientRect().width};});assert.equal(fit.overflow,false);assert.ok(fit.viewerWidth>fit.rootWidth*.5);assert.deepEqual(errors,[]);console.log('PASS color layout, renderer and browser errors',fit);
   const compatibility=await a.newPage();await compatibility.addInitScript(()=>{Object.defineProperty(window,'VideoFrame',{value:undefined});Object.defineProperty(crypto,'randomUUID',{value:undefined});});

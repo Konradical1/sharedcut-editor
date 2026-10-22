@@ -109,7 +109,7 @@ test('noise and film reference vectors (GPU and color-render.py must reproduce t
   near(grainNoise(10.3, 20.7, grainKey(0, 5, 3)), -0.7669556525773207, 'grain', 1e-15); near(grainNoise(.5, .5, grainKey(3, 0, 0)), 0.443845637058393, 'grain', 1e-15);
   const motion = filmMotion(filmParams({ filmWeave: 100, filmBreath: 100, filmGrainSeed: 7 }), 37);
   near(motion.ox, 0.0014169404374228581, 'weave x', 1e-15); near(motion.oy, 0.0021337956455018776, 'weave y', 1e-15); near(motion.breath, -0.020711009767320404, 'breath', 1e-15);
-  halationTint(filmParams({}), W).forEach((v, i) => near(v, [2.380521619897352, 0.6665460535712584, 0.23805216198973517][i], 'halation tint', 1e-12));
+  halationTint(filmParams({})).forEach((v, i) => near(v, [1, .28, .1][i], 'halation tint', 1e-12));
 });
 
 test('a film node adds a film stage after its own stages; the blend stays on the node\'s last real stage', () => {
@@ -157,5 +157,5 @@ test('film reference: blur, vignette, grain statistics and determinism, halation
   assert.deepEqual(applyFilm(grey, width, height, stage({ filmGrain: 50, filmGrainStatic: 1 }), 3), applyFilm(grey, width, height, stage({ filmGrain: 50, filmGrainStatic: 1 }), 9), 'still grain');
   const lamp = new Float32Array(width * height * 3).fill(.2); for (let y = 25; y < 29; y++) for (let x = 46; x < 50; x++) lamp.fill(1, (y * width + x) * 3, (y * width + x) * 3 + 3);
   const halo = applyFilm(lamp, width, height, stage({ filmHalation: 100, filmHalationThreshold: 0, filmHalationRadius: 4 }), 0), at = (27 * width + 53) * 3;
-  assert.ok(halo[at] > .25 && halo[at] - .2 > 3 * (halo[at + 2] - .2), `a red glow next to the lamp: ${halo[at]} ${halo[at + 1]} ${halo[at + 2]}`);
+  assert.ok(halo[at] > .215 && halo[at] - .2 > 3 * (halo[at + 2] - .2), `a red glow next to the lamp: ${halo[at]} ${halo[at + 1]} ${halo[at + 2]}`);
 });

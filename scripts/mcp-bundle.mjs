@@ -9,7 +9,7 @@ import { join, resolve } from 'node:path';
 const root = resolve(import.meta.dirname, '..'), out = resolve(process.argv[2] ?? join(root, 'dist-mcp'));
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
 // The app files help reads catalogs from at runtime (mcp/env.ts appFile).
-const sources = Object.fromEntries(['src/state/store.ts', 'src/components/SettingsDialog.tsx', 'src/workspaces/ColorWorkspace.tsx', 'src/services/color.ts']
+const sources = Object.fromEntries(['src/state/store.ts', 'src/components/SettingsDialog.tsx']
   .map(path => [path, readFileSync(join(root, path), 'utf8')]));
 mkdirSync(out, { recursive: true });
 await build({

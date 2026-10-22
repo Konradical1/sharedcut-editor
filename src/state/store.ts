@@ -1657,8 +1657,10 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       const index=selected>=0?(selected===output?selected:selected+1):output>=0?output:nodes.length;
       if(nodes.some(n=>!available(n.id,'*')))return;
       node.position={x:(nodes[index-1]?.position?.x??-110)+170,y:nodes[index-1]?.position?.y??80};node.order=index+1;
+      // Inserted before a node that sits where it lands (New Node before the Output CST): the rest of the chain moves right.
+      const after=nodes[index]?.position,crowded=!!after&&Math.abs(after.x-node.position.x)<150&&Math.abs(after.y-node.position.y)<90;
       nodes.splice(index,0,node);
-      commit('GradeNodeAdded', node.id, `added ${node.name} color node`, nodes.map((n,i)=>({collection:'nodes' as const,id:n.id,value:n.id===node.id?{...record(n),order:i+1}:{order:i+1},...(n.id===node.id?{replace:true}:{})}))); set({ selectedNodeId: node.id });
+      commit('GradeNodeAdded', node.id, `added ${node.name} color node`, nodes.map((n,i)=>({collection:'nodes' as const,id:n.id,value:n.id===node.id?{...record(n),order:i+1}:{order:i+1,...(crowded&&i>index&&n.position?{position:{x:n.position.x+170,y:n.position.y}}:{})},...(n.id===node.id?{replace:true}:{})}))); set({ selectedNodeId: node.id });
     },
     removeNode(id) {
       const node=get().nodes.find(n=>n.id===id); if(!node || !editableClip(node.clipId,'grade') || !available(id,'*'))return;

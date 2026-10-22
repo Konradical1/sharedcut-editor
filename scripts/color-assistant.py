@@ -46,9 +46,10 @@ def replace_atomic(path, data):
 
 
 def graded(rgb, stages):
-    """grade() in 64-row stripes, exactly like process_frames; numpy/OCIO release the GIL."""
+    """grade() in 64-row stripes, exactly like process_frames; numpy/OCIO release the GIL. A window is placed by each stripe's
+    rows; film stages are skipped (stills and measurements read the grade without grain, glow or weave)."""
     out = np.empty(rgb.shape, np.float32)
-    def stripe(row): out[row:row + 64] = engine.grade(np.ascontiguousarray(rgb[row:row + 64], np.float32), stages, None, True)
+    def stripe(row): out[row:row + 64] = engine.grade(np.ascontiguousarray(rgb[row:row + 64], np.float32), stages, None, True, (row, rgb.shape[0], rgb.shape[1]))
     list(pool.map(stripe, range(0, rgb.shape[0], 64)))
     return out
 

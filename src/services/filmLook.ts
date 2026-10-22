@@ -63,7 +63,7 @@ export function applyFilm(rgb: Float32Array, width: number, height: number, stag
   if (p.filmHalation > 0) {
     const threshold = .18 * 2 ** p.filmHalationThreshold, source = new Float32Array(n);
     for (let i = 0; i < n; i++) source[i] = Math.max(0, luma(i) - threshold);
-    const glow = filmBlur(source, width, height, 1, p.filmHalationRadius / 100 * height), tint = halationTint(p, w), k = p.filmHalation / 100;
+    const glow = filmBlur(source, width, height, 1, p.filmHalationRadius / 100 * height), tint = halationTint(p), k = p.filmHalation / 100 * .25;
     for (let i = 0; i < n; i++) for (let c = 0; c < 3; c++) out[i * 3 + c] += k * glow[i] * tint[c];
   }
   if (p.filmBloom > 0) {

@@ -1,0 +1,79 @@
+/* Color page keys: Qualifier and Windows panels (ColorQualifier.tsx, ColorWindows.tsx) and the viewer overlay (ColorWindowOverlay.tsx). */
+.ck-panel{--ck-line:#f4efe9;--ck-accent:var(--color-accent,#db978a);display:flex;flex-direction:column;gap:6px;padding:7px 12px 9px;min-width:0;min-height:0;flex:1;overflow:auto;overscroll-behavior:contain;font-size:11px;color:var(--text,#dedee3)}
+.ck-head{display:flex;align-items:center;gap:6px;min-height:25px;flex-wrap:wrap}
+.ck-head>.spacer{flex:1}
+.ck-head .icon-button{width:23px;height:23px}
+.ck-hint{font-size:10px!important;color:var(--muted,#9699a3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.ck-toggle,.ck-pick,.ck-view>button{height:23px;padding:0 9px;border:1px solid #45484f;background:#2a2c32;color:#b9bdc7;border-radius:4px;font-size:10.5px;display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.ck-toggle:hover,.ck-pick:hover,.ck-view>button:hover{color:#eceef2;border-color:#5b5e67}
+.ck-toggle[aria-pressed=true],.ck-pick[aria-pressed=true]{background:#4a3430;border-color:var(--ck-accent);color:#f8e6e1}
+.ck-view{display:inline-flex;border:1px solid #45484f;border-radius:4px;overflow:hidden}
+.ck-view>button{border:0;border-radius:0;border-left:1px solid #45484f;background:#24262b}
+.ck-view>button:first-child{border-left:0}
+.ck-view>button[aria-pressed=true]{background:#444750;color:#fff}
+
+/* A key row: name, bar, numbers. The bar holds an 18px track between a 6px lane above and an 8px feather lane below. */
+.ck-row{display:grid;grid-template-columns:28px minmax(140px,1fr) auto;align-items:center;gap:10px;min-width:0}
+.ck-name{font-size:10.5px;color:#b3b8c2}
+.ck-off .ck-bar{opacity:.55}
+.ck-fields{display:flex;gap:7px}
+.ck-field{display:flex;align-items:center;gap:4px;font-size:9.5px;color:var(--muted,#9699a3);text-transform:capitalize}
+.ck-field>input{width:44px;height:21px;font-size:10px!important}
+.ck-bar{position:relative;height:32px;touch-action:none;user-select:none;cursor:pointer;overflow:hidden;border-radius:3px}
+.ck-track{position:absolute;left:0;right:0;top:6px;height:18px;border-radius:3px;overflow:hidden;box-shadow:inset 0 0 0 1px #0008}
+.ck-track>i{position:absolute;inset:0}
+.ck-core{position:absolute;top:5px;height:20px;box-sizing:border-box;border:1.5px solid var(--ck-line);border-radius:3px;box-shadow:0 0 0 1px #000b,inset 0 0 0 1px #0006;cursor:grab}
+.ck-core:active{cursor:grabbing}
+.ck-centred:after{content:"";position:absolute;left:50%;top:2px;bottom:2px;width:1px;transform:translateX(-50%);background:var(--ck-line);opacity:.85;box-shadow:0 0 0 1px #0006}
+.ck-edge{position:absolute;top:3px;width:12px;height:24px;transform:translateX(-50%);cursor:ew-resize}
+.ck-edge:after{content:"";position:absolute;left:50%;top:6px;width:4px;height:12px;transform:translateX(-50%);border-radius:2px;background:var(--ck-line);box-shadow:0 0 0 1px #000c}
+.ck-edge:hover:after,.ck-feather:hover:after{background:var(--ck-accent)}
+.ck-feather{position:absolute;bottom:0;width:14px;height:8px;transform:translateX(-50%);cursor:ew-resize}
+.ck-feather:after{content:"";position:absolute;left:50%;bottom:0;transform:translateX(-50%);border:4.5px solid transparent;border-bottom:6px solid #cfd2d9;border-top:0}
+.ck-feather:hover:after{background:none;border-bottom-color:var(--ck-accent)}
+
+/* Windows: three cards side by side. */
+.ck-cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;min-width:0}
+.ck-card{border:1px solid #37393f;border-radius:5px;background:#1e1f23;padding:4px 8px 7px;min-width:0}
+.ck-card.on{border-color:#6a514b;background:#231f20}
+.ck-card>header{display:flex;align-items:center;gap:5px;height:27px;color:#c9ccd4}
+.ck-card>header>strong{font-size:11px;font-weight:550}
+.ck-card>header>.spacer{flex:1}
+.ck-card>header .icon-button{width:22px;height:22px}
+.ck-card.on>header>svg{color:var(--ck-accent)}
+.ck-card:not(.on) .ck-sliders{opacity:.5}
+.ck-card:not(.on) .ck-sliders:hover,.ck-card:not(.on) .ck-sliders:focus-within{opacity:.8}
+/* One grid per card: name, then one wide slider and its number, or two sliders with numbers for a pair (centre, size). */
+.ck-sliders{display:grid;grid-template-columns:58px minmax(16px,1fr) 44px minmax(16px,1fr) 44px;align-items:center;gap:3px 6px}
+.ck-slider,.ck-pair{display:contents}
+.ck-slider>span,.ck-pair>span{grid-column:1;font-size:10px;color:#a9aeb8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ck-slider:not(.bare)>input[type=range]{grid-column:2/5}
+.ck-slider>input[type=range]{width:100%;height:12px;margin:0}
+.ck-slider>input[inputmode=decimal]{width:100%;height:19px;font-size:10px!important;padding:2px 3px!important}
+@media(max-height:820px){.ck-panel{gap:5px;padding:5px 10px 6px}.ck-card{padding:2px 8px 5px}.ck-card>header{height:24px}.ck-sliders{row-gap:2px}}
+@media(max-width:1180px){.ck-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.ck-row{grid-template-columns:28px minmax(0,1fr)}.ck-row>.ck-fields{grid-column:2}}
+
+/* Viewer overlay. Above the transform, title and shape overlays while it is up; the SVG spans the program picture. */
+.color-window-overlay{position:absolute;inset:0;z-index:6;pointer-events:none}
+/* The clip's own transform box would read as window handles. */
+.viewer-frame:has(>.color-window-overlay)>.transform-overlay{display:none}
+.color-window-overlay>svg{display:block;width:100%;height:100%;overflow:hidden;pointer-events:all;touch-action:none}
+.color-window-overlay.picking>svg{cursor:crosshair}
+.color-window-overlay.picking .ckw-handle,.color-window-overlay.picking .ckw-body{pointer-events:none}
+.ckw-body{fill:transparent;stroke:none;cursor:move}
+.ckw-halo{fill:none;stroke:#000;stroke-opacity:.5;stroke-width:3.5;stroke-linejoin:round;vector-effect:non-scaling-stroke;pointer-events:none}
+.ckw-ring-halo,.ckw-guide-halo{stroke-width:2.5;stroke-opacity:.38}
+.ckw-edge{fill:none;stroke:#f4efe9;stroke-width:1.5;stroke-linejoin:round;vector-effect:non-scaling-stroke;pointer-events:none}
+.ckw-ring{fill:none;stroke:#f4efe9;stroke-opacity:.8;stroke-width:1;stroke-dasharray:5 4;vector-effect:non-scaling-stroke;pointer-events:none}
+.ckw-guide{fill:none;stroke:#f4efe9;stroke-opacity:.75;stroke-width:1;vector-effect:non-scaling-stroke;pointer-events:none}
+.ckw-arrow{fill:none;stroke:#f4efe9;stroke-width:1.5;vector-effect:non-scaling-stroke;pointer-events:none}
+.ckw-head{fill:#f4efe9;stroke:#000;stroke-opacity:.6;stroke-width:1;vector-effect:non-scaling-stroke;pointer-events:none}
+.ckw-handle{outline:none}
+.ckw-hit{fill:transparent}
+.ckw-shape{fill:#f4efe9;stroke:#141518;stroke-width:1;vector-effect:non-scaling-stroke}
+.ckw-move .ckw-shape{fill:#14151866;stroke:#f4efe9;stroke-width:1.5}
+.ckw-dot{fill:#f4efe9;pointer-events:none}
+.ckw-soft .ckw-shape{fill:#141518b3;stroke:#f4efe9;stroke-width:1.25}
+.ckw-handle:hover .ckw-shape,.ckw-handle:focus-visible .ckw-shape{fill:var(--color-accent,#db978a);stroke:#141518}
+.ckw-move:hover .ckw-shape,.ckw-move:focus-visible .ckw-shape{fill:#db978a59;stroke:var(--color-accent,#db978a)}
+.ckw-hint{position:absolute;top:8px;left:50%;transform:translateX(-50%);padding:5px 11px;border-radius:4px;background:#17181bdd;border:1px solid #ffffff1a;color:#e9e4df;font-size:10px;white-space:nowrap;pointer-events:none}

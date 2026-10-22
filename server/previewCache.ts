@@ -76,11 +76,12 @@ export function previewSlice(snapshot: Snapshot): Snapshot | undefined {
 
 /** Only what draws the range: an edit anywhere else, a waveform, a renamed track or a project's modified time leaves it alone. */
 // v2: held-frame and one-frame transition windows render like Export (server/media.ts, 2026-10-05).
-const STILL_VERSION = 'still-v2';
+// v3: Color page v3 grades (windows, qualifier, HSL curves, film) render frame by frame in color-render.py (2026-10-22).
+const STILL_VERSION = 'still-v3';
 function previewKey(slice: Snapshot) {
   const files = slice.assets.map(({ asset, path }) => { try { const file = statSync(path); return [asset.id, file.size, file.mtimeMs]; } catch { return [asset.id, null]; } });
   const tracks = slice.tracks.map(({ id, number, kind, muted, solo, hidden, gain, pan }) => [id, number, kind, muted, solo, hidden, gain, pan]);
-  return sha(['timeline-preview-v2', [slice.project.id, slice.project.resolution, slice.project.fps], slice.timeline.id, slice.settings, slice.clips, slice.nodes, tracks, slice.assets.map(({ asset }) => omit(asset, VOLATILE_ASSET)), files]);
+  return sha(['timeline-preview-v3', [slice.project.id, slice.project.resolution, slice.project.fps], slice.timeline.id, slice.settings, slice.clips, slice.nodes, tracks, slice.assets.map(({ asset }) => omit(asset, VOLATILE_ASSET)), files]);
 }
 
 /** Why the browser plays this range live instead of waiting for a render, if it must. */
@@ -135,7 +136,7 @@ export function createPreviewCache(directory: string, schedule: (id: string, wor
       const at = now(), from = Number(snapshot.settings.rangeIn), duration = Number(snapshot.settings.rangeOut) - from, fps = Number(snapshot.settings.fps);
       if (!Number.isFinite(from) || from < 0 || !Number.isFinite(duration) || duration <= 0 || duration > MAX_PREVIEW_SECONDS || !Number.isFinite(fps) || fps < 1 || fps > 120) throw new Error('Invalid preview range.');
       const slice = previewSlice(snapshot), reason = liveReason(slice), projectId = snapshot.project.id;
-      const key = slice && !reason ? previewKey(slice) : sha(['timeline-preview-v2', 'live', projectId, snapshot.timeline.id, snapshot.settings]);
+      const key = slice && !reason ? previewKey(slice) : sha(['timeline-preview-v3', 'live', projectId, snapshot.timeline.id, snapshot.settings]);
       const asked = jobs.get(key); if (asked) asked.lastAsked = at;
       sweep(at);
       // A depth key bakes at source resolution and waits on analysis any viewer would start from here, and a composition

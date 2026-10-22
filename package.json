@@ -32,7 +32,7 @@
     "test:library": "node --experimental-strip-types scripts/library-check.mjs",
     "test:sfx": "node --experimental-strip-types --test server/sfx.test.ts",
     "import:sfx": "node --experimental-strip-types scripts/import-sfx.mjs",
-    "test:color": "node scripts/color-gpu-check.mjs && node --experimental-strip-types scripts/color-overhaul-check.mjs && node --experimental-strip-types scripts/color-export-check.mjs",
+    "test:color": "node scripts/color-gpu-check.mjs && node scripts/color-v3-gpu-check.mjs && node --experimental-strip-types scripts/color-overhaul-check.mjs && node --experimental-strip-types scripts/color-export-check.mjs",
     "setup:color": "node scripts/setup-venv.mjs .venv-color scripts/color-requirements.txt",
     "generate:color": "node scripts/venv-run.mjs .venv-color scripts/generate-aces.py",
     "test:color-reference": "node --experimental-strip-types scripts/color-reference-check.mjs && node --experimental-strip-types scripts/color-managed-browser-check.mjs && node --experimental-strip-types scripts/color-managed-export-check.mjs",
