@@ -6,6 +6,13 @@ import { processingStages, sampleCurve, identityCurve, luminanceWeights, interpr
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 
 export class ColorPending extends Error {}
+/** What the viewer shows for one node's key (Color page Qualifier/Windows): its grade, the keyed area over grey ('highlight') or the black/white matte. */
+export type ColorView = { nodeId: string | null; mode: 'off' | 'highlight' | 'matte' };
+export const colorView: ColorView = { nodeId: null, mode: 'off' };
+/** Changes the key view and asks the viewer to redraw (stub until the GPU work lands). */
+export function setColorView(next: ColorView) { Object.assign(colorView, next); window.dispatchEvent(new Event('frameline:color-view')); }
+/** The selected node's input colour at picture position (px, py) ∈ [0,1]², in that node's working encoding, from the last drawn frame; null when unavailable (stub). */
+export async function probeNodeInput(_nodeId: string, _px: number, _py: number): Promise<number[] | null> { return null; }
 /** Immutable viewing LUTs; live corrections are tiny GPU parameters, never rebuilt LUTs. */
 export function createColorPreview(onReady:()=>void = ()=>{}) {
   const canvas=document.createElement('canvas'), gl=canvas.getContext('webgl2',{premultipliedAlpha:false,preserveDrawingBuffer:true});
