@@ -1,7 +1,8 @@
 import {browserExecutable} from './browser-options.mjs';
 // Color page v3 on the real GPU against the CPU reference (docs/color-grading-v3.md): every new per-pixel tool on legacy and
-// nodes-v2 clips, windows on full, letterboxed and YUV pictures, film passes against applyFilm, the key view, the node-input
-// probe, and the frame time of a 1920×1080 film grade.
+// nodes-v2 clips, windows on full, letterboxed and YUV pictures, film passes against applyFilm (transparent layers keep their
+// alpha), a spatial grade under a Stabilize warp, the key view, the node-input probe (layers drawn after the shot, bypassed
+// nodes, pasted grades), and the frame time of a 1920×1080 film grade.
 import assert from 'node:assert/strict';
 import {createServer} from 'vite';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
@@ -83,13 +84,14 @@ try{
 
   // ---- Film stage against applyFilm. Segments stay unclamped between passes (as color-render.py), while colorTransform clamps
   // each part, so the oracle counts the values it had to clamp before a film stage: the data keeps that at 0. ----
-  const cpuChain=(clip,asset,nodes,picture,frame)=>{
-   const {width,height}=picture,input=sourceOf(picture),films=processingStages(clip,nodes).filter(s=>s.type==='film'),parts=[[]];let clamped=0;
+  // `rgbAt(i)` overrides the picture's pixels (a warped float picture), `alphaAt(i, id)` gives windows and mattes per pixel.
+  const cpuChain=(clip,asset,nodes,picture,frame,rgbAt=sourceOf(picture).rgb,alphaAt)=>{
+   const {width,height}=picture,films=processingStages(clip,nodes).filter(s=>s.type==='film'),parts=[[]];let clamped=0,at=0;const maskAt=alphaAt&&(id=>alphaAt(at,id));
    for(const n of [...nodes].filter(n=>n.enabled).sort((a,b)=>a.order-b.order)){parts.at(-1).push(n);if(filmActive(n.parameters))parts.push([]);}
-   let rgb=new Float32Array(width*height*3);for(let i=0;i<width*height;i++)rgb.set(input.rgb(i),i*3);
-   const run=(transform,beforeFilm)=>{for(let i=0;i<width*height;i++){const out=transform(Array.from(rgb.subarray(i*3,i*3+3)));if(beforeFilm)clamped+=out.filter(v=>v<=0||v>=1).length;rgb.set(out,i*3);}};
-   run(colorTransform(clip,asset,parts[0]),films.length>0);
-   films.forEach((film,k)=>{rgb=applyFilm(rgb,width,height,film,frame);run(colorTransform({...clip,properties:{...clip.properties,inputProfile:film.gamma,inputGamut:film.gamut,inputExposure:0,inputTemperature:0}},asset,parts[k+1]),k+1<films.length);});
+   let rgb=new Float32Array(width*height*3);for(let i=0;i<width*height;i++)rgb.set(rgbAt(i),i*3);
+   const run=(transform,beforeFilm)=>{for(let i=0;i<width*height;i++){at=i;const out=transform(Array.from(rgb.subarray(i*3,i*3+3)));if(beforeFilm)clamped+=out.filter(v=>v<=0||v>=1).length;rgb.set(out,i*3);}};
+   run(colorTransform(clip,asset,parts[0],undefined,maskAt),films.length>0);
+   films.forEach((film,k)=>{rgb=applyFilm(rgb,width,height,film,frame);run(colorTransform({...clip,properties:{...clip.properties,inputProfile:film.gamma,inputGamut:film.gamut,inputExposure:0,inputTemperature:0}},asset,parts[k+1],undefined,maskAt),k+1<films.length);});
    return {clamped,expected:Array.from({length:width*height},(_,i)=>Array.from(rgb.subarray(i*3,i*3+3)))};
   };
   // A gradient with lamps; `tame` keeps S-Log3 colours inside DaVinci Wide Gamut (a saturated S-Gamut3.Cine red is not).
@@ -120,6 +122,43 @@ try{
     results.push({group:'film',pipeline:clip.properties.colorPipeline??'legacy',name:name+' '+mode,...compare(pixelsOf(rendered),expected)});
    }finally{renderer.dispose();}
   }
+  // A transparent layer (a title: an opaque and a half-transparent box on nothing) through film. Film changes colour only, so every
+  // pixel keeps the source's alpha (the viewer showed an opaque box) and the opaque pixels' colour matches applyFilm.
+  {
+   const title=canvasOf(96,54,ctx=>{ctx.fillStyle='rgb(200,150,60)';ctx.fillRect(20,12,40,16);ctx.fillStyle='rgba(60,120,190,.5)';ctx.fillRect(50,30,30,14);}),{d}=sourceOf(title);
+   const {clip,asset,nodes}=legacyFilm({offset:.04,saturation:110,filmGrain:40,filmGrainSeed:3,filmVignette:40,filmHalation:60,filmHalationThreshold:-1,filmHalationRadius:3,filmBloom:40,filmBloomRadius:6},'96 × 54');
+   for(const mode of ['gpu','software']){
+    const renderer=mode==='gpu'?createColorPreview():software();
+    try{
+     const rendered=pixelsOf(await draw(renderer,title,clip,asset,nodes,undefined,new Map(),undefined,5)),{clamped,expected}=cpuChain(clip,asset,nodes,title,5);
+     let alphaChanged=0;for(let i=0;i<96*54;i++)if(Math.abs(rendered[i*4+3]-d[i*4+3])>1)alphaChanged++;
+     if(mode==='gpu')oracle.push({name:'transparent title',clamped});
+     results.push({group:'film',pipeline:'legacy',name:'transparent title keeps its alpha '+mode,...compare(rendered,expected.map((rgb,i)=>d[i*4+3]===255?rgb:d[i*4+3]?undefined:null)),alphaChanged});
+    }finally{renderer.dispose();}
+   }
+  }
+  // Stabilize with a spatial grade: export grades the stabilized bake, so the picture and its Smart Mask are read through the warp
+  // (bilinear, original → stabilized layer pixels) while windows and film stay on the output frame. A warp off the frame leaves
+  // the uncovered pixels transparent.
+  {
+   const {invert,apply}=await import('/src/services/colorKeys.ts'),W=128,H=72;
+   const picture=canvasOf(W,H,ctx=>{const image=ctx.createImageData(W,H);for(let y=0;y<H;y++)for(let x=0;x<W;x++){const blob=Math.exp(-((x-40)**2+(y-30)**2)/50)+.8*Math.exp(-((x-95)**2+(y-50)**2)/30);image.data.set([50+120*x/W+55*blob,45+110*y/H+55*blob,150-70*x/W+50*blob,255].map(Math.round),(y*W+x)*4);}ctx.putImageData(image,0,0);});
+   const {d}=sourceOf(picture),matte=new Uint8Array(W*H);for(let i=0;i<W*H;i++)matte[i]=Math.round(255*(.15+.7*(i%W)/W*(.4+.6*Math.floor(i/W)/H)));
+   const bilinear=(data,channels,c,x,y)=>{const u=Math.max(0,Math.min(W-1,x-.5)),v=Math.max(0,Math.min(H-1,y-.5)),x0=Math.floor(u),y0=Math.floor(v),x1=Math.min(W-1,x0+1),y1=Math.min(H-1,y0+1),fx=u-x0,fy=v-y0,at=(X,Y)=>data[(Y*W+X)*channels+c];return (at(x0,y0)*(1-fx)+at(x1,y0)*fx)*(1-fy)+(at(x0,y1)*(1-fx)+at(x1,y1)*fx)*fy;};
+   const s=1.1,phi=Math.PI/180,a=s*Math.cos(phi),b=s*Math.sin(phi),zoom=[a,b,-b,a,W/2+2.25-a*W/2+b*H/2,H/2-1.25-b*W/2-a*H/2],shift=[1,0,0,1,5,3];
+   const windowed={offset:.03,saturation:120,circOn:1,circX:.35,circY:.45,circW:.22,circH:.18,circSoft:.1,gradOn:1,gradAngle:25,gradSoft:.3};
+   const clip={id:'stab',projectId:'p',properties:{}},asset={inputProfile:'Rec.709',resolution:`${W} × ${H}`},masks=new Map([['m1',{key:'m1-k',data:matte,width:W,height:H}]]);
+   const node=(id,order,parameters,mask)=>({id,clipId:'stab',projectId:'p',kind:'serial',name:id,enabled:true,order,parameters,...mask?{mask:{id:'m1',enabled:true,invert:false,amount:80}}:{}});
+   for(const [name,warp,nodes,film] of [['windows + matte',zoom,[node('w',1,windowed,true)],false],['windows + matte + film',zoom,[node('w',1,windowed,true),node('f',2,{gain:1.05,filmVignette:45,filmGrain:35,filmGrainSeed:4,filmHalation:50,filmHalationThreshold:-1,filmHalationRadius:3})],true],['shifted off the frame',shift,[node('w',1,windowed,true)],false]]){
+    const back=invert(warp),q=i=>apply(back,i%W+.5,Math.floor(i/W)+.5),outside=i=>{const p=q(i);return p.x<0||p.y<0||p.x>W||p.y>H;};
+    const {expected,clamped}=cpuChain(clip,asset,nodes,picture,5,i=>{const p=q(i);return [0,1,2].map(c=>bilinear(d,4,c,p.x,p.y)/255);},(i,id)=>{if(id==='m1'){const p=q(i);return bilinear(matte,1,0,p.x,p.y)/255;}return windowAlpha((i%W+.5)/W,(Math.floor(i/W)+.5)/H,W/H,nodes.find(n=>'window:'+n.id===id).parameters);});
+    if(film)oracle.push({name:'stabilize warp, '+name,clamped});
+    for(const mode of ['gpu','software']){
+     const renderer=mode==='gpu'?createColorPreview():software();
+     try{results.push({group:film?'film':'windows',pipeline:'legacy',name:`stabilize warp, ${name} ${mode}`,...compare(pixelsOf(await draw(renderer,picture,clip,asset,nodes,undefined,masks,undefined,5,warp)),expected.map((rgb,i)=>outside(i)?null:rgb))});}finally{renderer.dispose();}
+    }
+   }
+  }
   // A film stage that changes nothing (vignette outside the frame) must hand on out-of-range values untouched: the
   // saturated palette leaves DaVinci Wide Gamut and goes above 1, and the grade must equal the single pass (CPU skips film).
   for(const pipeline of ['legacy','nodes-v2']){
@@ -148,6 +187,14 @@ try{
      setColorView({nodeId:null,mode:'off'});
     }finally{renderer.dispose();}
    }
+   // A pasted grade (new ids, same values) re-plans, so the key view finds the new node.
+   const renderer=createColorPreview();
+   try{
+    await draw(renderer,moderate,clip,asset,[first,keyed]);
+    setColorView({nodeId:'xb',mode:'matte'});
+    results.push({group:'key view',pipeline:'legacy',name:'matte of a pasted grade',...compare(pixelsOf(await draw(renderer,moderate,clip,asset,[{...first,id:'xa'},{...keyed,id:'xb'}])),Array.from({length:1024},(_,i)=>Array(3).fill(alpha(i))))});
+    setColorView({nodeId:null,mode:'off'});
+   }finally{renderer.dispose();}
   }
   window.removeEventListener('frameline:color-view',onView);
 
@@ -161,6 +208,23 @@ try{
     await draw(renderer,flat,clip,asset,nodes);
     near('legacy second node',await probeNodeInput('p2',.5,.5),colorTransform(clip,asset,[nodes[0]])(rgb));
     near('legacy first node',await probeNodeInput('p1',.5,.5),rgb);near('legacy corner (5×5 kept inside)',await probeNodeInput('p1',0,1),rgb);
+    // A layer drawn after the shot (a graded adjustment above, picture-in-picture, a dissolve) leaves the pick to the shot's own
+    // next draw, which the viewer is asked for once.
+    let asked=0;const ask=()=>asked++;window.addEventListener('frameline:color-view',ask);
+    const other={id:'above',projectId:'p',properties:{}},above=[{id:'up',clipId:'above',projectId:'p',kind:'serial',name:'Up',enabled:true,order:1,parameters:{saturation:130}}];
+    await draw(renderer,flat,other,asset,above);
+    const waiting=probeNodeInput('p2',.5,.5);await draw(renderer,flat,clip,asset,nodes);await draw(renderer,flat,other,asset,above);
+    near('under a layer drawn after it',await waiting,colorTransform(clip,asset,[nodes[0]])(rgb));
+    window.removeEventListener('frameline:color-view',ask);near('a waiting pick asks for one redraw',[asked],[1]);
+    // A bypassed node reads the input of the place it holds: the next enabled node's input, or the whole grade when it is last.
+    const three={id:'p3',clipId:'probe',projectId:'p',kind:'serial',name:'Three',enabled:true,order:3,parameters:{gain:.9}},off=(id,order)=>({...nodes[1],id,order,enabled:false});
+    await draw(renderer,flat,clip,asset,[nodes[0],off('pb',2),three,off('pl',4)]);
+    near('bypassed node between two',await probeNodeInput('pb',.5,.5),colorTransform(clip,asset,[nodes[0]])(rgb));
+    near('bypassed last node',await probeNodeInput('pl',.5,.5),colorTransform(clip,asset,[nodes[0],three])(rgb));
+    await draw(renderer,flat,clip,asset,[off('pb',1)]);near('every node bypassed',await probeNodeInput('pb',.5,.5),rgb);
+    // A pasted grade (new ids, same values) re-plans, so the pick finds the new node.
+    await draw(renderer,flat,clip,asset,nodes);await draw(renderer,flat,clip,asset,nodes.map(n=>({...n,id:'pasted-'+n.id})));
+    near('pasted grade',await probeNodeInput('pasted-p2',.5,.5),colorTransform(clip,asset,[nodes[0]])(rgb));
     let id=0;const managed={id:'probem',projectId:'p',properties:{colorPipeline:'nodes-v2',inputProfile:'S-Log3',inputGamut:'S-Gamut3.Cine'}},log={inputProfile:'S-Log3',resolution:'1920 × 1080'},graded=starterGrade(managed,log,()=>'q'+ ++id);
     graded[1].parameters={...graded[1].parameters,exposure:.5,saturation:120};
     await draw(renderer,flat,managed,log,graded);
@@ -196,10 +260,11 @@ try{
  for(const o of report.oracle){console.log(`oracle    ${o.name.padEnd(58)} clamped ${o.clamped}`);assert.equal(o.clamped,0,`${o.name}: the CPU oracle clamped values before a film stage; keep the test picture in range`);}
  for(const r of report.results){
   assert.equal(r.leaks,0,`${r.group} ${r.name}: pixels outside the picture must stay transparent and pixels inside opaque`);
+  assert.equal(r.alphaChanged??0,0,`${r.name}: every pixel keeps the source's alpha`);
   if(r.group==='film'&&!r.name.startsWith('neutral'))assert.ok(r.meanError<=1&&r.maxError<=6,`${r.name}: film must match applyFilm (mean ≤ 1, max ≤ 6 codes)`);
   else assert.ok(r.maxError<=2,`${r.group} ${r.pipeline} ${r.name}: GPU must match the CPU reference within 2 codes`);
  }
  for(const p of report.probes)assert.ok(p.error<=2e-3,`probe ${p.name}: ${JSON.stringify(p.actual)} vs ${JSON.stringify(p.expected)}`);
- assert.equal(report.events,8,'setColorView announces every change');
+ assert.equal(report.events,10,'setColorView announces every change');
  console.log('PASS Color v3 GPU parity: log wheels, Shadows/Highlights, hue/boost/density, HSL curves, mixer, qualifier, windows, film, key view and probe.');
 }finally{await browser.close();await server.close();}

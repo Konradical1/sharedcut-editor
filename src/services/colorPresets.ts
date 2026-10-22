@@ -58,7 +58,8 @@ export function lookPatch(id: string, strength = 1, managed = true) {
     const initial = PARAM[key]?.initial ?? primaryDefaults[key] ?? 0;
     parameters[key] = ABSOLUTE.has(key) ? value : round(initial + (value - initial) * t);
   }
-  if (!managed && parameters.pivot === primaryDefaults.pivot) parameters.pivot = .5;
+  // Legacy nodes grade Gamma 2.4, where the neutral pivot is .5: also when the look leaves pivot to the reset.
+  if (!managed && (parameters.pivot ?? primaryDefaults.pivot) === primaryDefaults.pivot) parameters.pivot = .5;
   const curves: ColorCurves = Object.fromEntries(Object.entries(look.curves ?? {}).map(([key, points]) => {
     const flat = (x: number) => (HSL_CURVES as readonly string[]).includes(key) ? .5 : x;
     return [key, { mode: 'smooth', points: points!.map(([x, y], i) => ({ id: `${key}-${i}`, x, y: round(flat(x) + (y - flat(x)) * t) })) } satisfies ColorCurve];

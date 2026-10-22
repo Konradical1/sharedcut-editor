@@ -14,6 +14,8 @@ import { applyStateDelta } from '../../src/services/stateDelta.ts';
 import { neutralLook, type LookOption } from '../../src/services/colorAssistant.ts';
 import { GRADE_PARAMS } from '../../src/services/grading.ts';
 import { COLOR_LOOKS } from '../../src/services/colorPresets.ts';
+import { colorTransform, encodeLog, gamutMatrix } from '../../src/services/color.ts';
+import { measure, hints, regionHint } from '../colorStats.ts';
 import type { PersistedState } from '../../src/services/index.ts';
 
 process.env.FRAME_LINE_URL = 'http://color.test';
@@ -45,9 +47,10 @@ const normalized = () => { const body = normalizePosted.at(-1); return { id: nor
   result: { shots: [...body.clipIds, ...(body.contextIds ?? [])].map((clipId: string) => ({ clipId, balance: phone ? { exposure: 0, temperature: 0, tint: 0, lift: 0, gamma: .5, gain: .8 } : { exposure: .3, temperature: -500, tint: 2, lift: -.01 }, confidence: .9, warnings: [{ code: 'clipping', text: 'sky' }],
     ...(clipId === stale && { input: { profile: 'Rec.709', gamut: 'Rec.709' } }) })), level: { group: .18, target: .18 } } }; };
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
-// /api/frames: the rendered frame (a timeline) or a file's own picture (mediaId); `refuse` answers as the server does for a frame it cannot render alone.
+// /api/frames: the rendered frame (a timeline) or a file's own picture (mediaId); `refuse` answers as the server does for a frame it
+// cannot render alone, from request `refuseFrom` + 1 on.
 const frames: Record<string, string>[] = [];
-let frameJpeg = Buffer.alloc(0), mediaJpeg = Buffer.alloc(0), refuse: { live: string; error: string } | null = null;
+let frameJpeg = Buffer.alloc(0), mediaJpeg = Buffer.alloc(0), refuse: { live: string; error: string } | null = null, refuseFrom = 0;
 globalThis.fetch = (async (input: string | URL, init: RequestInit = {}) => {
   const url = new URL(String(input)), path = url.pathname, method = init.method ?? 'GET';
   if (path === '/api/auth/me') return json({ user: server.users.find(u => u.id === server.currentUserId) });
@@ -63,7 +66,7 @@ globalThis.fetch = (async (input: string | URL, init: RequestInit = {}) => {
   if (path.startsWith(`${base}/${jobId}/stills/`)) return new Response(Buffer.from(path), { headers: { 'content-type': 'image/jpeg' } });
   if (path === '/api/frames') {
     frames.push(Object.fromEntries(url.searchParams));
-    if (refuse) return json(refuse, 409);
+    if (refuse && frames.length > refuseFrom) return json(refuse, 409);
     return new Response(url.searchParams.has('mediaId') ? mediaJpeg : frameJpeg, { headers: { 'content-type': 'image/jpeg' } });
   }
   return json({ error: `not faked: ${method} ${path}` }, 404);
@@ -248,13 +251,22 @@ test('color-measure renders the graded frame, measures it against a reference pi
   assert.match(step.text, /\ncrushed black\/clipped white: 0\.0% 0\.0% \| ref 0\.0% 0\.0%\n/, 'the bars are not counted as crushed blacks');
   assert.match(step.text, /\nmids: \d+% rgb \d+\/\d+\/\d+ warm -\d\.\d mag \+\d\.\d sat \d+ \| ref \d+% rgb/);
   assert.match(step.text, /\nregion face \(\.4,\.3 \.15x\.3\): luma \d+ rgb \d+\/\d+\/\d+ warm \+\d+\.\d mag [-+]\d\.\d sat \d+ hue \d+° (red|orange) \| ref luma \d+ .*hue \d+° (red|orange) → luma \+\d+\.\d/);
-  // The amounts come from the clip's own grade (nodes-v2, S-Log3 through ACES 2) on the CPU reference.
-  assert.match(step.text, /\nto match the ref \(\+\/− add to the current value, × multiplies it; amounts from this grade, damped; change, frame, measure again\):\n- darker than ref \(median 51 vs 62\): exposure \+\.\d\d stops \(Balance\)/);
-  assert.match(step.text, /\n- overall cooler than ref \(warm -2\.9 vs \+3\.6, mag \+2\.3 vs -0\.4 after the saturation change\): temperature \+\d+, tint -\d+ \(Balance\)/);
-  assert.match(step.text, /\n- more saturated than ref \(colour spread 8 vs 5, mean 8 vs 6, p90 14 vs 7\): saturation ×0\.\d\d/);
+  // The amounts come from the clip's own grade (nodes-v2, S-Log3 through ACES 2) on the CPU reference. A brighter ref: the
+  // exposure hint comes alone (contrast, casts and saturation are judged again once the brightness matches).
+  assert.match(step.text, /\nto match the ref \(\+\/− add to the current value, × multiplies it; amounts from this grade, damped; apply top-down to the first exposure or Balance hint, then measure again\):\n- darker than ref \(median 51 vs 62\): exposure \+\.\d\d stops \(Balance\), or gamma \(Midtones\) up; then measure again \(contrast, colour and saturation follow the brightness\)$/);
   assert.equal(step.content?.length, 1, 'frame and ref side by side in one picture');
   const shown = await loadImage(Buffer.from((step.content![0] as { data: string }).data, 'base64'));
   assert.deepEqual([shown.width, shown.height], [772, 216]);
+
+  // As bright, but flatter, warmer and with less colour: contrast and saturation, then one Balance move (divided by both, as they
+  // go in the same round), then measure again; the hue mix waits for the casts.
+  await writeFile(file, await scene([82, 84, 92], [137, 130, 118], [200, 145, 115], 0, 'png'));
+  const match = (await run('color-measure', { clip: a.id, ref: file })).text, todo = match.split('\n').filter(l => l.startsWith('- '));
+  const at = (re: RegExp) => todo.findIndex(l => re.test(l));
+  assert.deepEqual([/^- more contrast than ref \(p95−p5 27 vs 18\): contrast ×0\.\d\d/, /^- more saturated than ref \(colour spread 8 vs 6, mean 8 vs 6, p90 14 vs 6\): saturation ×0\.\d\d/,
+    /^- overall cooler than ref \(warm -2\.9 vs \+1\.6, mag \+2\.3 vs \+0\.3 after the saturation change\): temperature \+\d+, tint -\d+ \(Balance\), or it needs .* via offsetR\/G\/B \(Offset wheel\); then measure again$/,
+    /^- ref has more orange .*: once the casts match, /].map(at).map((i, n, all) => i >= 0 && (n === 0 || i > all[n - 1])), [true, true, true, true], match);
+  assert.ok(todo.filter(l => /^- (after that, )?(shadows|mids|highlights) /.test(l)).length <= 1, 'one zone a round');
 
   // Without a reference: the numbers only, at the asked time.
   frames.length = 0;
@@ -284,7 +296,15 @@ test('color-measure takes a media item or another clip as the reference, and say
   await assert.rejects(run('color-measure', { clip: a.id, regions: [{ x: .9, y: 0, w: .2, h: .5 }] }), /params\.regions: up to 8 boxes/);
   refuse = { live: 'denoise', error: 'Noise Reduction bakes whole clips; this frame shows live in the editor.' };
   await assert.rejects(run('color-measure', { clip: a.id }), /cannot render the graded frame at [\d.]+s on its own \(Noise Reduction bakes whole clips.*\); bypass Noise Reduction while grading, measure, then turn it back on\./);
-  refuse = null;
+  // A ref clip is rendered at its middle, which `at` (the measured frame) cannot move.
+  refuse = { live: 'cut', error: 'A transition blends two clips here.' }; frames.length = 0; refuseFrom = 1;
+  await assert.rejects(run('color-measure', { clip: a.id, ref: b.id }), new RegExp(`cannot render the ref ${short(b.id)} at its middle \\([\\d.]+s\\) on its own \\(A transition blends two clips here\\.\\); use another shot as ref\\.$`));
+  refuse = null; refuseFrom = 0;
+  // A clip on a hidden track: the frame shows what is drawn instead, and says so.
+  await edit(run => run('updateTrack', a.trackId, { hidden: true }));
+  assert.match((await run('color-measure', { clip: a.id })).text, /\nnote: its track is hidden: this is what shows instead \(show the track to measure the clip\)\n/);
+  await edit(run => run('updateTrack', a.trackId, { hidden: false }));
+  assert.ok(!(await run('color-measure', { clip: a.id })).text.includes('hidden'));
 });
 
 test('the grade model answers exactly where the grade is linear, and stays finite through a log grade', () => {
@@ -294,6 +314,9 @@ test('the grade model answers exactly where the grade is linear, and stays finit
   near(model.exposure(25, 50), 1);
   const [temperature, tint] = model.balance(50, 2, 1);
   near(temperature, 400, .05); near(tint, 4, .01);
+  // Temperature scales R and B by 1 ± t/10000, tint G by 1 − t/200: a grey moves in step with its level.
+  model.balanced(50, 400, 4).forEach((v, i) => near(v, [2, -1, -2][i], 1e-3));
+  model.balanced(20, 400, 4).forEach((v, i) => near(v, [.8, -.4, -.8][i], 1e-3));
   near(model.saturation(50, 1.5), 150, .01);
   model.channels(['liftR', 'liftG', 'liftB'], 50, [1, 0, -1]).forEach((v, i) => near(v, [.02, 0, -.02][i], 1e-5));
   near(model.contrast(25, 75, 75), 1.5, 1e-3);
@@ -303,6 +326,60 @@ test('the grade model answers exactly where the grade is linear, and stays finit
   assert.ok(up > .1 && up < 3 && down < -.1, `exposure ${up} ${down}`);
   assert.ok(log.balance(40, 2, 0).every(Number.isFinite) && log.balance(40, 2, 0)[0] > 0, 'warmer needs a higher temperature');
   assert.ok(log.channels(['gainR', 'gainG', 'gainB'], 60, [1, 0, -1]).every(Number.isFinite));
+});
+
+test('followed literally round by round, the hints match a white balance or an exposure change on Balance (CPU reference)', () => {
+  // b's grade as initializeColorGrade makes it (nodes-v2, S-Log3, ACES 2 with the shoulder standing in, as in the model; the
+  // tests above left a Punch node after its Output CST) on a daylight scene: sky, skin, foliage, a grey road ramp and a grey card.
+  // The ref is the same grade with one Balance change; the frame starts without it.
+  const clip = s().clips.find(c => c.id === b.id)!, kept = s().nodes;
+  const own = kept.filter(n => n.clipId === b.id && ['Input CST', 'Balance', 'Look', 'Output CST'].includes(n.name)).map(n => n.effects?.length ? n : { ...n, parameters: { pivot: .336043 }, curves: undefined });
+  const balance = own.find(n => n.name === 'Balance')!, look = own.find(n => n.name === 'Look')!, W = 96, H = 54, M = gamutMatrix('Rec.709', 'S-Gamut3.Cine');
+  const scene = (x: number, y: number) => {
+    const u = x / (W - 1), lin = x > W * .8 && y > H * .8 ? [.18, .18, .18] : [[.45, .6, .95].map(v => v * (.8 + .4 * u)), [.42, .28, .2].map(v => v * (.6 + .8 * u)), [.025, .05, .015].map(v => v * (.5 + 1.5 * u)), [1, 1, 1].map(v => v * (.01 + .5 * u))][Math.floor(y / (H / 4))];
+    return M.map(row => encodeLog(row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2], 'S-Log3'));
+  };
+  const graded = (patch: Record<string, Record<string, number>>) => own.map(n => ({ ...n, parameters: { ...n.parameters, ...patch[n.id] }, effects: n.effects?.map(e => e.type === 'cst' && e.toneMapping === 'aces2' ? { ...e, toneMapping: 'shoulder' as const, gamutMapping: 'compress' as const } : e) }));
+  const render = (patch: Record<string, Record<string, number>>) => {
+    const tf = colorTransform(clip, undefined, graded(patch), undefined, () => 0), data = new Uint8ClampedArray(W * H * 4);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) data.set([...tf(scene(x, y)).map(v => Math.round(Math.max(0, Math.min(1, v)) * 255)), 255], (y * W + x) * 4);
+    return { width: W, height: H, data };
+  };
+  const card = { x: .82, y: .82, w: .18, h: .18 }, skin = { x: 0, y: .25, w: .78, h: .25 };
+  // The help's rule: top-down, every hint with an amount, and stop after an exposure or Balance hint.
+  const follow = (todo: string[], patch: Record<string, Record<string, number>>) => {
+    const add = (id: string, key: string, v: number) => { patch[id] = { ...patch[id], [key]: (patch[id]?.[key] ?? own.find(n => n.id === id)!.parameters[key] ?? 0) + v }; };
+    const times = (key: string, v: number, initial: number) => { patch[look.id] = { ...patch[look.id], [key]: (patch[look.id]?.[key] ?? look.parameters[key] ?? initial) * v }; };
+    for (const h of todo) {
+      const n = (re: RegExp) => Number(re.exec(h)?.[1] ?? 0), wheel = / via (lift|gamma|gain)R ([-+]?\.\d+|0) \1G ([-+]?\.\d+|0) \1B ([-+]?\.\d+|0)/.exec(h);
+      if (/ stops /.test(h)) return add(balance.id, 'exposure', n(/exposure ([-+.\d]+) stops/));
+      if (/contrast ×/.test(h)) times('contrast', n(/contrast ×([.\d]+)/), 1);
+      if (/saturation ×/.test(h)) times('saturation', n(/saturation ×([.\d]+)/), 100);
+      if (h.startsWith('overall ')) { add(balance.id, 'temperature', n(/temperature ([-+]\d+)/)); return add(balance.id, 'tint', n(/tint ([-+]\d+) \(/)); }
+      if (wheel) ['R', 'G', 'B'].forEach((c, i) => add(balance.id, wheel[1] + c, Number(wheel[i + 2])));
+    }
+  };
+  try {
+    for (const [change, first] of [[{ temperature: (balance.parameters.temperature ?? 0) + 1500 }, /^overall cooler than ref .*: temperature \+1[12]\d0(, tint [-+]\d)? \(Balance\)/], [{ exposure: (balance.parameters.exposure ?? 0) + 1 }, /^darker than ref .*: exposure \+\.[89]\d stops \(Balance\)/]] as const) {
+      const ref = render({ [balance.id]: change }), r = measure(ref), patch: Record<string, Record<string, number>> = {}, rounds: string[][] = [];
+      for (let round = 0; round < 5; round++) {
+        store.setState({ nodes: [...kept.filter(n => n.clipId !== b.id), ...graded(patch)] });
+        const todo = hints(measure(render(patch)), r, { linear: true, model: gradeModel(clip, b.start + b.duration / 2) });
+        rounds.push(todo);
+        if (!todo.length) break;
+        follow(todo, patch);
+      }
+      const trail = rounds.map((todo, i) => `round ${i}:\n${todo.join('\n')}`).join('\n');
+      // The one control that made the difference comes first, before any wheel; at most one zone gets a wheel hint.
+      const lead = rounds[0].findIndex(h => /^(overall|darker|brighter) /.test(h)), zone = rounds[0].findIndex(h => / than ref:/.test(h));
+      assert.match(rounds[0][lead] ?? '', first, trail);
+      assert.ok((zone < 0 || zone > lead) && rounds[0].filter(h => / than ref:/.test(h)).length <= 1, trail);
+      assert.ok(rounds.length <= 3 && !rounds.at(-1)!.length, `matched within two rounds:\n${trail}`);
+      const final = render(patch);
+      assert.equal(regionHint(measure(final, card), measure(ref, card)), '', 'the grey card matches');
+      assert.equal(regionHint(measure(final, skin), measure(ref, skin)), '', 'skin matches');
+    }
+  } finally { store.setState({ nodes: kept }); }
 });
 
 test('the help topic is the parameter registry, the look library and the grading recipes', () => {
@@ -318,6 +395,11 @@ test('the help topic is the parameter registry, the look library and the grading
   for (const topic of ['Log wheels:', 'HSL curves', 'Qualifier (qualOn 1)', 'Windows (', 'Film:', 'color-measure{', 'Looks: act applyColorLook', '- match a reference picture: 1) job color-measure', '- sky:', '- skin:', '- black and white:']) assert.ok(text.includes(topic), topic);
   assert.match(text, /gammas: Rec\.709, S-Log3, .*Gamma 2\.4/);
   assert.ok(!text.includes('hue≠0'), 'hue renders now');
+  // Hints go a round at a time (exposure or white balance first, measure again), and the wheels say what they do on each pipeline.
+  assert.ok(text.includes('Apply them top-down; after an exposure or Balance (temperature/tint) hint, measure again before the rest'));
+  assert.ok(text.includes('apply the hints top-down (Balance takes exposure, temperature, tint and the wheel amounts; Look contrast and saturation) and stop after an exposure or Balance hint'));
+  assert.ok(!text.includes('all of them work applied together'));
+  assert.ok(text.includes('Legacy (display signal): lift moves the blacks most and white not at all') && text.includes('lift moves whites about as much as blacks (close to Offset)') && text.includes('To colour one tonal band on nodes-v2, use the log wheels.'));
   // help{topic:"color", filter} keeps whole lines: the windows prose and every circle key.
   const circle = help('color', 'circ');
   assert.match(circle, /^Color grading/);

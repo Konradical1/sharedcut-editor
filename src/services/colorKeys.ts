@@ -1,5 +1,6 @@
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 import { fittedPoint, poseLayerPoint, type Size, type Vec } from './motionTracker.ts';
+import { isAdjustment } from './adjustment.ts';
 import { interpretation, processingStages } from './color.ts';
 import { PARAM, fromOpponent, hueOf, on, opponent, sse, windowLocal } from './grading.ts';
 
@@ -25,10 +26,11 @@ export const apply = ([a, b, c, d, e, f]: Affine, x: number, y: number): Vec => 
 export const multiply = ([a, b, c, d, e, f]: Affine, [A, B, C, D, E, F]: Affine): Affine => [a * A + c * B, b * A + d * B, a * C + c * D, b * C + d * D, a * E + c * F + e, b * E + d * F + f];
 /** Non-finite when the map is flat (a clip zoomed or scaled to 0). */
 export function invert([a, b, c, d, e, f]: Affine): Affine { const det = a * d - b * c; return [d / det, -b / det, -c / det, a / det, (c * f - d * e) / det, (b * e - a * f) / det]; }
-/** Source picture → project canvas pixels: the letterbox, then the clip's pose (`clip` evaluated at the playhead), as playback
- *  draws the layer. Both steps are affine, so three points define the map. */
+/** Source picture → project canvas pixels: the letterbox, Flip H (playback mirrors the graded layer before the pose), then
+ *  the clip's pose (`clip` evaluated at the playhead), as playback draws the layer. All affine, so three points define the map. */
 export function pictureToCanvas(clip: Clip, source: Size, project: Size): Affine {
-  const at = (u: number, v: number) => poseLayerPoint(clip, fittedPoint(u, v, source, project), project), o = at(0, 0), x = at(1, 0), y = at(0, 1);
+  const flip = clip.properties.flipH === true && !isAdjustment(clip);
+  const at = (u: number, v: number) => poseLayerPoint(clip, fittedPoint(flip ? 1 - u : u, v, source, project), project), o = at(0, 0), x = at(1, 0), y = at(0, 1);
   return [x.x - o.x, x.y - o.y, y.x - o.x, y.y - o.y, o.x, o.y];
 }
 /** Window-local units (picture heights, turned `angle`° clockwise about the centre) → picture: the inverse of grading.windowLocal. */

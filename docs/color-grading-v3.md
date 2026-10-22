@@ -139,9 +139,15 @@ clamped edges; bilinear upsample with half-pixel centres (`x = (i + .5)·m/n −
 
 - **Preview** (WebGL2): per-pixel steps and the blend in the stage loop; the film stage splits the chain into passes
   (stages before → float texture → film passes → stages after). Windows use the picture rectangle inside the layer.
+  Film changes colour only: the layer keeps the source alpha. Under Stabilize, a grade with a window or film reads the
+  picture and its mattes through the stabilize warp, as export grades the stabilized bake.
 - **Export** (`color-render.py`): `grade()` runs per-pixel stages in stripes and computes window alphas from the stripe's
   rows; `grade_frame()` runs film stages on the whole frame between segments. Clips whose grade has an active window or
-  film stage always take the per-frame path (no LUT bake).
+  film stage always take the per-frame path (no LUT bake). So does a qualifier when the worker is installed: the hue key
+  jumps at grey (grey reads hue 0), which a 33³/65³ table smears onto near-greys by up to 10 levels; without the worker
+  (SharedCut Desktop) a qualifier grade falls back to a 65³ table. Stills and compositions keep their alpha through the
+  worker. Grain counts frames as `round(source time × fps)` for footage and `round((in point + time into clip) × project
+  fps)` for stills, titles and adjustment clips, in preview and export alike.
 - **CPU** (`colorTransform`): per-pixel steps and the qualifier; a window needs `maskAt('window:<node id>')`; film stages
   are skipped (it bakes LUTs, which cannot hold them).
 

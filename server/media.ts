@@ -35,7 +35,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import type { Clip, Effect, GradeNode, MediaAsset, Project, Timeline, Track } from '../src/state/models.ts';
 import { colorTransform, cubeText, makeCube, parseCube, hasACES, interpretation, processingStages, hdrToSdr, isHdrTransfer, rangeDefaults, type Cube } from '../src/services/color.ts';
-import { spatialGrade } from '../src/services/grading.ts';
+import { hasQualifier, spatialGrade } from '../src/services/grading.ts';
 import { tmpdir, cpus, setPriority, totalmem } from 'node:os';
 import { renderOpticalFlow, trimFlowCache } from './opticalFlow.ts';
 import { renderStabilized, stabilizeSolve, stabilizeWarpMattes, trimStabilizeCache } from './stabilize.ts';
@@ -354,6 +354,7 @@ export function cachedLut(key: unknown, build: (file: string) => Promise<boolean
   return entry;
 }
 export const releaseLuts = (users: string[]) => { for (const id of users) { const left = (lutUsers.get(id) ?? 1) - 1; if (left > 0) lutUsers.set(id, left); else lutUsers.delete(id); } };
+const colorPython = () => process.env.FRAME_LINE_COLOR_PYTHON || venvPython('.venv-color');
 /** A table that changes nothing: ungraded Rec.709, log shown as recorded, every title. Skipping it skips a float pass. */
 function isIdentity(cube: Cube) {
   const n = cube.size - 1;
@@ -931,8 +932,10 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   }
   // One pass holds every clip it renders; a split export keeps each pass far below this.
   if ((request.only ? clips.filter(clip => request.only!.has(clip.id)) : clips).length > 128) throw new Error('This render range stacks more than 128 clips at once. Export shorter ranges.');
-  // Per frame: a matte, a depth key, a window or film (spatialGrade) needs the colour worker on every frame.
-  const perFrameColor = (clip: Clip) => activeSmartMasks(clip, request.nodes).length > 0 || activeDepthKeys(clip, request.nodes).length > 0 || spatialGrade(clip.id, request.nodes);
+  const keyedGrade = (clip: Clip) => request.nodes.some(n => n.clipId === clip.id && n.enabled && hasQualifier(n.parameters)) && existsSync(colorPython());
+  // Per frame: a matte, a depth key, a window or film (spatialGrade) needs the colour worker on every frame. So does a
+  // qualifier where the worker exists: its hue key jumps at grey, which no table holds (65³ drifted up to 10 levels).
+  const perFrameColor = (clip: Clip) => activeSmartMasks(clip, request.nodes).length > 0 || activeDepthKeys(clip, request.nodes).length > 0 || spatialGrade(clip.id, request.nodes) || keyedGrade(clip);
   const colorClips = clips.filter(clip => {
     const track = tracks.find(track => track.id === clip.trackId);
     return track?.kind === 'video' && !track.hidden && (perFrameColor(clip) || clip.properties.colorPipeline === 'nodes-v2' && hasACES(request.nodes, clip.id));
@@ -1179,15 +1182,18 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && ![...audioEffectNames, 'Stabilize', 'Depth', 'Noise Reduction'].includes(e.name));
       let videoIndex=index,acesCube:string|undefined,acesInterpolation='trilinear';
       const usedMasks=activeSmartMasks(clip,request.nodes),depthKeys=activeDepthKeys(clip,request.nodes),maskStreams=new Map<string,{index:number;timing:string[]}>();
-      // Windows need pixel positions and film whole frames (docs/color-grading-v3.md): no table can hold either.
-      const spatial=spatialGrade(clip.id,request.nodes),baked=adjust&&spatial;
+      // Windows need pixel positions and film whole frames (docs/color-grading-v3.md): no table can hold either, nor a
+      // qualifier exactly (keyedGrade, when the worker exists).
+      const spatial=spatialGrade(clip.id,request.nodes)||keyedGrade(clip),baked=adjust&&spatial;
       const exactColor=usedMasks.length>0||depthKeys.length>0||spatial||clip.properties.colorPipeline==='nodes-v2'&&hasACES(request.nodes,clip.id);
       if(exactColor&&adjust&&(usedMasks.length||depthKeys.length))throw Error(`${clip.name}: Smart Masks and depth keys need source footage. Grade masked looks on the clips themselves, not on an adjustment clip.`);
+      if(exactColor&&!existsSync(colorPython()))throw Error(`${clip.name}: this grade (film, windows, ACES or a mask) exports through the colour worker, which is not installed here. On a server run npm run setup:color; SharedCut Desktop cannot export it yet.`);
       let colorInput=source.path;
       if(baked){
         // An adjustment clip with windows or film grades the picture under it frame by frame: the clips before it in this
-        // pass are rendered on their own over its span (losslessly enough: ProRes 4444), then graded like footage.
-        const from=rangeIn+offset,before=new Set(clips.slice(0,clips.indexOf(clip)).map(c=>c.id)),under=path.join(lutDir,`${index}-under.mov`);
+        // pass are rendered on their own over its span (losslessly enough: ProRes 4444), then graded like footage. It starts
+        // on the output's frame grid, where the outer graph places this layer, or its picture runs a frame late.
+        const from=rangeIn+Math.round(offset*fps)/fps,before=new Set(clips.slice(0,clips.indexOf(clip)).map(c=>c.id)),under=path.join(lutDir,`${index}-under.mov`);
         request.onStage?.(`Rendering under ${clip.name}`);
         await renderTimeline({...request,clips:request.clips.filter(c=>c.timelineId!==timeline.id||before.has(c.id)),outputPath:under,pass:'video',only:undefined,decoder:undefined,onProgress:undefined,onStage:undefined,
           settings:{...settings,codec:'Apple ProRes 4444',quality:'Visually lossless',audio:'Disabled',rangeIn:String(from),rangeOut:String(Math.min(timelineDuration,from+Math.max(length,1/fps)))}});
@@ -1221,7 +1227,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         }
         // The first frame at or after the seek, as the plain -ss path and the viewer show (and the Depth bake, which
         // seeks half a frame early, wants): a trim between source frames must not start one frame early here.
-        const times=masks[0]?.sourceTimes??(image?undefined:depth?.run.times),renderSeek=baked?0:times?.find(t=>t>=seek-1e-7)??seek,span=baked?length:decoded;
+        const times=masks[0]?.sourceTimes??(image?undefined:depth?.run.times),renderSeek=baked?0:times?.find(t=>t>=seek-1e-7)??seek,span=baked||image?length:decoded;
         if(!masks.length&&times?.some((t,i)=>i>0&&Math.abs(t-times[i-1]-1/(metadata.fps||fps))>Math.max(.000003,.001/(metadata.fps||fps))))throw Error(`${clip.name}: a depth key on export currently needs constant-frame-rate footage. Convert this source to constant frame rate first.`);
         const frameTimes=times?.filter(t=>t>=renderSeek-1e-7&&t<renderSeek+span-1e-7);
         // Each decoded frame's depth from the masters; color-render.py keys it with the same table as the preview and
@@ -1235,7 +1241,9 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
           depthMasks=depthKeys.map(node=>({document:{id:nodeMaskId(node)!},depth:{...spec,table:Array.from(depthKeyTable(run,node.mask,1024))}}));
         }
         const hdr=hdrTransform(source.asset.colorTransfer),camera=clip.properties.colorPipeline!=='nodes-v2'?colorTransform(clip,source.asset,[],base):undefined;
-        const inputCube=camera||hdr?makeCube(rgb=>{const sdr=hdr?hdr(rgb):rgb;return camera?camera(sdr):sdr;},65):undefined;
+        // An identity table (a plain legacy clip) only clamped to 0–1, which the preview never does: skip it (it cost +54%).
+        let inputCube=camera||hdr?makeCube(rgb=>{const sdr=hdr?hdr(rgb):rgb;return camera?camera(sdr):sdr;},65):undefined;
+        if(inputCube&&isIdentity(inputCube))inputCube=undefined;
         // A still (and the picture under an adjustment clip) runs on the project clock: its decoded frames are timeline frames.
         const numericFps=image||baked?fps:metadata.fps||fps;
         // The film stage's frame number, as the preview counts it, round(source time × fps): the first frame at or after the
@@ -1248,10 +1256,14 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         const fitted=spatial&&fitFirst&&!masks.length&&!depthKeys.length&&fitW<sourceWidth&&fitH<sourceHeight;
         const job={input:colorInput,output,ffmpeg:ffmpeg(),image,seek:renderSeek,duration:span,width:fitted?fitW:metadata.width,height:fitted?fitH:metadata.height,...(fitted?{scale:true}:{}),fps:image?fps:metadata.frameRate||metadata.fps,numericFps,filmFrame,threads:Number(request.singlePass?threads:exportThreads),frames:frameTimes?.length??Math.ceil(span*numericFps),frameTimes,masks:[...masks,...depthMasks],
           // Title, shape and alpha-video pixels keep their transparency through the worker (and an adjustment's composite in a transparent render).
-          alpha:masks.length>0||spatial&&(Boolean(source.asset.hasAlpha)||isTitle(clip)||isShape(clip)||baked&&Boolean(request.transparent)),managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)};
+          alpha:masks.length>0||spatial&&(Boolean(source.asset.hasAlpha)||source.asset.kind==='image'||isTitle(clip)||isShape(clip)||baked&&Boolean(request.transparent)),managed:clip.properties.colorPipeline==='nodes-v2',...(inputCube?{inputCube:{...inputCube,data:Array.from(inputCube.data)}}:{}),matrix:['bt709','bt470bg','smpte170m','bt2020nc'].includes(matrix)?matrix:'auto',range:p.dataLevels==='Full'?'pc':p.dataLevels==='Video'?'tv':'auto',stages:processingStages({...clip,properties:{...p,inputProfile:colorSource.profile,inputGamut:colorSource.gamut}},request.nodes)};
         await writeFile(jobPath,JSON.stringify(job));
-        const python=process.env.FRAME_LINE_COLOR_PYTHON||venvPython('.venv-color');
-        if(!existsSync(python))throw Error('OpenColorIO export is not installed. Run npm run setup:color on the server.');
+        const python=colorPython();
+        if(usedMasks.length||depthKeys.length||spatial){
+          // The worker writes lossless 16-bit FFV1 (about 60% of raw): a long 4K film grade is tens of GB, so refuse early.
+          const need=job.frames*job.width!*job.height!*(job.alpha?4:3)*2*.6+512*1024**2,disk=statfsSync(lutDir),free=disk.bavail*disk.bsize;
+          if(free<need)throw Error(`${clip.name}: this grade needs about ${Math.ceil(need/1024**3)} GB of free disk to render and only ${Math.floor(free/1024**3)} GB is free. Free some space or export a shorter range.`);
+        }
         const colorStage = `Processing color · ${clip.name} (${colorsDone + 1}/${colorClips.length})`;
         request.onStage?.(colorStage);
         if(!usedMasks.length&&!depthKeys.length&&!spatial){
@@ -1296,7 +1308,7 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
         // HDR sources tone-map inside the same table, so the grade sees the SDR picture the preview shows.
         const hdr = hdrTransform(source.asset.colorTransfer);
         // Range saturation is a smooth step in luma: at 33³ it drifts several levels from the preview, at 65³ it matches as curves do.
-        const size = hdr||clip.properties.colorPipeline==='nodes-v2'||request.nodes.some(n=>n.clipId===clip.id&&(n.curves||n.effects?.length||Object.keys(rangeDefaults).some(k=>n.parameters[k]!==undefined&&n.parameters[k]!==100)))?65:base?.size ?? 33;
+        const size = hdr||clip.properties.colorPipeline==='nodes-v2'||request.nodes.some(n=>n.clipId===clip.id&&(n.curves||n.effects?.length||hasQualifier(n.parameters)||Object.keys(rangeDefaults).some(k=>n.parameters[k]!==undefined&&n.parameters[k]!==100)))?65:base?.size ?? 33;
         const table = await cachedLut(['look-v1', size, lookId ?? null, colorInputs(clip, source.asset, request.nodes), hdr ? [source.asset.colorTransfer, hdrNpl()] : null], async file => {
           const grade = colorTransform(clip, source.asset, request.nodes, base);
           const cube = makeCube(hdr ? rgb => grade(hdr(rgb)) : grade, size);
@@ -2240,7 +2252,7 @@ async function renderCompositions(request: RenderRequest) {
       request.onStage?.(`Rendering composition ${index+1}/${parents.length} · ${parent.name}`);
       await renderTimeline({...request,timeline,onStage:undefined,compositionPath:[...ancestry,request.timeline.id],transparent:true,sampledFrame:false,outputPath,onProgress:p=>request.onProgress?.((index+p/100)/parents.length*50),settings:{...request.settings,resolution:`${width} × ${height}`,rangeIn:String(read.from),rangeOut:String(read.to),codec:'Apple ProRes 4444',audio:request.settings.audio==='Disabled'?'Disabled':'Linear PCM · 24-bit · 48 kHz',masterGain:'0',masterMuted:'false'}});
       clips[clips.indexOf(parent)]={...parent,mediaId,sourceIn:parent.sourceIn-read.from};
-      assets.push({path:outputPath,asset:{id:mediaId,projectId:request.project.id,name:parent.name,kind:'video',duration:read.to-read.from,binId:'',thumbnail:'',fps,resolution:`${width} × ${height}`,size:'',status:'ready',progress:100,hasAudio:request.settings.audio!=='Disabled',inputProfile:'Rec.709'}});
+      assets.push({path:outputPath,asset:{id:mediaId,projectId:request.project.id,name:parent.name,kind:'video',duration:read.to-read.from,binId:'',thumbnail:'',fps,resolution:`${width} × ${height}`,size:'',status:'ready',progress:100,hasAudio:request.settings.audio!=='Disabled',hasAlpha:true,inputProfile:'Rec.709'}});
     }
     await renderTimeline({...request,clips,assets,onProgress:p=>request.onProgress?.(50+p*.5)});
   } finally {await rm(directory,{recursive:true,force:true});}

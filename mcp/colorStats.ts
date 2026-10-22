@@ -1,8 +1,10 @@
 // Picture statistics for job color-measure (mcp/jobs/color.ts): what a colorist reads off the waveform and vectorscope,
 // as a few numbers, and plain hints that name the grade controls when a reference picture is given. Pure maths on 8-bit
 // RGBA. Everything is display code values 0–100 with Rec.709 luma weights, so a rendered frame and a reference image
-// compare like for like. Hue is the qualifier's and HSL curves' hue (grading.ts hueOf: red 0, then yellow, green, …).
-import { hueOf, PARAM } from '../src/services/grading.ts';
+// compare like for like. Hue is grading.ts hueOf (red 0, then yellow, green, …) on the display picture; a hint's curve x is
+// the hue the HSL curves read, which on nodes-v2 is the working space's (DaVinci Wide Gamut).
+import { hueOf, opponent, fromOpponent, PARAM } from '../src/services/grading.ts';
+import { encodeLog, gamutMatrix, luminanceWeights } from '../src/services/color.ts';
 
 export interface Pixels { width: number; height: number; data: Uint8Array | Uint8ClampedArray }
 /** A box on the picture as fractions of its width and height, top-left origin. */
@@ -13,7 +15,8 @@ export interface Box { x: number; y: number; w: number; h: number }
 export interface Tone { share: number; luma: number; rgb: number[]; cast: number[]; warm: number; mag: number; sat: number; spread: number }
 /** `luma`: percentiles p1 p5 p25 p50 p75 p95 p99; black/white: % of pixels crushed (all channels ≤ 2/255) or clipped
  *  (a channel ≥ 253/255); zones: shadows (luma < 25), mids, highlights (> 75); hues: % of the colour (saturation-weighted)
- *  in 12 bins of 30° centred on HUES; hue: the saturation-weighted mean hue in degrees. */
+ *  in 12 bins centred 30° apart on HUES, each pixel split between its two nearest by distance (so a few degrees of shift
+ *  moves a few % across a bin edge, and the bins keep the mean hue); hue: the saturation-weighted mean hue in degrees. */
 export interface Stats { n: number; luma: number[]; black: number; white: number; all: Tone; zones: Tone[]; sat: number; sat90: number; hues: number[]; hue: number }
 
 const W = [.2126, .7152, .0722], PERCENTILES = [1, 5, 25, 50, 75, 95, 99];
@@ -39,7 +42,7 @@ export function measure(px: Pixels, box: Box = { x: 0, y: 0, w: 1, h: 1 }): Stat
     if (R >= 253 || G >= 253 || B >= 253) white++;
     for (const k of [l < .25 ? 0 : l > .75 ? 2 : 1, 3]) { const t = sums[k]; t[0]++; t[1] += r; t[2] += g; t[3] += b; t[4] += l; t[5] += s; t[6] += (r - l) ** 2 + (g - l) ** 2 + (b - l) ** 2; }
     // Greys and near-black pixels have no reliable hue.
-    if (s > .03 && l > .02) { const h = hueOf(cb, cr, W); bins[Math.round(h * 12) % 12] += s; hx += s * Math.cos(2 * Math.PI * h); hy += s * Math.sin(2 * Math.PI * h); }
+    if (s > .03 && l > .02) { const h = hueOf(cb, cr, W), k = h * 12, i = Math.floor(k); bins[i % 12] += s * (1 - k + i); bins[(i + 1) % 12] += s * (k - i); hx += s * Math.cos(2 * Math.PI * h); hy += s * Math.sin(2 * Math.PI * h); }
   }
   lumas.sort(); sats.sort();
   const tone = ([count, r, g, b, l, s, c2]: number[]): Tone => {
@@ -114,6 +117,8 @@ export interface GradeModel {
   contrast(low: number, high: number, spread: number): number;
   /** Temperature and tint that change a grey's warm and mag by these display units. */
   balance(level: number, warm: number, mag: number): [number, number];
+  /** How a grey at `level` moves (display R, G, B change) when temperature and tint change by these amounts. */
+  balanced(level: number, temperature: number, tint: number): number[];
   /** Saturation (%) that scales the display chroma of colours at `level` by `ratio`. */
   saturation(level: number, ratio: number): number;
   /** Values of `keys` (an R, G and B parameter) that move a grey's R, G, B by `need` display units. */
@@ -132,12 +137,23 @@ const minus = (a: number[], b: number[]) => a.map((v, i) => v - b[i]);
 const delta = (v: number, digits = 3) => Math.abs(v) < .5 * 10 ** -digits ? '0' : `${v > 0 ? '+' : ''}${v.toFixed(digits).replace(/^(-?)0\./, '$1.')}`;
 const step = (base: string, values: number[]) => values.map((v, c) => `${base}${'RGB'[c]} ${delta(v)}`).join(' ');
 const tryModel = <T>(compute: () => T): T | undefined => { try { const v = compute(); return [v].flat().every(x => Number.isFinite(x)) ? v : undefined; } catch { return undefined; } };
+const castOf = (d: number[]) => { const l = W[0] * d[0] + W[1] * d[1] + W[2] * d[2]; return d.map(v => v - l); };
+const lean = (v: number, digits = 2) => String(+v.toFixed(digits)).replace(/^(-?)0\./, '$1.');
+const DWG = luminanceWeights('DaVinci Wide Gamut'), TO_DWG = gamutMatrix('Rec.709', 'DaVinci Wide Gamut'), HUE_ZERO = Math.atan2(.5, -W[0] / (2 * (1 - W[2])));
+/** The hue (turns) nodes-v2 HSL curves read for a display hue: a mid colour taken to DaVinci Intermediate/Wide Gamut (up to
+ *  13° away; it hardly depends on the colour's level and saturation). */
+function workingHue(turns: number) {
+  const a = 2 * Math.PI * turns + HUE_ZERO, rgb = fromOpponent(.45, .075 * Math.cos(a), .075 * Math.sin(a), W);
+  const [, cb, cr] = opponent(TO_DWG.map(row => encodeLog(row.reduce((v, k, c) => v + k * Math.max(0, rgb[c]) ** 2.4, 0), 'DaVinci Intermediate')), DWG);
+  return hueOf(cb, cr, DWG);
+}
 
 /**
- * What to change so the frame looks like the reference, in grading order (brightness, contrast, ends, clipping, overall
- * tint, tint per zone, saturation, hues). Directions are reliable. Amounts come from `model` (the clip's own grade) and are
- * damped so a first step undershoots; without one they are display-gamma guesses (`linear`: exposure and white balance
- * scale linear light, as on nodes-v2, not the display signal, as on legacy). Measure again after each round.
+ * What to change so the frame looks like the reference, in the order to apply them (contrast, ends, clipping, saturation,
+ * overall tint, tint of one zone, hues). A brightness difference comes alone, since every other number moves with it; after
+ * it or a Balance (temperature/tint) move, measure again before the rest. Directions are reliable. Amounts come from `model`
+ * (the clip's own grade) and are damped so a step undershoots; without one they are display-gamma guesses (`linear`: exposure
+ * and white balance scale linear light, as on nodes-v2, not the display signal, as on legacy).
  */
 export function hints(f: Stats, r: Stats, options: { linear?: boolean; model?: GradeModel } = {}): string[] {
   const { linear = true, model } = options, out: string[] = [], [f5, f50, f95] = [f.luma[1], f.luma[3], f.luma[5]], [r5, r50, r95] = [r.luma[1], r.luma[3], r.luma[5]];
@@ -145,7 +161,7 @@ export function hints(f: Stats, r: Stats, options: { linear?: boolean; model?: G
   const gamma = linear ? 2.4 : 1, where = linear ? 'Balance' : 'a node', damp = (k: number, by = .9) => 1 + by * (k - 1);
   if (Math.abs(f50 - r50) >= 3) {
     const stops = clamp(.9 * (tryModel(() => model!.exposure(f50, r50)) ?? .9 * gamma * Math.log2(Math.max(r50, 2) / Math.max(f50, 2))), -4, 4);
-    out.push(`${f50 < r50 ? 'darker' : 'brighter'} than ref (median ${int(f50)} vs ${int(r50)}): exposure ${delta(stops, 2)} stops (${where}), or gamma (Midtones) ${f50 < r50 ? 'up' : 'down'}`);
+    return [`${f50 < r50 ? 'darker' : 'brighter'} than ref (median ${int(f50)} vs ${int(r50)}): exposure ${delta(stops, 2)} stops (${where}), or gamma (Midtones) ${f50 < r50 ? 'up' : 'down'}; then measure again (contrast, colour and saturation follow the brightness)`];
   }
   const fs = f95 - f5, rs = r95 - r5, contrast = fs > 2 && Math.abs(rs / fs - 1) >= .08 ? damp(clamp(tryModel(() => model!.contrast(f5, f95, rs)) ?? rs / fs, .25, 4)) : 1;
   if (contrast !== 1) out.push(`${rs > fs ? 'less' : 'more'} contrast than ref (p95−p5 ${int(fs)} vs ${int(rs)}): contrast ×${contrast.toFixed(2)} around pivot, or an S-curve`);
@@ -157,47 +173,68 @@ export function hints(f: Stats, r: Stats, options: { linear?: boolean; model?: G
     out.push(`ref is black and white (saturation ${int(r.sat)}): mixMono 1 with a mix row (looks tri-x, soft-silver), or saturation 0`);
     return out;
   }
+  // Colours, not a tint (a sepia or white-balanced grey keeps all its colour within one 30° span, a cast can match it): no
+  // wheel brings them back to a picture without colour, and their solves blow up.
+  if (f.sat < 2 && r.sat >= 4 && Math.max(...r.hues.map((v, i) => v + r.hues[(i + 1) % 12])) < 80) {
+    out.push(`frame is black and white (saturation ${int(f.sat)}), ref is colour: turn off the mixMono 1 or saturation 0 doing it (color-grade lists the nodes), then measure again`);
+    return out;
+  }
   // Saturation scales the chroma of every pixel, a cast shifts it: the ratio of the picture's chroma spreads is the saturation
   // change, and what is left of each mean colour after scaling by it is the cast (so a greener field is saturation, not a
   // green cast). One ratio for the whole picture: a zone's own spread is mostly which pixels fall in it, too noisy to divide by.
-  // The saturation and contrast steps suggested below multiply what a change at Balance adds: its amounts are divided by them.
-  // Casts are compared after the suggested saturation change, so without one they are compared as they are.
+  // The saturation and contrast steps suggested here multiply what a change at Balance adds: its amounts are divided by them,
+  // so they come first and go in the same round. Casts are compared after the suggested saturation change.
   const spread = f.all.spread >= 1 && r.all.spread >= .5 ? clamp(r.all.spread / f.all.spread, .25, 4) : 1;
   const satHint = Math.abs(spread - 1) >= .12 && Math.abs(r.all.spread - f.all.spread) >= 1.5, ratio = satHint ? spread : 1, scaled = (t: Tone) => t.cast.map(v => v * ratio);
   const saturation = satHint ? damp(clamp((tryModel(() => model!.saturation(f.all.luma, ratio)) ?? ratio * 100) / 100, 0, 4)) : 1;
-  const gain = saturation * contrast, overall = minus(r.all.cast, scaled(f.all));
-  const warm = (overall[0] - overall[2]) / 2, mag = (overall[0] + overall[2]) / 2 - overall[1];
-  const zones = [0, 1, 2].filter(z => f.zones[z].share >= 3 && r.zones[z].share >= 3), needs = zones.map(z => minus(r.zones[z].cast, scaled(f.zones[z])));
-  const size = (v: number[]) => Math.max(...v.map(Math.abs));
-  // One Balance move only when it brings every zone closer; a split tone (cool shadows, warm highlights) is per zone.
-  const global = (Math.abs(warm) >= 1.5 || Math.abs(mag) >= 1.5) && needs.every(need => size(minus(need, overall)) < size(need));
-  if (global) {
-    // Temperature scales R and B by 1 ± t/10000, tint G by 1 − t/200; the guess without a model assumes Rec.709 primaries.
-    const d = Math.max(.1, f.all.luma / 100), [t, k] = (tryModel(() => model!.balance(f.all.luma, warm / gain, mag / gain)) ?? [warm * gamma * 100 / d / gain, mag * gamma * 2 / d / gain]).map(v => .8 * v);
-    const temperature = clamp(Math.round(t / 10) * 10, PARAM.temperature.min, PARAM.temperature.max), tint = clamp(Math.round(k), PARAM.tint.min, PARAM.tint.max);
-    const moves = [temperature && `temperature ${temperature > 0 ? '+' : ''}${temperature}`, tint && `tint ${tint > 0 ? '+' : ''}${tint}`].filter(Boolean).join(', ');
-    out.push(`overall ${castWords(overall)} than ref (warm ${one(f.all.warm)} vs ${one(r.all.warm)}, mag ${one(f.all.mag)} vs ${one(r.all.mag)}${ratio === 1 ? '' : ' after the saturation change'}): ${moves || 'temperature/tint'} (${where}), or it ${channels(overall)} via offsetR/G/B (Offset wheel)`);
-  }
-  zones.forEach((z, i) => {
-    const need = global ? minus(needs[i], overall) : needs[i], [primary, log, wheel] = WHEELS[z];
-    if (!big(need)) return;
-    const level = f.zones[z].luma, amounts = (base: string) => tryModel(() => model!.channels(['R', 'G', 'B'].map(c => base + c), level, need.map(v => v / gain)).map(v => .8 * v));
-    // A log band that does not reach this zone's level cannot be solved for: say so rather than give nothing.
-    const a = amounts(primary), b = amounts(log), band = z === 0 ? 'logLowRange' : z === 2 ? 'logHighRange' : 'logLowRange/logHighRange';
-    out.push(`${ZONES[z]}${global ? ' also' : ''} ${castWords(need)} than ref: ${channels(need)} via ${a ? step(primary, a) : `${primary}R/G/B`} (${wheel}), or ${b ? step(log, b) : `${log}R/G/B${model && a ? ` once ${band} takes in this level` : ''}`}`);
-  });
   if (satHint) {
     // Boost moves muted colours more than vivid ones: say which end the change is mostly about.
     const vivid = r.sat90 / Math.max(1, f.sat90), muted = Math.abs(ratio - 1) - Math.abs(vivid - 1), up = ratio > 1;
     out.push(`${up ? 'less' : 'more'} saturated than ref (colour spread ${int(f.all.spread)} vs ${int(r.all.spread)}, mean ${int(f.sat)} vs ${int(r.sat)}, p90 ${int(f.sat90)} vs ${int(r.sat90)}): saturation ×${saturation.toFixed(2)}${muted > .1 ? `, or mostly boost ${up ? '+' : '−'} (muted colours differ most)` : muted < -.1 ? ` with boost ${up ? '−' : '+'} (vivid colours differ most)` : ''}`);
   }
+  const gain = saturation * contrast, overall = minus(r.all.cast, scaled(f.all));
+  const warm = (overall[0] - overall[2]) / 2, mag = (overall[0] + overall[2]) / 2 - overall[1];
+  const zones = [0, 1, 2].filter(z => f.zones[z].share >= 3 && r.zones[z].share >= 3), needs = zones.map(z => minus(r.zones[z].cast, scaled(f.zones[z])));
+  const size = (v: number[]) => Math.max(...v.map(Math.abs));
+  // Temperature and tint scale linear light, so a grey moves in step with its level (the shadows least): the model says how
+  // much in each zone, the guess scales the overall need by the zone's luma. One Balance move only when it brings every zone
+  // closer; a split tone (cool shadows, warm highlights) is per zone.
+  let moved: number[][] | undefined;
+  if (Math.abs(warm) >= 1.5 || Math.abs(mag) >= 1.5) {
+    // Temperature scales R and B by 1 ± t/10000, tint G by 1 − t/200; the guess without a model assumes Rec.709 primaries.
+    const d = Math.max(.1, f.all.luma / 100), [t, k] = tryModel(() => model!.balance(f.all.luma, warm / gain, mag / gain)) ?? [warm * gamma * 100 / d / gain, mag * gamma * 2 / d / gain];
+    const shift = zones.map(z => tryModel(() => castOf(model!.balanced(f.zones[z].luma, t, k)).map(v => v * gain)) ?? overall.map(v => v * f.zones[z].luma / Math.max(1, f.all.luma)));
+    if (needs.every((need, i) => size(minus(need, shift[i])) < size(need))) {
+      moved = shift;
+      const temperature = clamp(Math.round(.8 * t / 10) * 10, PARAM.temperature.min, PARAM.temperature.max), tint = clamp(Math.round(.8 * k), PARAM.tint.min, PARAM.tint.max);
+      const moves = [temperature && `temperature ${temperature > 0 ? '+' : ''}${temperature}`, tint && `tint ${tint > 0 ? '+' : ''}${tint}`].filter(Boolean).join(', ');
+      out.push(`overall ${castWords(overall)} than ref (warm ${one(f.all.warm)} vs ${one(r.all.warm)}, mag ${one(f.all.mag)} vs ${one(r.all.mag)}${ratio === 1 ? '' : ' after the saturation change'}): ${moves || 'temperature/tint'} (${where}), or it ${channels(overall)} via offsetR/G/B (Offset wheel); then measure again`);
+    }
+  }
+  // One zone a round, the one furthest off (after the Balance move): every wheel moves every zone (on nodes-v2 lift is close
+  // to Offset), so wheel steps for all three at once overshoot.
+  const rest = needs.map((need, i) => moved ? minus(need, moved[i]) : need), worst = rest.reduce((w, need, i) => big(need) && (w < 0 || size(need) > size(rest[w])) ? i : w, -1);
+  if (worst >= 0) {
+    const z = zones[worst], need = rest[worst], [primary, log, wheel] = WHEELS[z], level = f.zones[z].luma;
+    // A solve past a sane step (a log band that hardly reaches this level, a grade that barely passes colour) has no amount.
+    const amounts = (base: string, limit: number) => tryModel(() => { const v = model!.channels(['R', 'G', 'B'].map(c => base + c), level, need.map(v => v / gain)).map(v => .8 * v); return v.every(x => Math.abs(x) <= limit) ? v : undefined; });
+    const a = amounts(primary, PARAM[primary + 'R'].max), b = amounts(log, .1), band = z === 0 ? 'logLowRange' : z === 2 ? 'logHighRange' : 'logLowRange/logHighRange';
+    out.push(`${moved ? 'after that, ' : ''}${ZONES[z]} ${castWords(need)} than ref: ${channels(need)} via ${a ? step(primary, a) : `${primary}R/G/B`} (${wheel}), or ${b ? step(log, b) : `${log}R/G/B${model && a ? ` once ${band} takes in this level` : ''}`}`);
+  }
   if (f.sat >= 4 && r.sat >= 4) {
     const diff = r.hues.map((v, i) => v - f.hues[i]), more = diff.indexOf(Math.max(...diff)), less = diff.indexOf(Math.min(...diff)), up = diff[more] >= 8, down = diff[less] <= -8;
     if (up || down) {
-      const x = (i: number) => `x ${String(+(i / 12).toFixed(2)).replace(/^0\./, '.')}`;
+      const curve = (turns: number) => linear ? workingHue(turns) : turns - Math.floor(turns), x = (turns: number) => `x ${lean(curve(turns))}`;
       const has = [up && `more ${HUES[more]} (${pct(r.hues[more])} vs ${pct(f.hues[more])} of the colour)`, down && `less ${HUES[less]} (${pct(r.hues[less])} vs ${pct(f.hues[less])})`].filter(Boolean).join(', ');
-      const fix = [up && `up at ${HUES[more]} (${x(more)})`, down && `down at ${HUES[less]} (${x(less)})`].filter(Boolean).join(', ');
-      out.push(`ref has ${has}: once the casts match, HueSat ${fix}${up && down ? `, or HueHue turning ${HUES[less]} toward ${HUES[more]}` : ''}`);
+      const fix = [up && `up at ${HUES[more]} (${x(more / 12)})`, down && `down at ${HUES[less]} (${x(less / 12)})`].filter(Boolean).join(', ');
+      const next = (more - less + 12) % 12, apart = Math.min(next, 12 - next);
+      if (up && down && apart <= 2) {
+        // Bins up to 60° apart trade: one colour turned, not a colour missing. The bins split each pixel by distance, so the
+        // weighted centre of the bins from one side of the pair to the other is that colour's mean hue, in frame and ref.
+        const from = (next <= 2 ? less : more) - 1, centre = (hues: number[]) => { let w = 0, m = 0; for (let j = 0; j < apart + 3; j++) { const v = hues[(from + j + 12) % 12]; w += v; m += v * (from + j); } return m / w / 12; };
+        const hue = centre(f.hues), turn = ((curve(centre(r.hues)) - curve(hue) + 1.5) % 1) - .5;
+        out.push(`ref has ${has}: once the casts match, HueHue ${turn > 0 ? '+' : ''}${int(turn * 360)}° at ${x(hue)} (y ${lean(.5 + turn, 3)})`);
+      } else out.push(`ref has ${has}: once the casts match, HueSat ${fix}${up && down ? `, or HueHue turning ${HUES[less]} toward ${HUES[more]}` : ''}`);
     }
   }
   return out;

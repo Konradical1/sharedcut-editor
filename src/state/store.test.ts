@@ -2146,3 +2146,10 @@ test('a library look replaces a node\'s look tools in one undo step; exposure, w
   const added = nodes()[3]; assert.equal(added.name, 'Film'); assert.equal(nodes()[4].id, output.id);
   assert.ok(nodes()[4].position!.x - added.position!.x >= 150 && nodes()[4].position!.x === before + 170, 'the output CST moved over instead of sitting under the new node');
 });
+
+test('a film stock on a legacy (Gamma 2.4) node keeps the legacy pivot .5, even though the stock sets no pivot', () => {
+  state().selectClip('c3'); state().addNode('Look', { exposure: 0, contrast: 1, pivot: .5, saturation: 100 });
+  const id = state().selectedNodeId!; state().applyColorLook(id, 'kodak-2383');
+  const p = state().nodes.find(n => n.id === id)!.parameters;
+  assert.equal(p.pivot, .5); assert.equal(p.contrast, 1.16);
+});

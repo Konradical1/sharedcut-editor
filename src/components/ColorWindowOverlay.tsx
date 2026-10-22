@@ -55,11 +55,13 @@ function WindowEditor({ picking, windows }: { picking: boolean; windows: boolean
   const trackOf = (c: Clip) => tracks.find(t => t.id === c.trackId);
   const visible = playhead < 0 ? [] : clips.filter(c => c.timelineId === timelineId && trackOf(c)?.kind === 'video' && !trackOf(c)?.hidden && !c.disabled && (isAdjustment(c) || media.some(m => m.id === c.mediaId)) && c.start <= playhead && c.start + c.duration > playhead);
   const clip = visible.find(c => c.id === selectedClipId) ?? [...visible].sort((a, b) => (trackOf(b)?.number ?? 0) - (trackOf(a)?.number ?? 0))[0];
-  const own = clip ? nodes.filter(n => n.clipId === clip.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0)) : [], stored = own.find(n => n.id === selectedNodeId) ?? own[0];
+  const own = clip ? nodes.filter(n => n.clipId === clip.id).sort((a, b) => (a.order ?? 0) - (b.order ?? 0)) : [], stored = own.find(n => n.id === selectedNodeId) ?? own.find(n => !n.effects?.some(e => e.enabled && e.type === 'cst')) ?? own[0];
   const node = clip && stored ? evaluateNodes([stored], clip, playhead)[0] : undefined, asset = clip && media.find(m => m.id === clip.mediaId);
   // An adjustment clip grades the composite below it, which is the project canvas.
   const source: Size = clip && !isAdjustment(clip) && asset ? sourceSize(asset) : size, aspect = source[0] / source[1];
   const toCanvas = clip && pictureToCanvas(preview?.id === clip.id ? preview : evaluateClip(clip, playhead, fps), source, size), toPicture = toCanvas && invert(toCanvas);
+  // Flip H mirrors the picture on screen: arrows still move and turn a window the way they point.
+  const mirror = toCanvas && toCanvas[0] * toCanvas[3] - toCanvas[1] * toCanvas[2] < 0 ? -1 : 1;
   const usable = !!node && !!toCanvas && !!toPicture?.every(Number.isFinite);
 
   const framePoint = (e: { clientX: number; clientY: number }): Vec => { const q = root.current!.createSVGPoint(); q.x = e.clientX; q.y = e.clientY; const r = q.matrixTransform(root.current!.getScreenCTM()!.inverse()); return { x: r.x, y: r.y }; };
@@ -96,11 +98,11 @@ function WindowEditor({ picking, windows }: { picking: boolean; windows: boolean
   };
   // Arrows nudge: a centre by a thousandth of the picture (Shift: ten), a knob by a degree (Shift: 15°), sizes and softness by .002.
   const nudge = (e: KeyboardEvent, kind: WindowKind, handle: WindowHandle) => {
-    const dx = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0, dy = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0;
+    const dx = (e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0) * mirror, dy = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0;
     if (!usable || !dx && !dy) return;
     e.preventDefault(); e.stopPropagation();
-    const k = (name: string) => kind + name, get = (name: string) => node!.parameters[k(name)] ?? PARAM[k(name)].initial, step = e.shiftKey ? 10 : 1, grow = (dx || -dy) * step * .002;
-    const patch = handle === 'move' ? { [k(dx ? 'X' : 'Y')]: get(dx ? 'X' : 'Y') + (dx || dy) * step * .001 } : handle === 'rotate' ? { [k('Angle')]: get('Angle') + (dx || dy) * (e.shiftKey ? 15 : 1) }
+    const k = (name: string) => kind + name, get = (name: string) => node!.parameters[k(name)] ?? PARAM[k(name)].initial, step = e.shiftKey ? 10 : 1, grow = (dx * mirror || -dy) * step * .002;
+    const patch = handle === 'move' ? { [k(dx ? 'X' : 'Y')]: get(dx ? 'X' : 'Y') + (dx || dy) * step * .001 } : handle === 'rotate' ? { [k('Angle')]: get('Angle') + (dx || dy * mirror) * (e.shiftKey ? 15 : 1) }
       : Object.fromEntries((handle === 'soft' ? ['Soft'] : handle === 'size' ? ['W', 'H'] : [handle.toUpperCase()]).map(n => [k(n), get(n) + grow]));
     useEditorStore.getState().updateNode(node!.id, { parameters: tidyParams(patch) });
   };

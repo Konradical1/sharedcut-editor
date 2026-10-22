@@ -26,6 +26,14 @@ test('picture → canvas is the letterbox and pose playback draws with, and inve
   }
 });
 
+test('Flip H: handles and picks follow the mirrored picture playback shows (adjustment clips never flip)', () => {
+  const flipped = pictureToCanvas(clip({ flipH: true }), [1920, 1080], project), plain = pictureToCanvas(clip(), [1920, 1080], project);
+  assert.deepEqual(apply(flipped, .25, .4), apply(plain, .75, .4), 'circX .25 is drawn where the mirrored grade shows it');
+  const back = apply(invert(flipped), 1440, 540); near(back.x, .25, 'a click on the right picks the left of the source'); near(back.y, .5, 'y');
+  const adjustment = clip({ flipH: true, adjustment: true }); (adjustment as unknown as { mediaId: string }).mediaId = 'frameline-adjustment';
+  assert.deepEqual(apply(pictureToCanvas(adjustment, [1920, 1080], project), .25, .4), apply(plain, .25, .4));
+});
+
 test('a window frame is the exact inverse of grading.windowLocal', () => {
   for (let i = 0; i < 20; i++) {
     const aspect = .5 + random() * 2, cx = random(), cy = random(), angle = random() * 720 - 360, f = windowFrame(aspect, cx, cy, angle), u = random() - .5, v = random() - .5;

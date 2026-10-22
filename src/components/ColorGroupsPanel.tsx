@@ -2,7 +2,8 @@ import type {CSSProperties} from 'react';
 import {RotateCcw,Wand2} from 'lucide-react';
 import {useStoreWithoutPlayhead} from '../state/store';
 import type {Clip} from '../state/models';
-import {primaryDefaults,rangeDefaults} from '../services/color';
+import {primaryDefaults} from '../services/color';
+import {neutralValue} from '../services/colorPresets';
 import {colorGroupOf,colorGroups,groupNodeOf} from '../services/colorGroups';
 import {Parameter} from '../workspaces/ColorTools';
 import {Badge,Button} from './ui';
@@ -26,7 +27,7 @@ export default function ColorGroupsPanel({shots,current,gesture,onNormalize}:{sh
         <div className="color-group-actions"><button onClick={()=>select(g.clipIds)}>Select shots</button><button onClick={()=>onNormalize(g.clipIds,g.id)}>Re-normalize</button><button onClick={()=>s.setColorGroup(g.clipIds,null)}>Ungroup</button></div>
         {open&&<div className="color-group-controls"><small>Changes all {g.clipIds.length} shots at once.</small>
           {CONTROLS.map(([name,key,min,max,step])=><Parameter key={key} name={name} value={p[key]} min={min} max={max} step={step} onChange={v=>s.updateColorGroup(g.id,{parameters:{[key]:v}},gesture.current)}/>)}
-          <div className="color-group-footer"><button onClick={()=>s.updateColorGroup(g.id,{parameters:{...Object.fromEntries(Object.keys(p).map(k=>[k,rangeDefaults[k]??0])),...primaryDefaults},curves:{}})}><RotateCcw size={12}/>Reset group</button>
+          <div className="color-group-footer"><button onClick={()=>s.updateColorGroup(g.id,{parameters:{...Object.fromEntries(Object.keys(p).map(k=>[k,neutralValue(k)])),...primaryDefaults},curves:{}})}><RotateCcw size={12}/>Reset group</button>
             {current&&<button onClick={()=>{const node=groupNodeOf(current.id,s.nodes);if(node)s.selectNode(node.id);}}>Select group node</button>}</div>
           <small>For wheels and curves, select the “{g.name}” node in the node graph: its changes reach every shot in the group too.</small>
         </div>}

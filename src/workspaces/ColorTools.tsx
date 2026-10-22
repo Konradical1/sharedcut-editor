@@ -111,8 +111,7 @@ function useSize<T extends Element>(w:number,h:number){
 export function Curves({node,update}:{node:GradeNode;update:(curves:ColorCurves)=>void}){
   const [channel,setChannel]=useState<'RGB'|'R'|'G'|'B'>('RGB'),[selected,setSelected]=useState<string|null>(null);
   const [svg,{w:sw,h:sh}]=useSize<SVGSVGElement>(600,240),w=sw-2*PAD,h=sh-2*PAD,X=(x:number)=>PAD+x*w,Y=(y:number)=>PAD+(1-y)*h,drag=useRef<{id:string;handle:boolean}|null>(null);
-  const legacy:ColorCurve={mode:'linear',points:[{id:'black',x:0,y:0},...[.25,.5,.75].map((x,i)=>({id:`legacy${i}`,x,y:node.parameters[['curve25','curve50','curve75'][i]]??x})),{id:'white',x:1,y:1}]};
-  const curves=node.curves??(Object.keys(node.parameters).some(k=>k.startsWith('curve'))?{RGB:legacy}:{}),curve=curves[channel]??identityCurve();
+  const curves=nodeCurves(node),curve=curves[channel]??identityCurve();
   const index=curve.points.findIndex(p=>p.id===selected),point=curve.points[index];
   const commit=(next:ColorCurve)=>update({...curves,[channel]:next});
   const patch=(id:string,value:Partial<CurvePoint>)=>{const i=curve.points.findIndex(p=>p.id===id);if(i<0)return;const p=curve.points[i],x=i===0?0:i===curve.points.length-1?1:Math.max(curve.points[i-1].x+.001,Math.min(curve.points[i+1].x-.001,value.x??p.x));commit({...curve,points:curve.points.map(v=>v.id===id?{...v,...value,x,y:Math.max(0,Math.min(1,value.y??v.y))}:v)});};
@@ -152,8 +151,13 @@ export const curveEffect=(y:number,a:Axis)=>{const v=toUnit(y,a);return a==='hue
 const curveInput=(x:number,a:Axis)=>{if(a!=='hue')return `${a==='lum'?'Luma':'Saturation'} ${Math.round(x*100)}%`;const i=HUES.findIndex(h=>Math.min(Math.abs(h-x),1-Math.abs(h-x))<.02);return `${i<0?'Hue':HUE_NAMES[i]} ${Math.round(x*360)%360}°`;};
 const STRIP:Record<Axis,string[]>={hue:Array.from({length:37},(_,i)=>hueColor(i/36)),lum:['#000','#fff'],sat:['#8a8a8a',hueColor(.06)]};
 /** Hue vs Hue/Sat/Lum, Lum vs Sat, Sat vs Sat and Sat vs Lum (grading.ts hslCurves). The centre line is no change; hue curves wrap at red. */
+/** A node's curves, an old three-point tone curve (curve25/50/75) standing in as its RGB curve, so saving any curve keeps it. */
+function nodeCurves(node:GradeNode):ColorCurves{
+  if(node.curves||!Object.keys(node.parameters).some(k=>/^curve(25|50|75)$/.test(k)))return node.curves??{};
+  return {RGB:{mode:'linear',points:[{id:'black',x:0,y:0},...[.25,.5,.75].map((x,i)=>({id:`legacy${i}`,x,y:node.parameters[['curve25','curve50','curve75'][i]]??x})),{id:'white',x:1,y:1}]}};
+}
 export function HslCurve({kind,node,update}:{kind:HslKind;node:GradeNode;update:(curves:ColorCurves)=>void}){
-  const info=HSL_INFO[kind],hue=HUE_CURVES.includes(kind),curves=node.curves??{},stored=curves[kind];
+  const info=HSL_INFO[kind],hue=HUE_CURVES.includes(kind),curves=nodeCurves(node),stored=curves[kind];
   const curve:ColorCurve=stored??(hue?{mode:'smooth',points:[...HUES.map((x,i)=>({id:`hue${i}`,x,y:.5})),{id:'hue6',x:1,y:.5}]}:flatCurve());
   const [selected,setSelected]=useState<string|null>(null),[svg,{w:sw,h:sh}]=useSize<SVGSVGElement>(600,200),drag=useRef<{id:string;x:number;y:number;px:number;py:number}|null>(null),gradient=`hsl-${kind}-${useId().replace(/\W/g,'')}`;
   const w=sw-2*PAD,h=sh-2*PAD,X=(x:number)=>PAD+x*w,Y=(y:number)=>PAD+(1-y)*h,index=curve.points.findIndex(p=>p.id===selected),point=curve.points[index],last=curve.points.length-1;

@@ -3,7 +3,8 @@
 The app runs all of SharedCut on the computer itself: its own server (bundled Node 26 and FFmpeg 9) with projects in
 `~/Library/Application Support/SharedCut/data`. New projects, imports, editing, color, audio and exports work with no
 connection. Not bundled yet: the Python features (captions, Smart Mask, depth, denoise, stabilize, optical flow,
-tracking) and the Color Assistant, which needs the internet anyway.
+tracking, and the colour worker that exports ACES, film and window grades; the viewer shows them all) and
+the Color Assistant, which needs the internet anyway.
 
 ## Build (Mac)
 

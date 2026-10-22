@@ -18,7 +18,8 @@ import type { Clip, GradeNode, MediaAsset, Project, Settings, Timeline, Track } 
 import { gradeValues } from './grade.ts';
 import { createVideoFrames, NEAR_PICTURES } from './videoFrames.ts';
 import { createScrubFrames } from './scrubFrames.ts';
-import { createColorPreview, ColorPending } from './colorPreview.ts';
+import { createColorPreview, ColorPending, probeWaiting } from './colorPreview.ts';
+import { spatialGrade } from './grading.ts';
 import { createFlowPreview } from './flowPreview.ts';
 import { createStabilizePreview } from './stabilizePreview.ts';
 import { stabilizeEffect, stabilizeLayerTransform, stabilizeRange, stabilizeSettings, stabilizeZoom, type StabilizeSolve } from './stabilize.ts';
@@ -1026,10 +1027,11 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
     /** `denoised`: the picture is a Noise Reduction chunk whose media time 0 is source second `from`; `noise` (Show removed
      *  noise) draws it as decoded, with no grade or effects. */
     const finishLayer = (clip:Clip,asset:MediaAsset,time:number,target:CanvasRenderingContext2D,element?:HTMLVideoElement,warp?:LayerWarp,snapshot?:VideoFrame,flip=false,stampAt=-1,denoised?:{from:number;noise:boolean}) => {
-      let masks=new Map<string,SmartMaskPixels>();
+      let masks=new Map<string,SmartMaskPixels>(),warped=false;
       const offset=denoised?.from??0;
       try {
-        const nodes = evaluateNodes(nodesOf(state.nodes, clip.id),focusing?.clip??clip,focusing?.time??time).filter(node=>node.enabled);
+        // Bypassed nodes go to the colour renderer too, so a qualifier pick on one reads the input of the place it holds.
+        const graded = evaluateNodes(nodesOf(state.nodes, clip.id),focusing?.clip??clip,focusing?.time??time), nodes = graded.filter(node=>node.enabled);
         const maskCount=activeSmartMasks(clip,nodes).length,depthKeys=activeDepthKeys(clip,nodes);
         if(maskCount&&clip.properties.opticalFlow)throw Error('Smart Mask and optical-flow retiming need a shared warped matte. Disable optical flow for this clip.');
         if(depthKeys.length&&clip.properties.opticalFlow)throw Error('A depth key cannot follow optical-flow retiming yet. Disable optical flow for this clip.');
@@ -1060,11 +1062,14 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           }
           return masks;
         };
-        if(!denoised?.noise && (maskCount || nodes.length || clip.properties.resolveLookUrl || Number(clip.properties.inputExposure) || Number(clip.properties.inputTemperature) || clip.properties.yuvMatrix || clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto')) {
+        if(!denoised?.noise && (maskCount || nodes.length || probeWaiting(graded) || clip.properties.resolveLookUrl || Number(clip.properties.inputExposure) || Number(clip.properties.inputTemperature) || clip.properties.yuvMatrix || clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto')) {
           color ??= createColorPreview(()=>{dirty=true;});
           const previewAsset=element?.src.includes('/files/')?{...asset,colorMatrix:'bt709'}:asset;
+          // Windows and film are placed on the frame export grades, the stabilized bake: under Stabilize the renderer reads the
+          // stabilized picture itself. A per-pixel grade commutes with the warp and keeps the warp below.
+          const colorWarp = warp && spatialGrade(clip.id,nodes) ? warpTransform(warp) : undefined;
           // Film grain on a picture without a source clock counts timeline frames from the clip's in point, as export does.
-          const result = color.draw(layer,clip,previewAsset,nodes,element,sampleTime=>loadMasks(element?sampleTime+offset:sourceTime(clip,time,asset.fps||24,asset.duration)),snapshot,asset.kind==='video'&&element?undefined:Math.round((clip.sourceIn+time-clip.start)*(project?.fps||24)));
+          const result = color.draw(layer,clip,previewAsset,graded,element,sampleTime=>loadMasks(element?sampleTime+offset:sourceTime(clip,time,asset.fps||24,asset.duration)),snapshot,asset.kind==='video'&&element?undefined:Math.round((clip.sourceIn+time-clip.start)*(project?.fps||24)),colorWarp);
           // The copy shown can lag the element (native path): the picture counters follow what was drawn, so re-stamp this layer's entry.
           if(element){const drawn=result.dataset.sourceTimestamp;sourceTimestamp=drawn?String(+drawn+offset):'';if(stampAt>=0)pictureStamps[stampAt]=`${clip.id}@${sourceTimestamp}`;}
           canvas.dataset.colorPrecision=result.dataset.colorPrecision??'8-bit RGB fallback';
@@ -1072,11 +1077,13 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           // Show key (viewer only): where the node grades, white where it grades fully (Invert included).
           const shown=depthKeys.find(n=>depthUi.showKey(n.id)),key=shown&&masks.get(nodeMaskId(shown)!);
           if(key){const image=layerContext.createImageData(width,height),flip=shown.mask.invert?255:0;for(let i=0;i<key.data.length;i++){image.data[i*4]=image.data[i*4+1]=image.data[i*4+2]=Math.abs(flip-key.data[i]);image.data[i*4+3]=255;}layerContext.putImageData(image,0,0);}
+          // The shown key is in the original framing: it still takes the warp below.
+          warped=!!colorWarp&&!key;
         }
       } catch (cause) { if(cause instanceof ColorPending||cause instanceof SmartMaskPending){loading=true;footageCache.setDecoderStatus(clip.id,asset.proxyUrl??'',`${asset.name} · ${cause instanceof ColorPending?'Preparing color frame':'Preparing mask'}`);const pending=seeks.findIndex(([media])=>media===element);if(pending>=0)seeks.splice(pending,1);}else {const message=cause instanceof Error?cause.message:'Color preview unavailable.';skipped.set(clip.id,`${clip.name} (${message})`);footageCache.setDecoderStatus(clip.id,asset.proxyUrl??'',`${asset.name}: ${message}`,true);} layerContext.clearRect(0,0,width,height);return; }
-      // Stabilize goes first. Grading and node masks read the frame the camera shot; from here on every
-      // screen-space effect below, and the Smart Mask cut, sees the stabilized picture.
-      if(warp) {
+      // Stabilize goes first. A per-pixel grade and node masks read the frame the camera shot (a spatial one was warped by the
+      // renderer); from here on every screen-space effect below, and the Smart Mask cut, sees the stabilized picture.
+      if(warp&&!warped) {
         if(warpScratch.width!==width||warpScratch.height!==height){warpScratch.width=width;warpScratch.height=height;}
         const scratch=warpScratch.getContext('2d')!;
         scratch.setTransform(1,0,0,1,0,0);scratch.globalCompositeOperation='copy';scratch.drawImage(layer,0,0);

@@ -250,8 +250,9 @@ function topAt(tl: Timeline, t: number, pick: (c: Clip) => boolean) {
   const s = store.getState(), number = new Map(s.tracks.filter(x => x.timelineId === tl.id && x.kind === 'video' && !x.hidden).map(x => [x.id, x.number]));
   return s.clips.filter(c => c.timelineId === tl.id && !c.disabled && number.has(c.trackId) && c.start <= t + 1e-6 && t < c.start + c.duration - 1e-6 && pick(c)).sort((a, b) => number.get(b.trackId)! - number.get(a.trackId)!)[0];
 }
-/** The graded timeline picture at `t`, rendered by Export's renderer (GET /api/frames, as the frame tool); a composition is looked inside. */
-async function gradedStill(tl: Timeline, t: number, depth = 0): Promise<Shot> {
+/** The graded timeline picture at `t`, rendered by Export's renderer (GET /api/frames, as the frame tool); a composition is
+ *  looked inside. `ref` names the reference clip it is for, whose frame `at` cannot pick. */
+async function gradedStill(tl: Timeline, t: number, depth = 0, ref = ''): Promise<Shot> {
   for (let attempt = 0; ; attempt++) {
     try { return { jpeg: await bytes(`/frames?${new URLSearchParams({ projectId: tl.projectId, timelineId: tl.id, t: String(t), w: String(MEASURE_EDGE) })}`), note: '' }; }
     catch (error) {
@@ -260,9 +261,10 @@ async function gradedStill(tl: Timeline, t: number, depth = 0): Promise<Shot> {
       const live = String(error.data?.live ?? '');
       if (error.status === 409 && live === 'composition' && depth < 4) {
         const top = topAt(tl, t, isComposition), inner = top && store.getState().timelines.find(x => x.id === top.properties.compositionId);
-        if (inner) { const at = sourceTime(top, t, project().fps, inner.duration), shot = await gradedStill(inner, at, depth + 1); return { jpeg: shot.jpeg, note: `inside composition ${quote(inner.name, 30)} @${secs(at)}s${shot.note ? `; ${shot.note}` : ''}` }; }
+        if (inner) { const at = sourceTime(top, t, project().fps, inner.duration), shot = await gradedStill(inner, at, depth + 1, ref); return { jpeg: shot.jpeg, note: `inside composition ${quote(inner.name, 30)} @${secs(at)}s${shot.note ? `; ${shot.note}` : ''}` }; }
       }
-      if (error.status === 409) throw new Error(`The server cannot render the graded frame at ${secs(t)}s on its own (${error.data?.error ?? 'refused'}); ${UNMEASURABLE[live] ?? 'measure another frame'}.`);
+      const advice = ref && (live === 'cut' || !UNMEASURABLE[live]) ? 'use another shot as ref' : UNMEASURABLE[live] ?? 'measure another frame';
+      if (error.status === 409) throw new Error(`The server cannot render ${ref ? `the ref ${ref} at its middle (${secs(t)}s)` : `the graded frame at ${secs(t)}s`} on its own (${error.data?.error ?? 'refused'}); ${advice}.`);
       if (error.status === 404 && error.data?.error === 'API endpoint not found.') throw new Error('This server has no /api/frames; update it to measure frames.');
       throw error;
     }
@@ -286,7 +288,7 @@ function measuredFrame(p: Record<string, any>) {
     const tl = timelineOf(), end = Math.max(0, ...s.clips.filter(c => c.timelineId === tl.id && !c.disabled).map(c => c.start + c.duration));
     if (!end) throw new Error('The open timeline is empty: nothing to measure.');
     const t = snap(Math.max(0, Math.min(end - 1 / fps, at ?? s.playhead))), shown = topAt(tl, t, c => s.media.some(m => m.id === c.mediaId));
-    return { tl, t, title: `"${tl.name}"`, over: [] as Clip[], disabled: false, linear: !shown || shown.properties.colorPipeline === 'nodes-v2', graded: shown as Clip | undefined };
+    return { tl, t, title: `"${tl.name}"`, over: [] as Clip[], disabled: false, hidden: false, linear: !shown || shown.properties.colorPipeline === 'nodes-v2', graded: shown as Clip | undefined };
   }
   const c = clipOf(need(p, 'clip')), track = s.tracks.find(x => x.id === c.trackId);
   if (track?.kind !== 'video') throw new Error(`${handle(c.id)} is not on a video track; measure a picture clip.`);
@@ -294,7 +296,7 @@ function measuredFrame(p: Record<string, any>) {
   // What the frame also shows over this clip (titles, captions, other video): it counts in the stats.
   const above = new Set(s.tracks.filter(x => x.timelineId === c.timelineId && x.kind === 'video' && !x.hidden && x.number > track.number).map(x => x.id));
   const over = s.clips.filter(o => above.has(o.trackId) && !o.disabled && o.start <= t + 1e-6 && t < o.start + o.duration - 1e-6);
-  return { tl: timelineOf(c.timelineId), t, title: `${handle(c.id)} ${quote(c.name, 40)}`, over, disabled: c.disabled, linear: c.properties.colorPipeline === 'nodes-v2', graded: c as Clip | undefined };
+  return { tl: timelineOf(c.timelineId), t, title: `${handle(c.id)} ${quote(c.name, 40)}`, over, disabled: c.disabled, hidden: track.hidden, linear: c.properties.colorPipeline === 'nodes-v2', graded: c as Clip | undefined };
 }
 /** params.ref as a picture: an image file (absolute path), a media item's own picture, or another clip's graded frame. */
 async function reference(ref: string): Promise<{ picture: Image; title: string }> {
@@ -305,7 +307,7 @@ async function reference(ref: string): Promise<{ picture: Image; title: string }
     return { picture: await decode(await bytes(`/frames?${new URLSearchParams({ projectId: asset.projectId, mediaId: asset.id, t: String(t), w: String(MEASURE_EDGE) })}`), `${handle(asset.id)}`), title: `${handle(asset.id)} ${quote(asset.name, 40)}${asset.kind === 'image' ? '' : ` @${secs(t)}s ungraded`}` };
   }
   if (other) {
-    const frame = measuredFrame({ clip: other.id, at: other.start + other.duration / 2 }), shot = await gradedStill(frame.tl, frame.t);
+    const frame = measuredFrame({ clip: other.id, at: other.start + other.duration / 2 }), shot = await gradedStill(frame.tl, frame.t, 0, handle(other.id));
     return { picture: await decode(shot.jpeg, handle(other.id)), title: `${frame.title} @${secs(frame.t)}s graded${shot.note ? ` (${shot.note})` : ''}` };
   }
   if (!isAbsolute(ref)) throw new Error('params.ref: an absolute path to an image file, or a media or clip @id of this project.');
@@ -354,6 +356,7 @@ export function gradeModel(c: Clip, time: number): GradeModel | undefined {
       if (Math.abs(det) < 1e-9) throw new Error('White balance does not move this grade.');
       return [(warm * km - kw * mag) / det, (tw * mag - warm * tm) / det];
     },
+    balanced(level, temperature, tint) { const x = grey(level), base = plain(x); return graded({ temperature, tint })(x).map((v, i) => v - base[i]); },
     saturation(level, ratio) {
       const [x] = grey(level), colours = [[spread, 0, -spread], [-spread, 0, spread], [0, spread, -spread], [0, -spread, spread]].map(o => o.map(v => x + v));
       const amount = (s: number) => { const g = graded({ saturation: s }); return colours.reduce((sum, rgb) => sum + chroma(g(rgb)), 0); }, base = amount(100);
@@ -404,7 +407,7 @@ async function colorMeasure(p: Record<string, any>) {
   const px = pixels(picture), rx = target && pixels(target.picture), fb = content(px), rb = rx && content(rx);
   const f = measure(px, fb), r = rx && measure(rx, rb);
   const bars = (b: Box) => b.w < 1 || b.h < 1 ? ` bars trimmed (picture ${boxText(b)})` : '';
-  const notes = [shot.note, frame.disabled ? 'the clip is disabled: this is what plays instead' : '', frame.over.length ? `drawn over it and counted: ${frame.over.map(o => `${handle(o.id)} ${quote(o.name, 24)}`).join(', ')}` : ''].filter(Boolean);
+  const notes = [shot.note, frame.disabled ? 'the clip is disabled: this is what plays instead' : '', frame.hidden ? 'its track is hidden: this is what shows instead (show the track to measure the clip)' : '', frame.over.length ? `drawn over it and counted: ${frame.over.map(o => `${handle(o.id)} ${quote(o.name, 24)}`).join(', ')}` : ''].filter(Boolean);
   const lines = [`${frame.title} ${timecode(frame.t, project().fps)} (${secs(frame.t)}s) graded frame ${px.width}×${px.height}${bars(fb)}${target ? ` · ref ${target.title} ${target.picture.width}×${target.picture.height}${bars(rb!)}` : ''}`, ...notes.map(n => `note: ${n}`)];
   lines.push(...statsLines(f, r));
   for (const region of regions) {
@@ -415,7 +418,7 @@ async function colorMeasure(p: Record<string, any>) {
     let model: GradeModel | undefined;
     try { model = frame.graded && gradeModel(frame.graded, frame.t); } catch { /* The display-gamma guesses stand in. */ }
     const todo = hints(f, r, { linear: frame.linear, model });
-    lines.push(todo.length ? `to match the ref (+/− add to the current value, × multiplies it; ${model ? 'amounts from this grade, damped' : 'amounts are guesses'}; change, frame, measure again):` : 'matches the ref within the hint thresholds.', ...todo.map(h => `- ${h}`));
+    lines.push(todo.length ? `to match the ref (+/− add to the current value, × multiplies it; ${model ? 'amounts from this grade, damped' : 'amounts are guesses'}; apply top-down to the first exposure or Balance hint, then measure again):` : 'matches the ref within the hint thresholds.', ...todo.map(h => `- ${h}`));
   }
   if (!wantImages) return done(lines.join('\n'));
   const boxes = (which: 'box' | 'ref') => regions.map(g => [g.name, g[which]] as [string, Box]);
@@ -533,7 +536,7 @@ function colorTopic() {
     'Model: each clip has grade nodes run in `order`. In a node: exposure/temperature/tint → contrast around pivot, offset, gamma, gain, lift → log wheels → shadows/highlights → saturation (+ range sat) → hue, boost, density → custom curves → HSL curves → mixer → its cst/lut effects → blend over the node input by mask × windows × qualifier → film stage (whole frame) → next node. color-grade{clip} lists the nodes and says if preview/export would refuse the grade (an unknown key or out-of-range value saves but breaks rendering).',
     'Pipelines: a clip starts legacy (nodes work in Gamma 2.4/Rec.709). act initializeColorGrade(clip) makes it nodes-v2: Input CST (source → DaVinci Intermediate/DaVinci Wide Gamut) · Balance · Look · Output CST (→ Gamma 2.4/Rec.709; aces2 for log sources, none for Rec.709). It replaces every node (a snapshot keeps the old grade). Grade between the two CSTs.',
     'Values: updateNode(node,{parameters:{key:value}}) merges keys; an absent key is its default and does nothing; toggles are 0|1. A node without pivot contrasts around .5: on nodes-v2 store pivot .336 (the UI\'s New Node does; color-grade flags pivot=.5(unset)). All keys: Parameters below.',
-    'Wheels: Shadows = lift (adds lift·(1−v): most in the blacks, none at white) · Midtones = gamma (v^(1/2^gamma): + brightens mids) · Highlights = gain (multiplies: white moves most) · Offset (adds everywhere). Master = brightness, R/G/B = colour: warmer R+ B−, teal R− B+, magenta G−. nodes-v2 grades a log signal (DaVinci Intermediate): .01 on a lift, gain or log-wheel channel moves its zone ~1–2 display units, gamma needs ~3× that.',
+    'Wheels: Shadows = lift (adds lift·(1−v)) · Midtones = gamma (v^(1/2^gamma): + brightens mids) · Highlights = gain (multiplies) · Offset (adds everywhere). Master = brightness, R/G/B = colour: warmer R+ B−, teal R− B+, magenta G−. Legacy (display signal): lift moves the blacks most and white not at all, gain white most. nodes-v2 runs them on the log signal (DaVinci Intermediate, white ~.51), so lift moves whites about as much as blacks (close to Offset) and gain reaches the mids: .01 on a lift or gain channel moves display ~2–3 units, gamma ~1 at mid grey. To colour one tonal band on nodes-v2, use the log wheels.',
     'Log wheels: logShadow/logMid/logHighlight (+R/G/B) offset one tonal band of the signal: Shadow below logLowRange, Highlight above logHighRange, Midtone between, edges feathered ±.1. On nodes-v2 mid grey is .336 and diffuse white ~.51: Shadow is everything below mid grey, Highlight mostly speculars (logHighRange ~.45 reaches bright skin and sky). The split-tone tool: teal shadows logShadowR− B+, warm highlights logHighlightR+ B−.',
     'shadows/highlights bend the tones below/above the node\'s pivot (black, white and pivot stay put): highlights −30..−60 recovers skies and windows, shadows +15..+30 opens faces in shade. boost = vibrance; density = film dye (saturated colours darker, richer).',
     'HSL curves (in node.curves, points as custom curves; updateNode curves replaces ALL of them, so resend RGB/R/G/B: get{id:"@node",path:"curves"}): HueHue HueSat HueLum take x = hue in turns (red 0, skin .08, yellow .2, green .35, cyan .5, blue .7, magenta .85) and wrap (first y = last y); LumSat x = luma; SatSat SatLum x = saturation (nodes-v2: most colours below .25). y .5 = no change. HueHue shifts hue y−.5 turns (.55 = +18°); HueSat/LumSat/SatSat scale chroma by 2y (0 greys); HueLum adds (y−.5)·.5 luma on saturated colours; SatLum adds (y−.5)·.5. Quieter greens: {HueSat:{mode:"smooth",points:[{id:"a",x:0,y:.5},{id:"b",x:.25,y:.5},{id:"c",x:.35,y:.3},{id:"d",x:.45,y:.5},{id:"e",x:1,y:.5}]}}',
@@ -542,7 +545,7 @@ function colorTopic() {
     'Windows (circOn/rectOn/gradOn 1; several on a node = their union): source-picture coordinates, x 0 left..1 right, y 0 top..1 bottom, sizes in picture heights (16:9 is 1.78 wide). They do not follow motion: keyframe them (help keyframes; path nodes.<node id>.parameters.circX, key stored first).',
     'Blend: a node mixes over its input by mask × windows × qualifier, so give each isolated correction (sky, face, vignette) its own node between Balance and Look. A node with a window, qualifier or mask cannot hold a CST.',
     'Film: any film amount (filmHalation, filmBloom, filmGrain, filmVignette, filmWeave, filmBreath, filmAberration) ≠ 0 adds a film stage after the node on the whole frame, never masked, windowed or keyed. Put it on the Look node or a Film node just before the Output CST (thresholds are stops above mid grey there). Judge it with frame{}; color-measure barely sees it.',
-    'color-measure{clip?, at?, ref?, regions?, images?}: the graded frame (rendered like Export, letterbox bars left out) as luma percentiles (display code 0–100), crushed/clipped %, zones shadows (luma <25)/mids/highlights (>75) with share, mean R/G/B, warm (R−B)/2, mag (R+B)/2−G (+ magenta) and sat, saturation (vectorscope 0–100) mean/p90 and main hues. ref (image file, media item or another clip) adds its numbers after " | ref " and hints: each names controls with amounts solved on this clip\'s own grade (+/− add to the value, × multiplies it; damped to undershoot), and all of them work applied together. Saturation is told from a cast by the chroma spread. regions:[{name,x,y,w,h}] (fractions, top-left origin; ref:{x,y,w,h} if framed elsewhere) measures boxes; images:true shows both pictures with them.',
+    'color-measure{clip?, at?, ref?, regions?, images?}: the graded frame (rendered like Export, letterbox bars left out) as luma percentiles (display code 0–100), crushed/clipped %, zones shadows (luma <25)/mids/highlights (>75) with share, mean R/G/B, warm (R−B)/2, mag (R+B)/2−G (+ magenta) and sat, saturation (vectorscope 0–100) mean/p90 and main hues. ref (image file, media item or another clip) adds its numbers after " | ref " and hints: each names controls with amounts solved on this clip\'s own grade (+/− add to the value, × multiplies it; damped to undershoot). Apply them top-down; after an exposure or Balance (temperature/tint) hint, measure again before the rest, since brightness and white balance move every other number (a brightness hint comes alone). One zone gets a wheel hint a round (each wheel moves every zone). Saturation is told from a cast by the chroma spread; a hint\'s curve x is the hue the HSL curves read (working-space hue on nodes-v2, up to 13° off the display hue regions show). regions:[{name,x,y,w,h}] (fractions, top-left origin; ref:{x,y,w,h} if framed elsewhere) measures boxes; images:true shows both pictures with them.',
     'Looks: act applyColorLook(node, look, strength 0..1 = 1), on the Look node, replaces its primaries, wheels, log wheels, mixer and curves (and film keys when the look has film); exposure/temperature/tint, windows, qualifier, mask and effects stay. One undo; plain parameters after. Strength .5–.8 is often enough. Looks:',
     ...COLOR_LOOKS.map(l => `- ${l.id}${l.group === 'Looks' ? '' : l.group === 'Film stocks' ? ' (stock)' : ' (b&w)'}: ${l.about}`),
     'Recipes:',
@@ -554,7 +557,7 @@ function colorTopic() {
     '- teal and orange: applyColorLook(node,"teal-amber",.7), or by hand on the Look node {logShadowR:-.012, logShadowB:.012, logHighRange:.45, logHighlightR:.01, logHighlightB:-.008, saturation:105} plus HueSat down at the greens (x .35); keep skin natural (color-measure a skin region).',
     '- film look: act{do:[["applyColorLook","@look","kodak-2383",.7]]}, then filmGrain, filmHalation, filmBloom by eye with frame{}.',
     '- black and white: applyColorLook(node,"tri-x") (red-filter mix, grain) or "soft-silver"; or mixMono 1 with your own R row.',
-    '- match a reference picture: 1) job color-measure{clip, ref:"/abs/target.png", images:true}; 2) apply the hints (Balance takes exposure, temperature, tint and the wheel amounts; Look contrast and saturation), or fix in this order: exposure and white balance → contrast, shadows/highlights → colour per zone (wheels or log wheels) → saturation, boost, density → single hues (HSL curves, qualifier) → film texture by eye; 3) frame{} to look, measure again, repeat until the hints are gone (on a test scene three rounds took the median, contrast and a grey card to within 3 units). A generated reference shows a direction: never clip skin or crush faces to hit its numbers. Then copyGrade/pasteGrade or a color group to similar shots and measure each (ref:"@clip" matches one shot to another).',
+    '- match a reference picture: 1) job color-measure{clip, ref:"/abs/target.png", images:true}; 2) apply the hints top-down (Balance takes exposure, temperature, tint and the wheel amounts; Look contrast and saturation) and stop after an exposure or Balance hint; 3) frame{} to look, measure again, repeat until the hints are gone (on test scenes a +1 stop or +1500 temperature ref matched in two rounds, skin and a grey card within 2 units). By hand: exposure → white balance → contrast, shadows/highlights → colour per zone (log wheels) → saturation, boost, density → single hues (HSL curves, qualifier) → film texture by eye. A generated reference shows a direction: never clip skin or crush faces to hit its numbers. Then copyGrade/pasteGrade or a color group to similar shots and measure each (ref:"@clip" matches one shot to another).',
     '- order: reorderNode(node,-1|1) · moveColorNode(node, beforeNode|null=end) · removeNode(node) · arrangeColorNodes(clip) tidies the graph.',
     '- copy a grade: act{do:[["copyGrade","@from"],["pasteGrade","@to1"],["pasteGrade","@to2"]]} (replaces all nodes, source settings and node keyframes on each target, and its Noise Reduction when @from has one; same project).',
     '- highlights clipping on a log grade: useAcesOutput(clip) (color-grade suggests it when it applies).',

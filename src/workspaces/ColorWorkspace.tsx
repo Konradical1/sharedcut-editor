@@ -85,9 +85,11 @@ const NODE_KINDS:Record<NodeKind,[Record<string,number>,ColorTool|null]>={Correc
 const TOOLS_KEY='frameline.colorToolsHeight';
 const storedTools=()=>{try{const v=Number(localStorage.getItem(TOOLS_KEY));return v>=140&&v<=4000?v:null;}catch{return null;}};
 const storeTools=(v:number|null)=>{try{if(v===null)localStorage.removeItem(TOOLS_KEY);else localStorage.setItem(TOOLS_KEY,String(v));}catch{/* storage blocked: the height is not remembered */}};
+/** A node that grades (no enabled colour-space transform): where tools and looks belong. */
+const gradingNode=(n:GradeNode)=>!n.effects?.some(e=>e.enabled&&e.type==='cst');
 export default function ColorWorkspace(){
   // Shot choice and animated grades follow the playhead in quarter-second steps while playing, not every frame.
-  const s={...useStoreWithoutPlayhead(),playhead:usePanelPlayhead()},gesture=useRef<string|undefined>(undefined),fileInput=useRef<HTMLInputElement>(null),fileTarget=useRef<string>(''),root=useRef<HTMLDivElement>(null),bottom=useRef<HTMLDivElement>(null);
+  const s={...useStoreWithoutPlayhead(),playhead:usePanelPlayhead()},gesture=useRef<string|undefined>(undefined),field=useRef<string|undefined>(undefined),fileInput=useRef<HTMLInputElement>(null),fileTarget=useRef<string>(''),root=useRef<HTMLDivElement>(null),bottom=useRef<HTMLDivElement>(null);
   const tool=useColorUi(u=>u.tool),chooseTool=(t:ColorTool)=>useColorUi.setState({tool:t,picking:false});
   const [scope,setScope]=useState<Scope>('RGB Parade'),[rightTab,setRightTab]=useState<'Library'|'Settings'|'Groups'|'Assistant'>('Settings'),[rightOpen,setRightOpen]=useState(false),[search,setSearch]=useState('');
   const [log,setLog]=useState(false),[curveKind,setCurveKind]=useState<CurveKind>('Custom'),[toolsHeight,setToolsHeight]=useState(storedTools);
@@ -101,7 +103,8 @@ export default function ColorWorkspace(){
   const visible=shots.filter(c=>c.start<=s.playhead&&c.start+c.duration>s.playhead&&!c.disabled&&!s.tracks.find(t=>t.id===c.trackId)?.hidden);
   const active=visible.find(c=>c.id===s.selectedClipId)||visible.sort((a,b)=>(s.tracks.find(t=>t.id===b.trackId)?.number??0)-(s.tracks.find(t=>t.id===a.trackId)?.number??0))[0];
   const clip=active||shots.find(c=>c.id===s.selectedClipId)||shots[0],asset=s.media.find(m=>m.id===clip?.mediaId),source=clip?interpretation(clip,asset):{profile:'Rec.709',gamut:'Rec.709'};
-  const nodes=s.nodes.filter(n=>n.clipId===clip?.id).sort((a,b)=>(a.order??0)-(b.order??0)),stored=nodes.find(n=>n.id===s.selectedNodeId)||nodes[0];
+  // With no node picked on this shot, the tools work on its first grading node, not on the Input CST (a camera conversion).
+  const nodes=s.nodes.filter(n=>n.clipId===clip?.id).sort((a,b)=>(a.order??0)-(b.order??0)),stored=nodes.find(n=>n.id===s.selectedNodeId)||nodes.find(gradingNode)||nodes[0];
   const evaluated=stored&&clip?evaluateNodes([stored],clip,s.playhead)[0]:stored;
   const node=evaluated?{...evaluated,parameters:Object.fromEntries(Object.entries(evaluated.parameters).map(([k,v])=>[k.toLowerCase() in primaryDefaults?k.toLowerCase():k,v]))}:undefined;
   const managed=clip?.properties.colorPipeline==='nodes-v2',imported=Boolean(clip?.properties.resolveLookUrl)&&!managed;
@@ -116,7 +119,8 @@ export default function ColorWorkspace(){
   const add=(kind:NodeKind='Correction')=>{if(!clip)return;if(s.selectedClipId!==clip.id)s.selectClip(clip.id);const [extra,opens]=NODE_KINDS[kind];s.addNode(kind,{...defaults,...extra});if(opens)chooseTool(opens);};
   // A look goes on the selected node; a shot without nodes gets a Look node for it first. Returns the node it went on.
   const applyLook=(lookId:string,strength:number)=>{
-    if(!clip)return;let target=node?.id;
+    // Never inside a colour-space conversion: a CST node hands the look to the Look node (or the first grading node).
+    if(!clip)return;let target=node&&gradingNode(node)?node.id:(nodes.find(n=>n.name==='Look'&&gradingNode(n))??nodes.find(gradingNode))?.id;
     if(!target){if(s.selectedClipId!==clip.id)s.selectClip(clip.id);s.addNode('Look',{...defaults});target=useEditorStore.getState().selectedNodeId??undefined;if(!target||!useEditorStore.getState().nodes.some(n=>n.id===target&&n.clipId===clip.id))return;}
     useEditorStore.getState().applyColorLook(target,lookId,strength);return target;
   };
@@ -163,10 +167,11 @@ export default function ColorWorkspace(){
   return <div ref={root} className={`color-workspace color-overhaul ${rightOpen?'':'inspector-closed'}`} style={{'--color-inspector':`${rightWidth}px`,'--color-scopes':`${scopeWidth}px`,'--wheel-ring':WHEEL_RING,...(toolsHeight?{'--color-tools':`${toolsHeight}px`}:{})}as CSSProperties}
     onPointerDownCapture={e=>{if((e.target as Element).closest('input[type=range],.color-wheel,.curve-editor,[data-grade-gesture]'))gesture.current=createId('grade');}}
     onPointerUp={e=>{const r=resize.current;if(r?.kind==='tools'&&Math.abs(e.clientY-r.y)>1)resizeTools(r.value-(e.clientY-r.y));gesture.current=undefined;resize.current=null;}} onPointerCancel={()=>{gesture.current=undefined;resize.current=null;}}
-    onFocusCapture={e=>{if((e.target as Element).matches('input[inputmode=decimal]'))gesture.current=createId('grade');}}
+    onFocusCapture={e=>{if((e.target as Element).matches('input[inputmode=decimal]'))gesture.current=field.current=createId('grade');}}
     // A number field's gesture lasts while it has focus; a drag's lasts until pointer up. A wheel or node card losing focus to
-    // the slider being pressed must not end the drag's gesture, or one drag becomes many undo steps.
-    onBlurCapture={e=>{if((e.target as Element).matches('input[inputmode=decimal]'))gesture.current=undefined;}}
+    // the slider being pressed must not end the drag's gesture, or one drag becomes many undo steps. A field that loses focus
+    // ends only the gesture it started: pressing a slider in a <label> blurs the field after the drag's gesture began.
+    onBlurCapture={e=>{if((e.target as Element).matches('input[inputmode=decimal]')&&gesture.current===field.current)gesture.current=undefined;}}
     onKeyDownCapture={e=>{if((e.target as Element).closest('input[inputmode=decimal],input[type=range]')&&(e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();e.stopPropagation();gesture.current=undefined;s.undo();}}}
     onPointerMove={e=>{const r=resize.current;if(!r)return;if(r.kind==='tools')setToolsHeight(toolsLimit(r.value-(e.clientY-r.y)));else if(r.kind==='inspector')setRightWidth(Math.max(260,Math.min(460,r.value+r.x-e.clientX)));else setScopeWidth(Math.max(220,Math.min(480,r.value+r.x-e.clientX)));}}>
     <input hidden type="file" accept=".cube" ref={fileInput} onChange={async e=>{const file=e.target.files?.[0];e.target.value='';if(!file)return;const id=fileTarget.current;try{if(file.size>32*1024*1024)throw Error('Use a LUT smaller than 32 MB.');const cube=parseCube(await file.text()),state=useEditorStore.getState(),n=state.nodes.find(n=>n.id===id);if(!n)return;state.updateNode(id,{effects:[...(n.effects??[]),{id:createId('lut'),type:'lut',enabled:true,name:file.name.slice(0,100),amount:1,inputGamma:managed?'DaVinci Intermediate':'Gamma 2.4',inputGamut:managed?'DaVinci Wide Gamut':'Rec.709',cube:{...cube,data:Array.from(cube.data)}}]});}catch(error){s.notify((error as Error).message,'error');}}}/>

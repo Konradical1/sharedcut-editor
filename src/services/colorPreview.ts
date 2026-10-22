@@ -5,6 +5,7 @@ import { createCopyProbe } from './copyProbe.ts';
 import { processingStages, sampleCurve, identityCurve, luminanceWeights, interpretation, profiles, hasACES, colorTransform, type Cube } from './color.ts';
 import { HSL_CURVES, HUE_CURVES, PARAM, filmActive, filmMotion, grainKey, halationTint, hasQualifier, hasWindow, on, periodicCurve, windowAlpha } from './grading.ts';
 import { applyFilm } from './filmLook.ts';
+import { apply, invert, type Affine } from './colorKeys.ts';
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 
 export class ColorPending extends Error {}
@@ -13,10 +14,27 @@ export type ColorView = { nodeId: string | null; mode: 'off' | 'highlight' | 'ma
 export const colorView: ColorView = { nodeId: null, mode: 'off' };
 /** Changes the key view and asks the viewer to redraw. */
 export function setColorView(next: ColorView) { Object.assign(colorView, next); window.dispatchEvent(new Event('frameline:color-view')); }
-/** The last successful GPU draw, re-run up to a node for the probe. */
-let lastDraw: ((nodeId: string, px: number, py: number) => number[] | null) | undefined;
-/** The selected node's input colour at picture position (px, py) ∈ [0,1]², in that node's working encoding, averaged over 5×5 pixels of the last drawn frame; null when that clip was not the last drawn or WebGL2 is unavailable. */
-export async function probeNodeInput(nodeId: string, px: number, py: number): Promise<number[] | null> { return lastDraw?.(nodeId, px, py) ?? null; }
+/** A qualifier pick waiting for the layer that grades its node to be drawn. */
+type Probe = { nodeId: string; px: number; py: number; resolve: (rgb: number[] | null) => void };
+const probes = new Set<Probe>();
+/** The last successful GPU draw: answers a probe while its textures are bound, false when its clip does not own the node. */
+let lastDraw: ((probe: Probe) => boolean) | undefined;
+/**
+ * The selected node's input colour at picture position (px, py) ∈ [0,1]², in that node's working encoding, averaged over 5×5
+ * pixels of its clip's frame; a bypassed node reads the input of the place it holds. The last draw answers when it drew that
+ * clip; otherwise the viewer redraws and the clip's own draw answers (a layer above it, a dissolve or picture-in-picture may
+ * draw last). null after 2 s without that draw, or without WebGL2.
+ */
+export function probeNodeInput(nodeId: string, px: number, py: number): Promise<number[] | null> {
+  return new Promise(resolve => {
+    const probe = { nodeId, px, py, resolve };
+    if (lastDraw?.(probe)) return;
+    probes.add(probe); window.dispatchEvent(new Event('frameline:color-view'));
+    setTimeout(() => { if (probes.delete(probe)) resolve(null); }, 2000);
+  });
+}
+/** A pick waits for one of these nodes: playback grades their clip even with every node bypassed, so its draw can answer. */
+export const probeWaiting = (nodes: GradeNode[]) => [...probes].some(p => nodes.some(n => n.id === p.nodeId));
 
 type Stage = ReturnType<typeof processingStages>[number];
 type FilmStage = Extract<Stage, { type: 'film' }>;
@@ -121,7 +139,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
   out vec4 pixel;
   uniform sampler2DArray maskAtlas;
   uniform sampler2D picture, parameters, luma, chromaU, chromaV, curves, lutAtlas, film; uniform sampler3D grade;
-  uniform float size, stops, warmth; uniform vec3 domainMin, domainMax; uniform int profile, first, count, yuvMode, viewStage, viewMode; uniform vec4 sourceRect, yuvCoefficients, yuvScale, pictureRect; uniform vec2 canvasSize; uniform ivec2 origin, region; uniform float fullRange; uniform bool nativeView, managed, displaySRGB, fromFilm, toCanvas;
+  uniform float size, stops, warmth; uniform vec3 domainMin, domainMax; uniform int profile, first, count, yuvMode, viewStage, viewMode; uniform vec4 sourceRect, yuvCoefficients, yuvScale, pictureRect; uniform vec2 canvasSize; uniform ivec2 origin, region; uniform float fullRange; uniform mat3 unwarp; uniform bool nativeView, managed, displaySRGB, fromFilm, toCanvas;
   ${TRANSFER}
   float decode(float v){return decode(v,profile);}
   float encode(float v){return encode(v,profile);}
@@ -181,16 +199,18 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     return mask.x>=0.||(se&4)!=0?mix(before,rgb,alpha):rgb;
   }
   void main(){
-    // Canvas pixel centre, top row first; float targets cover the picture box from \`origin\`, also top row first.
+    // Canvas pixel centre, top row first; float targets cover the picture box from \`origin\`, also top row first. A Stabilize
+    // warp (\`unwarp\`: stabilized → original layer pixels) moves where the picture and its mattes are read, never the windows or film.
     vec2 pixelAt=toCanvas?vec2(gl_FragCoord.x,canvasSize.y-gl_FragCoord.y):vec2(origin)+gl_FragCoord.xy;
-    vec2 coord=pixelAt/canvasSize,maskCoord=coord,picturePos=(pixelAt-pictureRect.xy)/pictureRect.zw;vec4 source;float viewAlpha=1.;
+    vec2 coord=(unwarp*vec3(pixelAt,1.)).xy/canvasSize,maskCoord=coord,picturePos=(pixelAt-pictureRect.xy)/pictureRect.zw,frame=yuvMode>0?(coord-sourceRect.xy)/sourceRect.zw:coord;vec4 source;float viewAlpha=1.;
+    bool inside=all(greaterThanEqual(frame,vec2(0)))&&all(lessThanEqual(frame,vec2(1)));
     if(fromFilm){
       ivec2 t=ivec2(pixelAt)-origin;if(any(lessThan(t,ivec2(0)))||any(greaterThanEqual(t,region))){pixel=vec4(0);return;}
-      vec4 v=texelFetch(film,t,0);source=vec4(v.rgb,1.);viewAlpha=v.a;
-    }else if(yuvMode>0){
-      coord=(coord-sourceRect.xy)/sourceRect.zw;
-      if(any(lessThan(coord,vec2(0)))||any(greaterThan(coord,vec2(1)))){pixel=vec4(0);return;}
-      float y=texture(luma,coord).r;vec2 chroma=yuvMode==2?texture(chromaU,coord).rg:vec2(texture(chromaU,coord).r,texture(chromaV,coord).r);
+      // Film changes colour only: the layer keeps the source's alpha (a title, alpha video, a picture warped off the frame).
+      vec4 v=texelFetch(film,t,0);source=vec4(v.rgb,!inside?0.:yuvMode>0?1.:texture(picture,coord).a);viewAlpha=v.a;
+    }else if(!inside){pixel=vec4(0);return;}
+    else if(yuvMode>0){
+      float y=texture(luma,frame).r;vec2 chroma=yuvMode==2?texture(chromaU,frame).rg:vec2(texture(chromaU,frame).r,texture(chromaV,frame).r);
       y=(y-yuvScale.x)*yuvScale.y;chroma=(chroma-yuvScale.z)*yuvScale.w;
       source=vec4(y+chroma.y*yuvCoefficients.x,y+dot(chroma,yuvCoefficients.yz),y+chroma.x*yuvCoefficients.w,1.);
     }else source=texture(picture,coord);
@@ -320,8 +340,8 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
   let previousMasks='',previous='',previousLuts='';
   const cubeIds=new WeakMap<object,number>();let nextCube=0;
   const cubeId=(cube:object)=>{if(!cubeIds.has(cube))cubeIds.set(cube,++nextCube);return cubeIds.get(cube)!;};
-  // The stages behind the parameter texture, the picture box of the last draw and its film frame number.
-  let planned:Stage[]=[],box=pictureBox([0,0,1,1],1,1),filmFrame=0,shownLook:Look=neutral;
+  // The stages behind the parameter texture, the last draw's clip and nodes (bypassed ones too), its picture box and film frame number.
+  let planned:Stage[]=[],drawn:GradeNode[]=[],drawnClip='',box=pictureBox([0,0,1,1],1,1),filmFrame=0,shownLook:Look=neutral;
   type Target={texture:WebGLTexture;fbo:WebGLFramebuffer;width:number;height:number};
   const targets=new Map<string,Target>();
   /** A float render target kept by name; a new one only when its size changes. */
@@ -379,16 +399,29 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     if(box.width&&box.height)for(let i=0;i<end;i++){const stage=planned[i];if(stage.type!=='film')continue;const a=target('A',box.width,box.height);grade(at,i-at,input,a,viewStage,0);input=film(stage,a);at=i+1;}
     grade(at,end-at,input,out,viewStage,viewMode);
   };
-  /** The input of `nodeId` (stages before its first, film included) at picture position (px, py), averaged over 5×5 pixels. */
-  const probeInput=(nodeId:string,px:number,py:number)=>{
-    const start=planned.findIndex(s=>s.type!=='film'&&s.node.id===nodeId&&s.nodeStart),{rect,x0,y0,width,height}=box;
-    if(start<0||!width||!height||!Number.isFinite(px)||!Number.isFinite(py))return null;
+  /** Where `nodeId`'s input is among the planned stages: its first one; for a bypassed node of the drawn clip, the first of the
+   *  next enabled node after it (the end when none follows); -1 when the drawn clip does not own the node. */
+  const inputAt=(nodeId:string)=>{
+    const start=planned.findIndex(s=>s.type!=='film'&&s.node.id===nodeId&&s.nodeStart),node=drawn.find(n=>n.id===nodeId&&n.clipId===drawnClip&&!n.enabled);
+    if(start>=0||!node)return start;
+    const next=planned.findIndex(s=>s.type!=='film'&&s.nodeStart&&(s.node.order??0)>(node.order??0));return next<0?planned.length:next;
+  };
+  /** The output of stages [0, start) (film included) at picture position (px, py), averaged over 5×5 pixels. */
+  const probeInput=(start:number,px:number,py:number)=>{
+    const {rect,x0,y0,width,height}=box;
+    if(!width||!height||!Number.isFinite(px)||!Number.isFinite(py))return null;
     gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_3D,shownLook.texture);
     const a=target('A',width,height);render(start,a);
     const w=Math.min(5,width),h=Math.min(5,height),x=Math.max(0,Math.min(width-w,Math.floor(rect[0]+px*rect[2])-x0-2)),y=Math.max(0,Math.min(height-h,Math.floor(rect[1]+py*rect[3])-y0-2));
     const values=byteTargets?new Uint8Array(w*h*4):new Float32Array(w*h*4);gl.bindFramebuffer(gl.FRAMEBUFFER,a.fbo);gl.readPixels(x,y,w,h,gl.RGBA,byteTargets?gl.UNSIGNED_BYTE:gl.FLOAT,values);into(null);
     const sum=[0,0,0];for(let i=0;i<w*h;i++)for(let c=0;c<3;c++)sum[c]+=values[i*4+c];
     return sum.map(v=>v/(w*h)/(byteTargets?255:1));
+  };
+  /** Answers `probe` from the current draw when its clip owns the node; a failed read asks to pick again. */
+  const answer=(probe:Probe)=>{
+    const start=inputAt(probe.nodeId);if(start<0)return false;
+    let rgb:number[]|null=null;try{rgb=probeInput(start,probe.px,probe.py);}catch{/* null: pick again */}
+    probe.resolve(rgb);return true;
   };
 
   return {
@@ -400,9 +433,11 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
       if (typeof VideoFrame !== 'undefined' && (snapshot || video.readyState >= 2 && !video.seeking)) frameFor(video,snapshot);
       return started !== before;
     },
-    /** `filmAt`: the film stage's frame number when the picture has no source clock (a still, title or adjustment clip), as export counts it. */
-    draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame,filmAt?:number) {
-      if(lastDraw===probeInput)lastDraw=undefined;
+    /** `filmAt`: the film stage's frame number when the picture has no source clock (a still, title or adjustment clip), as export counts it.
+     *  `warp`: the layer's Stabilize warp (setTransform arguments, original → stabilized layer pixels); the grade then reads the
+     *  stabilized picture and mattes, as export grades the stabilized bake, and the result needs no further warp. */
+    draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame,filmAt?:number,warp?:Affine) {
+      if(lastDraw===answer)lastDraw=undefined;
       const key=preload(clip,asset),look=key?looks.get(key):neutral;
       if(look instanceof Error)throw look;if(!look)throw new ColorPending('Preparing color…');
       const frame=video&&typeof VideoFrame!=='undefined'?frameFor(video,snapshot,true):undefined;
@@ -411,12 +446,13 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
       const {profile,gamut}=interpretation(clip,asset),stops=Number(clip.properties.inputExposure??0),warmth=Number(clip.properties.inputTemperature??0);
       if(!Number.isFinite(stops)||Math.abs(stops)>8||!Number.isFinite(warmth)||Math.abs(warmth)>2000)throw new Error('Camera exposure or white balance is out of range.');
       gl.useProgram(program);
-      const controls=JSON.stringify([clip.id,clip.properties.colorPipeline,profile,gamut,nodes.map(({enabled,order,parameters,curves,effects,mask})=>({enabled,order,parameters,curves,mask,effects:effects?.map(e=>e.type==='lut'?{...e,cube:cubeId(e.cube)}:e)}))]);
+      // Node ids too: a pasted grade (new ids, same values) must re-plan, or the probe and key view look for the old nodes.
+      const controls=JSON.stringify([clip.id,clip.properties.colorPipeline,profile,gamut,nodes.map(({id,enabled,order,parameters,curves,effects,mask})=>({id,enabled,order,parameters,curves,mask,effects:effects?.map(e=>e.type==='lut'?{...e,cube:cubeId(e.cube)}:e)}))]);
       const maskIds=[...new Set(nodes.filter(n=>n.enabled&&n.clipId===clip.id&&n.mask?.enabled).map(n=>nodeMaskId(n)!))];
       const maskKey=JSON.stringify([source.width,source.height,maskIds.map(id=>maskPixels.get(id)?.key??id)]);
       if(maskKey!==previousMasks){
         const alpha=new Uint8Array(Math.max(1,maskIds.length)*source.width*source.height);
-        maskIds.forEach((id,i)=>{const data=maskPixels.get(id);if(!data){if(nodes.some(n=>nodeMaskId(n)===id&&n.mask!.enabled&&n.mask!.amount>0))throw new ColorPending('Loading Smart Mask…');return;}alpha.set(data.data,i*source.width*source.height);});
+        maskIds.forEach((id,i)=>{const data=maskPixels.get(id);if(!data){if(nodes.some(n=>n.enabled&&nodeMaskId(n)===id&&n.mask!.enabled&&n.mask!.amount>0))throw new ColorPending('Loading Smart Mask…');return;}alpha.set(data.data,i*source.width*source.height);});
         gl.activeTexture(gl.TEXTURE0+maskUnit);gl.bindTexture(gl.TEXTURE_2D_ARRAY,maskTexture);gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);gl.texImage3D(gl.TEXTURE_2D_ARRAY,0,gl.R8,source.width,source.height,Math.max(1,maskIds.length),0,gl.RED,gl.UNSIGNED_BYTE,alpha);previousMasks=maskKey;
       }
       if(controls!==previous){
@@ -476,14 +512,17 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
       canvas.dataset.sourceTimestamp=String(time);filmFrame=filmAt??Math.round(time*(asset.fps||24));
       box=pictureBox(rect,canvas.width,canvas.height);
       gl.uniform4fv(uniform('pictureRect'),rect);gl.uniform2f(uniform('canvasSize'),canvas.width,canvas.height);gl.uniform2i(uniform('origin'),box.x0,box.y0);gl.uniform2i(uniform('region'),box.width,box.height);
+      const u=warp?invert(warp):[1,0,0,1,0,0];gl.uniformMatrix3fv(uniform('unwarp'),false,[u[0],u[1],0,u[2],u[3],0,u[4],u[5],1]);
       // Key view: the selected node's alpha as a matte (stages up to that node only), or the grade over grey where it is 0.
       const viewed=colorView.mode!=='off'&&nodes.some(n=>n.id===colorView.nodeId&&n.enabled&&n.clipId===clip.id)?planned.findIndex(s=>s.type!=='film'&&s.node.id===colorView.nodeId&&s.nodeEnd):-1;
       const viewMode=viewed<0?0:colorView.mode==='matte'?2:1;
       render(viewMode===2?viewed+1:planned.length,null,viewed,viewMode);
-      lastDraw=probeInput;
+      // Picks waiting for this clip's nodes read this frame while its textures are bound.
+      drawn=nodes;drawnClip=clip.id;for(const probe of probes)if(answer(probe))probes.delete(probe);
+      lastDraw=answer;
       return canvas;
     },
-    dispose(){if(lastDraw===probeInput)lastDraw=undefined;worker.terminate();gl.deleteTexture(neutral.texture);for(const look of looks.values())if(look&&!(look instanceof Error))gl.deleteTexture(look.texture);for(const t of targets.values()){gl.deleteTexture(t.texture);gl.deleteFramebuffer(t.fbo);}targets.clear();gl.deleteTexture(picture);gl.deleteTexture(parameters);gl.deleteTexture(maskTexture);gl.deleteTexture(curveTexture);gl.deleteTexture(lutTexture);gl.deleteTexture(blank);planes.forEach(t=>gl.deleteTexture(t));acesTables.forEach(t=>gl.deleteTexture(t));gl.deleteProgram(program);gl.deleteProgram(filmProgram);gl.getExtension('WEBGL_lose_context')?.loseContext();looks.clear();},
+    dispose(){if(lastDraw===answer)lastDraw=undefined;worker.terminate();gl.deleteTexture(neutral.texture);for(const look of looks.values())if(look&&!(look instanceof Error))gl.deleteTexture(look.texture);for(const t of targets.values()){gl.deleteTexture(t.texture);gl.deleteFramebuffer(t.fbo);}targets.clear();gl.deleteTexture(picture);gl.deleteTexture(parameters);gl.deleteTexture(maskTexture);gl.deleteTexture(curveTexture);gl.deleteTexture(lutTexture);gl.deleteTexture(blank);planes.forEach(t=>gl.deleteTexture(t));acesTables.forEach(t=>gl.deleteTexture(t));gl.deleteProgram(program);gl.deleteProgram(filmProgram);gl.getExtension('WEBGL_lose_context')?.loseContext();looks.clear();},
   };
 }
 
@@ -556,16 +595,17 @@ function createSoftwareColorPreview(onReady:()=>void) {
   };
   return {
     preload,probe:createCopyProbe().read,prepare(_video:HTMLVideoElement,_snapshot?:VideoFrame):boolean{return false;},
-    draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame,filmAt?:number){
+    draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame,filmAt?:number,warp?:Affine){
       const key=preload(clip,asset),look=key?looks.get(key):undefined;
       if(look instanceof Error)throw look;if(key&&!look)throw new ColorPending('Preparing color…');
       if(canvas.width!==source.width||canvas.height!==source.height){canvas.width=source.width;canvas.height=source.height;}
-      context.clearRect(0,0,canvas.width,canvas.height);context.drawImage(source,0,0);
+      context.clearRect(0,0,canvas.width,canvas.height);if(warp)context.setTransform(...warp);context.drawImage(source,0,0);context.setTransform(1,0,0,1,0,0);
       if(hasACES(nodes,clip.id))throw Error('ACES preview requires WebGL2. Enable browser graphics acceleration or use a supported browser.');
       const maskPixels=typeof masks==='function'?masks(snapshot?snapshot.timestamp/1e6:video?.currentTime??0):masks;
-      const W=canvas.width,H=canvas.height,rect=pictureRect(asset,W,H),windows=new Map(nodes.map(n=>[`window:${n.id}`,n.parameters]));
-      // Windows read the pixel's picture position; Smart Masks their fitted alpha.
-      let at=0;const maskAt=(id:string)=>{const p=windows.get(id);if(p)return windowAlpha((at%W+.5-rect[0])/rect[2],(Math.floor(at/W)+.5-rect[1])/rect[3],rect[2]/rect[3],p);const mask=maskPixels.get(id);if(!mask)throw new ColorPending('Loading Smart Mask…');return mask.data[at]/255;};
+      const W=canvas.width,H=canvas.height,rect=pictureRect(asset,W,H),windows=new Map(nodes.map(n=>[`window:${n.id}`,n.parameters])),back=warp&&invert(warp);
+      // Windows read the pixel's picture position; Smart Masks their fitted alpha, where a warped pixel came from.
+      const from=(i:number)=>{if(!back)return i;const q=apply(back,i%W+.5,Math.floor(i/W)+.5),x=Math.floor(q.x),y=Math.floor(q.y);return x<0||y<0||x>=W||y>=H?-1:y*W+x;};
+      let at=0;const maskAt=(id:string)=>{const p=windows.get(id);if(p)return windowAlpha((at%W+.5-rect[0])/rect[2],(Math.floor(at/W)+.5-rect[1])/rect[3],rect[2]/rect[3],p);const mask=maskPixels.get(id);if(!mask)throw new ColorPending('Loading Smart Mask…');return (mask.data[from(at)]??0)/255;};
       const pixels=context.getImageData(0,0,W,H),data=pixels.data,{profile,gamut}=interpretation(clip,asset);
       // Film stages split the nodes: each part grades per pixel, applyFilm runs on the whole picture between parts.
       const films=processingStages({...clip,properties:{...clip.properties,inputProfile:profile,inputGamut:gamut}},nodes).filter((s):s is FilmStage=>s.type==='film'),parts:GradeNode[][]=[[]];
@@ -581,7 +621,8 @@ function createSoftwareColorPreview(onReady:()=>void) {
         let rgb:Float32Array=new Float32Array(width*height*3);each(i=>rgb.set(transforms[0]([data[at*4]/255,data[at*4+1]/255,data[at*4+2]/255]),i*3));
         const time=snapshot?snapshot.timestamp/1e6:video?Math.floor(video.currentTime*(asset.fps||24)+1e-6)/(asset.fps||24):0;
         films.forEach((film,k)=>{const filmed=applyFilm(rgb,width,height,film,filmAt??Math.round(time*(asset.fps||24)));each(i=>filmed.set(transforms[k+1](Array.from(filmed.subarray(i*3,i*3+3))),i*3));rgb=filmed;});
-        each(i=>{for(let c=0;c<3;c++)data[at*4+c]=rgb[i*3+c]*255;data[at*4+3]=255;});
+        // Film changes colour only: each pixel keeps the source's alpha.
+        each(i=>{for(let c=0;c<3;c++)data[at*4+c]=rgb[i*3+c]*255;});
       }
       context.putImageData(pixels,0,0);
       canvas.dataset.sourceTimestamp=String(snapshot?snapshot.timestamp/1e6:video?Math.floor(video.currentTime*(asset.fps||24)+1e-6)/(asset.fps||24):0);
