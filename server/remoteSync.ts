@@ -15,6 +15,7 @@ import { mergeState } from '../src/services/merge.ts';
 import { applyStateDelta, stateDelta, stateEqual as equal } from '../src/services/stateDelta.ts';
 import type { PersistedState } from '../src/services/index.ts';
 import type { MediaAsset, User } from '../src/state/models.ts';
+import type { NormalizeLink } from './colorNormalize.ts';
 
 const LISTS = ['timelines', 'tracks', 'clips', 'nodes', 'comments', 'snapshots', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const;
 // Each server's own: who may open the project, its offline lock and its Final Cut import card.
@@ -226,6 +227,31 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
     if (!on) { rmSync(basePath(id), { force: true }); status.delete(id); }
     save(); seen = '';
   }
+
+  // Auto balance on a computer without the colour worker (colorNormalize.ts): a kept project's copy on sharedcut.com after a fresh
+  // sync, and that project's normalize route there through this link's session. Nothing else is reachable, and the cookie stays here.
+  const copyOf = (state: PersistedState, id: string) => ({ clips: state.clips.filter(c => c.projectId === id), nodes: state.nodes.filter(n => n.projectId === id), media: state.media.filter(m => m.projectId === id) });
+  const normalize: NormalizeLink = {
+    blocked(id: string) {
+      if (!config.cookie || !config.user) return `Auto balance runs on sharedcut.com: sign in to sharedcut.com${config.user ? ' again' : ''} on the Projects page.`;
+      if (!config.kept.includes(id)) return 'Auto balance runs on sharedcut.com: sync this project with sharedcut.com on the Projects page.';
+      if (!online && status.get(id)?.status === 'offline') return "You're offline: Auto balance needs sharedcut.com.";
+    },
+    async synced(id: string) {
+      // A pass already under way may have read this computer before the last edit: let it finish, then merge this project afresh.
+      await tick(); seen = ''; await tick();
+      const why = normalize.blocked(id), now = status.get(id);
+      if (why) throw new Error(why);
+      if (!online || !remote) throw new Error("You're offline: Auto balance needs sharedcut.com.");
+      if (now?.status === 'error') throw new Error(`Could not sync with sharedcut.com: ${now.error}`);
+      return { here: copyOf(host.state(), id), there: swap(copyOf(remote.state, id), config.user!.id, config.localUserId!) };
+    },
+    async call(id: string, method: 'GET' | 'POST' | 'DELETE', jobId?: string, body?: unknown) {
+      if (!ID.test(id) || (jobId !== undefined && !/^[a-f0-9-]{36}$/.test(jobId))) throw httpError('Invalid Normalize job.', 400);
+      try { return await api(`/api/projects/${id}/color-normalize${jobId ? `/${jobId}` : ''}`, { method, ...(body !== undefined && { json: body }) }, 30_000); }
+      catch (error) { throw error instanceof Offline ? Object.assign(error, { offline: true }) : error; }
+    },
+  };
   return {
     tick,
     status() {
@@ -245,5 +271,6 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
     logout() { config = { ...config, cookie: undefined }; save(); remote = undefined; online = false; },
     keep(id: string, on: boolean) { keep(id, on); void tick(); },
     close() { closed = true; clearInterval(timer); return running; },
+    normalize,
   };
 }

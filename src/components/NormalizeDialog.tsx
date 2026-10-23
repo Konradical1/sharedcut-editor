@@ -4,7 +4,7 @@ import {useEditorStore,useStoreWithoutPlayhead} from '../state/store';
 import type {Clip} from '../state/models';
 import {isAdjustment} from '../services/adjustment';
 import {colorGroupOf,colorGroups,nextGroupName} from '../services/colorGroups';
-import {cancelNormalize,normalizeJob,startNormalize,type NormalizeJob,type NormalizeRequest} from '../services/colorNormalizeClient';
+import {cancelNormalize,normalizeCapabilities,normalizeJob,startNormalize,type NormalizeCapabilities,type NormalizeJob,type NormalizeRequest} from '../services/colorNormalizeClient';
 import {Button,Modal} from './ui';
 
 const running=(job:NormalizeJob|null):job is NormalizeJob=>job?.status==='waiting'||job?.status==='running';
@@ -14,10 +14,12 @@ const MAX_SHOTS=200,MAX_ALL=300; // server/colorNormalize.ts refuses more
 export const normalizable=(clip:Clip,media:{id:string;kind:string}[])=>!isAdjustment(clip)&&media.find(m=>m.id===clip.mediaId)?.kind==='video';
 const plural=(n:number,word='shot')=>`${n} ${word}${n===1?'':'s'}`;
 
-/** Starts and follows one Normalize job; `then` runs once with the finished job. Unmounting cancels a job still running and says so with `cancelled`. */
+/** Starts and follows one Normalize job; `then` runs once with the finished job. Unmounting cancels a job still running and says so with `cancelled`. `where`: whether it can run, and on sharedcut.com (SharedCut Desktop). */
 export function useNormalize(cancelled='Normalize cancelled'){
   const projectId=useEditorStore(s=>s.projectId),[job,setJob]=useState<NormalizeJob|null>(null),[error,setError]=useState(''),[starting,setStarting]=useState(false);
-  const then=useRef<((job:NormalizeJob)=>void)|null>(null),current=useRef(job),alive=useRef(true);current.current=job;
+  const then=useRef<((job:NormalizeJob)=>void)|null>(null),current=useRef(job),alive=useRef(true),[where,setWhere]=useState<NormalizeCapabilities|null>(null);current.current=job;
+  // Asked again after each run: a sign-out or a lost connection changes the answer.
+  const idle=!running(job);useEffect(()=>{if(!projectId||!idle)return;let live=true;void normalizeCapabilities(projectId).then(c=>{if(live)setWhere(c);});return()=>{live=false;};},[projectId,idle]);
   useEffect(()=>{alive.current=true;return()=>{alive.current=false;const j=current.current;if(running(j)){void cancelNormalize(j.projectId,j.id).catch(()=>{});useEditorStore.getState().notify(cancelled,'info');}};},[]);
   useEffect(()=>{
     if(!running(job))return;let live=true;
@@ -32,7 +34,7 @@ export function useNormalize(cancelled='Normalize cancelled'){
     catch(e){if(alive.current)setError((e as Error).message);}finally{if(alive.current)setStarting(false);}
   };
   const cancel=()=>{const j=current.current;if(!running(j))return;then.current=null;void cancelNormalize(j.projectId,j.id).then(()=>normalizeJob(j.projectId,j.id)).then(setJob).catch(e=>setError((e as Error).message));};
-  return {job,busy:starting||running(job),error:error||(job?.status==='failed'?job.error||'Normalize failed.':''),start,cancel};
+  return {job,busy:starting||running(job),error:error||(job?.status==='failed'?job.error||'Normalize failed.':''),start,cancel,where};
 }
 
 type Summary={count:number;job:NormalizeJob;into?:string};
@@ -42,7 +44,7 @@ export default function NormalizeDialog({clipIds,group:preset,onClose}:{clipIds:
   const picked=clipIds.map(id=>clips.find(c=>c.id===id)).filter((c):c is Clip=>Boolean(c)),shots=picked.filter(c=>normalizable(c,s.media)),others=picked.filter(c=>!shots.includes(c));
   const common=colorGroupOf(shots[0]),[choice,setChoice]=useState(()=>preset??(common&&shots.every(c=>colorGroupOf(c)===common)?common:'new'));
   const [name,setName]=useState(()=>nextGroupName(groups)),[clean,setClean]=useState(false),[summary,setSummary]=useState<Summary|null>(null);
-  const {job,busy,error,start,cancel}=useNormalize(),chosen=groups.find(g=>g.id===choice),leaving=choice==='none'?shots.filter(c=>colorGroupOf(c)).length:0;
+  const {job,busy,error,start,cancel,where}=useNormalize(),chosen=groups.find(g=>g.id===choice),leaving=choice==='none'?shots.filter(c=>colorGroupOf(c)).length:0;
   const label=(id:string)=>s.clips.find(c=>c.id===id)?.name??'Removed shot';
   const run=()=>{
     const targets=shots.map(c=>c.id),contextIds=(chosen?.clipIds??[]).filter(id=>!targets.includes(id)).slice(0,MAX_ALL-targets.length);
@@ -56,6 +58,7 @@ export default function NormalizeDialog({clipIds,group:preset,onClose}:{clipIds:
   const shotsDone=summary?.job.result?.shots??[],check=(w:{code:string})=>!INFO.has(w.code),warned=shotsDone.filter(shot=>shot.warnings.some(check)),kept=shotsDone.filter(shot=>shot.warnings.some(w=>w.code==='low-confidence')).length,gentle=shotsDone.filter(shot=>shot.warnings.some(w=>w.code==='display-referred')).length,skipped=[...others.map(c=>({clipId:c.id,text:isAdjustment(c)?'Adjustment layer':'Still or graphic, not video'})),...(summary?.job.skipped??job?.skipped??[])];
   return <Modal title="Normalize & Group" onClose={onClose}><div className="modal-body normalize-dialog">
     {!summary&&<p>{shots.length?`Balances ${plural(shots.length)}: exposure, white balance and black level, so they look correct and match.`:'None of these shots is video footage.'}</p>}
+    {!summary&&where&&(where.remote||!where.available)&&<small>{where.available?'Runs on sharedcut.com.':where.reason}</small>}
     {shots.length>MAX_SHOTS&&<p className="danger-text" role="alert">Pick at most {MAX_SHOTS} shots at a time.</p>}
     {!summary&&<><fieldset className="normalize-groups" disabled={busy}><legend>Color group</legend>
       <div className="normalize-option"><label><input type="radio" name="normalize-group" checked={choice==='new'} onChange={()=>setChoice('new')}/>New group</label><input aria-label="New group name" maxLength={60} value={name} onFocus={()=>setChoice('new')} onChange={e=>setName(e.target.value)}/></div>

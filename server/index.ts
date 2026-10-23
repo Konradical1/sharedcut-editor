@@ -299,7 +299,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const denoise = denoiseService(join(dataDir, 'denoise'), { freeGpu: () => masks.stopIdlePreview() });
   const depth = depthService(join(dataDir, 'depth'), { sourceTimes: masks.sourceTimes, freeGpu: () => { masks.stopIdlePreview(); denoise.stopIdle(); } });
   const colorAssistant = colorAssistantService(dataDir);
-  const colorNormalize = colorNormalizeService(dataDir);
+  // SharedCut Desktop has no colour worker: Normalize runs on sharedcut.com through the sync link (`remote`, made further down).
+  const colorNormalize = colorNormalizeService(dataDir, undefined, () => remote?.normalize);
   const flowJobs = new Map<string, FlowPreview & { projectId: string; clipId: string; generation: string; controller: AbortController }>();
   let flowQueue = Promise.resolve();
   const stabilizeDirectory = join(dataDir, 'stabilize');
@@ -1986,10 +1987,11 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (!jobId && method === 'POST') { const body = await jsonBody(req); send(res, 202, colorAssistant.start({ projectId, body, clips: state.clips, media: state.media, nodes: state.nodes, source: originalPath })); return; }
           fail(405, 'Method not allowed.');
         }
-        // Normalize measures and balances shots on this server; no AI, so no allow-list. Starting and cancelling need an editor role.
-        const normalizeRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)\/color-normalize(?:\/([a-f0-9-]{36}))?$/.exec(path);
+        // Normalize measures and balances shots on this server (SharedCut Desktop: on sharedcut.com); no AI, so no allow-list. Starting and cancelling need an editor role.
+        const normalizeRoute = /^\/api\/projects\/([a-zA-Z0-9_-]+)\/color-normalize(?:\/([a-f0-9-]{36}|capabilities))?$/.exec(path);
         if (normalizeRoute) {
           const [, projectId, jobId] = normalizeRoute; requireProject(projectId, userId, method !== 'GET');
+          if (jobId === 'capabilities') { if (method !== 'GET') fail(405, 'Method not allowed.'); send(res, 200, colorNormalize.capabilities(projectId)); return; }
           if (jobId && method === 'GET') { send(res, 200, colorNormalize.get(projectId, jobId)); return; }
           if (jobId && method === 'DELETE') { colorNormalize.cancel(projectId, jobId); send(res, 200, { ok: true }); return; }
           if (!jobId && method === 'GET') { send(res, 200, colorNormalize.latest(projectId)); return; }
