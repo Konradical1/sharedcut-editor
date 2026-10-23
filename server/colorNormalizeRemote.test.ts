@@ -212,7 +212,8 @@ test('SharedCut Desktop: Auto balance goes through its sync link to sharedcut.co
     mkdirSync(join(deskDir, 'media', 'cam'), { recursive: true }); writeFileSync(join(deskDir, 'media', 'cam', 'original'), 'footage');
     assert.equal((await as('/remote/login', 'POST', { email: 'alice@example.com', password: PASSWORD })).status, 200);
     assert.equal((await as('/remote/projects/trip', 'PUT')).status, 200); await desk.remote!.tick();
-    assert.match((await where('solo')).reason, /sync this project with sharedcut\.com on the Projects page/);
+    // Made here, so it went up with the first pass (remoteSync pushes projects made on this computer) and balances there too.
+    assert.deepEqual(await where('solo'), { available: true, remote: true });
     assert.deepEqual(await where('trip'), { available: true, remote: true });
 
     // Forwarded: only c1 can be measured there as it is here; its balance comes back and applies as a local one would.
