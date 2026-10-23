@@ -41,6 +41,35 @@ function canon(head: Buffer): CameraColor | undefined {
   return { inputProfile, inputGamut, colorEvidence: `Canon maker notes (${model}): ${inputProfile} / ${inputGamut ?? 'gamut not recorded'}` };
 }
 
+/** ffprobe's main video stream, as much of it as appleLog reads. */
+export type ProbedVideo = { color_primaries?: string; color_transfer?: string; pix_fmt?: string; bits_per_raw_sample?: string; tags?: Record<string, string> };
+const APPLE = 'Apple camera metadata';
+/**
+ * Apple Log has no transfer tag: an iPhone (its Camera app, or Blackmagic Camera on it) writes BT.2020 primaries with the
+ * transfer unspecified, while Apple's HDR video is tagged HLG and its SDR video BT.709. So an Apple-made clip of 10 bits or
+ * more with BT.2020 primaries and no transfer is Apple Log. HLG/PQ/BT.709-tagged, 8-bit and non-Apple clips are never marked.
+ */
+export function appleLog(video: ProbedVideo | undefined, format: Record<string, string> = {}): CameraColor | undefined {
+  const tags = Object.fromEntries(Object.entries({ ...format, ...video?.tags }).map(([k, v]) => [k.toLowerCase(), String(v).trim()]));
+  const make = tags['com.apple.quicktime.make'] ?? tags['com.apple.proapps.manufacturer'], model = tags['com.apple.quicktime.model'], lens = tags['com.blackmagic-design.camera.lenstype'];
+  const bits = Number(/(?:p|gray)(\d\d)(?:le|be)$|^p[024](1\d)(?:le|be)?$/.exec(video?.pix_fmt ?? '')?.slice(1).find(Boolean) ?? video?.bits_per_raw_sample);
+  const apple = /^apple\b/i.test(make ?? '') || [model, lens].some(name => /^ip(hone|ad)/i.test(name ?? ''));
+  if (!video || !apple || video.color_primaries !== 'bt2020' || !['unknown', 'unspecified', undefined].includes(video.color_transfer) || !(bits >= 10)) return undefined;
+  const software = tags['com.apple.quicktime.software'];
+  return { inputProfile: 'Apple Log', inputGamut: 'Rec.2020', colorMatrix: 'bt2020nc', colorEvidence: `${APPLE} (${[lens || model || make, software].filter(Boolean).join(', ')}): BT.2020, Apple Log` };
+}
+/**
+ * A stored asset's labels after a later metadata check. Camera maker metadata corrects a label; the Apple Log signature, read
+ * from tags rather than recorded, only fills an empty one. A missing finding never removes a label, but says so when import only assumed it.
+ */
+export function cameraLabels(current: { inputProfile?: string; inputGamut?: string; colorEvidence?: string }, found: CameraColor | undefined): { colorEvidence?: string; inputProfile?: string; inputGamut?: string } {
+  if (found?.colorEvidence.startsWith(APPLE) && current.inputProfile) return {};
+  const assumed = !found?.inputProfile && current.inputProfile && current.colorEvidence?.startsWith('Canon container (CAEP)') ? `; ${current.inputProfile} was assumed at import, not verified` : '';
+  return { ...(found && { colorEvidence: found.colorEvidence + assumed }), ...(found?.inputProfile && { inputProfile: found.inputProfile, inputGamut: found.inputGamut ?? current.inputGamut }) };
+}
+/** Bump to check every ready video's camera metadata again at startup (v2: Sony at the end of the file, no Canon Log guess; v3: Apple Log). */
+export const CAMERA_METADATA_VERSION = 3;
+
 export function cameraColor(head: Buffer, tail: Buffer): CameraColor | undefined {
   return sony(head.toString('latin1') + tail.toString('latin1')) ?? canon(head);
 }

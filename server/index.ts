@@ -56,8 +56,8 @@ import { motionTrackerCapabilities, motionTrackerService } from './motionTracker
 import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } from './colorAssistant.ts';
 import { colorNormalizeService } from './colorNormalize.ts';
 import { validateMotionTrackers } from '../src/services/motionTracker.ts';
-import { readCameraColor } from './cameraMetadata.ts';
-import { FILMSTRIP_VERSION, FULL_VARIANT, MEDIA_CONCURRENCY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, exportAspect, PROBE_VERSION, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, prepareWaveform, renderTimeline, renderSoundEffect, depthRuns, depthSpan } from './media.ts';
+import { CAMERA_METADATA_VERSION, cameraLabels } from './cameraMetadata.ts';
+import { FILMSTRIP_VERSION, FULL_VARIANT, MEDIA_CONCURRENCY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, exportAspect, PROBE_VERSION, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, probeCameraColor, prepareWaveform, renderTimeline, renderSoundEffect, depthRuns, depthSpan } from './media.ts';
 import { migrateAsset, needsMigration, removeLeftovers, sweepPreparedTemp } from './mediaMigration.ts';
 
 const scrypt = promisify(scryptCallback);
@@ -2165,22 +2165,21 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     }
   };
   const queueMigration = (id: string) => { if (!migrations.includes(id)) migrations.push(id); if (!migrating) migrateNext(); };
-  const cameraDue = (asset: Asset) => asset.kind === 'video' && asset.status === 'ready' && asset.cameraMetadataVersion !== 2 && existsSync(originalPath(asset.id));
+  const cameraDue = (asset: Asset) => asset.kind === 'video' && asset.status === 'ready' && (asset.cameraMetadataVersion ?? 0) < CAMERA_METADATA_VERSION && existsSync(originalPath(asset.id));
   // Imports before version 2 read only the file's first 2 MB (Sony can write its profile at the end) and guessed Canon Log 3.
   // An untagged stream then fell back to a BT.601 matrix, which the grading proxy baked in. The files that carry it go
   // before the correction is saved, so the migration rebuilds full-v3 from the original whenever it gets there, even
-  // after restarts; only then is the check marked done.
+  // after restarts; only then is the check marked done. Version 3 adds Apple Log, read from ffprobe's tags (probeCameraColor):
+  // a label only, previews keep the recorded signal through the stream's own matrix. A clip's own input choice always wins over it.
   for (const asset of state.media) if (cameraDue(asset)) addWork(`camera-${asset.id}`, async signal => {
     try {
-      const found = await readCameraColor(originalPath(asset.id), statSync(originalPath(asset.id)).size), current = state.media.find(m => m.id === asset.id);
+      const found = await probeCameraColor(originalPath(asset.id), signal), current = state.media.find(m => m.id === asset.id);
       if (!current || signal.aborted || closed) return;
       const stale = current.colorMatrix === 'auto' ? found?.colorMatrix : undefined;
       let matrix = stale;
       // Windows refuses to delete a file FFmpeg or a player still holds: keep the old matrix and retry on the next start.
       if (matrix) try { for (const name of ['color-v1.mp4', FULL_VARIANT]) rmSync(join(mediaDir(asset.id), 'prepared', name), { force: true, maxRetries: 3 }); } catch (error) { matrix = undefined; console.error(`${asset.name}: stale grading picture in use, corrected on the next start.`, error); }
-      // Positive camera metadata corrects a label. A missing tag never removes one, but says so when import only assumed it.
-      const assumed = !found?.inputProfile && current.inputProfile && current.colorEvidence?.startsWith('Canon container (CAEP)') ? `; ${current.inputProfile} was assumed at import, not verified` : '';
-      updateAsset(asset.id, { ...(stale === matrix && { cameraMetadataVersion: 2 }), ...(found && { colorEvidence: found.colorEvidence + assumed }), ...(found?.inputProfile && { inputProfile: found.inputProfile, inputGamut: found.inputGamut ?? current.inputGamut }), ...(matrix && { colorMatrix: matrix, colorProxyUrl: undefined }) });
+      updateAsset(asset.id, { ...(stale === matrix && { cameraMetadataVersion: CAMERA_METADATA_VERSION }), ...cameraLabels(current, found), ...(matrix && { colorMatrix: matrix, colorProxyUrl: undefined }) });
     } catch (error) { if (!signal.aborted) console.error(`Camera metadata check failed for ${asset.name}:`, error); }
     finally { if (!signal.aborted && !closed) queueMigration(asset.id); }
   });

@@ -5,7 +5,7 @@ import { gradeValues } from './grade.ts';
 import { identityCurve, curveSlope, sampleCurve, tonal, chroma, hslCurves, mixer, qualifierAlpha, hasWindow, hasQualifier, filmActive, filmParams, validateGradeParameters, V3_KEYS, CURVE_KEYS, HUE_CURVES } from './grading.ts';
 export { identityCurve, curveSlope, sampleCurve };
 
-export const profiles = ['Rec.709', 'S-Log3', 'Canon Log', 'Canon Log 2', 'Canon Log 3', 'S-Log2', 'S-Log', 'DaVinci Intermediate', 'Linear', 'Gamma 2.4'] as const;
+export const profiles = ['Rec.709', 'S-Log3', 'Canon Log', 'Canon Log 2', 'Canon Log 3', 'S-Log2', 'S-Log', 'DaVinci Intermediate', 'Linear', 'Gamma 2.4', 'Apple Log'] as const;
 export const gamuts = ['Rec.709', 'S-Gamut3.Cine', 'S-Gamut3', 'Cinema Gamut', 'Rec.2020', 'DaVinci Wide Gamut', 'S-Gamut'] as const;
 export type Cube = { size: number; data: Float32Array; min: number[]; max: number[] };
 const clamp = (v: number, min = 0, max = 1) => Math.max(min, Math.min(max, v));
@@ -25,6 +25,9 @@ export function decodeLog(v: number, profile: string): number {
     return Math.sign(ire - b) * (10 ** (Math.abs(ire - b) / a) - 1) / c * .9;
   }
   if (profile === 'Canon Log 3') { const ire = (v * 1023 - 64) / 876; return .9 * (ire < .04076162 ? -(10 ** ((.07623209 - ire) / .42889912) - 1) / 14.98325 : ire <= .105357102 ? (ire - .073059361) / 2.3069815 : (10 ** ((ire - .069886632) / .42889912) - 1) / 14.98325); }
+  // Apple Log Profile (Apple, 2023) on the video-range scale like Sony, scene-linear (grey .18 at P .488, black at code 196). Pt = c·(Rt−R0)² = .208555316.
+  // Below code 64 the square segment is mirrored (Apple clamps it to R0), so the curve stays monotonic and invertible like the others.
+  if (profile === 'Apple Log') { const x = (v * 1023 - 64) / 876; return x >= .208555316 ? 2 ** ((x - .69336945) / .08550479) - .00964052 : Math.sign(x) * Math.sqrt(Math.abs(x) / 47.28711236) - .05641088; }
   if (profile !== 'Rec.709') throw new Error(`Unsupported input profile: ${profile}`);
   return Math.max(0, v) ** 2.4;
 }
@@ -39,6 +42,7 @@ export function encodeLog(v: number, profile: string): number {
     return ((Math.sign(v)*a*Math.log10(c*Math.abs(v)/.9+1)+b)*876+64)/1023;
   }
   if(profile==='Canon Log 3'){const x=v/.9,ire=x<-.014?-.42889912*Math.log10(-x*14.98325+1)+.07623209:x<=.014?2.3069815*x+.073059361:.42889912*Math.log10(x*14.98325+1)+.069886632;return (ire*876+64)/1023;}
+  if(profile==='Apple Log'){const d=v+.05641088;return ((v>=.01?.08550479*Math.log2(v+.00964052)+.69336945:47.28711236*d*Math.abs(d))*876+64)/1023;}
   if(profile!=='Rec.709')throw new Error(`Unsupported input profile: ${profile}`);
   return Math.max(0,v)**(1/2.4);
 }
@@ -73,7 +77,7 @@ export function logView(profile:string,gamut:string){
 }
 export function interpretation(clip: Clip, asset?: MediaAsset) {
   const profile = String(clip.properties.inputProfile ?? asset?.inputProfile ?? 'Rec.709');
-  const gamut = String(clip.properties.inputGamut ?? asset?.inputGamut ?? (profile === 'S-Log3' ? 'S-Gamut3.Cine' : profile==='S-Log'||profile==='S-Log2' ? 'S-Gamut' : profile==='DaVinci Intermediate' ? 'DaVinci Wide Gamut' : profile.startsWith('Canon') ? 'Cinema Gamut' : 'Rec.709'));
+  const gamut = String(clip.properties.inputGamut ?? asset?.inputGamut ?? (profile === 'S-Log3' ? 'S-Gamut3.Cine' : profile==='S-Log'||profile==='S-Log2' ? 'S-Gamut' : profile==='DaVinci Intermediate' ? 'DaVinci Wide Gamut' : profile.startsWith('Canon') ? 'Cinema Gamut' : profile==='Apple Log' ? 'Rec.2020' : 'Rec.709'));
   if (!(profiles as readonly string[]).includes(profile) || !(gamuts as readonly string[]).includes(gamut)) throw new Error('Choose a supported input profile and gamut.');
   return { profile, gamut };
 }

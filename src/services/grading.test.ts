@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { colorTransform, processingStages, validateGradeNode, luminanceWeights } from './color.ts';
+import { colorTransform, processingStages, validateGradeNode, luminanceWeights, decodeLog, encodeLog } from './color.ts';
 import { GRADE_PARAMS, PARAM, V3_KEYS, chroma, filmMotion, flatCurve, grainKey, grainNoise, halationTint, hash32, hslCurves, hueOf, mixer, opponent, qualifierAlpha, sampleHueCurve, tonal, validateGradeParameters, valueNoise2, windowAlpha, filmParams } from './grading.ts';
 import { applyFilm, filmBlur } from './filmLook.ts';
 import type { Clip, ColorCurve, GradeNode } from '../state/models.ts';
@@ -158,4 +158,11 @@ test('film reference: blur, vignette, grain statistics and determinism, halation
   const lamp = new Float32Array(width * height * 3).fill(.2); for (let y = 25; y < 29; y++) for (let x = 46; x < 50; x++) lamp.fill(1, (y * width + x) * 3, (y * width + x) * 3 + 3);
   const halo = applyFilm(lamp, width, height, stage({ filmHalation: 100, filmHalationThreshold: 0, filmHalationRadius: 4 }), 0), at = (27 * width + 53) * 3;
   assert.ok(halo[at] > .215 && halo[at] - .2 > 3 * (halo[at + 2] - .2), `a red glow next to the lamp: ${halo[at]} ${halo[at + 1]} ${halo[at + 2]}`);
+});
+
+test('Apple Log reference vectors (the preview shader and color-render.py decode the same; OpenColorIO agrees to 1e-5)', () => {
+  // The white paper formula in float64 (Python), P = (code − 64)/876; below P 0 the square segment is mirrored.
+  const code = (P: number) => (P * 876 + 64) / 1023, P = (v: number) => (v * 1023 - 64) / 876;
+  for (const [p, r] of [[-.1, -0.10239719426664469], [0.15047645230091253, 0], [.05, -0.023893645340279858], [.2, 0.00862358931944028], [.488, 0.17958160447137267], [.6, 0.4594768499747651], [1, 12.000002102815703]]) near(decodeLog(code(p), 'Apple Log'), r, `P ${p}`, 1e-12 * Math.max(1, Math.abs(r)));
+  near(P(encodeLog(.18, 'Apple Log')), 0.4882724585268676, 'grey', 1e-12); near(P(encodeLog(0, 'Apple Log')), 0.15047645230091253, 'black', 1e-12);
 });

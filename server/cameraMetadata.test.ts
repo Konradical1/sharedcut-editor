@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { cameraColor } from './cameraMetadata.ts';
+import { appleLog, cameraColor, cameraLabels } from './cameraMetadata.ts';
+import { isHdrTransfer } from '../src/services/color.ts';
 
 const sonyXml = (gamma: string, primaries: string, model = 'ZV-E10M2') => Buffer.from(`<NonRealTimeMeta><Device manufacturer="Sony" modelName="${model}"/><AcquisitionRecord><Group name="CameraUnitMetadataSet"><Item name="CaptureGammaEquation" value="${gamma}"/><Item name="CaptureColorPrimaries" value="${primaries}"/><Item name="CodingEquations" value="rec709"/></Group></AcquisitionRecord></NonRealTimeMeta>`, 'latin1');
 
@@ -48,4 +49,40 @@ test('does not guess Canon Log when the camera recorded it off or not at all', (
 test('ignores truncated maker notes and unrelated files', () => {
   assert.equal(cameraColor(canonHead(3).subarray(0, 120), Buffer.alloc(0))?.inputProfile, undefined);
   assert.equal(cameraColor(Buffer.from('ftypisom'), Buffer.alloc(0)), undefined);
+});
+
+// ffprobe's JSON leaves an unspecified transfer out, as on the real Blackmagic Camera files (HEVC Rext 4:2:2 10-bit, colr nclc 9/2/9).
+const iphone = { color_primaries: 'bt2020', color_space: 'bt2020nc', pix_fmt: 'yuv422p10le' };
+const blackmagic = { 'com.apple.proapps.manufacturer': 'Apple Inc.', 'com.apple.quicktime.software': 'Blackmagic Cam 3.5.200045', 'com.blackmagic-design.camera.lensType': 'iPhone 15 Pro Max 24mm', 'com.apple.proapps.clipID': 'A001_10231512_C001' };
+const cameraApp = { 'com.apple.quicktime.make': 'Apple', 'com.apple.quicktime.model': 'iPhone 15 Pro Max', 'com.apple.quicktime.software': '17.1' };
+
+test('reads Apple Log from an Apple-made 10-bit clip with BT.2020 primaries and no transfer', () => {
+  assert.deepEqual(appleLog(iphone, blackmagic), { inputProfile: 'Apple Log', inputGamut: 'Rec.2020', colorMatrix: 'bt2020nc', colorEvidence: 'Apple camera metadata (iPhone 15 Pro Max 24mm, Blackmagic Cam 3.5.200045): BT.2020, Apple Log' });
+  assert.equal(appleLog({ ...iphone, pix_fmt: 'yuv420p10le' }, cameraApp)?.colorEvidence, 'Apple camera metadata (iPhone 15 Pro Max, 17.1): BT.2020, Apple Log');
+  // The transfer as ffprobe can spell it (and isHdrTransfer keeps every one of them off the HLG/PQ tone map), the depth from the format or the stream.
+  for (const color_transfer of [undefined, 'unknown', 'unspecified']) { assert.equal(appleLog({ ...iphone, color_transfer }, blackmagic)?.inputProfile, 'Apple Log', String(color_transfer)); assert.equal(isHdrTransfer(color_transfer), false); }
+  for (const pix_fmt of ['p010le', 'yuv444p12le', 'gbrp10le']) assert.equal(appleLog({ ...iphone, pix_fmt }, cameraApp)?.inputProfile, 'Apple Log', pix_fmt);
+  assert.equal(appleLog({ ...iphone, pix_fmt: undefined, bits_per_raw_sample: '10' }, cameraApp)?.inputProfile, 'Apple Log', 'ProRes reports its depth per stream');
+  assert.equal(appleLog(iphone, { 'com.apple.quicktime.model': 'iPad Pro' })?.inputProfile, 'Apple Log', 'an iPad');
+  assert.equal(appleLog({ ...iphone, tags: { 'COM.APPLE.QUICKTIME.MAKE': 'Apple' } })?.inputProfile, 'Apple Log', 'stream tags, any case');
+});
+
+test('never marks tagged HLG/PQ/BT.709, 8-bit, non-BT.2020 or non-Apple clips Apple Log', () => {
+  for (const color_transfer of ['arib-std-b67', 'smpte2084', 'bt709', 'bt2020-10']) assert.equal(appleLog({ ...iphone, color_transfer }, cameraApp), undefined, color_transfer);
+  for (const pix_fmt of ['yuv420p', 'yuvj420p', 'nv12']) assert.equal(appleLog({ ...iphone, pix_fmt, bits_per_raw_sample: '8' }, cameraApp), undefined, pix_fmt);
+  assert.equal(appleLog({ ...iphone, pix_fmt: 'yuv420p' }, cameraApp), undefined, 'no depth reported');
+  for (const color_primaries of ['bt709', undefined]) assert.equal(appleLog({ ...iphone, color_primaries }, cameraApp), undefined, String(color_primaries));
+  assert.equal(appleLog(iphone, { 'com.apple.quicktime.make': 'SONY', 'com.apple.quicktime.model': 'ILME-FX3' }), undefined, 'another make in the Apple keys');
+  assert.equal(appleLog(iphone, { encoder: 'Lavf61', 'com.apple.quicktime.software': 'Final Cut Pro' }), undefined, 'Apple software is not an Apple camera');
+  assert.equal(appleLog(iphone, {}), undefined); assert.equal(appleLog(undefined, cameraApp), undefined);
+});
+
+test('a later check: camera maker metadata corrects a label, Apple Log only fills an empty one', () => {
+  const apple = appleLog(iphone, blackmagic)!, untagged = { colorEvidence: 'Camera profile untagged; set input manually for log footage' };
+  assert.deepEqual(cameraLabels(untagged, apple), { colorEvidence: apple.colorEvidence, inputProfile: 'Apple Log', inputGamut: 'Rec.2020' });
+  assert.deepEqual(cameraLabels({ inputProfile: 'Gamma 2.4', inputGamut: 'Rec.709', colorEvidence: 'set elsewhere' }, apple), {}, 'a label it did not read stays');
+  assert.deepEqual(cameraLabels(untagged, undefined), {}, 'nothing found changes nothing');
+  const sony = cameraColor(Buffer.from('ftypXAVC'), sonyXml('s-log3-cine', 's-gamut3-cine'))!;
+  assert.deepEqual(cameraLabels({ inputProfile: 'Canon Log 3', inputGamut: 'Cinema Gamut', colorEvidence: 'Canon container (CAEP)' }, sony), { colorEvidence: sony.colorEvidence, inputProfile: 'S-Log3', inputGamut: 'S-Gamut3.Cine' });
+  assert.match(cameraLabels({ inputProfile: 'Canon Log 3', colorEvidence: 'Canon container (CAEP)' }, cameraColor(canonHead(0), Buffer.alloc(0))).colorEvidence!, /Canon Log off; Canon Log 3 was assumed at import, not verified$/);
 });

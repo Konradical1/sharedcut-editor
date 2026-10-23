@@ -141,7 +141,7 @@ test('every rule rejects the whole output with the bad field named', () => {
 
 test('eligibility never guesses the camera and refuses grades the assistant cannot edit safely', () => {
   const nodes = grade(), code = (c: Clip, a: MediaAsset | undefined, n: GradeNode[]) => { const r = eligibility(c, a, n); return r.ok ? 'ok' : r.code; };
-  assert.equal(code(clip, asset, nodes), 'ok');
+  assert.equal(code(clip, asset, nodes), 'ok'); assert.equal(code(clip, { ...asset, cameraMetadataVersion: 3 }, nodes), 'ok', 'version 3 (Apple Log) reads as much as 2');
   assert.equal(code({ ...clip, properties: { ...clip.properties, colorPipeline: '' } }, asset, nodes), 'legacy-pipeline');
   for (const a of [undefined, { ...asset, cameraMetadataVersion: 1 }, { ...asset, inputProfile: undefined }, { ...asset, inputProfile: 'Canon Log 3' }, { ...asset, inputGamut: 'S-Gamut3' }, { ...asset, inputGamut: undefined }]) assert.equal(code(clip, a, nodes), 'unverified-camera');
   assert.equal(code(clip, asset, nodes.map(n => n.name === 'Input CST' ? { ...n, enabled: false } : n)), 'unverified-camera');

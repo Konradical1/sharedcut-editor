@@ -1,5 +1,13 @@
 # Color pipeline investigation and validation — September 13, 2026
 
+## Update — October 23, 2026: Apple Log
+
+Report: iPhone 15 Pro Max clips from Blackmagic Camera (Apple Log, HEVC Rext 4:2:2 10-bit) probed as untagged and graded as Rec.709, washed out.
+
+- **No transfer tag exists for Apple Log.** The files carry BT.2020 primaries and matrix with the transfer unspecified (colr `nclc` 9/2/9), and Apple tags on the container (`com.apple.proapps.manufacturer`, `com.blackmagic-design.camera.lensType`; the Camera app writes `com.apple.quicktime.make/model`). Apple's HDR video is tagged HLG and its SDR video BT.709, so `appleLog()` in `server/cameraMetadata.ts` reads an Apple-made clip of 10+ bits with BT.2020 primaries and no transfer as Apple Log / Rec.2020. Tagged, 8-bit or non-Apple clips are never marked.
+- **Curve:** Apple Log Profile white paper (2023), P on the video-range scale (code 64 → 0, 940 → 1) like the Sony curves: black at code 196, 18% grey at P .488. It matches OpenColorIO 2.5.2's `Apple Log` → ACES2065-1 (a half-float table on P, Rec.2020 primaries) to 1e-5 (`color.test.ts`). Below code 64 the square segment is mirrored where Apple clamps to R0, so encode/decode stay invertible.
+- **Existing media:** camera metadata version 3 re-checks every ready video once at startup and only labels it; previews keep the recorded signal (they convert through the stream's own BT.2020 matrix, no profile baked in), so nothing is prepared again. Interrupted preparations are labelled when they finish. A clip's own Source gamma/gamut (set by hand or by an earlier "Start wide-gamut grade") wins over the label: such clips keep their grade until the input is changed to Apple Log.
+
 ## Update — September 26, 2026: camera metadata, YUV matrix, missing tone mapping
 
 Report: Sony ZV-E10M2 S-Log3 clips (FischMedia2026Reel C0518, C0539) looked washed out and too bright.

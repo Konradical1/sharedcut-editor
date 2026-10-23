@@ -34,6 +34,9 @@ def decode(v,p):
     if p=='Canon Log 3':
         ire=(v*1023-64)/876  # Canon IRE curve on code values: black 128/1023, as the ACES IDT
         return .9*np.where(ire<.04076162,-(10**((.07623209-ire)/.42889912)-1)/14.98325,np.where(ire<=.105357102,(ire-.073059361)/2.3069815,(10**((ire-.069886632)/.42889912)-1)/14.98325))
+    if p=='Apple Log':
+        x=(v*1023-64)/876  # Apple Log Profile on the video-range scale; mirrored below code 64 as decodeLog
+        return np.where(x>=.208555316,2**((x-.69336945)/.08550479)-.00964052,np.sign(x)*np.sqrt(np.abs(x)/47.28711236)-.05641088)
     raise ValueError('Unsupported gamma: '+p)
 
 def encode(v,p):
@@ -51,6 +54,9 @@ def encode(v,p):
     if p=='Canon Log 3':
         x=v/.9
         return (np.where(x<-.014,-.42889912*np.log10(-x*14.98325+1)+.07623209,np.where(x<=.014,2.3069815*x+.073059361,.42889912*np.log10(x*14.98325+1)+.069886632))*876+64)/1023
+    if p=='Apple Log':
+        d=v+.05641088
+        return (np.where(v>=.01,.08550479*np.log2(np.maximum(v,.01)+.00964052)+.69336945,47.28711236*d*np.abs(d))*876+64)/1023
     raise ValueError('Unsupported gamma: '+p)
 
 def curve(v,c):

@@ -149,7 +149,8 @@ export function eligibility(clip: Clip, asset: MediaAsset | undefined, nodes: Gr
   const no = (code: Extract<Eligibility, { ok: false }>['code'], text: string): Eligibility => ({ ok: false, code, text });
   if (clip.properties.colorPipeline !== 'nodes-v2') return no('legacy-pipeline', 'Start wide-gamut grade first.');
   const enabled = ordered(clip, nodes).filter(n => n.enabled), input = enabled.flatMap(n => n.effects ?? []).find(e => e.enabled && e.type === 'cst');
-  if (asset?.cameraMetadataVersion !== 2 || !asset.inputProfile || input?.type !== 'cst' || input.inputGamma !== asset.inputProfile || input.inputGamut !== asset.inputGamut) return no('unverified-camera', 'Set the camera input first.');
+  // Camera metadata from version 2 on is read, not guessed (server/cameraMetadata.ts; 3 adds Apple Log).
+  if ((asset?.cameraMetadataVersion ?? 0) < 2 || !asset?.inputProfile || input?.type !== 'cst' || input.inputGamma !== asset.inputProfile || input.inputGamut !== asset.inputGamut) return no('unverified-camera', 'Set the camera input first.');
   const { balance, look, output } = findGradeNodes(clip, nodes);
   if (!output) return no('not-aces', 'Use ACES 2 output first.');
   if (!balance || !look || !((output.order ?? 0) > (look.order ?? 0) && (output.order ?? 0) > (balance.order ?? 0))) return no('missing-nodes', 'This grade needs Balance and Look nodes before the ACES 2 output.');

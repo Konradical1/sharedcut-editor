@@ -5,7 +5,8 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { colorTransform, decodeLog, makeCube, cubeText, parseCube, sampleCube, processingStages, rangeDefaults, starterGrade } from './color.ts';
+import { colorTransform, decodeLog, encodeLog, makeCube, cubeText, parseCube, sampleCube, processingStages, rangeDefaults, starterGrade, profiles, interpretation, defaultCST, validateGradeNode } from './color.ts';
+import { acesMatrices } from './aces.generated.ts';
 import { venvPython } from '../../server/platform.ts';
 import { timecode } from './timecode.ts';
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
@@ -54,7 +55,7 @@ test('wide-gamut references, reversible transforms, custom curves and complete l
   assert.ok(Math.abs(encodeLog(1,'DaVinci Intermediate')-.513837)<.000001);
   assert.ok(Math.abs(encodeLog(.18,'S-Log2')-.339532524633774)<1e-12);
   assert.ok(Math.abs(encodeLog(.18,'S-Log')-.384970815928670)<1e-12);
-  for(const profile of ['S-Log','S-Log2','S-Log3','Canon Log','Canon Log 2','Canon Log 3','DaVinci Intermediate','Gamma 2.4','Linear'])for(const v of [-.01,0,.002,.18,1,5,20])assert.ok(Math.abs(decodeLog(encodeLog(v,profile),profile)-v)<2e-5,`${profile}: ${v}`);
+  for(const profile of ['S-Log','S-Log2','S-Log3','Canon Log','Canon Log 2','Canon Log 3','DaVinci Intermediate','Gamma 2.4','Linear','Apple Log'])for(const v of [-.01,0,.002,.18,1,5,20])assert.ok(Math.abs(decodeLog(encodeLog(v,profile),profile)-v)<2e-5,`${profile}: ${v}`);
   const m=gamutMatrix('DaVinci Wide Gamut','Rec.709');// Published DWG red XYZ column multiplied by the Rec.709 XYZ-to-RGB matrix.
   assert.ok(Math.abs(m[0][0]-(3.2409699419*.70062239-1.5373831776*.27411851-.4986107603*(-.09896291)))<1e-7);
   const input=defaultCST('in'),output=defaultCST('out','DaVinci Intermediate','DaVinci Wide Gamut','S-Log3','S-Gamut3.Cine');
@@ -87,7 +88,7 @@ test('ACES output validates its final display and stays isolated to its own clip
 
 test('ungraded log footage is shown as recorded; only a grade or an imported look converts it',()=>{
   const clip={id:'raw',projectId:'p',properties:{}} as unknown as Clip;
-  for(const [inputProfile,inputGamut] of [['S-Log3','S-Gamut3.Cine'],['Canon Log 3','Cinema Gamut']]){
+  for(const [inputProfile,inputGamut] of [['S-Log3','S-Gamut3.Cine'],['Canon Log 3','Cinema Gamut'],['Apple Log','Rec.2020']]){
     const transform=colorTransform(clip,{inputProfile,inputGamut} as unknown as MediaAsset,[]);
     for(const rgb of [[128/1023,128/1023,128/1023],[.3,.5,.7],[.9,.2,.4]])assert.deepEqual(transform(rgb),rgb,`${inputProfile} must pass through untouched`);
   }
@@ -177,4 +178,45 @@ test('the export worker (color-render.py) grades range saturation like colorTran
       colors.forEach((rgb,i)=>cpu(rgb).forEach((v,c)=>{const py=Math.min(1,Math.max(0,data[[2,0,1][c]*colors.length+i]));assert.ok(Math.abs(v-py)<1e-5,`${clip.properties.colorPipeline??'legacy'} ${rgb} channel ${c}: ${v} vs ${py}`);}));
     }
   }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+// Apple Log Profile white paper (2023): R0, Rt, c, β, γ, δ; P on the video-range scale (code 64 → 0, 940 → 1).
+const AL={R0:-.05641088,Rt:.01,c:47.28711236,b:.00964052,g:.08550479,d:.69336945},alP=(v:number)=>(v*1023-64)/876,alCode=(P:number)=>(P*876+64)/1023;
+test('Apple Log: the white paper curve on the video-range scale, grey .18 at P .488, monotonic and invertible past both ends',()=>{
+  const near=(a:number,b:number,m:string,e=1e-9)=>assert.ok(Math.abs(a-b)<=e*Math.max(1,Math.abs(b)),`${m}: ${a} vs ${b}`);
+  near(alP(encodeLog(.18,'Apple Log')),AL.g*Math.log2(.18+AL.b)+AL.d,'grey on the log segment');assert.ok(Math.abs(alP(encodeLog(.18,'Apple Log'))-.488)<5e-4,'18% grey at P .488');
+  near(decodeLog(alCode(AL.c*AL.R0**2),'Apple Log'),0,'black at P = c·R0²');assert.ok(Math.abs(encodeLog(0,'Apple Log')*1023-195.8)<.1,'black is code 196');
+  for(const R of [AL.R0,-.02,0,.004,.0099])near(alP(encodeLog(R,'Apple Log')),AL.c*(R-AL.R0)**2,`square segment ${R}`);
+  for(const R of [.01,.18,1,10])near(alP(encodeLog(R,'Apple Log')),AL.g*Math.log2(R+AL.b)+AL.d,`log segment ${R}`);
+  near(decodeLog(alCode(.2085553159546),'Apple Log'),AL.Rt,'the segments meet at Pt = c·(Rt−R0)²',1e-8);
+  // Every 10-bit code and well past both ends (footroom below code 64 mirrors the square segment): finite, rising, back where it came from.
+  let last=-Infinity;for(let code=-200;code<=1300;code++){const v=code/1023,r=decodeLog(v,'Apple Log');assert.ok(Number.isFinite(r)&&r>last,`rises at code ${code}`);near(encodeLog(r,'Apple Log'),v,`code ${code} round trip`,1e-8);last=r;}
+  assert.deepEqual(interpretation({properties:{}} as unknown as Clip,{inputProfile:'Apple Log'} as MediaAsset),{profile:'Apple Log',gamut:'Rec.2020'},'Apple Log defaults to Rec.2020');
+  assert.doesNotThrow(()=>validateGradeNode({effects:[defaultCST('in','Apple Log','Rec.2020'),defaultCST('out','DaVinci Intermediate','DaVinci Wide Gamut','Apple Log','Rec.2020'),{id:'lut',type:'lut',enabled:true,name:'Phone LUT',amount:1,inputGamma:'Apple Log',inputGamut:'Rec.2020',cube:{size:2,data:Array(24).fill(.5),min:[0,0,0],max:[1,1,1]}}]}),'the save check takes Apple Log nodes');
+  // A wide-gamut grade from Apple Log puts 18% grey where one from S-Log3 does: each Input CST lands it on DaVinci Intermediate .336.
+  let id=0;const grade=(inputProfile:string,inputGamut:string)=>{const clip={id:'g',projectId:'p',properties:{colorPipeline:'nodes-v2',inputProfile,inputGamut}} as unknown as Clip;return colorTransform(clip,undefined,starterGrade(clip,undefined,()=>String(++id)))([.18,.18,.18].map(v=>encodeLog(v,inputProfile)));};
+  grade('Apple Log','Rec.2020').forEach((v,c)=>near(v,grade('S-Log3','S-Gamut3.Cine')[c],'grey through the starter grade',1e-6));
+});
+
+test('the preview shader transfers every profile like decodeLog/encodeLog (Apple Log at index 10)',async()=>{
+  const {TRANSFER}=await import('./colorPreview.ts');
+  // The two GLSL functions run as JavaScript: the same statements, GLSL's built-ins mapped to Math.
+  const glsl=(name:string)=>new Function('v','profile',`const pow=Math.pow,exp2=x=>2**x,log2=Math.log2,log=Math.log,sign=Math.sign,abs=Math.abs,sqrt=Math.sqrt,max=Math.max;${TRANSFER.split(`float ${name}(float v, int profile) {`)[1].split('\n  }')[0].replace(/\bfloat /g,'let ')}`) as (v:number,profile:number)=>number;
+  const [decode,encode]=[glsl('decode'),glsl('encode')],near=(a:number,b:number,m:string)=>assert.ok(Math.abs(a-b)<=1e-9*Math.max(1,Math.abs(b)),`${m}: ${a} vs ${b}`);
+  assert.equal(profiles.indexOf('Apple Log'),10);
+  profiles.forEach((profile,p)=>{
+    for(const v of [-.05,0,.03,.1,.17,.19,.2,.25,.4,.6,.9,1,1.08])near(decode(v,p),decodeLog(v,profile),`${profile} decode ${v}`);
+    for(const r of [-.03,0,.001,.0099,.01,.05,.18,1,6,30])near(encode(r,p),encodeLog(r,profile),`${profile} encode ${r}`);
+  });
+});
+
+test('Apple Log decodes like OpenColorIO\'s ACES input transform (P = (code − 64)/876, Rec.2020 into ACES2065-1)',{skip:!existsSync(colorPython)&&'the colour worker (npm run setup:color) is not installed'},()=>{
+  const samples=[[0,0,0],[.1505,.1505,.1505],[.2,.21,.2085],[.488,.3,.6],[.8,.5,.25],[1,.6,.1],[1.09,1,.9]];
+  const script="import json,sys,PyOpenColorIO as o\np=o.Config.CreateFromBuiltinConfig('studio-config-v4.0.0_aces-v2.0_ocio-v2.5').getProcessor('Apple Log','ACES2065-1').getDefaultCPUProcessor()\nprint(json.dumps([p.applyRGB(s) for s in json.loads(sys.argv[1])]))";
+  const ocio=JSON.parse(execFileSync(colorPython,['-c',script,JSON.stringify(samples)]).toString()) as number[][];
+  samples.forEach((P,i)=>{
+    const linear=P.map(x=>decodeLog(alCode(x),'Apple Log')),ours=acesMatrices['Rec.2020'].map(row=>row.reduce((s,k,c)=>s+k*linear[c],0)),scale=Math.max(...ours.map(Math.abs));
+    // OCIO samples the curve through a half-float 1D table, so it agrees to about 1e-5 of the signal.
+    ours.forEach((v,c)=>assert.ok(Math.abs(v-ocio[i][c])<=1e-6+2e-5*scale,`P ${P} channel ${c}: ${v} vs OCIO ${ocio[i][c]}`));
+  });
 });

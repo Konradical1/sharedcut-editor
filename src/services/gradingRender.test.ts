@@ -77,6 +77,12 @@ test('every per-pixel v3 step grades like colorTransform, legacy and nodes-v2', 
   const nodes = [node('in', 1, {}, { effects: [defaultCST('cst')] }), node('look', 2, { hue: 15, boost: 30, shadows: -20, qualOn: 1, qualHue: 30, qualHueWidth: 60, qualHueSoft: 20 }, { curves: { HueLum: curve([[0, .55], [.5, .45], [1, .55]]) } })];
   const [out] = stream(job(camera, nodes), [flat], colors.length, 1), cpu = colorTransform(camera, undefined, nodes);
   colors.forEach((rgb, i) => cpu(rgb).forEach((v, c) => assert.ok(Math.abs(v - clamp(out[i * 3 + c])) <= 1e-5, `S-Log3 input CST then a v3 node: ${rgb} ${c}`)));
+  // Apple Log both ways: exposure on the camera signal (before the Input CST), Rec.2020 into the working space and back out to Apple Log.
+  const iphone = { id: 'c', properties: { colorPipeline: 'nodes-v2', inputProfile: 'Apple Log', inputGamut: 'Rec.2020' } } as unknown as Clip;
+  const apple = [node('in', 1, { exposure: .3, temperature: 300 }, { effects: [defaultCST('cst', 'Apple Log', 'Rec.2020')] }), node('look', 2, { saturation: 120, shadows: 15, logMid: .02 }),
+    node('back', 3, {}, { effects: [defaultCST('out', 'DaVinci Intermediate', 'DaVinci Wide Gamut', 'Apple Log', 'Rec.2020')] })];
+  const [phone] = stream(job(iphone, apple), [flat], colors.length, 1), reference = colorTransform(iphone, undefined, apple);
+  colors.forEach((rgb, i) => reference(rgb).forEach((v, c) => assert.ok(Math.abs(v - clamp(phone[i * 3 + c])) <= 1e-5, `Apple Log in and out: ${rgb} channel ${c}: ${v} vs ${phone[i * 3 + c]}`)));
 });
 
 test('windows blend by pixel position like windowAlpha, across stripes and odd sizes', { skip }, () => {

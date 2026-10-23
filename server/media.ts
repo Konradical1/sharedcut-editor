@@ -1,7 +1,7 @@
 import { venvPython, quotedFilterPath } from './platform.ts';
 import { exportPassCount, admitStart, killProcessTree, trackChild } from './processTree.ts';
 import { JOB_COST_BYTES, type AdmitRequest } from './hostGuard.ts';
-import { readCameraColor, type CameraColor } from './cameraMetadata.ts';
+import { appleLog, readCameraColor, CAMERA_METADATA_VERSION, type CameraColor, type ProbedVideo } from './cameraMetadata.ts';
 import { resolveSmartMaskArtifact } from './smartMask.ts';
 import { activeDepthKeys, nodeMaskId, smartMaskFrame, type SmartMaskManifest } from '../src/services/smartMask.ts';
 import { depthFrameAt, depthKeyTable } from '../src/services/depth.ts';
@@ -174,14 +174,24 @@ async function toneMap(transfer: string | undefined, directory: string, outRange
   return `,format=gbrpf32le,lut3d=file=${quotedFilterPath(file)}:interp=tetrahedral,scale=out_color_matrix=bt709:out_range=${outRange}:flags=accurate_rnd+full_chroma_int,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709`;
 }
 
+type Probed = {
+  streams: (ProbedVideo & { codec_type: string; codec_name?: string; color_range?: string; color_space?: string; width?: number; height?: number; avg_frame_rate?: string; duration?: string; sample_rate?: string; channels?: number; disposition?: { attached_pic?: number }; side_data_list?: { rotation?: number }[] })[];
+  format: { duration?: string; format_name?: string; tags?: Record<string, string> };
+};
+const ffprobeJson = async (inputPath: string, signal?: AbortSignal) => JSON.parse((await run(ffprobe(), ['-v', 'error', ...safeInput, '-show_streams', '-show_format', '-of', 'json', inputPath], { signal })).toString()) as Probed;
+const mainVideo = (data: Probed) => data.streams.find(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic);
+/** What the camera recorded, positive findings only: its maker metadata (Sony, Canon), else the Apple Log signature in ffprobe's tags. */
+export async function probeCameraColor(inputPath: string, signal?: AbortSignal, data?: Probed): Promise<CameraColor | undefined> {
+  const found = await readCameraColor(inputPath, (await stat(inputPath)).size);
+  if (found) return found;
+  data ??= await ffprobeJson(inputPath, signal);
+  return appleLog(mainVideo(data), data.format.tags);
+}
+
 export async function probeMedia(inputPath: string, signal?: AbortSignal) {
   const file = await stat(inputPath);
   if (!file.isFile()) throw new Error('Media source is not a file.');
-  const data = JSON.parse((await run(ffprobe(), ['-v', 'error', ...safeInput, '-show_streams', '-show_format', '-of', 'json', inputPath], { signal })).toString()) as {
-    streams: { codec_type: string; codec_name?: string; color_range?: string; color_space?: string; color_primaries?: string; color_transfer?: string; pix_fmt?: string; width?: number; height?: number; avg_frame_rate?: string; duration?: string; sample_rate?: string; channels?: number; disposition?: { attached_pic?: number }; side_data_list?: { rotation?: number }[]; tags?: Record<string, string> }[];
-    format: { duration?: string; format_name?: string };
-  };
-  const video = data.streams.find(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic);
+  const data = await ffprobeJson(inputPath, signal), video = mainVideo(data);
   const audio = data.streams.find(stream => stream.codec_type === 'audio');
   if (!video && !audio) throw new Error('This file contains no decodable video, image, or audio stream.');
   const image = Boolean(video && !audio && /image2|image2pipe|_pipe|gif/.test(data.format.format_name || '') && !Number(data.format.duration));
@@ -191,8 +201,8 @@ export async function probeMedia(inputPath: string, signal?: AbortSignal) {
   // Phones store portrait as landscape plus a display matrix. FFmpeg decodes it upright, so report it that way.
   const rotation = Number(video?.side_data_list?.find(d => d.rotation !== undefined)?.rotation ?? 0);
   const [width, height] = Math.abs(rotation) % 180 === 90 ? [video?.height, video?.width] : [video?.width, video?.height];
-  const color: CameraColor = (video && await readCameraColor(inputPath, file.size)) || { colorEvidence: video?.color_transfer ? 'Stream transfer tag: '+video.color_transfer+'; verify camera profile' : 'Camera profile untagged; set input manually for log footage' };
-  return { ...color, cameraMetadataVersion: 2, colorRange: video?.color_range || 'unknown', colorMatrix: video?.color_space || color.colorMatrix || 'auto', frameRate: video?.avg_frame_rate, kind: image ? 'image' as const : video ? 'video' as const : 'audio' as const, duration, fps, hasAlpha: Boolean(video && !image && alphaFormat(video.pix_fmt, video.tags?.alpha_mode ?? video.tags?.ALPHA_MODE)), hasAudio: Boolean(audio), resolution: video ? `${width} × ${height}` : `${Math.round(Number(audio?.sample_rate || 48000) / 1000)} kHz · ${audio?.channels === 1 ? 'Mono' : 'Stereo'}`, width, height, colorTransfer: video?.color_transfer, probeVersion: PROBE_VERSION, size: file.size };
+  const color: CameraColor = (video && await probeCameraColor(inputPath, signal, data)) || { colorEvidence: video?.color_transfer ? 'Stream transfer tag: '+video.color_transfer+'; verify camera profile' : 'Camera profile untagged; set input manually for log footage' };
+  return { ...color, cameraMetadataVersion: CAMERA_METADATA_VERSION, colorRange: video?.color_range || 'unknown', colorMatrix: video?.color_space || color.colorMatrix || 'auto', frameRate: video?.avg_frame_rate, kind: image ? 'image' as const : video ? 'video' as const : 'audio' as const, duration, fps, hasAlpha: Boolean(video && !image && alphaFormat(video.pix_fmt, video.tags?.alpha_mode ?? video.tags?.ALPHA_MODE)), hasAudio: Boolean(audio), resolution: video ? `${width} × ${height}` : `${Math.round(Number(audio?.sample_rate || 48000) / 1000)} kHz · ${audio?.channels === 1 ? 'Mono' : 'Stereo'}`, width, height, colorTransfer: video?.color_transfer, probeVersion: PROBE_VERSION, size: file.size };
 }
 
 /**

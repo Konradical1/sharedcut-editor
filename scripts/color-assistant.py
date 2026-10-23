@@ -270,12 +270,12 @@ def selftest():
     with open(os.path.join(HERE, 'color-assistant-fixture.json'), encoding='utf-8') as f: fx = json.load(f)
     pre, post, weights, to709 = fx['preStages'], fx['postStages'], fx['weights'], fx['toRec709']
     h, w = 360, 640
-    def scene(gain=1.0, cast=(1, 1, 1)):
+    def scene(gain=1.0, cast=(1, 1, 1), curve='S-Log3'):
         lin = np.full((h, w, 3), .18, np.float32)  # 66% 18% grey
         lin[:60] = .01                             # deep shadows
         lin[60:110, :320] = [.30, .18, .10]         # warm patch
         lin[60:110, 320:] = [.35, .22, .15]         # skin-like patch
-        code = engine.encode(lin * gain * np.array(cast, np.float32), 'S-Log3')
+        code = engine.encode(lin * gain * np.array(cast, np.float32), curve)
         code[348:] = .94                           # clipped plateau (decodes to ~22x scene white)
         return code
     # Shots: A normal, B warm cast, C lighting change (+1 stop halfway), D one stop darker than A.
@@ -302,6 +302,13 @@ def selftest():
         assert a['mids']['rg'] > 1 and a['skin']['fraction'] > .02, ('warm patch and skin', a['mids'], a['skin'])
         assert b['neutral']['rg'] > 1.1 and b['neutral']['bg'] < .9 and b['neutral']['temperature'] < 0, ('warm cast', b['neutral'])
         assert c['lightingChange'] and abs(c['variation']['p50StopsRange'] - 1) < .1, ('lighting change', c['variation'])
+        # Apple Log (iPhone): the same scene through its curve measures the same stops (the S-Gamut3.Cine matrix kept from the fixture leaves grey neutral).
+        apple, iphone = json.loads(json.dumps(pre).replace('"S-Log3"', '"Apple Log"')), os.path.join(tmp, 'apple-log.mkv')
+        subprocess.run([ff, '-v', 'error', '-y', '-f', 'rawvideo', '-pixel_format', 'rgb48le', '-video_size', f'{w}x{h}', '-framerate', '2', '-i', '-', '-c:v', 'ffv1', '-pix_fmt', 'gbrp16le', iphone],
+                       input=b''.join(np.rint(np.clip(scene(g, curve='Apple Log'), 0, 1) * 65535).astype('<u2').tobytes() for g in [1, 1, .5, .5]), check=True)
+        logs = {s['clipId']: s['stats'] for s in measure({**job, 'shots': [{**job['shots'][0], 'clipId': k, 'key': 'apple-' + k, 'input': iphone, 'times': [i, i + .5], 'preStages': apple} for i, k in enumerate('AD')]})['shots']}
+        report.update(p50AppleA=logs['A']['stops']['p50'], p50AppleD=logs['D']['stops']['p50'], clippedApple=logs['A']['clipped'])
+        assert abs(logs['A']['stops']['p50']) < .1 and abs(logs['D']['stops']['p50'] + 1) < .1 and .02 < logs['A']['clipped'] < .05, ('Apple Log stops', report)
         # Second run is served from the cache: the source is gone and the numbers are identical.
         os.replace(video, video + '.gone')
         again = {s['clipId']: s for s in measure(job)['shots']}

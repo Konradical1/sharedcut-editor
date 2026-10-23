@@ -50,7 +50,8 @@ function pictureRect(asset: MediaAsset, width: number, height: number) {
 /** Canvas pixels whose centres lie inside the picture: what film passes process. */
 const pictureBox = (rect: number[], width: number, height: number) => { const x0 = Math.max(0, Math.ceil(rect[0] - .5)), y0 = Math.max(0, Math.ceil(rect[1] - .5)); return { rect, x0, y0, width: Math.max(0, Math.min(width, Math.ceil(rect[0] + rect[2] - .5)) - x0), height: Math.max(0, Math.min(height, Math.ceil(rect[1] + rect[3] - .5)) - y0) }; };
 
-const TRANSFER = `
+/** The preview's transfer functions, `profile` = the index in `profiles` (Apple Log is 10). color.test.ts runs them against decodeLog/encodeLog. */
+export const TRANSFER = `
   float decode(float v, int profile) {
     if(profile==8)return v;
     if(profile==7)return v>.02740668?exp2(v/.07329248-7.)-.0075:v/10.44426855;
@@ -59,6 +60,7 @@ const TRANSFER = `
     if(profile==1)return v>=171.2102946929/1023.?pow(10.,(v*1023.-420.)/261.5)*.19-.01:(v*1023.-95.)*.01125/(171.2102946929-95.);
     if(profile==2||profile==3){float a=profile==2?.529136:.281863093,b=profile==2?.0730597:.035388128,c=profile==2?10.1596:87.09937546,ire=(v*1023.-64.)/876.;return sign(ire-b)*(pow(10.,abs(ire-b)/a)-1.)/c*.9;}
     if(profile==4){float ire=(v*1023.-64.)/876.;return .9*(ire<.04076162?-(pow(10.,(.07623209-ire)/.42889912)-1.)/14.98325:ire<=.105357102?(ire-.073059361)/2.3069815:(pow(10.,(ire-.069886632)/.42889912)-1.)/14.98325);}
+    if(profile==10){float x=(v*1023.-64.)/876.;return x>=.208555316?exp2((x-.69336945)/.08550479)-.00964052:sign(x)*sqrt(abs(x)/47.28711236)-.05641088;}
     return pow(max(0.,v),2.4);
   }
   float encode(float v, int profile) {
@@ -69,6 +71,7 @@ const TRANSFER = `
     if(profile==1)return v>=.01125?(420.+log((v+.01)/.19)/log(10.)*261.5)/1023.:(v*(171.2102946929-95.)/.01125+95.)/1023.;
     if(profile==2||profile==3){float a=profile==2?.529136:.281863093,b=profile==2?.0730597:.035388128,c=profile==2?10.1596:87.09937546;return ((sign(v)*a*log(c*abs(v)/.9+1.)/log(10.)+b)*876.+64.)/1023.;}
     if(profile==4){float x=v/.9,ire=x<-.014?-.42889912*log(-x*14.98325+1.)/log(10.)+.07623209:x<=.014?2.3069815*x+.073059361:.42889912*log(x*14.98325+1.)/log(10.)+.069886632;return (ire*876.+64.)/1023.;}
+    if(profile==10){float d=v+.05641088;return ((v>=.01?.08550479*log2(v+.00964052)+.69336945:47.28711236*d*abs(d))*876.+64.)/1023.;}
     return pow(max(0.,v),1./2.4);
   }
   vec3 decodeRGB(vec3 v,int p){return vec3(decode(v.r,p),decode(v.g,p),decode(v.b,p));}
