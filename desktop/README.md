@@ -52,7 +52,10 @@ A Mac update only installs when the installed build and the new build are signed
 On the Projects screen, sign in to sharedcut.com and choose **Keep on this computer** for a project. The app downloads its
 footage and keeps the project live with sharedcut.com every few seconds while online. Edits made offline stay on the
 computer and merge in when it is back online; when both sides changed the same thing, the computer's edit wins. New
-footage imported in the app uploads by itself. `server/remoteSync.ts` does this; `SHAREDCUT_REMOTE` points the app at
+footage imported in the app uploads by itself. Projects made in the app go up by themselves once it is signed in and online
+(offline ones at the next connection), as the sharedcut.com account's private projects, with their footage two files at a
+time; one deleted on sharedcut.com is never made again. The sidebar says whether the app is signed in to sharedcut.com
+("Server connected" above it is the app's own server). `server/remoteSync.ts` does this; `SHAREDCUT_REMOTE` points the app at
 another server. The bundle steps below are the manual route.
 
 ## Taking a sharedcut.com project offline

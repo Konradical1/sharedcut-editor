@@ -12,7 +12,7 @@ import SettingsDialog from './SettingsDialog';
 import './dashboard.css';
 import ResolveImport from './ResolveImport';
 import { ServerControl } from './AccountControls';
-import RemoteSync from './RemoteSync';
+import RemoteSync, { RemoteStatus, useRemoteLink } from './RemoteSync';
 import { usePhoneLayout } from '../services/device';
 
 function modified(timestamp: number) {
@@ -61,6 +61,7 @@ export default function Dashboard({ onOpenProject, onOpenAuth }: { onOpenProject
   const phone = usePhoneLayout();
   const { projects, users, currentUserId, createProject, operations, settings: preferences } = useEditorStore();
   const [section, setSection] = useState('Projects');
+  const [link, setLink] = useRemoteLink();
   const [resolveImport,setResolveImport]=useState(false);
   const [newProject, setNewProject] = useState(false);
   const [createFolder, setCreateFolder] = useState<LibraryView['folders'][number] | null>(null);
@@ -115,6 +116,7 @@ export default function Dashboard({ onOpenProject, onOpenAuth }: { onOpenProject
       <div className="dash-sidebar-bottom">
         <button className="dash-settings-button" onClick={() => setSettings(true)}><Settings size={16} /> Settings</button>
         <ServerControl/>
+        <RemoteStatus link={link} onOpen={() => changeSection('Projects')}/>
         <button className="dash-user" aria-label="Open account menu" onClick={() => setAccount(!account)} aria-expanded={account}>{user && <Avatar user={user} size={34} />}<span><strong>{user?.name ?? 'Kyle'}</strong><small>Personal account</small></span><MoreHorizontal size={17} /></button>
       </div>
     </aside>
@@ -122,7 +124,7 @@ export default function Dashboard({ onOpenProject, onOpenAuth }: { onOpenProject
     <main className="dash-main">
       <header className="dash-heading"><h1>Your workspace</h1><div className="dash-top-actions"><IconButton label="Recent activity" onClick={() => setActivity(!activity)}><Bell size={17}/></IconButton>{!phone && <><Button variant="secondary" onClick={() => setResolveImport(true)}>Import Resolve</Button><a className="button button-secondary" href="/importer">Import from Final Cut</a></>}<span className="dash-mobile-account"><IconButton label="Open account menu" onClick={() => setAccount(!account)}>{user && <Avatar user={user} size={28}/>}</IconButton></span></div></header>
       <ProjectLibrary projects={projects} users={users} userId={currentUserId} section={section} onOpen={onOpenProject} onCreate={folder => { setCreateFolder(folder); setShared(folder ? false : preferences.defaultSharing !== 'Private'); setCreateError(''); setNewProject(true); }} onSettings={(project, deleting, sharing) => setProjectSettings({ project, deleting, sharing })}/>
-      {section === 'Projects' && <RemoteSync/>}
+      {section === 'Projects' && <RemoteSync link={link} onLink={setLink}/>}
       {section === 'Projects' && recentlyDeleted.length > 0 && <section className="dash-deleted" aria-label="Recently deleted"><h2>Recently deleted</h2>{recentlyDeleted.map(item => <div key={item.id}><Trash2 size={14}/><span><strong>{item.name}</strong><small>Restorable until {new Date(item.expiresAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}</small></span><Button variant="secondary" onClick={() => void restore(item.id)}>Restore</Button></div>)}</section>}
     </main>
     {projectSettings && <ProjectSettings project={projectSettings.project} users={users} currentUserId={currentUserId} deleting={projectSettings.deleting} sharing={projectSettings.sharing} onClose={() => setProjectSettings(null)} onDeleted={backup => setDeletedProject({ id: backup.projectId, name: projectSettings.project.name, expiresAt: backup.expiresAt })}/>} 

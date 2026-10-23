@@ -11,7 +11,7 @@ process.env.FRAME_LINE_COOKIE = 'frameline_session=test';
 let saved: any = structuredClone(persistentState(store.getState()));
 let revision = 1;
 // SharedCut Desktop's /api/remote: signed in to sharedcut.com, one project there not kept yet.
-let remoteLink: { user: { email: string }; online: boolean; projects: { id: string; name: string; kept: boolean; status?: string; uploading: number; downloading: number }[] } = { user: { email: 'konrad@example.com' }, online: true, projects: [{ id: 'trip-1', name: 'Konrad Trip', kept: false, uploading: 0, downloading: 0 }] };
+let remoteLink: { user: { email: string } | null; expired?: string; online: boolean; projects: { id: string; name: string; kept: boolean; status?: string; uploading: number; downloading: number }[] } = { user: { email: 'konrad@example.com' }, online: true, projects: [{ id: 'trip-1', name: 'Konrad Trip', kept: false, uploading: 0, downloading: 0 }] };
 const deleted: any[] = [], calls: { method: string; path: string; body?: any }[] = [];
 const json = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
 const project = (id: string) => saved.projects.find((p: any) => p.id === id);
@@ -140,4 +140,7 @@ test('keep-offline keeps a sharedcut.com project on this computer, lists what is
   assert.match(await run('keep-offline', {}), /^konrad@example\.com\n.*"Konrad Trip" synced$/);
   assert.match(await run('keep-offline', { project: 'trip-1', stop: true }), /only online/);
   assert.equal(last().method, 'DELETE');
+  // A session sharedcut.com ended says so, naming the account to sign in with again.
+  remoteLink = { ...remoteLink, user: null, expired: 'konrad@example.com' };
+  await assert.rejects(run('keep-offline', {}), /session of konrad@example\.com ended/);
 });

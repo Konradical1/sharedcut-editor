@@ -2,7 +2,9 @@
 // ways every few seconds: the copy both sides last agreed on (its base, data/remote-sync/<id>.json), this computer's and
 // sharedcut.com's. While online that keeps the two live within seconds; offline the edits wait in the local copy and go
 // up with the first merge back online. When both sides changed the same field, this computer's edit wins. New footage
-// goes up (resumable upload) and comes down (ranged download) beside the merge, never inside it.
+// goes up (resumable upload) and comes down (ranged download) beside the merge, never inside it. A project made on this
+// computer goes up by itself, as the signed-in account's own, and is kept from then on; one made on sharedcut.com comes
+// down only when kept (its footage can be hundreds of GB).
 // ponytail: undo history, exports and server-side analysis files (motion tracks, masks, depth) stay on the computer that
 // made them; carry them when someone misses them.
 import { createHash } from 'node:crypto';
@@ -39,7 +41,9 @@ export interface SyncHost {
   originalPath(id: string): string;
 }
 export type ProjectSync = { id: string; name: string; kept: boolean; here: boolean; status?: 'synced' | 'offline' | 'error'; error?: string; syncedAt?: number; uploading: number; downloading: number };
-type Config = { url: string; cookie?: string; user?: User; localUserId?: string; kept: string[] };
+// linked: every project kept here at any time, so one deleted or unshared on sharedcut.com never goes up again by itself.
+// made: projects made here that go up once signed in and online.
+type Config = { url: string; cookie?: string; user?: User; localUserId?: string; kept: string[]; linked?: string[]; made?: string[] };
 class Offline extends Error {}
 const httpError = (message: string, status: number) => Object.assign(new Error(message), { status });
 
@@ -105,17 +109,36 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
 
   const status = new Map<string, Pick<ProjectSync, 'status' | 'error' | 'syncedAt'>>(), flight = new Map<string, 'up' | 'down'>();
   let online = false, seen = '';
+  /** Saves `next` on sharedcut.com as one delta against the revision it was read at; false when that revision moved on (409). */
+  async function patch(next: PersistedState) {
+    const delta = stateDelta(remote!.state, next); if (!Object.keys(delta).length) return true;
+    try { const body = await api('/api/state', { method: 'PATCH', json: { revision: remote!.revision, delta } }); remote = { revision: body.revision, state: applyStateDelta(next, body.delta) }; return true; }
+    catch (error) { if ((error as { status?: number }).status === 409) return false; throw error; }
+  }
+  const moved = () => httpError('sharedcut.com changed meanwhile; this syncs on the next pass.', 409);
 
   /** One project's merge; `again` allows one fresh look at sharedcut.com after changing its media or losing a race. */
   async function syncOne(id: string, again = true): Promise<void> {
     const me = config.user!.id, localUser = config.localUserId!;
-    const view = remote!.state, there = view.projects.find(p => p.id === id);
-    if (!there) throw new Error('This project is no longer on sharedcut.com for your account.');
+    const view = remote!.state, there = view.projects.find(p => p.id === id), now = host.state(), L = sliceOf(now, id), B = readBase(id);
+    // Deleted on this computer after it was kept, or before it went up: it stops syncing; sharedcut.com keeps any copy.
+    if (!L && (B || !there)) { keep(id, false); return; }
+    if (!there) {
+      // Made here and not up yet: it goes up as this account's private project, made the way a browser makes one (the
+      // project with its timelines and tracks); its media, then the rest, follow below. Anything else missing there was
+      // deleted on sharedcut.com or unshared: never brought back, and this computer keeps its copy.
+      if (!config.made?.includes(id)) throw new Error('Not on sharedcut.com any more (deleted there, or no longer shared with you). Your copy here stays.');
+      const up = swap({ ...EMPTY, project: L!.project, timelines: L!.timelines, tracks: L!.tracks }, localUser, me);
+      const made = await patch(withSlice(view, id, up, { ...up.project, members: [{ userId: me, role: 'Owner' }], shared: false }))
+        .catch((error: { status?: number }) => { throw error.status === 403 ? httpError('sharedcut.com has a project with this id that your account cannot open, so this one stays on this computer.', 403) : error; });
+      if (made) return syncOne(id, again);
+      if (!again) throw moved();
+      remote = undefined; await pull(); return syncOne(id, false);
+    }
+    if (config.made?.includes(id)) { config = { ...config, made: config.made.filter(item => item !== id) }; save(); }
     // Locked there (an offline copy being put back by hand): its copy is not the one to merge with until it is unlocked.
     if (there.lock) throw new Error(`Locked on sharedcut.com${there.lock.note ? ` (${there.lock.note})` : ''}. It syncs once its owner unlocks it.`);
-    const now = host.state(), L = sliceOf(now, id), B = readBase(id), theirs = sliceOf(view, id)!, R = canon(swap(theirs, me, localUser));
-    // Deleted on this computer after it was kept: it stops syncing; sharedcut.com keeps its copy.
-    if (!L && B) { keep(id, false); return; }
+    const theirs = sliceOf(view, id)!, R = canon(swap(theirs, me, localUser));
     let M = L ? canon(mergeState(B ?? EMPTY, L, R).value) : R;
     // An asset a clip still uses stays, whichever side deleted it: a clip without its media is refused.
     const used = new Set([...M.clips.map(c => c.mediaId), ...M.boardItems.map(b => b.mediaId), ...M.shots.flatMap(s => s.mediaIds ?? []), ...M.snapshots.flatMap(s => s.state.clips.map((c: Item) => c.mediaId))]);
@@ -126,9 +149,10 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
     const remoteMedia = new Map(view.media.filter(m => m.projectId === id).map(m => [m.id, m])), localMedia = new Map(now.media.filter(m => m.projectId === id).map(m => [m.id, m]));
     let touched = false;
     for (const asset of M.media) {
-      const up = remoteMedia.get(asset.id), here = localMedia.get(asset.id);
-      if (!up && here) { await api(`/api/media?${new URLSearchParams({ projectId: id, id: asset.id, name: here.name, placeholder: '1' })}`, { method: 'POST' }); touched = true; }
-      else if (up && (up.name !== asset.name || up.binId !== asset.binId)) { await api(`/api/media/${asset.id}`, { method: 'PATCH', json: { name: asset.name, binId: asset.binId } }); touched = true; }
+      let up = remoteMedia.get(asset.id); const here = localMedia.get(asset.id);
+      // A placeholder takes its bin from its kind there; a file in another bin here moves at once, not on a second pass.
+      if (!up && here) { up = (await api(`/api/media?${new URLSearchParams({ projectId: id, id: asset.id, name: here.name, placeholder: '1' })}`, { method: 'POST' })).asset; sent.delete(asset.id); touched = true; }
+      if (up && (up.name !== asset.name || up.binId !== asset.binId)) { await api(`/api/media/${asset.id}`, { method: 'PATCH', json: { name: asset.name, binId: asset.binId } }); touched = true; }
     }
     if (touched && again) { await pull(); return syncOne(id, false); }
 
@@ -147,12 +171,9 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
 
     // sharedcut.com: the same merge in its account's ids, as one delta against the revision it was read at.
     const Mr = swap(M, localUser, me);
-    if (!equal({ ...Mr, media: [] }, { ...theirs, media: [] })) {
-      const next = withSlice(view, id, Mr, { ...Mr.project, ...pick(there as unknown as Item, HELD) }), delta = stateDelta(view, next);
-      if (Object.keys(delta).length) {
-        try { const body = await api('/api/state', { method: 'PATCH', json: { revision: remote!.revision, delta } }); remote = { revision: body.revision, state: applyStateDelta(next, body.delta) }; }
-        catch (error) { if ((error as { status?: number }).status === 409 && again) { remote = undefined; await pull(); return syncOne(id, false); } throw error; }
-      }
+    if (!equal({ ...Mr, media: [] }, { ...theirs, media: [] }) && !(await patch(withSlice(view, id, Mr, { ...Mr.project, ...pick(there as unknown as Item, HELD) })))) {
+      if (!again) throw moved();
+      remote = undefined; await pull(); return syncOne(id, false);
     }
     writeBase(id, M);
     // Removed on this computer and unused: removed there too. Refused (a snapshot there still uses it) means it comes back.
@@ -186,6 +207,17 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
         ({ offset, complete } = await api(`/api/media/${id}/upload`, { method: 'PUT', headers: { 'Upload-Offset': String(offset), 'Upload-Checksum': createHash('sha256').update(chunk).digest('hex') }, body: chunk }, 300_000));
       }
     } finally { await handle.close(); }
+    sent.add(id);
+  }
+  // sent: uploaded this run (sharedcut.com's status catches up on the next look); resting: failed, tried again after a while.
+  const sent = new Set<string>(), resting = new Map<string, number>();
+  /** Which way an asset's original still has to go. Down when only sharedcut.com has it. Up when sharedcut.com waits for it
+   *  (or dropped an upload untouched for a day) and this computer has all of it: one still arriving here, from a browser
+   *  ('uploading') or a download ('downloading'), waits; any other status here means its original is whole. */
+  function way(asset: MediaAsset, there: MediaAsset | undefined): 'up' | 'down' | undefined {
+    if (!there || !config.kept.includes(asset.projectId)) return undefined;
+    if (!existsSync(host.originalPath(asset.id))) return there.status === 'ready' && !asset.importLink ? 'down' : undefined;
+    return ['uploading', 'failed'].includes(there.status) && !['uploading', 'downloading'].includes(asset.status) && !sent.has(asset.id) ? 'up' : undefined;
   }
   /** Footage either side still lacks, two files at a time; a failed one resumes from its last byte on a later pass. */
   function transfers() {
@@ -193,13 +225,12 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
     const local = host.state(), up = new Map(remote.state.media.map(m => [m.id, m]));
     for (const asset of local.media) {
       if (flight.size >= TRANSFERS) return;
-      if (!config.kept.includes(asset.projectId) || flight.has(asset.id) || asset.importLink) continue;
-      const there = up.get(asset.id), have = existsSync(host.originalPath(asset.id));
-      const way = !have && there?.status === 'ready' ? 'down' : have && there?.status === 'uploading' ? 'up' : undefined;
-      if (!way) continue;
-      flight.set(asset.id, way);
-      void (way === 'down' ? download(asset.id) : upload(asset.id)).catch(error => console.warn(`SharedCut sync: ${asset.name} ${way === 'down' ? 'download' : 'upload'} paused: ${(error as Error).message}`))
-        .finally(() => { flight.delete(asset.id); transfers(); });
+      const to = flight.has(asset.id) || (resting.get(asset.id) ?? 0) > Date.now() ? undefined : way(asset, up.get(asset.id));
+      if (!to) continue;
+      flight.set(asset.id, to);
+      // Offline, the next file would fail the same way: the next pass online picks them up again.
+      void (to === 'down' ? download(asset.id) : upload(asset.id)).then(() => true, error => { if (!(error instanceof Offline)) resting.set(asset.id, Date.now() + 60_000); console.warn(`SharedCut sync: ${asset.name} ${to === 'down' ? 'download' : 'upload'} paused: ${(error as Error).message}`); return !(error instanceof Offline); })
+        .then(more => { flight.delete(asset.id); if (more) transfers(); });
     }
   }
 
@@ -212,6 +243,14 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
       const key = `${remote!.revision}:${host.revision()}`;
       if (key !== seen) {
         let clean = true;
+        // Made here by this computer's account, never kept and not on sharedcut.com: kept, so it goes up below. One this
+        // account deleted there (a bundle's copy, still in its Recently deleted) is kept without going up: restored there, it syncs.
+        const linked = new Set([...config.kept, ...config.linked ?? []]), made = host.state().projects.filter(p => !linked.has(p.id) && !remote!.state.projects.some(r => r.id === p.id)
+          && p.members.some(m => m.userId === config.localUserId && m.role === 'Owner') && !existsSync(basePath(p.id))).map(p => p.id);
+        if (made.length) try {
+          const deleted = new Set((await api<{ projects: { id: string }[] }>('/api/projects/deleted')).projects.map(p => p.id));
+          config = { ...config, kept: [...config.kept, ...made], linked: [...linked, ...made], made: [...config.made ?? [], ...made.filter(id => !deleted.has(id))] }; save();
+        } catch { clean = false; }
         for (const id of [...config.kept]) try { await syncOne(id); } catch (error) { clean = false; status.set(id, { ...status.get(id), status: error instanceof Offline ? 'offline' : 'error', error: (error as Error).message }); }
         seen = clean && remote ? `${remote.revision}:${host.revision()}` : '';
       }
@@ -223,7 +262,8 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
 
   function keep(id: string, on: boolean) {
     if (!ID.test(id)) throw httpError('Invalid project.', 400);
-    config = { ...config, kept: on ? [...new Set([...config.kept, id])] : config.kept.filter(item => item !== id) };
+    // Stopped before it went up, a project made here stays here: it is linked, so it never goes up by itself again.
+    config = on ? { ...config, kept: [...new Set([...config.kept, id])], linked: [...new Set([...config.linked ?? [], id])] } : { ...config, kept: config.kept.filter(item => item !== id), made: config.made?.filter(item => item !== id) };
     if (!on) { rmSync(basePath(id), { force: true }); status.delete(id); }
     save(); seen = '';
   }
@@ -254,10 +294,12 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
   };
   return {
     tick,
+    /** expired: the account whose session sharedcut.com ended (a sign-out forgets it). uploading/downloading: files still to go. */
     status() {
-      const local = host.state(), count = (id: string, way: 'up' | 'down') => [...flight].filter(([asset, w]) => w === way && local.media.some(m => m.id === asset && m.projectId === id)).length;
+      const local = host.state(), there = new Map((remote?.state.media ?? []).map(m => [m.id, m])), left = new Map<string, Record<'up' | 'down', number>>();
+      for (const asset of local.media) { const to = flight.get(asset.id) ?? way(asset, there.get(asset.id)); if (to) { const n = left.get(asset.projectId) ?? { up: 0, down: 0 }; n[to]++; left.set(asset.projectId, n); } }
       const listed = new Map<string, string>([...(remote?.state.projects ?? []).map(p => [p.id, p.name] as const), ...config.kept.filter(id => !remote?.state.projects.some(p => p.id === id)).map(id => [id, local.projects.find(p => p.id === id)?.name ?? id] as const)]);
-      return { url: config.url, user: config.cookie ? config.user ?? null : null, online, projects: [...listed].map(([id, name]): ProjectSync => ({ id, name, kept: config.kept.includes(id), here: local.projects.some(p => p.id === id), ...status.get(id), uploading: count(id, 'up'), downloading: count(id, 'down') })) };
+      return { url: config.url, user: config.cookie ? config.user ?? null : null, expired: !config.cookie && config.user ? config.user.email : null, online, projects: [...listed].map(([id, name]): ProjectSync => ({ id, name, kept: config.kept.includes(id), here: local.projects.some(p => p.id === id), ...status.get(id), uploading: left.get(id)?.up ?? 0, downloading: left.get(id)?.down ?? 0 })) };
     },
     async login(localUserId: string, email: string, password: string) {
       const response = await call('/api/auth/login', { method: 'POST', json: { email, password } }), body = await response.json().catch(() => ({}));
@@ -268,7 +310,7 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
       // The project list comes with the first look at sharedcut.com, kept projects or not.
       await pull().then(() => { online = true; }, () => {});
     },
-    logout() { config = { ...config, cookie: undefined }; save(); remote = undefined; online = false; },
+    logout() { config = { ...config, cookie: undefined, user: undefined }; save(); remote = undefined; online = false; },
     keep(id: string, on: boolean) { keep(id, on); void tick(); },
     close() { closed = true; clearInterval(timer); return running; },
     normalize,

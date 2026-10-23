@@ -145,5 +145,6 @@ in the app's userData folder, so it works with no connection. A server or editor
 too, and it must still run that way: no hard dependency on the Lenovo, the network or a Python venv for core editing.
 The app starts `server/index.ts` on 127.0.0.1:41237 with `FRAME_LINE_STOP_WITH_STDIN`, so the server stops when the
 app's pipe closes. Projects kept from sharedcut.com sync both ways through `server/remoteSync.ts` (`FRAME_LINE_REMOTE`):
-live while online, a three-way merge after offline edits, with this computer winning a conflict. Installers and update feeds are served from `<data>/downloads` at `/download/<file>`. The page is
+live while online, a three-way merge after offline edits, with this computer winning a conflict. Projects made in the app go up
+by themselves once it is signed in (`config.made`); one deleted on sharedcut.com is never made again (`config.linked`). Installers and update feeds are served from `<data>/downloads` at `/download/<file>`. The page is
 sharedcut.com/download. Build, sign, check and publish: `desktop/README.md`.
