@@ -122,11 +122,11 @@ export const jobs: Record<string, JobDef> = {
     },
   },
   'keep-offline': {
-    doc: '{project?, stop?:true} SharedCut Desktop only: keep a sharedcut.com project (name or id) on this computer, live online, merged after offline edits; no project = what is kept',
+    doc: '{project?, stop?:true} SharedCut Desktop only: keep a sharedcut.com project (name or id) on this computer, live online, merged after offline edits; ones made here go up by themselves; no project = what is kept',
     async start(params) {
       type Kept = { id: string; name: string; kept: boolean; status?: string; error?: string; uploading: number; downloading: number };
-      const link = await call<{ user: { email: string } | null; online: boolean; projects: Kept[] }>('/remote').catch(() => { throw new Error('Only SharedCut Desktop syncs with sharedcut.com; this server does not.'); });
-      if (!link.user) throw new Error('Sign in to sharedcut.com first: the Projects screen of SharedCut Desktop.');
+      const link = await call<{ user: { email: string } | null; expired?: string | null; online: boolean; projects: Kept[] }>('/remote').catch(() => { throw new Error('Only SharedCut Desktop syncs with sharedcut.com; this server does not.'); });
+      if (!link.user) throw new Error(link.expired ? `The sharedcut.com session of ${link.expired} ended: sign in again on the Projects screen of SharedCut Desktop.` : 'Not signed in to sharedcut.com: sign in on the Projects screen of SharedCut Desktop.');
       const line = (p: Kept) => `${handle(p.id)} ${quote(p.name)} ${p.kept ? p.error ?? p.status ?? 'syncing' : 'only online'}${p.uploading ? ` · ${p.uploading} up` : ''}${p.downloading ? ` · ${p.downloading} down` : ''}`;
       if (params.project === undefined) return done([`${link.user.email}${link.online ? '' : ' (offline)'}`, ...link.projects.filter(p => p.kept).map(line)].join('\n'));
       const want = String(params.project).replace(/^@/, ''), low = want.toLowerCase();
