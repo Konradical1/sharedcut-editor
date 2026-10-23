@@ -231,7 +231,7 @@ function followNormalize(projectId: string, jobId: string, targets: string[], op
       const { text, value } = await edit(run => run('normalizeColorGroup', { shots, level: job.result!.level }, options));
       // The group asked for; a new one is the group a shot actually moved into (a skipped shot keeps its old one).
       const id = options.group ? ('id' in options.group ? options.group.id : shots.map(groupOfShot).find((g, i) => g && g !== before[i])) : undefined, group = id && projectGroups().find(g => g.id === id);
-      return done([`Normalized ${value} of ${shots.length} shot${shots.length === 1 ? '' : 's'}${group ? ` into ${quote(group.name, 40)} ${group.id} (${group.clipIds.length} shot${group.clipIds.length === 1 ? '' : 's'})` : options.group === null ? ', out of their color groups' : ''}${options.clean ? ', grades rebuilt' : ''}; a snapshot keeps the old grades.`,
+      return done([`Normalized ${value} of ${shots.length} shot${shots.length === 1 ? '' : 's'}${job.remote ? ' on sharedcut.com' : ''}${group ? ` into ${quote(group.name, 40)} ${group.id} (${group.clipIds.length} shot${group.clipIds.length === 1 ? '' : 's'})` : options.group === null ? ', out of their color groups' : ''}${options.clean ? ', grades rebuilt' : ''}; a snapshot keeps the old grades.`,
         `balance: ${shots.map(shotText).join(' · ')}${skipped}`, text].join('\n'));
     },
     async cancel() { await cancelNormalize(projectId, jobId); },
@@ -489,7 +489,7 @@ export const jobs: Record<string, JobDef> = {
     },
   },
   'color-normalize': {
-    doc: '{clips?=selected, group?:name|cg-id|null, clean?} measures shots, sets each Balance (exposure, white balance, black point); group joins or makes a color group, null leaves',
+    doc: '{clips?=selected, group?:name|cg-id|null, clean?} measures shots, sets each Balance (exposure, white balance, black point); group joins or makes a color group, null leaves; Desktop: on sharedcut.com',
     async start(p) {
       const s = store.getState(), picked = p.clips !== undefined ? need<string[]>(p, 'clips', 'array') : s.selectedClipIds.length ? s.selectedClipIds : s.selectedClipId ? [s.selectedClipId] : [];
       const targets = [...new Set(picked.map(id => clipOf(id).id))];
