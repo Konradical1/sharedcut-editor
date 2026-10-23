@@ -100,7 +100,8 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
   // sharedcut.com's workspace as this account sees it, kept current with the same deltas a browser tab uses.
   let remote: { revision: number; state: PersistedState } | undefined;
   async function pull(): Promise<{ revision: number; state: PersistedState }> {
-    const body = await api(`/api/state${remote ? `?since=${remote.revision}&delta=1` : ''}`);
+    // The first look is the whole workspace (tens of MB): on a slow link it needs far longer than a delta does.
+    const body = await api(`/api/state${remote ? `?since=${remote.revision}&delta=1` : ''}`, {}, remote ? 60_000 : 20 * 60_000);
     if (body.state) remote = { revision: body.revision, state: body.state };
     else if (body.delta && remote && body.baseRevision === remote.revision) remote = { revision: body.revision, state: applyStateDelta(remote.state, body.delta) };
     else if (body.revision !== remote?.revision) { remote = undefined; return pull(); }
@@ -239,6 +240,8 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
     running ??= (async () => {
       if (closed || !config.cookie || !config.user) return;
       try { await pull(); online = true; } catch (error) { online = error instanceof Offline ? false : online; for (const id of config.kept) status.set(id, { ...status.get(id), status: error instanceof Offline ? 'offline' : 'error', error: (error as Error).message }); return; }
+      // A sign-in or sign-out during the pull drops the copy: the next pass starts from a fresh one.
+      if (!remote) return;
       // Nothing moved on either side since the last clean pass: nothing to merge.
       const key = `${remote!.revision}:${host.revision()}`;
       if (key !== seen) {
@@ -255,7 +258,7 @@ export function remoteSync(host: SyncHost, options: { url: string; everyMs?: num
         seen = clean && remote ? `${remote.revision}:${host.revision()}` : '';
       }
       transfers();
-    })().finally(() => { running = undefined; });
+    })().catch(error => console.warn(`SharedCut sync: pass stopped: ${(error as Error).message}`)).finally(() => { running = undefined; });
     return running;
   }
   const timer = setInterval(() => void tick(), options.everyMs ?? 3000); timer.unref();
