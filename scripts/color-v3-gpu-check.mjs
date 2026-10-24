@@ -3,7 +3,7 @@ import {browserExecutable} from './browser-options.mjs';
 // nodes-v2 clips, windows on full, letterboxed and YUV pictures, film passes against applyFilm (transparent layers keep their
 // alpha), a spatial grade under a Stabilize warp, the key view, the node-input probe (layers drawn after the shot, bypassed
 // nodes, pasted grades), Dehaze/Clarity against gradePicture (k = 0, 1, 2, film, windows, masks, letterbox, no float targets),
-// and the frame time of 1920×1080 film and detail grades.
+// layers of two picture shapes on one renderer, and the frame time of 1920×1080 film and detail grades.
 import assert from 'node:assert/strict';
 import {createServer} from 'vite';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
@@ -310,12 +310,31 @@ try{
    }finally{renderer.dispose();}
   }
   {
-   // Without float render targets a detail picture takes the exact software preview; other pictures stay on the GPU.
+   // One renderer draws every layer: a 16:9 and a pillarboxed 1:1 detail layer in turn (a transition) each keep their targets, so
+   // a frame of both allocates none, and each matches gradePicture; once the 1:1 layer is gone its targets are deleted.
+   const box={x0:32,y0:0,width:97,height:97},wide=encoded(161,97,footage,'Gamma 2.4'),square=encoded(161,97,footage,'Gamma 2.4',box);
+   const a=detailLegacy({dehaze:60,clarity:40},'161 × 97'),b=detailLegacy({dehaze:-50,clarity:30},'1080 × 1080'),renderer=createColorPreview(),P=WebGL2RenderingContext.prototype,{createTexture,deleteTexture}=P;
+   let allocated=0,freed=0;
+   try{
+    for(let i=0;i<2;i++){await draw(renderer,wide,a.clip,a.asset,a.nodes);await draw(renderer,square,b.clip,b.asset,b.nodes);}
+    P.createTexture=function(){allocated++;return createTexture.call(this);};
+    const gotA=pixelsOf(await draw(renderer,wide,a.clip,a.asset,a.nodes)),gotB=pixelsOf(await draw(renderer,square,b.clip,b.asset,b.nodes));
+    P.createTexture=createTexture;P.deleteTexture=function(t){freed++;return deleteTexture.call(this,t);};
+    for(let i=0;i<6;i++)await draw(renderer,wide,a.clip,a.asset,a.nodes);
+    results.push({group:'detail',pipeline:'legacy',name:'16:9 and 1:1 layers in turn: the 16:9',...compare(gotA,cpuPicture(a.clip,a.asset,a.nodes,wide)),allocated});
+    results.push({group:'detail',pipeline:'legacy',name:'16:9 and 1:1 layers in turn: the 1:1',...compare(gotB,cpuPicture(b.clip,b.asset,b.nodes,square,box)),allocated,freed});
+   }finally{P.createTexture=createTexture;P.deleteTexture=deleteTexture;renderer.dispose();}
+  }
+  {
+   // Without float render targets a detail picture is refused at once (the software preview takes seconds a frame) and a pick
+   // on it gets null without the 2 s wait; other pictures stay on the GPU.
    const native=WebGL2RenderingContext.prototype.getExtension;WebGL2RenderingContext.prototype.getExtension=function(name){return name==='EXT_color_buffer_float'?null:native.call(this,name);};
    let renderer;try{renderer=createColorPreview();}finally{WebGL2RenderingContext.prototype.getExtension=native;}
    try{
-    const picture=encoded(161,97,footage,'DaVinci Intermediate'),grade=detailManaged({dehaze:60,clarity:40},{},'161 × 97'),soft=await draw(renderer,picture,grade.clip,grade.asset,grade.nodes);
-    results.push({group:'detail',pipeline:'nodes-v2',name:'no float targets: software preview',...compare(pixelsOf(soft),cpuPicture(grade.clip,grade.asset,grade.nodes,picture)),wrongPath:!!soft.getContext('webgl2')});
+    const picture=encoded(161,97,footage,'DaVinci Intermediate'),grade=detailManaged({dehaze:60,clarity:40},{},'161 × 97'),pick=probeNodeInput(grade.nodes[1].id,.5,.5);
+    let refused='';try{await draw(renderer,picture,grade.clip,grade.asset,grade.nodes);}catch(e){refused=e.message;}
+    results.push({group:'detail',pipeline:'nodes-v2',name:'no float targets: detail refused',meanError:0,maxError:0,leaks:0,wrongPath:refused!=='Dehaze and Clarity need a GPU with float render targets.'});
+    near('no float targets: a pick on a detail clip, at once',await Promise.race([pick,new Promise(r=>setTimeout(()=>r('late'),500))]),null);
     const plain=detailManaged({},{},'161 × 97'),gpu=await draw(renderer,picture,plain.clip,plain.asset,plain.nodes);results.push({group:'detail',pipeline:'nodes-v2',name:'no float targets: no detail stays on the GPU',...compare(pixelsOf(gpu),cpuPicture(plain.clip,plain.asset,plain.nodes,picture)),wrongPath:!gpu.getContext('webgl2')});
    }finally{renderer.dispose();}
   }
@@ -342,6 +361,7 @@ try{
  for(const r of report.results){
   assert.equal(r.leaks,0,`${r.group} ${r.name}: pixels outside the picture must stay transparent and pixels inside opaque`);
   assert.equal(r.alphaChanged??0,0,`${r.name}: every pixel keeps the source's alpha`);assert.ok(!r.wrongPath,`${r.name}: drawn by the wrong renderer`);
+  assert.equal(r.allocated??0,0,`${r.name}: a picture shape drawn in the last frames keeps its render targets`);assert.notEqual(r.freed,0,`${r.name}: a shape no longer drawn frees its render targets`);
   if(r.group==='detail')assert.ok(r.meanError<=.5&&r.maxError<=2,`${r.pipeline} ${r.name}: Dehaze/Clarity must match gradePicture (mean ≤ .5, max ≤ 2 codes)`);
   else if(r.group==='film'&&!r.name.startsWith('neutral'))assert.ok(r.meanError<=1&&r.maxError<=6,`${r.name}: film must match applyFilm (mean ≤ 1, max ≤ 6 codes)`);
   else assert.ok(r.maxError<=2,`${r.group} ${r.pipeline} ${r.name}: GPU must match the CPU reference within 2 codes`);

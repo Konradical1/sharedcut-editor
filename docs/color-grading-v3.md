@@ -149,7 +149,7 @@ fix forward.
 blend `out = in + (graded − in)·mask·windows·qualifier` limits both tools and the qualifier keys on the pre-detail input.
 - nodes-v2: step 1 becomes `lin = decode(rgb, gamma)·G` → **dehaze → clarity** → `rgb = encode(lin, gamma)`, with
   `G = 2^exposure·(1 + T/1e4, 1 − tint/200, 1 − T/1e4)` (`detailGain`; run even at G = 1).
-- legacy: at the very start of the stage, `lin = decode(rgb, 'Gamma 2.4')`, G = 1, then encode and the legacy stage as before.
+- legacy: at the very start of the stage, `lin = decode(rgb, stage gamma)` (Gamma 2.4 unless an earlier CST changed it), G = 1, then encode and the legacy stage as before.
 - The maps come from the whole node input decoded the same way and × the same G, so they see exactly the `lin` they are
   applied to: Dehaze on Balance acts on the balanced picture, identical to Dehaze on its own node right after Balance.
   Whole-frame renderers split *before* a detail point (film splits after its node); intermediate parts stay unclamped.

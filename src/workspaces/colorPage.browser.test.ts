@@ -1,8 +1,9 @@
 // Browser check for the Color page v3 layout and tools (ColorWorkspace.tsx, ColorPanels.tsx, ColorTools.tsx, color.css): it fits a
-// MacBook Air (1470×760) and 1280×720 with no page scroll and no clipped control (Primaries in both modes), every tool tab renders,
-// sliders, wheels, HSL curves, the mixer, film and a library look change the selected node, a slider drag is one undo, Detail
-// (Dehaze, Clarity) is in both Primaries modes and resets, undoes and keyframes, New Node makes a Film node, and the tool area
-// keeps its dragged height after a reload. Needs FFmpeg for the test clip.
+// MacBook Air (1470×760) and 1280×720 with no page scroll and no clipped control (Primaries in both modes), Detail fits there and at
+// 1180×800 without shrinking the other sliders or the wheels, every tool tab renders, sliders, wheels, HSL curves, the mixer, film and
+// a library look change the selected node, a slider drag is one undo, Detail (Dehaze, Clarity) is in both Primaries modes and resets,
+// undoes and keyframes, New Node makes a Film node, and the tool area keeps its dragged height after a reload. Needs FFmpeg for the
+// test clip.
 // Run: node --experimental-strip-types --test src/workspaces/colorPage.browser.test.ts
 // DIST=<built dist> skips the build; PLAYWRIGHT_CHROME_PATH picks a Chrome binary (default: installed Chrome); SHOTS=<dir> saves screenshots.
 import assert from 'node:assert/strict';
@@ -104,6 +105,23 @@ test('Color page v3: fits a MacBook, every tool works and saves to the selected 
     await page.getByRole('button', { name: 'Log', exact: true }).click();
     assert.deepEqual(await misfit(page, 'Primaries'), [], `Log Primaries at ${width}×${height}`);
     await page.getByRole('button', { name: 'Primary', exact: true }).click();
+  }
+  // Detail takes only room the panel had free: the other sliders' tracks and the wheels keep their pre-Detail widths (cecc5b3: px
+  // per size, the same in both modes), and Dehaze and Clarity are whole, inside the tool area.
+  await tool('Primaries').click();
+  for (const [width, height, track, wheel] of [[1180, 800, 57, 93], [1280, 720, 81, 106], [1470, 760, 141, 109]]) {
+    await page.setViewportSize({ width, height });
+    for (const mode of ['Log', 'Primary']) {
+      await page.getByRole('button', { name: mode, exact: true }).click();
+      await page.waitForTimeout(120);
+      const at = `${mode} Primaries at ${width}×${height}`;
+      assert.deepEqual(await misfit(page, 'Primaries'), [], at);
+      const size = await page.evaluate(() => { const w = (s: string) => [...document.querySelectorAll(s)].map(e => Math.round(e.getBoundingClientRect().width)); return { tracks: w('.slider-groups input[type=range]'), wheels: w('.color-wheel'), detail: w('.detail-group input[type=range]'), boxes: w('.detail-group input[inputmode=decimal]') }; });
+      assert.ok(size.tracks.length >= 13 && Math.min(...size.tracks) >= track - 2, `${at}: slider tracks ${size.tracks} (were ${track})`);
+      assert.ok(size.wheels.length === 4 && Math.min(...size.wheels) >= wheel - 2, `${at}: wheels ${size.wheels} (were ${wheel})`);
+      assert.ok(size.detail.length === 2 && Math.min(...size.detail) >= 36 && Math.min(...size.boxes) >= 44, `${at}: Detail ${size.detail} / ${size.boxes}`);
+      for (const label of ['Dehaze', 'Clarity']) assert.ok(await page.getByRole('slider', { name: label, exact: true }).isVisible(), `${at}: ${label}`);
+    }
   }
   await page.setViewportSize({ width: 1470, height: 760 });
 

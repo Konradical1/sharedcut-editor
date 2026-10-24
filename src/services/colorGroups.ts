@@ -1,6 +1,6 @@
 import { interpretation, primaryDefaults, processingStages, starterGrade } from './color.ts';
 import { findGradeNodes } from './colorAssistant.ts';
-import { detailParams } from './grading.ts';
+import { detailParams, PARAM } from './grading.ts';
 import type { Clip, ColorCurves, ColorTransformEffect, GradeNode, MediaAsset } from '../state/models.ts';
 
 /**
@@ -116,9 +116,11 @@ export function normalizedGrade(clip: Clip, asset: MediaAsset | undefined, nodes
     }
   }
   next.sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-  // Keyframes on removed or rewritten nodes would fight the new values.
+  // Keyframes on removed or rewritten nodes would fight the new values; a kept node's Dehaze/Clarity keeps its animation too.
   const drop = [...removed, ...reset].map(nodeId => `nodes.${nodeId}.`), keys = Object.entries(clip.keyframes ?? {});
-  const keyframes = keys.some(([path]) => drop.some(p => path.startsWith(p))) ? Object.fromEntries(keys.filter(([path]) => !drop.some(p => path.startsWith(p)))) : undefined;
+  const kept = (path: string) => { const m = /^nodes\.([^.]+)\.parameters\.([^.]+)$/.exec(path); return !!m && !removed.includes(m[1]) && PARAM[m[2]]?.group === 'detail'; };
+  const gone = (path: string) => drop.some(p => path.startsWith(p)) && !kept(path);
+  const keyframes = keys.some(([path]) => gone(path)) ? Object.fromEntries(keys.filter(([path]) => !gone(path))) : undefined;
   return { next, removed, properties, unset, keyframes, ids: { input: input.id, balance: balance.id, output: output.id, group: next.find(n => isGroupNode(n))?.id } };
 }
 

@@ -152,7 +152,7 @@ function hazy(width: number, height: number, encode = (v: number) => v) {
   return rgb;
 }
 
-test('Dehaze and Clarity grade like gradePicture: alone, in the C993 grade through ACES 2, legacy, after film, under a window and a qualifier, k = 0..3', { skip, timeout: 300_000 }, t => {
+test('Dehaze and Clarity grade like gradePicture: alone, in the C993 grade through ACES 2, legacy (also after a CST), after film, under a window and a qualifier, k = 0..3', { skip, timeout: 300_000 }, t => {
   const apple = { id: 'c', properties: { colorPipeline: 'nodes-v2', inputProfile: 'Apple Log', inputGamut: 'Rec.2020' } } as unknown as Clip, log = (v: number) => encodeLog(v * 1.9, 'Apple Log');
   // Konrad's C993 grade (lab c993-stages.json) with a detail node between Balance and Look. TS has no ACES 2 (OCIO only): both engines
   // grade the four nodes, then the same worker's ACES 2 output stages turn each into display codes.
@@ -164,6 +164,7 @@ test('Dehaze and Clarity grade like gradePicture: alone, in the C993 grade throu
     { name: 'detail only, two nodes back to back', clip: managed, width: 160, height: 90, nodes: [node('d', 1, { dehaze: 60, clarity: 40, exposure: .3, temperature: 500, tint: -10 }), node('e', 2, { dehaze: -50, clarity: -40, saturation: 110 })] },
     { name: 'C993 through ACES 2, 963×541 (k = 1)', clip: apple, width: 963, height: 541, nodes: c993, picture: hazy(963, 541, log), display: true },
     { name: 'legacy', clip: legacy, width: 157, height: 91, nodes: [node('d', 1, { dehaze: 50, clarity: 30, gain: .9, saturation: 110, lift: .02 }), node('e', 2, { dehaze: -40, contrast: 1.1 })] },
+    { name: 'legacy after a CST to DaVinci Intermediate', clip: legacy, width: 160, height: 90, nodes: [node('a', 1, {}, { effects: [defaultCST('cst-a', 'Gamma 2.4', 'Rec.709', 'DaVinci Intermediate', 'Rec.709')] }), node('d', 2, { dehaze: 60, clarity: 40 }), node('z', 3, {}, { effects: [defaultCST('cst-z', 'DaVinci Intermediate', 'Rec.709', 'Gamma 2.4', 'Rec.709')] })] },
     { name: 'after a film node', clip: managed, width: 240, height: 135, nodes: [node('a', 1, { offset: .02 }), film, node('d', 1.7, { dehaze: 60, clarity: 50 }), node('b', 2, { saturation: 120 })], film: true },
     { name: 'under a gradient window and a qualifier', clip: managed, width: 200, height: 113, nodes: [node('d', 1, { dehaze: 70, clarity: 60, gain: 1.05, gradOn: 1, gradAngle: 160, gradY: .5, gradSoft: .3, qualOn: 1, qualLumLow: 30, qualLumSoft: 15 })] },
     { name: '75×1081 (k = 2)', clip: managed, width: 75, height: 1081, nodes: [node('d', 1, { dehaze: 100, clarity: 100 })] },

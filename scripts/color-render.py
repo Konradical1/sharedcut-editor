@@ -226,8 +226,8 @@ def grade(rgb,stages,masks=None,managed=True,coords=None):
                 rgb=blend(lut(rgb,s['effect']),before,s,keyed);continue
             g=s['g'];p=s['extra'];gamma=s['gamma'];channels='RGB';w=[float(v) for v in s['weights']]
             per=lambda key:np.array([p.get(key+c,0) for c in channels],np.float32);detail=detail_point(s)
-            # Dehaze and Clarity first, in linear light: nodes-v2 inside the exposure/white balance step, legacy on Gamma 2.4.
-            if detail and not managed: rgb=encode(apply_detail(decode(rgb,'Gamma 2.4'),w,*detail_at(masks,s,coords,rgb.shape),p),'Gamma 2.4')
+            # Dehaze and Clarity first, in linear light: nodes-v2 inside the exposure/white balance step, legacy in the stage's encoding.
+            if detail and not managed: rgb=encode(apply_detail(decode(rgb,gamma),w,*detail_at(masks,s,coords,rgb.shape),p),gamma)
             if managed:
                 if detail or g['exposure'] or g['temperature'] or g['tint']:
                     lin=decode(rgb,gamma)*gain(g);rgb=encode(apply_detail(lin,w,*detail_at(masks,s,coords,rgb.shape),p) if detail else lin,gamma)
@@ -405,13 +405,13 @@ def softcap(u): return u/np.sqrt(np.sqrt(1+(u/.8)**4))
 
 def detail_maps(rgb,s,managed,pool=None):
     """Level-k maps of the node input: M1 = G(a_c, b_c, α, β), M2 = B2 = G(dk', lm·dk', dk'·vr, dk'·vb), from the linear picture
-    grade() applies them to (decode·G on nodes-v2, Gamma 2.4 on legacy stages). Level and blurs are filmBlur's at σ = 2 % of the
+    grade() applies them to (decode·G on nodes-v2, the stage's encoding with G = 1 on legacy stages). Level and blurs are filmBlur's at σ = 2 % of the
     height. The source pass runs in even-row stripes halved at once (a 2×2 box never crosses one): a 4K frame never holds full-size maps."""
     height,width=rgb.shape[:2];w=[float(v) for v in s['weights']];sigma=.02*height;k=max(0,math.floor(math.log2(sigma/4)));sg=sigma/2**k
     SA=np.empty((-(-height//2),-(-width//2),4) if k else (height,width,4),np.float32);SB=np.empty((*SA.shape[:2],3),np.float32)
     def source(r):
         # SA = (l, l², lm, mx), SB = clamp(lin, 2⁻⁸, 1)⁻⁴ per channel (the soft dark channel's power mean), in log stops re 18 % grey.
-        with np.errstate(invalid='ignore',divide='ignore',over='ignore'): lin=decode(rgb[r:r+STRIPE],s['gamma'])*gain(s['g']) if managed else decode(rgb[r:r+STRIPE],'Gamma 2.4')
+        with np.errstate(invalid='ignore',divide='ignore',over='ignore'): lin=decode(rgb[r:r+STRIPE],s['gamma'])*(gain(s['g']) if managed else 1)
         mx=np.maximum(lin.max(-1),0);l,lm=stops(luma(lin,w)),stops(mx);q=1/np.clip(lin,2**-8,1);q=q*q;a,b=np.stack([l,l*l,lm,mx],-1),q*q
         if k: a,b,r=halve(a),halve(b),r//2
         SA[r:r+len(a)]=a;SB[r:r+len(b)]=b

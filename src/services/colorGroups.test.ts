@@ -54,6 +54,9 @@ test('Normalize keeps Dehaze and Clarity on the nodes it resets', () => {
   const { next, ids } = normalizedGrade(clip, asset(), nodes, { balance }, id), at = (nodeId: string) => next.find(n => n.id === nodeId)!.parameters;
   assert.deepEqual(at(nodes[0].id), { ...primaryDefaults, dehaze: 20 });
   assert.deepEqual([at(ids.balance).temperature, at(ids.balance).dehaze, at(ids.balance).clarity], [-800, 60, 35]);
+  const dehaze = `nodes.${nodes[1].id}.parameters.dehaze`, temperature = `nodes.${nodes[1].id}.parameters.temperature`;
+  clip.keyframes = { [dehaze]: [{ time: 0, value: 40 }, { time: 3, value: 100 }], [temperature]: [{ time: 0, value: 300 }, { time: 3, value: 900 }] } as never;
+  assert.deepEqual(Object.keys(normalizedGrade(clip, asset(), nodes, { balance }, id).keyframes ?? {}), [dehaze], 'the Dehaze animation stays, the rewritten Temp animation goes');
 });
 
 test('clean rebuilds every node', () => {

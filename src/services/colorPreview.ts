@@ -405,18 +405,19 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
   const cubeId=(cube:object)=>{if(!cubeIds.has(cube))cubeIds.set(cube,++nextCube);return cubeIds.get(cube)!;};
   // The stages behind the parameter texture, the last draw's clip and nodes (bypassed ones too), its picture box and film frame number.
   let planned:Stage[]=[],plannedV2=false,drawn:GradeNode[]=[],drawnClip='',box=pictureBox([0,0,1,1],1,1),filmFrame=0,shownLook:Look=neutral;
-  type Target={texture:WebGLTexture;fbo:WebGLFramebuffer;width:number;height:number;second?:WebGLTexture};
+  type Target={name:string;texture:WebGLTexture;fbo:WebGLFramebuffer;width:number;height:number;second?:WebGLTexture;used:number};
   const targets=new Map<string,Target>(),drop=(t:Target)=>{gl.deleteTexture(t.texture);if(t.second)gl.deleteTexture(t.second);gl.deleteFramebuffer(t.fbo);};
-  /** A float render target kept by name; a new one only when its size changes. `pair`: a second texture at attachment 1 (MRT). */
-  // ponytail: one target per name, so two film pictures of different shapes in one frame (a transition) reallocate each frame; key by size if that shows up.
+  /** Draws so far; a target no draw used in the last 4 belongs to a picture shape gone from the viewer and is deleted. */
+  let draws=0;const evict=()=>{draws++;for(const [key,t] of targets)if(draws-t.used>4){drop(t);targets.delete(key);}};
+  /** A float render target kept by name and size: one renderer draws every layer, so layers of different picture boxes in one
+   *  frame (a transition, a vertical clip over 16:9) each keep their own. `pair`: a second texture at attachment 1 (MRT). */
   const target=(name:string,width:number,height:number,pair=false)=>{
-    const old=targets.get(name);if(old&&old.width===width&&old.height===height)return old;
-    if(old)drop(old);
+    const key=`${name} ${width}×${height}`,old=targets.get(key);if(old){old.used=draws;return old;}
     const fbo=gl.createFramebuffer()!;gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
     const attach=(i:number)=>{const t=gl.createTexture()!;gl.activeTexture(gl.TEXTURE0+passUnit);gl.bindTexture(gl.TEXTURE_2D,t);settings(gl.TEXTURE_2D,gl.NEAREST);gl.texImage2D(gl.TEXTURE_2D,0,targetFormat,width,height,0,gl.RGBA,byteTargets?gl.UNSIGNED_BYTE:gl.FLOAT,null);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,t,0);return t;};
-    const made:Target={texture:attach(0),fbo,width,height,...pair?{second:attach(1)}:{}};if(pair)gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1]);
+    const made:Target={name,texture:attach(0),fbo,width,height,used:draws,...pair?{second:attach(1)}:{}};if(pair)gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1]);
     if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE){gl.bindFramebuffer(gl.FRAMEBUFFER,null);drop(made);throw new Error('This GPU cannot render the film stage.');}
-    targets.set(name,made);return made;
+    targets.set(key,made);return made;
   };
   const into=(out:Target|null)=>{gl.bindFramebuffer(gl.FRAMEBUFFER,out?out.fbo:null);gl.viewport(0,0,out?out.width:canvas.width,out?out.height:canvas.height);};
   /** Correction stages [first, first+count) from the source (or a film output) into a float target or, when `out` is null, the canvas. */
@@ -459,7 +460,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     return B;
   };
   /** The last detail point's maps, M1 and M2 at level k (read by the grade pass that starts at that point). */
-  let maps:WebGLTexture[]=[blank,blank],software:ReturnType<typeof createSoftwareColorPreview>|undefined;
+  let maps:WebGLTexture[]=[blank,blank];
   /** A detail point's maps from its node input (the picture box; H = its height), as filmLook.ts detailMaps: sources halved to
    *  level k, the small Gaussian with the soft dark channel, the large one with the coefficients, and once more on those. */
   const detail=(stage:Extract<Stage,{type:'correction'}>,input:Target)=>{
@@ -484,7 +485,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
       const stage=planned[i];
       if(stage.type==='film'){const a=target('A',box.width,box.height);grade(at,i-at,input,a,viewStage,0,point);input=film(stage,a);at=i+1;point=-1;}
       // The maps read the node input: a film output it follows as is, otherwise a split into N0/N1 (never A, which a probe renders into).
-      else if(detailPoint(stage)){if(i>at||!input){const n=target(input===targets.get('N0')?'N1':'N0',box.width,box.height);grade(at,i-at,input,n,viewStage,0,point);input=n;}detail(stage,input);at=point=i;}
+      else if(detailPoint(stage)){if(i>at||!input){const n=target(input?.name==='N0'?'N1':'N0',box.width,box.height);grade(at,i-at,input,n,viewStage,0,point);input=n;}detail(stage,input);at=point=i;}
     }
     grade(at,end-at,input,out,viewStage,viewMode,point);
   };
@@ -526,9 +527,13 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
      *  `warp`: the layer's Stabilize warp (setTransform arguments, original → stabilized layer pixels); the grade then reads the
      *  stabilized picture and mattes, as export grades the stabilized bake, and the result needs no further warp. */
     draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame,filmAt?:number,warp?:Affine) {
-      if(lastDraw===answer)lastDraw=undefined;
-      // Dehaze/Clarity never run in 16F/8-bit (P reaches 2³², E[l²] − E[l]² cancels): without float targets the picture takes the exact software preview.
-      if(!floatRender&&nodes.some(n=>n.enabled&&n.clipId===clip.id&&detailActive(n.parameters))){if(hasACES(nodes,clip.id))throw Error('Dehaze and Clarity need a GPU with float render targets.');return (software??=createSoftwareColorPreview(onReady)).draw(source,clip,asset,nodes,video,masks,snapshot,filmAt,warp);}
+      if(lastDraw===answer)lastDraw=undefined;evict();
+      // Dehaze/Clarity never run in 16F/8-bit (P reaches 2³², E[l²] − E[l]² cancels). The exact software preview takes seconds a frame on the
+      // main thread at layer size, so without float targets the viewer says so instead, and picks on this clip get no answer now.
+      if(!floatRender&&nodes.some(n=>n.enabled&&n.clipId===clip.id&&detailActive(n.parameters))){
+        for(const p of probes)if(nodes.some(n=>n.id===p.nodeId&&n.clipId===clip.id)){probes.delete(p);p.resolve(null);}
+        throw Error('Dehaze and Clarity need a GPU with float render targets.');
+      }
       const key=preload(clip,asset),look=key?looks.get(key):neutral;
       if(look instanceof Error)throw look;if(!look)throw new ColorPending('Preparing color…');
       const frame=video&&typeof VideoFrame!=='undefined'?frameFor(video,snapshot,true):undefined;
@@ -613,7 +618,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
       lastDraw=answer;
       return canvas;
     },
-    dispose(){if(lastDraw===answer)lastDraw=undefined;worker.terminate();gl.deleteTexture(neutral.texture);for(const look of looks.values())if(look&&!(look instanceof Error))gl.deleteTexture(look.texture);targets.forEach(drop);targets.clear();software?.dispose();gl.deleteTexture(picture);gl.deleteTexture(parameters);gl.deleteTexture(maskTexture);gl.deleteTexture(curveTexture);gl.deleteTexture(lutTexture);gl.deleteTexture(blank);planes.forEach(t=>gl.deleteTexture(t));acesTables.forEach(t=>gl.deleteTexture(t));gl.deleteProgram(program);gl.deleteProgram(filmProgram);gl.deleteProgram(detailProgram);gl.getExtension('WEBGL_lose_context')?.loseContext();looks.clear();},
+    dispose(){if(lastDraw===answer)lastDraw=undefined;worker.terminate();gl.deleteTexture(neutral.texture);for(const look of looks.values())if(look&&!(look instanceof Error))gl.deleteTexture(look.texture);targets.forEach(drop);targets.clear();gl.deleteTexture(picture);gl.deleteTexture(parameters);gl.deleteTexture(maskTexture);gl.deleteTexture(curveTexture);gl.deleteTexture(lutTexture);gl.deleteTexture(blank);planes.forEach(t=>gl.deleteTexture(t));acesTables.forEach(t=>gl.deleteTexture(t));gl.deleteProgram(program);gl.deleteProgram(filmProgram);gl.deleteProgram(detailProgram);gl.getExtension('WEBGL_lose_context')?.loseContext();looks.clear();},
   };
 }
 
