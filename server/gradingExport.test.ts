@@ -1,5 +1,5 @@
-// Color page v3 through the real export renderer: windows and film take the per-frame colour worker (never a LUT), at the
-// preview's source frame numbers, in exports, /api/frames stills and on adjustment clips.
+// Color page v3 through the real export renderer: windows, film, dehaze and clarity take the per-frame colour worker (never a
+// LUT), at the preview's source frame numbers, in exports, /api/frames stills and on adjustment clips.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
@@ -97,4 +97,43 @@ test('an adjustment clip with windows and film grades the composite under it, on
       assert.ok(Math.abs(at(out[6], 20, 30) - at(out[7], 20, 30)) > 1e-3 || Math.abs(at(out[6], 40, 8) - at(out[7], 40, 8)) > 1e-3, 'its grain moves from frame to frame');
     }
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('dehaze and clarity alone export frame by frame through the colour worker, never a table', { skip, timeout: 180_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-grading-detail-'));
+  try {
+    // Flat grey 128 on the left, a 4-pixel 128/176 checker on the right: the same grey 128 on both sides, which no table can tell apart.
+    const source = path.join(dir, 'texture.mkv');
+    await run(ff, ['-v', 'error', '-y', '-f', 'lavfi', '-i', "color=c=0x808080:s=64x36:r=24:d=2,format=gray,geq=lum='if(lt(X,32),128,if(mod(floor(X/4)+floor(Y/4),2),176,128))',format=gbrp", '-c:v', 'ffv1', '-pix_fmt', 'gbrp', source]);
+    const flat = (f: Float32Array) => at(f, 8, 18) * 255, grey = (f: Float32Array) => at(f, 48, 16) * 255, light = (f: Float32Array) => at(f, 52, 16) * 255;
+    for (const properties of [{}, { colorPipeline: 'nodes-v2', inputProfile: 'Gamma 2.4', inputGamut: 'Rec.709' }] as Record<string, string>[]) {
+      for (const [name, parameters] of [['dehaze', { dehaze: 60 }], ['clarity', { clarity: 100 }]] as [string, Record<string, number>][]) {
+        const outputPath = path.join(dir, `${name}-${Object.keys(properties).length}.mov`), stages: string[] = [];
+        await renderTimeline({ project, timeline: { id: 't', projectId: 'p', name: 'T', duration: 1 }, tracks: [track('v1', 1)], clips: [clip('shot', { mediaId: 'texture', properties: { ...properties } })],
+          nodes: [node('d', 'shot', 1, parameters)], assets: [{ asset: asset('texture'), path: source }], outputPath, onStage: stage => stages.push(stage),
+          settings: { fps: '24', resolution: '64 × 36', codec: 'Apple ProRes 4444', audio: 'Disabled', rangeIn: '0', rangeOut: '.25' } });
+        assert.ok(stages.some(s => /^Processing color · shot \(1\/1\) · \d+%$/.test(s)), `${name}: graded frame by frame by the worker (${stages.join(' | ')})`);
+        const [picture] = await frames(outputPath), where = `${name} ${properties.colorPipeline ?? 'legacy'}: flat ${flat(picture).toFixed(1)}, textured 128 ${grey(picture).toFixed(1)}, 176 ${light(picture).toFixed(1)}`;
+        // color-render.py: dehaze 60 takes flat grey to 114.6 and the textured 128 to 105.5; clarity 100 leaves the flat field and makes the texture 121.4 / 185.5.
+        if (name === 'dehaze') assert.ok(flat(picture) < 122 && grey(picture) < flat(picture) - 5, where);
+        else assert.ok(Math.abs(flat(picture) - 128) < 1.5 && grey(picture) < 125 && light(picture) > 181, where);
+      }
+    }
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('without the colour worker a dehaze or clarity grade refuses to export, naming them', { timeout: 60_000 }, async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'frameline-grading-noworker-')), saved = process.env.FRAME_LINE_COLOR_PYTHON;
+  process.env.FRAME_LINE_COLOR_PYTHON = path.join(dir, 'no-python');
+  try {
+    const grey = path.join(dir, 'grey.mkv');
+    await run(ff, ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=0x808080:s=64x36:r=24:d=1', '-c:v', 'ffv1', '-pix_fmt', 'gbrp', grey]);
+    for (const parameters of [{ dehaze: 40 }, { clarity: -30 }] as Record<string, number>[])
+      await assert.rejects(renderTimeline({ project, timeline: { id: 't', projectId: 'p', name: 'T', duration: 1 }, tracks: [track('v1', 1)], clips: [clip('shot')], nodes: [node('d', 'shot', 1, parameters)],
+        assets: [{ asset: asset('grey'), path: grey }], outputPath: path.join(dir, 'out.mov'), settings: { fps: '24', resolution: '64 × 36', codec: 'Apple ProRes 4444', audio: 'Disabled', rangeIn: '0', rangeOut: '.25' } }),
+      /shot: this grade \(film, dehaze, clarity, windows, ACES or a mask\) exports through the colour worker, which is not installed here/);
+  } finally {
+    if (saved === undefined) delete process.env.FRAME_LINE_COLOR_PYTHON; else process.env.FRAME_LINE_COLOR_PYTHON = saved;
+    await rm(dir, { recursive: true, force: true });
+  }
 });

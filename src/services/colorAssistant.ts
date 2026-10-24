@@ -1,7 +1,7 @@
 import { colorStages, interpretation, primaryDefaults, processingStages, validateGradeNode } from './color.ts';
 import type { Clip, ColorCurve, GradeNode, MediaAsset } from '../state/models.ts';
 import { recipeLook, RECIPES } from './colorLooks.ts';
-import { hasQualifier, hasWindow } from './grading.ts';
+import { detailParams, hasQualifier, hasWindow } from './grading.ts';
 
 /** Shared by server and client: the model only proposes these numbers; SharedCut's engine renders and applies them. */
 export type AssistantMode = 'looks' | 'balance' | 'match';
@@ -165,16 +165,17 @@ export function eligibility(clip: Clip, asset: MediaAsset | undefined, nodes: Gr
   if (Object.entries(clip.keyframes ?? {}).some(([path, keys]) => keys?.length && prefixes.some(p => path.startsWith(p)))) return no('keyframed', 'A grade node on this shot is keyframed.');
   return { ok: true };
 }
-/** Pure: the clip's node list after the change, plus per-node changes (null = removed). Never touches CST/LUT nodes, masks, keyframes or clip properties. */
+/** Pure: the clip's node list after the change, plus per-node changes (null = removed). Never touches CST/LUT nodes, masks, keyframes, clip properties or a node's Dehaze/Clarity. */
 export function proposedNodes(clip: Clip, nodes: GradeNode[], change: { balance?: BalanceValues; look?: { look: LookValues; extraNodes: LookValues[] } }, id: (prefix: string) => string): { next: GradeNode[]; changes: { id: string; value: GradeNode | null }[] } {
   const { balance, look, output, extras } = findGradeNodes(clip, nodes), changes: { id: string; value: GradeNode | null }[] = [];
-  if (change.balance) { if (!balance) throw Error(`${clip.name}: no Balance node to change.`); changes.push({ id: balance.id, value: { ...structuredClone(balance), enabled: true, parameters: balanceParameters(change.balance) } }); }
+  if (change.balance) { if (!balance) throw Error(`${clip.name}: no Balance node to change.`); changes.push({ id: balance.id, value: { ...structuredClone(balance), enabled: true, parameters: { ...balanceParameters(change.balance), ...detailParams(balance.parameters) } } }); }
   if (change.look) {
     const { look: values, extraNodes } = change.look, lo = look?.order ?? 0, hi = output?.order ?? 0;
     if (!look || !output || !(hi > lo)) throw Error(`${clip.name}: the Look node must come before the ACES 2 output.`);
     if (extraNodes.length > LIMITS.extraNodes) throw Error(`Use at most ${LIMITS.extraNodes} extra look nodes.`);
     // A bypassed target is switched back on: otherwise every proposal would be a silent no-op. Only the node being changed.
-    changes.push({ id: look.id, value: { ...structuredClone(look), enabled: true, ...lookNodePatch(values, () => id('point')) } });
+    const patch = lookNodePatch(values, () => id('point'));
+    changes.push({ id: look.id, value: { ...structuredClone(look), enabled: true, ...patch, parameters: { ...patch.parameters, ...detailParams(look.parameters) } } });
     for (const n of extras) if (!n.effects?.length) changes.push({ id: n.id, value: null });
     const at = look.position ?? { x: 400, y: 80 };
     extraNodes.forEach((values, i) => { const nodeId = id('ai-look'); changes.push({ id: nodeId, value: { id: nodeId, projectId: clip.projectId, clipId: clip.id, name: `Look ${i + 2}`, kind: 'serial', enabled: true, order: lo + (i + 1) * (hi - lo) / (extraNodes.length + 1), position: { x: at.x, y: at.y + 120 * (i + 1) }, ...lookNodePatch(values, () => id('point')) } }); });

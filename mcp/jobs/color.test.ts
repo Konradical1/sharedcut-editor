@@ -203,7 +203,7 @@ test('color-grade summarizes windows, the qualifier, HSL curves, the mixer and f
   const look = nodes(a.id).find(n => n.name === 'Look')!, flat = (id: string, ys: number[]) => ({ mode: 'smooth' as const, points: ys.map((y, i) => ({ id: `${id}${i}`, x: i / (ys.length - 1), y })) });
   await edit(run => run('updateNode', look.id, {
     parameters: { circOn: 1, circX: .5, circY: .4, circW: .3, circH: .2, circSoft: .1, circInvert: 1, gradOn: 1, gradY: .3, qualOn: 1, qualHue: 25, qualHueWidth: 30, qualHueSoft: 10, qualSatLow: 20, qualSatHigh: 80, qualLumLow: 10, qualLumHigh: 90, qualSatSoft: 5,
-      mixRR: .4, mixRG: .5, mixRB: .1, mixMono: 1, filmGrain: 20, filmHalation: 15, filmBloom: 8, filmVignette: 10, filmGrainSize: 1.3, logShadowB: .01, pivot: .336 },
+      mixRR: .4, mixRG: .5, mixRB: .1, mixMono: 1, filmGrain: 20, filmHalation: 15, filmBloom: 8, filmVignette: 10, filmGrainSize: 1.3, logShadowB: .01, dehaze: 60, clarity: -35, pivot: .336 },
     curves: { ...look.curves, HueSat: flat('hs', [.5, .5, .3, .5, .5]), LumSat: flat('ls', [.5, .6, .5]) },
   }));
   await edit(run => run('setKeyframes', a.id, `nodes.${look.id}.parameters.circX`, [{ id: 'k1', time: 0, value: .3, interpolation: 'linear' }, { id: 'k2', time: a.duration, value: .7, interpolation: 'linear' }]));
@@ -212,6 +212,7 @@ test('color-grade summarizes windows, the qualifier, HSL curves, the mixer and f
   assert.match(line, / logShadowB=0\.01 /);
   assert.match(line, / qualSatSoft=5 /, 'the rarely used softness stays a plain value');
   assert.match(line, / filmGrainSize=1\.3 /);
+  assert.match(line, / dehaze=60 clarity=-35 /, 'dehaze and clarity are plain values');
   assert.ok(!/pivot=/.test(line), 'a stored .336 is the default pivot');
   assert.match(line, / curves RGB3 hsl HueSat5,LumSat3 /);
   assert.match(line, / circ\(\.5~,\.4 r\.3x\.2 soft \.1 inv\) /, 'a keyframed field is marked ~');
@@ -326,6 +327,14 @@ test('the grade model answers exactly where the grade is linear, and stays finit
   assert.ok(up > .1 && up < 3 && down < -.1, `exposure ${up} ${down}`);
   assert.ok(log.balance(40, 2, 0).every(Number.isFinite) && log.balance(40, 2, 0)[0] > 0, 'warmer needs a higher temperature');
   assert.ok(log.channels(['gainR', 'gainG', 'gainB'], 60, [1, 0, -1]).every(Number.isFinite));
+  // Dehaze and clarity are spatial: the model leaves them out instead of reading the maps a probe grey has none of.
+  const kept = s().nodes, look = kept.find(n => n.clipId === b.id && n.name === 'Look')!;
+  try {
+    store.setState({ nodes: kept.map(n => n.id === look.id ? { ...n, parameters: { ...n.parameters, dehaze: -50, clarity: 60 } } : n) });
+    const hazy = gradeModel(s().clips.find(c => c.id === b.id)!, b.start + b.duration / 2)!;
+    assert.equal(hazy.exposure(30, 45), up);
+    assert.deepEqual(hazy.balance(40, 2, 0), log.balance(40, 2, 0));
+  } finally { store.setState({ nodes: kept }); }
 });
 
 test('followed literally round by round, the hints match a white balance or an exposure change on Balance (CPU reference)', () => {
@@ -392,7 +401,7 @@ test('the help topic is the parameter registry, the look library and the grading
   assert.ok(lines.includes('## Wheels: Shadows/Midtones/Highlights/Offset = DaVinci Lift/Gamma/Gain/Offset, stored as lift/gamma/gain/offset'));
   assert.ok(lines.some(line => line.startsWith('qualOn 0|1 ')));
   for (const look of COLOR_LOOKS) assert.ok(lines.some(line => line.startsWith(`- ${look.id}: `) || line.startsWith(`- ${look.id} (`)), look.id);
-  for (const topic of ['Log wheels:', 'HSL curves', 'Qualifier (qualOn 1)', 'Windows (', 'Film:', 'color-measure{', 'Looks: act applyColorLook', '- match a reference picture: 1) job color-measure', '- sky:', '- skin:', '- black and white:']) assert.ok(text.includes(topic), topic);
+  for (const topic of ['Log wheels:', 'HSL curves', 'Qualifier (qualOn 1)', 'Windows (', 'Film:', 'color-measure{', 'Looks: act applyColorLook', '- match a reference picture: 1) job color-measure', '- sky:', '- skin:', '- black and white:', '- hazy landscape: a node after Balance with dehaze 50–70', '## Detail (spatial, first in the node']) assert.ok(text.includes(topic), topic);
   assert.match(text, /gammas: Rec\.709, S-Log3, .*Gamma 2\.4/);
   assert.ok(!text.includes('hue≠0'), 'hue renders now');
   // Hints go a round at a time (exposure or white balance first, measure again), and the wheels say what they do on each pipeline.

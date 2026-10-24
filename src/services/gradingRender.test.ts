@@ -7,7 +7,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { colorTransform, defaultCST, processingStages, starterGrade } from './color.ts';
+import { colorTransform, defaultCST, encodeLog, gradePicture, processingStages, starterGrade } from './color.ts';
 import { eligibility } from './colorAssistant.ts';
 import { GRADE_PARAMS, windowAlpha, opponent, hueOf } from './grading.ts';
 import { applyFilm } from './filmLook.ts';
@@ -141,6 +141,44 @@ test('the film stage renders like applyFilm, between nodes, at the source frame'
   }
 });
 
+/** final_detail.pattern(H, W), encoded: a linear blue sky with a 1.6 cloud over a hazy textured ridge (what Dehaze and Clarity read). */
+function hazy(width: number, height: number, encode = (v: number) => v) {
+  const rgb = new Float32Array(width * height * 3);
+  for (let i = 0; i < height; i++) for (let j = 0; j < width; j++) {
+    const v = (i + .5) / height, u = (j + .5) / width, ridge = .38 + .06 * Math.sin(6.1 * u) + .02 * Math.sin(31 * u), fade = 1 - .6 * Math.min(Math.max(v - ridge, 0), 1);
+    const tex = 2 ** (.8 * Math.sin(53 * u + 3 * v) * Math.sin(41 * v - 2 * u) + .4 * Math.sin(170 * u) * Math.sin(150 * v));
+    rgb.set(((u - .3) ** 2 * (width / height) ** 2 + (v - .18) ** 2 < .07 ** 2 ? [1.6, 1.6, 1.6] : v < ridge ? [.2, .28, .55].map(c => c * (1 + .25 * v)) : [1, .95, .86].map((c, k) => .045 * tex * c * .5 + [.3, .33, .38][k] * .5 * fade)).map(encode), (i * width + j) * 3);
+  }
+  return rgb;
+}
+
+test('Dehaze and Clarity grade like gradePicture: alone, in the C993 grade through ACES 2, legacy, after film, under a window and a qualifier, k = 0..3', { skip, timeout: 300_000 }, t => {
+  const apple = { id: 'c', properties: { colorPipeline: 'nodes-v2', inputProfile: 'Apple Log', inputGamut: 'Rec.2020' } } as unknown as Clip, log = (v: number) => encodeLog(v * 1.9, 'Apple Log');
+  // Konrad's C993 grade (lab c993-stages.json) with a detail node between Balance and Look. TS has no ACES 2 (OCIO only): both engines
+  // grade the four nodes, then the same worker's ACES 2 output stages turn each into display codes.
+  const c993 = [node('in', 1, {}, { effects: [defaultCST('cst-in', 'Apple Log', 'Rec.2020')] }), node('balance', 2, { exposure: -.95, pivot: .336043 }), node('detail', 2.5, { dehaze: 60, clarity: 35 }),
+    node('look', 3, { pivot: .336, saturation: 117, boost: 25, shadows: 25, highlights: -15, logHighRange: .42, logHighlightR: .02, logHighlightB: -.02, logMidR: .005, logMidB: .002, logShadowR: -.002, logShadowB: .0015, gainR: .005, gainB: -.006, logMidG: .001 })];
+  const aces = processingStages(apple, [...c993, node('out', 4, {}, { effects: [{ ...defaultCST('cst-out', 'DaVinci Intermediate', 'DaVinci Wide Gamut', 'Gamma 2.4', 'Rec.709'), toneMapping: 'aces2', gamutMapping: 'none' }] })]).filter(s => s.node.id === 'out');
+  const film = node('f', 1.5, { filmHalation: 80, filmHalationRadius: 6, filmBloom: 60, filmBloomRadius: 18, filmVignette: 40, filmGrain: 40, filmGrainSeed: 3 });
+  const cases: { name: string; clip: Clip; width: number; height: number; nodes: GradeNode[]; picture?: Float32Array; display?: boolean; film?: boolean }[] = [
+    { name: 'detail only, two nodes back to back', clip: managed, width: 160, height: 90, nodes: [node('d', 1, { dehaze: 60, clarity: 40, exposure: .3, temperature: 500, tint: -10 }), node('e', 2, { dehaze: -50, clarity: -40, saturation: 110 })] },
+    { name: 'C993 through ACES 2, 963×541 (k = 1)', clip: apple, width: 963, height: 541, nodes: c993, picture: hazy(963, 541, log), display: true },
+    { name: 'legacy', clip: legacy, width: 157, height: 91, nodes: [node('d', 1, { dehaze: 50, clarity: 30, gain: .9, saturation: 110, lift: .02 }), node('e', 2, { dehaze: -40, contrast: 1.1 })] },
+    { name: 'after a film node', clip: managed, width: 240, height: 135, nodes: [node('a', 1, { offset: .02 }), film, node('d', 1.7, { dehaze: 60, clarity: 50 }), node('b', 2, { saturation: 120 })], film: true },
+    { name: 'under a gradient window and a qualifier', clip: managed, width: 200, height: 113, nodes: [node('d', 1, { dehaze: 70, clarity: 60, gain: 1.05, gradOn: 1, gradAngle: 160, gradY: .5, gradSoft: .3, qualOn: 1, qualLumLow: 30, qualLumSoft: 15 })] },
+    { name: '75×1081 (k = 2)', clip: managed, width: 75, height: 1081, nodes: [node('d', 1, { dehaze: 100, clarity: 100 })] },
+    { name: '121×2161 (k = 3)', clip: managed, width: 121, height: 2161, nodes: [node('d', 1, { dehaze: 35, clarity: -40, exposure: -.5 })] },
+  ];
+  for (const { name, clip, width, height, nodes, picture = hazy(width, height, v => encodeLog(v, clip === legacy ? 'Gamma 2.4' : 'DaVinci Intermediate')), display, film: filmed } of cases) {
+    const extra = filmed ? { filmFrame: 5, numericFps: 24 } : {}, [py] = stream(job(clip, nodes, extra), [picture], width, height), ts = gradePicture(clip, undefined, nodes, picture, width, height, { frame: 5 });
+    const finish = (rgb: Float32Array) => display ? stream({ stages: aces, managed: true }, [rgb], width, height)[0].map(clamp) : rgb;
+    const { max, mean } = worst(finish(ts), finish(py.map(clamp)));
+    t.diagnostic(`${name}: max ${(max * 255).toExponential(1)}, mean ${(mean * 255).toExponential(1)} ${display ? 'display' : 'output'} codes (of 255)`);
+    assert.ok(max <= 1e-4, `${name}: mean ${mean} max ${max}`);
+    assert.ok(worst(py.map(clamp), stream(job(clip, nodes.map(n => ({ ...n, parameters: { ...n.parameters, dehaze: 0, clarity: 0 } })), extra), [picture], width, height)[0].map(clamp)).max > .02, `${name}: the tools show`);
+  }
+});
+
 test('the Color Assistant and Normalize workers grade through film stages (skipped) and windows (by stripe rows)', { skip }, () => {
   const dir = mkdtempSync(join(tmpdir(), 'frameline-grading-assistant-'));
   try {
@@ -167,10 +205,10 @@ test('the Color Assistant leaves shots with a window or a qualifier alone; film 
   assert.equal(with_('Balance', { circOn: 0, qualOn: 0, filmGrain: 30 }), 'ok', 'switched-off tools and film stay eligible');
 });
 
-test('LUT bakes and grades without positions refuse windows and film', { skip }, () => {
+test('LUT bakes and grades without positions refuse windows, film, dehaze and clarity', { skip }, () => {
   const dir = mkdtempSync(join(tmpdir(), 'frameline-grading-cube-'));
   try {
-    for (const parameters of [{ circOn: 1 }, { filmGrain: 20 }] as Record<string, number>[]) {
+    for (const parameters of [{ circOn: 1 }, { filmGrain: 20 }, { dehaze: 30 }, { clarity: -20 }] as Record<string, number>[]) {
       writeFileSync(join(dir, 'job.json'), JSON.stringify(job(managed, [node('n', 1, { offset: .1, ...parameters })])));
       assert.throws(() => execFileSync(python, [script, join(dir, 'job.json'), '--cube', '9', join(dir, 'out.cube')], { stdio: 'pipe' }), /whole frames/);
     }

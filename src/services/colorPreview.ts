@@ -2,9 +2,8 @@ import type { SmartMaskPixels } from './smartMaskPreview.ts';
 import { nodeMaskId } from './smartMask.ts';
 import { acesShader, acesTextures } from './aces.generated.ts';
 import { createCopyProbe } from './copyProbe.ts';
-import { processingStages, sampleCurve, identityCurve, luminanceWeights, interpretation, profiles, hasACES, colorTransform, type Cube } from './color.ts';
-import { HSL_CURVES, HUE_CURVES, PARAM, filmActive, filmMotion, grainKey, halationTint, hasQualifier, hasWindow, on, periodicCurve, windowAlpha } from './grading.ts';
-import { applyFilm } from './filmLook.ts';
+import { processingStages, sampleCurve, identityCurve, luminanceWeights, interpretation, profiles, hasACES, colorTransform, gradePicture, detailPoint, detailGain, type Cube } from './color.ts';
+import { DETAIL, HSL_CURVES, HUE_CURVES, PARAM, detailActive, filmActive, filmMotion, grainKey, halationTint, hasQualifier, hasWindow, on, periodicCurve, windowAlpha } from './grading.ts';
 import { apply, invert, type Affine } from './colorKeys.ts';
 import type { Clip, GradeNode, MediaAsset } from '../state/models.ts';
 
@@ -77,6 +76,48 @@ export const TRANSFER = `
   vec3 decodeRGB(vec3 v,int p){return vec3(decode(v.r,p),decode(v.g,p),decode(v.b,p));}
   vec3 encodeRGB(vec3 v,int p){return vec3(encode(v.r,p),encode(v.g,p),encode(v.b,p));}
   float sse(float a,float b,float x){return b>a?smoothstep(a,b,x):x>=a?1.:0.;}`;
+/** Bilinear at normalised q with half-pixel centres and clamped edges, in full float precision (hardware LINEAR weights are ~8-bit). */
+const BILINEAR = `
+  vec4 bilinear(sampler2D t,vec2 q){vec2 n=vec2(textureSize(t,0)),p=clamp(q*n-.5,vec2(0),n-1.),f=p-floor(p);ivec2 a=ivec2(p),b=min(a+1,ivec2(n)-1);return mix(mix(texelFetch(t,a,0),texelFetch(t,ivec2(b.x,a.y),0),f.x),mix(texelFetch(t,ivec2(a.x,b.y),0),texelFetch(t,b,0),f.x),f.y);}`;
+/** Dehaze/Clarity constants (grading.ts DETAIL) as GLSL floats, stops re 18 % grey and the soft cap of the removed fraction. */
+const DETAIL_GLSL = Object.entries(DETAIL).map(([k, v]) => `const float ${k}=${Number.isInteger(v) ? v.toFixed(1) : v};`).join('') + `
+  float stopsOf(float x){return log2(max(x,0.)+TOE)-log2(.18);}
+  float softcap(float u){float r=u/UMAX;r*=r;return u/sqrt(sqrt(1.+r*r));}`;
+
+/**
+ * Dehaze/Clarity maps (docs/color-grading-v3.md, "Detail"; filmLook.ts detailMaps), every target RGBA32F: 0 the sources
+ * SA = (l, l², lm, mx), SB = 1/clamp(lin, M0, 1)⁴ from the node input decoded × G, halved once unless k = 0; 1 a 2×2 halving of
+ * both; 2 one Gaussian direction of srcA; 3 the small vertical Gaussian of SB with the soft dark channel → T1, T2; 4 both
+ * Gaussians in one direction; 5 the vertical one with the coefficients → B2 (= M2), C. Gaussian weights come as `taps`.
+ */
+const DETAIL_SHADER = `#version 300 es
+  precision highp float; precision highp int; precision highp sampler2D;
+  uniform sampler2D srcA, srcB;
+  uniform int pass, profile, radius; uniform bool horizontal, halve; uniform vec3 weights, gain; uniform float taps[25];
+  layout(location=0) out vec4 outA; layout(location=1) out vec4 outB;
+  ${TRANSFER}
+  ${DETAIL_GLSL}
+  void source(ivec2 p,inout vec4 a,inout vec4 b){vec3 lin=decodeRGB(texelFetch(srcA,p,0).rgb,profile)*gain,r=1./clamp(lin,M0,1.);float l=stopsOf(dot(weights,lin)),mx=max(max(lin.r,max(lin.g,lin.b)),0.),lm=stopsOf(mx);r*=r;a+=vec4(l,l*l,lm,mx);b+=vec4(r*r,0);}
+  vec4 blur(sampler2D t,ivec2 p){ivec2 n=textureSize(t,0)-1;vec4 s=vec4(0);for(int k=-radius;k<=radius;k++)s+=taps[abs(k)]*texelFetch(t,horizontal?ivec2(clamp(p.x+k,0,n.x),p.y):ivec2(p.x,clamp(p.y+k,0,n.y)),0);return s;}
+  void main(){
+    ivec2 p=ivec2(gl_FragCoord.xy);outA=vec4(0);outB=vec4(0);
+    if(pass<2){
+      if(pass==0&&!halve){source(p,outA,outB);return;}
+      ivec2 a=2*p,b=min(a+1,textureSize(srcA,0)-1),q[4]=ivec2[4](a,ivec2(b.x,a.y),ivec2(a.x,b.y),b);
+      for(int i=0;i<4;i++)if(pass==0)source(q[i],outA,outB);else{outA+=texelFetch(srcA,q[i],0);outB+=texelFetch(srcB,q[i],0);}
+      outA/=4.;outB/=4.;return;
+    }
+    if(pass==2){outA=blur(srcA,p);return;}
+    if(pass==3){
+      // Power-mean soft minimum per channel, its veil colour within SMAX stops of neutral, sky and clouds out before any blur.
+      vec3 sm=1./sqrt(sqrt(blur(srcA,p).rgb));vec4 sa=texelFetch(srcB,p,0);float vr=log2(sm.r/sm.g),vb=log2(sm.b/sm.g),sc=min(1.,SMAX/max(sqrt(vr*vr+vb*vb),1e-6)),dk=min(sm.r,min(sm.g,sm.b))*(1.-smoothstep(GLO,GHI,sa.w));
+      outA=vec4(sa.xyz,sa.z*sa.z);outB=vec4(dk,sa.z*dk,dk*vr*sc,dk*vb*sc);return;
+    }
+    if(pass==4){outA=blur(srcA,p);outB=blur(srcB,p);return;}
+    // Clarity's self-guided base of l, and the haze map guided by lm so it snaps to ridgelines.
+    vec4 b1=blur(srcA,p),b2=blur(srcB,p);float vl=max(b1.y-b1.x*b1.x,0.),vm=max(b1.w-b1.z*b1.z,0.),ac=vl/(vl+EPS_C),al=(b2.y-b1.z*b2.x)/(vm+EPS_D);
+    outA=b2;outB=vec4(ac,(1.-ac)*b1.x,al,b2.x-al*b1.z);
+  }`;
 
 /**
  * Film stage passes (docs/color-grading-v3.md, filmLook.ts): 0 weave/aberration resample and decode (rgb = linear, a = luma);
@@ -92,8 +133,7 @@ const FILM_SHADER = `#version 300 es
   out vec4 pixel;
   ${TRANSFER}
   vec4 at(ivec2 p){vec4 l=texelFetch(src,p,0);return srcMode==1?vec4(max(0.,l.a-thresholds.x)):srcMode==2?vec4(l.rgb*(max(0.,l.a-thresholds.y)/max(l.a,1e-4)),0):l;}
-  // Bilinear at normalised q with half-pixel centres and clamped edges, in full float precision (hardware LINEAR weights are ~8-bit).
-  vec4 bilinear(sampler2D t,vec2 q){vec2 n=vec2(textureSize(t,0)),p=clamp(q*n-.5,vec2(0),n-1.),f=p-floor(p);ivec2 a=ivec2(p),b=min(a+1,ivec2(n)-1);return mix(mix(texelFetch(t,a,0),texelFetch(t,ivec2(b.x,a.y),0),f.x),mix(texelFetch(t,ivec2(a.x,b.y),0),texelFetch(t,b,0),f.x),f.y);}
+  ${BILINEAR}
   float hash(ivec2 p,uint k){uint h=(uint(p.x)*0x8da6b343u)^(uint(p.y)*0xd8163841u)^(k*0xcb1ab31fu);h^=h>>16u;h*=0x7feb352du;h^=h>>15u;h*=0x846ca68bu;h^=h>>16u;return float(h>>8u)/16777216.;}
   float noise(vec2 p,uint k){vec2 i=floor(p),f=p-i,u=f*f*(3.-2.*f);ivec2 c=ivec2(i);float a=hash(c,k),b=hash(c+ivec2(1,0),k),d=hash(c+ivec2(0,1),k),e=hash(c+ivec2(1),k);a+=(b-a)*u.x;d+=(e-d)*u.x;return a+(d-a)*u.y;}
   float grainAt(vec2 p,uint k){return 1.6*(.7*(2.*noise(p,k)-1.)+.3*(2.*noise(2.37*p+17.1,k^0x68E31DA4u)-1.));}
@@ -141,9 +181,11 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
   ${acesShader}
   out vec4 pixel;
   uniform sampler2DArray maskAtlas;
-  uniform sampler2D picture, parameters, luma, chromaU, chromaV, curves, lutAtlas, film; uniform sampler3D grade;
-  uniform float size, stops, warmth; uniform vec3 domainMin, domainMax; uniform int profile, first, count, yuvMode, viewStage, viewMode; uniform vec4 sourceRect, yuvCoefficients, yuvScale, pictureRect; uniform vec2 canvasSize; uniform ivec2 origin, region; uniform float fullRange; uniform mat3 unwarp; uniform bool nativeView, managed, displaySRGB, fromFilm, toCanvas;
+  uniform sampler2D picture, parameters, luma, chromaU, chromaV, curves, lutAtlas, film, detailM1, detailM2; uniform sampler3D grade;
+  uniform float size, stops, warmth; uniform vec3 domainMin, domainMax; uniform int profile, first, count, yuvMode, viewStage, viewMode, detailStage; uniform vec4 sourceRect, yuvCoefficients, yuvScale, pictureRect; uniform vec2 canvasSize; uniform ivec2 origin, region; uniform float fullRange; uniform mat3 unwarp; uniform bool nativeView, managed, displaySRGB, fromFilm, toCanvas;
   ${TRANSFER}
+  ${BILINEAR}
+  ${DETAIL_GLSL}
   float decode(float v){return decode(v,profile);}
   float encode(float v){return encode(v,profile);}
   float customCurve(float v,int row){
@@ -194,6 +236,20 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     vec4 g=param(28,n);if(g.y!=0.){vec4 s=param(29,n);a=sse(-s.z/2.,s.z/2.,(p.x-g.z)*aspect*s.x-(p.y-g.w)*s.y);keep*=1.-(g.y==2.?1.-a:a);any=true;}
     return any?1.-keep:1.;
   }
+  vec3 nodeGain(vec4 a,vec4 c,vec4 d){return exp2(a.x)*vec3(1.+c.w,1.-d.w,1.-c.w);}
+  // Dehaze, then Clarity (grading.ts applyDetail) on linear light at box position q: maps M1 = (a_c, b_c, α, β), M2 = (μd, ·, dvr, dvb); texel 9 = amounts.
+  vec3 detailStep(vec3 lin,vec3 w,int n,vec2 q){
+    vec4 m1=bilinear(detailM1,q),m2=bilinear(detailM2,q),k=param(9,n);float y=dot(w,lin),l=stopsOf(y),ac=m1.x,bc=m1.y,base=ac*l+bc;vec3 o=lin;
+    if(k.x!=0.){
+      float am=RM*ac/(RM*ac+1.-ac),bm=am*l+(1.-am)*bc/max(1.-ac,1e-3),mu=.18*exp2(bm),h=y>1e-6?clamp(m1.z*(bm+stopsOf(max(max(lin.r,max(lin.g,lin.b)),0.))-l)+m1.w,0.,1.)*(1.-smoothstep(LO,HI,y)):0.;
+      if(k.x>0.){
+        float t=max(1.-OMEGA*k.x*h,TMIN),s=1.-t,uc=softcap(s/max(y,1e-6)),g=(1.-uc)/t,gc=g*(1.-CHROMA)+CHROMA/t,den=m2.x+VEPS;vec3 col=vec3(exp2(m2.z/den),1.,exp2(m2.w/den));
+        o=(g*y+gc*(lin-y-uc*y*(col/dot(w,col)-1.)))*exp2(-KAPPA*log2((1.-softcap(s/max(mu,1e-6)))/t));
+      }else{float v=-k.x*(KN*max(mu-TOE,0.)*(1.-smoothstep(LO,HI,y))+KH*h);o=(lin+v)*exp2(KAPPA_N*log2(mu/(mu+v)));}
+    }
+    if(k.y!=0.){float d=l-base,f=d/sqrt(1.+(d/D)*(d/D)),mid=smoothstep(-6.,-1.5,base)*(1.-smoothstep(2.,5.,base)),g=ac/(ac+GATE*(1.-ac));o*=exp2(k.y*(k.y>0.?2.:1.)*mid*g*f);}
+    return o;
+  }
   // A node's end: blend over its input by mask × windows × qualifier (keyed); the key view reads that alpha.
   vec3 endNode(vec3 rgb,vec3 before,vec4 mask,int n,float keyed,vec2 coord,inout float viewAlpha){
     int se=int(mask.w);if((se&2)==0)return rgb;
@@ -241,8 +297,10 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
         rgb=endNode(mix(rgb,result,a.z),nodeInput,mask,n,keyed,maskCoord,viewAlpha);continue;
       }
       int flags=int(kind.z);
+      // A detail point (first in its segment, its maps bound): decode × G (nodes-v2 step 1; 1 on legacy stages), Dehaze/Clarity, encode.
+      if(n==detailStage)rgb=encodeRGB(detailStep(decodeRGB(rgb,int(kind.y))*(managed?nodeGain(a,c,d):vec3(1)),w,n,(pixelAt-vec2(origin))/vec2(region)),int(kind.y));
+      else if(managed&&(a.x!=0.||c.w!=0.||d.w!=0.))rgb=encodeRGB(decodeRGB(rgb,int(kind.y))*nodeGain(a,c,d),int(kind.y));
       if(managed){
-        if(a.x!=0.||c.w!=0.||d.w!=0.)rgb=encodeRGB(decodeRGB(rgb,int(kind.y))*exp2(a.x)*vec3(1.+c.w,1.-d.w,1.-c.w),int(kind.y));
         vec3 v=rgb,x=(v-a.z)*a.y+a.z+b.w+e.xyz;
         rgb=sign(x)*pow(abs(x),vec3(1.)/exp2(b.y+c.xyz))*(b.z+d.xyz)+(b.x+f.xyz)*(1.-v);
         rgb=tonal(rgb,w,a.z,flags,n);
@@ -270,18 +328,20 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     }
     if(viewMode==1)rgb=mix(vec3(.5),rgb,viewAlpha);
     pixel=vec4(clamp(rgb,0.,1.),source.a);
-  }`),filmProgram=link(FILM_SHADER);
+  }`),filmProgram=link(FILM_SHADER),detailProgram=link(DETAIL_SHADER);
   gl.useProgram(program);
   const acesTables=acesTextures.map((t,i)=>{const texture=gl.createTexture()!;gl.activeTexture(gl.TEXTURE8+i);gl.bindTexture(gl.TEXTURE_2D,texture);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.pixelStorei(gl.UNPACK_ALIGNMENT,1);gl.texImage2D(gl.TEXTURE_2D,0,t.channels===1?gl.R32F:gl.RGB32F,t.width,t.height,0,t.channels===1?gl.RED:gl.RGB,gl.FLOAT,new Float32Array(t.values));gl.uniform1i(gl.getUniformLocation(program,t.sampler),8+i);return texture;});
-  const maskTexture=gl.createTexture()!,maskUnit=8+acesTables.length,filmUnit=maskUnit+1,passUnit=filmUnit+1;
+  const maskTexture=gl.createTexture()!,maskUnit=8+acesTables.length,filmUnit=maskUnit+1,passUnit=filmUnit+1,detailUnit=passUnit+4;
   const curveTexture=gl.createTexture()!,lutTexture=gl.createTexture()!;
   const picture=gl.createTexture()!, parameters=gl.createTexture()!, planes=[gl.createTexture()!,gl.createTexture()!,gl.createTexture()!],blank=gl.createTexture()!;
   const locate=(p:WebGLProgram)=>{const cache=new Map<string,WebGLUniformLocation|null>();return (name:string)=>{if(!cache.has(name))cache.set(name,gl.getUniformLocation(p,name));return cache.get(name)!;};};
-  const uniform=locate(program),filmUniform=locate(filmProgram);
+  const uniform=locate(program),filmUniform=locate(filmProgram),detailUniform=locate(detailProgram);
   gl.uniform1i(uniform('maskAtlas'),maskUnit);gl.uniform1i(uniform('film'),filmUnit);
   gl.uniform1i(uniform('curves'),6);gl.uniform1i(uniform('lutAtlas'),7);
   gl.uniform1i(uniform('picture'),0);gl.uniform1i(uniform('grade'),1);gl.uniform1i(uniform('parameters'),2);['luma','chromaU','chromaV'].forEach((name,i)=>gl.uniform1i(uniform(name),i+3));
-  gl.useProgram(filmProgram);['src','glowH','glowB','carry'].forEach((name,i)=>gl.uniform1i(filmUniform(name),passUnit+i));gl.useProgram(program);
+  gl.uniform1i(uniform('detailM1'),detailUnit);gl.uniform1i(uniform('detailM2'),detailUnit+1);
+  gl.useProgram(filmProgram);['src','glowH','glowB','carry'].forEach((name,i)=>gl.uniform1i(filmUniform(name),passUnit+i));
+  gl.useProgram(detailProgram);['srcA','srcB'].forEach((name,i)=>gl.uniform1i(detailUniform(name),passUnit+i));gl.useProgram(program);
   const settings=(target:number,filter:number=gl.LINEAR)=>{gl.texParameteri(target,gl.TEXTURE_MIN_FILTER,filter);gl.texParameteri(target,gl.TEXTURE_MAG_FILTER,filter);gl.texParameteri(target,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(target,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);};
   type Look={texture:WebGLTexture;size:number;min:number[];max:number[]};
   gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,picture);settings(gl.TEXTURE_2D);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,1,1,0,gl.RGBA,gl.UNSIGNED_BYTE,new Uint8Array([0,0,0,255]));
@@ -344,26 +404,28 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
   const cubeIds=new WeakMap<object,number>();let nextCube=0;
   const cubeId=(cube:object)=>{if(!cubeIds.has(cube))cubeIds.set(cube,++nextCube);return cubeIds.get(cube)!;};
   // The stages behind the parameter texture, the last draw's clip and nodes (bypassed ones too), its picture box and film frame number.
-  let planned:Stage[]=[],drawn:GradeNode[]=[],drawnClip='',box=pictureBox([0,0,1,1],1,1),filmFrame=0,shownLook:Look=neutral;
-  type Target={texture:WebGLTexture;fbo:WebGLFramebuffer;width:number;height:number};
-  const targets=new Map<string,Target>();
-  /** A float render target kept by name; a new one only when its size changes. */
+  let planned:Stage[]=[],plannedV2=false,drawn:GradeNode[]=[],drawnClip='',box=pictureBox([0,0,1,1],1,1),filmFrame=0,shownLook:Look=neutral;
+  type Target={texture:WebGLTexture;fbo:WebGLFramebuffer;width:number;height:number;second?:WebGLTexture};
+  const targets=new Map<string,Target>(),drop=(t:Target)=>{gl.deleteTexture(t.texture);if(t.second)gl.deleteTexture(t.second);gl.deleteFramebuffer(t.fbo);};
+  /** A float render target kept by name; a new one only when its size changes. `pair`: a second texture at attachment 1 (MRT). */
   // ponytail: one target per name, so two film pictures of different shapes in one frame (a transition) reallocate each frame; key by size if that shows up.
-  const target=(name:string,width:number,height:number)=>{
+  const target=(name:string,width:number,height:number,pair=false)=>{
     const old=targets.get(name);if(old&&old.width===width&&old.height===height)return old;
-    if(old){gl.deleteTexture(old.texture);gl.deleteFramebuffer(old.fbo);}
-    const texture=gl.createTexture()!,fbo=gl.createFramebuffer()!;
-    gl.activeTexture(gl.TEXTURE0+passUnit);gl.bindTexture(gl.TEXTURE_2D,texture);settings(gl.TEXTURE_2D,gl.NEAREST);gl.texImage2D(gl.TEXTURE_2D,0,targetFormat,width,height,0,gl.RGBA,byteTargets?gl.UNSIGNED_BYTE:gl.FLOAT,null);
-    gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,texture,0);
-    if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE){gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.deleteTexture(texture);gl.deleteFramebuffer(fbo);throw new Error('This GPU cannot render the film stage.');}
-    const made={texture,fbo,width,height};targets.set(name,made);return made;
+    if(old)drop(old);
+    const fbo=gl.createFramebuffer()!;gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+    const attach=(i:number)=>{const t=gl.createTexture()!;gl.activeTexture(gl.TEXTURE0+passUnit);gl.bindTexture(gl.TEXTURE_2D,t);settings(gl.TEXTURE_2D,gl.NEAREST);gl.texImage2D(gl.TEXTURE_2D,0,targetFormat,width,height,0,gl.RGBA,byteTargets?gl.UNSIGNED_BYTE:gl.FLOAT,null);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0+i,gl.TEXTURE_2D,t,0);return t;};
+    const made:Target={texture:attach(0),fbo,width,height,...pair?{second:attach(1)}:{}};if(pair)gl.drawBuffers([gl.COLOR_ATTACHMENT0,gl.COLOR_ATTACHMENT1]);
+    if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE){gl.bindFramebuffer(gl.FRAMEBUFFER,null);drop(made);throw new Error('This GPU cannot render the film stage.');}
+    targets.set(name,made);return made;
   };
   const into=(out:Target|null)=>{gl.bindFramebuffer(gl.FRAMEBUFFER,out?out.fbo:null);gl.viewport(0,0,out?out.width:canvas.width,out?out.height:canvas.height);};
   /** Correction stages [first, first+count) from the source (or a film output) into a float target or, when `out` is null, the canvas. */
-  const grade=(first:number,count:number,input:Target|null,out:Target|null,viewStage:number,viewMode:number)=>{
+  /** `detail`: the stage whose Dehaze/Clarity reads the last computed maps (-1: none). */
+  const grade=(first:number,count:number,input:Target|null,out:Target|null,viewStage:number,viewMode:number,detail=-1)=>{
     gl.useProgram(program);into(out);
     gl.activeTexture(gl.TEXTURE0+filmUnit);gl.bindTexture(gl.TEXTURE_2D,input?input.texture:blank);
-    gl.uniform1i(uniform('first'),first);gl.uniform1i(uniform('count'),count);gl.uniform1i(uniform('fromFilm'),input?1:0);gl.uniform1i(uniform('toCanvas'),out?0:1);gl.uniform1i(uniform('viewStage'),viewStage);gl.uniform1i(uniform('viewMode'),viewMode);
+    if(detail>=0)maps.forEach((t,i)=>{gl.activeTexture(gl.TEXTURE0+detailUnit+i);gl.bindTexture(gl.TEXTURE_2D,t);});
+    gl.uniform1i(uniform('detailStage'),detail);gl.uniform1i(uniform('first'),first);gl.uniform1i(uniform('count'),count);gl.uniform1i(uniform('fromFilm'),input?1:0);gl.uniform1i(uniform('toCanvas'),out?0:1);gl.uniform1i(uniform('viewStage'),viewStage);gl.uniform1i(uniform('viewMode'),viewMode);
     gl.drawArrays(gl.TRIANGLES,0,3);
   };
   /** One film stage on a whole picture (`input`, the box size); returns the target holding its encoded result. */
@@ -396,11 +458,35 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
     pass(3,B,L,0,halation?.texture??blank,bloom?.texture??blank,input.texture);
     return B;
   };
-  /** Stages [0, end): segments between film stages into float targets, film passes between them, the last segment into `out` (null = canvas). */
+  /** The last detail point's maps, M1 and M2 at level k (read by the grade pass that starts at that point). */
+  let maps:WebGLTexture[]=[blank,blank],software:ReturnType<typeof createSoftwareColorPreview>|undefined;
+  /** A detail point's maps from its node input (the picture box; H = its height), as filmLook.ts detailMaps: sources halved to
+   *  level k, the small Gaussian with the soft dark channel, the large one with the coefficients, and once more on those. */
+  const detail=(stage:Extract<Stage,{type:'correction'}>,input:Target)=>{
+    const u=detailUniform,K=DETAIL,sigma=K.R/100*input.height,k=Math.max(0,Math.floor(Math.log2(sigma/4))),s=sigma/2**k;
+    const pass=(index:number,out:Target,a:WebGLTexture,b=blank)=>{[a,b].forEach((t,i)=>{gl.activeTexture(gl.TEXTURE0+passUnit+i);gl.bindTexture(gl.TEXTURE_2D,t);});into(out);gl.uniform1i(u('pass'),index);gl.drawArrays(gl.TRIANGLES,0,3);};
+    // filmBlur's Gaussian (radius ⌈3s⌉, weights exp(−i²/2s²) normalised) in one direction.
+    const taps=(sg:number,horizontal:boolean)=>{const r=Math.ceil(3*sg),w=Array.from({length:r+1},(_,i)=>Math.exp(-i*i/(2*sg*sg))),total=2*w.reduce((a,b)=>a+b)-w[0];gl.uniform1i(u('radius'),r);gl.uniform1fv(u('taps'),w.map(x=>x/total));gl.uniform1i(u('horizontal'),horizontal?1:0);};
+    gl.useProgram(detailProgram);gl.uniform1i(u('profile'),profiles.indexOf(stage.gamma as typeof profiles[number]));gl.uniform3fv(u('weights'),stage.weights);gl.uniform3fv(u('gain'),detailGain(stage.g,plannedV2));gl.uniform1i(u('halve'),k?1:0);
+    let w=k?Math.ceil(input.width/2):input.width,h=k?Math.ceil(input.height/2):input.height,src=target('d0',w,h,true);pass(0,src,input.texture);
+    for(let level=1;level<k;level++){w=Math.ceil(w/2);h=Math.ceil(h/2);const next=target('d'+level,w,h,true);pass(1,next,src.texture,src.second);src=next;}
+    const P=target('dP',w,h),T=target('dT',w,h,true),U=target('dU',w,h,true),B=target('dB',w,h,true),C=target('dC',w,h),M=target('dM',w,h);
+    taps(s*K.RD/K.R,true);pass(2,P,src.second!);taps(s*K.RD/K.R,false);pass(3,T,P.texture,src.texture);
+    taps(s,true);pass(4,U,T.texture,T.second);taps(s,false);pass(5,B,U.texture,U.second);
+    taps(s,true);pass(2,C,B.second!);taps(s,false);pass(2,M,C.texture);
+    maps=[M.texture,B.texture];
+  };
+  /** Stages [0, end): segments split after film stages and before Dehaze/Clarity points into float targets, film passes and
+   *  detail maps between them, the last segment into `out` (null = canvas). */
   const render=(end:number,out:Target|null,viewStage=-1,viewMode=0)=>{
-    let input:Target|null=null,at=0;
-    if(box.width&&box.height)for(let i=0;i<end;i++){const stage=planned[i];if(stage.type!=='film')continue;const a=target('A',box.width,box.height);grade(at,i-at,input,a,viewStage,0);input=film(stage,a);at=i+1;}
-    grade(at,end-at,input,out,viewStage,viewMode);
+    let input:Target|null=null,at=0,point=-1;
+    if(box.width&&box.height)for(let i=0;i<end;i++){
+      const stage=planned[i];
+      if(stage.type==='film'){const a=target('A',box.width,box.height);grade(at,i-at,input,a,viewStage,0,point);input=film(stage,a);at=i+1;point=-1;}
+      // The maps read the node input: a film output it follows as is, otherwise a split into N0/N1 (never A, which a probe renders into).
+      else if(detailPoint(stage)){if(i>at||!input){const n=target(input===targets.get('N0')?'N1':'N0',box.width,box.height);grade(at,i-at,input,n,viewStage,0,point);input=n;}detail(stage,input);at=point=i;}
+    }
+    grade(at,end-at,input,out,viewStage,viewMode,point);
   };
   /** Where `nodeId`'s input is among the planned stages: its first one; for a bypassed node of the drawn clip, the first of the
    *  next enabled node after it (the end when none follows); -1 when the drawn clip does not own the node. */
@@ -441,6 +527,8 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
      *  stabilized picture and mattes, as export grades the stabilized bake, and the result needs no further warp. */
     draw(source:HTMLCanvasElement,clip:Clip,asset:MediaAsset,nodes:GradeNode[],video?:HTMLVideoElement,masks:Map<string,SmartMaskPixels>|((time:number)=>Map<string,SmartMaskPixels>)=new Map(),snapshot?:VideoFrame,filmAt?:number,warp?:Affine) {
       if(lastDraw===answer)lastDraw=undefined;
+      // Dehaze/Clarity never run in 16F/8-bit (P reaches 2³², E[l²] − E[l]² cancels): without float targets the picture takes the exact software preview.
+      if(!floatRender&&nodes.some(n=>n.enabled&&n.clipId===clip.id&&detailActive(n.parameters))){if(hasACES(nodes,clip.id))throw Error('Dehaze and Clarity need a GPU with float render targets.');return (software??=createSoftwareColorPreview(onReady)).draw(source,clip,asset,nodes,video,masks,snapshot,filmAt,warp);}
       const key=preload(clip,asset),look=key?looks.get(key):neutral;
       if(look instanceof Error)throw look;if(!look)throw new ColorPending('Preparing color…');
       const frame=video&&typeof VideoFrame!=='undefined'?frameFor(video,snapshot,true):undefined;
@@ -469,7 +557,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
           const atlas=new Float32Array(512*lutHeight*4);let at=0;for(const stage of lutEffects){const d=stage.effect.cube.data;for(let j=0;j<d.length;j+=3){atlas.set([d[j],d[j+1],d[j+2],1],at);at+=4;}}
           gl.activeTexture(gl.TEXTURE7);gl.bindTexture(gl.TEXTURE_2D,lutTexture);settings(gl.TEXTURE_2D,gl.NEAREST);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,512,lutHeight,0,gl.RGBA,gl.FLOAT,atlas);previousLuts=lutKey;
         }
-        gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,parameters);settings(gl.TEXTURE_2D,gl.NEAREST);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,STAGE_TEXELS,height,0,gl.RGBA,gl.FLOAT,data);planned=stages;previous=controls;
+        gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,parameters);settings(gl.TEXTURE_2D,gl.NEAREST);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,STAGE_TEXELS,height,0,gl.RGBA,gl.FLOAT,data);planned=stages;plannedV2=clip.properties.colorPipeline==='nodes-v2';previous=controls;
       }
       gl.uniform1i(uniform('managed'),clip.properties.colorPipeline==='nodes-v2'?1:0);
       gl.uniform1i(uniform('displaySRGB'),hasACES(nodes,clip.id)?1:0);
@@ -525,7 +613,7 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
       lastDraw=answer;
       return canvas;
     },
-    dispose(){if(lastDraw===answer)lastDraw=undefined;worker.terminate();gl.deleteTexture(neutral.texture);for(const look of looks.values())if(look&&!(look instanceof Error))gl.deleteTexture(look.texture);for(const t of targets.values()){gl.deleteTexture(t.texture);gl.deleteFramebuffer(t.fbo);}targets.clear();gl.deleteTexture(picture);gl.deleteTexture(parameters);gl.deleteTexture(maskTexture);gl.deleteTexture(curveTexture);gl.deleteTexture(lutTexture);gl.deleteTexture(blank);planes.forEach(t=>gl.deleteTexture(t));acesTables.forEach(t=>gl.deleteTexture(t));gl.deleteProgram(program);gl.deleteProgram(filmProgram);gl.getExtension('WEBGL_lose_context')?.loseContext();looks.clear();},
+    dispose(){if(lastDraw===answer)lastDraw=undefined;worker.terminate();gl.deleteTexture(neutral.texture);for(const look of looks.values())if(look&&!(look instanceof Error))gl.deleteTexture(look.texture);targets.forEach(drop);targets.clear();software?.dispose();gl.deleteTexture(picture);gl.deleteTexture(parameters);gl.deleteTexture(maskTexture);gl.deleteTexture(curveTexture);gl.deleteTexture(lutTexture);gl.deleteTexture(blank);planes.forEach(t=>gl.deleteTexture(t));acesTables.forEach(t=>gl.deleteTexture(t));gl.deleteProgram(program);gl.deleteProgram(filmProgram);gl.deleteProgram(detailProgram);gl.getExtension('WEBGL_lose_context')?.loseContext();looks.clear();},
   };
 }
 
@@ -533,7 +621,8 @@ export function createColorPreview(onReady:()=>void = ()=>{}) {
  * Each stage as one STAGE_TEXELS-texel row of the shader's parameter texture, plus its CURVE_ROWS curve rows. Texel 7 is
  * [kind (0 correction, 1 CST, 2 LUT, 3 film), gamma, v3 flags (1 log wheels, 2 Shadows/Highlights, 4 hue/boost/density,
  * 8 HSL curves, 16 mixer), 0]; texel 8 holds range saturation as factor − 1; texel 11 the stage's luma weights; texel 12
- * [mask layer, amount, invert, 1 node start + 2 node end + 4 qualifier or window]; texels 13–29 the v3 tools.
+ * [mask layer, amount, invert, 1 node start + 2 node end + 4 qualifier or window]; texels 13–29 the v3 tools; a correction's
+ * texel 9 [dehaze, clarity]/100 (applied only at the detail point the draw computed maps for).
  */
 export function packStages(clip:Clip,stages:ReturnType<typeof processingStages>,maskIds:string[]){
   const height=Math.max(1,stages.length),S=STAGE_TEXELS*4,data=new Float32Array(height*S),curveData=new Float32Array(1024*height*CURVE_ROWS);
@@ -552,7 +641,7 @@ export function packStages(clip:Clip,stages:ReturnType<typeof processingStages>,
       const {g,extra:p,node}=stage,w=stage.weights,v=(k:string)=>p[k]??PARAM[k].initial;
       data.set([(p.saturationShadows??100)/100-1,(p.saturationMidtones??100)/100-1,(p.saturationHighlights??100)/100-1],row+32);
       data.set([g.exposure,g.contrast,g.pivot,g.saturation,g.lift,g.gamma,g.gain,g.offset,p.gammaR??0,p.gammaG??0,p.gammaB??0,clip.properties.colorPipeline==='nodes-v2'?g.temperature/10000:Math.max(-.5,Math.min(.5,g.temperature/10000)),p.gainR??0,p.gainG??0,p.gainB??0,clip.properties.colorPipeline==='nodes-v2'?g.tint/200:Math.max(-.5,Math.min(.5,g.tint/200)),p.offsetR??0,p.offsetG??0,p.offsetB??0,0,p.liftR??0,p.liftG??0,p.liftB??0,0,p.curve25??.25,p.curve50??.5,p.curve75??.75,node.curves?2:Object.keys(p).some(k=>k.startsWith('curve'))?1:0,0,profiles.indexOf(stage.gamma as typeof profiles[number]),0,0],row);
-      data.set(w,row+44);
+      data.set(w,row+44);data.set([(p.dehaze??0)/100,(p.clarity??0)/100],row+36);
       // v3 tools (grading.ts), with identity skipped by the flags exactly where the CPU skips it.
       const range=(r:string)=>['R','G','B'].map(c=>(p[`log${r}`]??0)+(p[`log${r}${c}`]??0)),shadow=range('Shadow'),mid=range('Mid'),high=range('Highlight');
       const sh=p.shadows??0,hl=p.highlights??0,hue=(p.hue??0)*Math.PI/180,boost=p.boost??0,density=p.density??0,mono=on(p.mixMono);
@@ -609,23 +698,19 @@ function createSoftwareColorPreview(onReady:()=>void) {
       // Windows read the pixel's picture position; Smart Masks their fitted alpha, where a warped pixel came from.
       const from=(i:number)=>{if(!back)return i;const q=apply(back,i%W+.5,Math.floor(i/W)+.5),x=Math.floor(q.x),y=Math.floor(q.y);return x<0||y<0||x>=W||y>=H?-1:y*W+x;};
       let at=0;const maskAt=(id:string)=>{const p=windows.get(id);if(p)return windowAlpha((at%W+.5-rect[0])/rect[2],(Math.floor(at/W)+.5-rect[1])/rect[3],rect[2]/rect[3],p);const mask=maskPixels.get(id);if(!mask)throw new ColorPending('Loading Smart Mask…');return (mask.data[from(at)]??0)/255;};
-      const pixels=context.getImageData(0,0,W,H),data=pixels.data,{profile,gamut}=interpretation(clip,asset);
-      // Film stages split the nodes: each part grades per pixel, applyFilm runs on the whole picture between parts.
-      const films=processingStages({...clip,properties:{...clip.properties,inputProfile:profile,inputGamut:gamut}},nodes).filter((s):s is FilmStage=>s.type==='film'),parts:GradeNode[][]=[[]];
-      for(const n of nodes.filter(n=>n.enabled&&n.clipId===clip.id).sort((a,b)=>(a.order??0)-(b.order??0))){parts.at(-1)!.push(n);if(filmActive(n.parameters))parts.push([]);}
-      const transforms=parts.map((part,k)=>k?colorTransform({...clip,properties:{...clip.properties,inputProfile:films[k-1].gamma,inputGamut:films[k-1].gamut,inputExposure:0,inputTemperature:0}},asset,part,undefined,maskAt):colorTransform(clip,asset,part,look??undefined,maskAt));
-      const box=pictureBox(rect,W,H);
-      if(!films.length||!box.width||!box.height){
+      const pixels=context.getImageData(0,0,W,H),data=pixels.data,box=pictureBox(rect,W,H);
+      if(!nodes.some(n=>n.enabled&&n.clipId===clip.id&&(filmActive(n.parameters)||detailActive(n.parameters)))){
         // ponytail: exact per-pixel fallback is slow without a GPU; move to a worker if software-only devices are common.
-        const all=(rgb:number[])=>transforms.reduce((v,t)=>t(v),rgb);
-        for(let i=0;i<data.length;i+=4){at=i/4;if(!data[i+3])continue;const rgb=all([data[i]/255,data[i+1]/255,data[i+2]/255]);for(let c=0;c<3;c++)data[i+c]=rgb[c]*255;}
-      }else{
-        const {x0,y0,width,height}=box,each=(f:(i:number)=>void)=>{for(let y=0;y<height;y++)for(let x=0;x<width;x++){at=(y0+y)*W+x0+x;f(y*width+x);}};
-        let rgb:Float32Array=new Float32Array(width*height*3);each(i=>rgb.set(transforms[0]([data[at*4]/255,data[at*4+1]/255,data[at*4+2]/255]),i*3));
+        const transform=colorTransform(clip,asset,nodes,look??undefined,maskAt);
+        for(let i=0;i<data.length;i+=4){at=i/4;if(!data[i+3])continue;const rgb=transform([data[i]/255,data[i+1]/255,data[i+2]/255]);for(let c=0;c<3;c++)data[i+c]=rgb[c]*255;}
+      }else if(box.width&&box.height){
+        // Film and Dehaze/Clarity need the whole picture: gradePicture grades the picture box, split after film and before detail points.
+        const {x0,y0,width,height}=box,rgb=new Float32Array(width*height*3),each=(f:(i:number)=>void)=>{for(let y=0;y<height;y++)for(let x=0;x<width;x++){at=(y0+y)*W+x0+x;f(y*width+x);}};
+        each(i=>{for(let c=0;c<3;c++)rgb[i*3+c]=data[at*4+c]/255;});
         const time=snapshot?snapshot.timestamp/1e6:video?Math.floor(video.currentTime*(asset.fps||24)+1e-6)/(asset.fps||24):0;
-        films.forEach((film,k)=>{const filmed=applyFilm(rgb,width,height,film,filmAt??Math.round(time*(asset.fps||24)));each(i=>filmed.set(transforms[k+1](Array.from(filmed.subarray(i*3,i*3+3))),i*3));rgb=filmed;});
+        const out=gradePicture(clip,asset,nodes,rgb,width,height,{base:look??undefined,maskAt:(id,i)=>{at=(y0+Math.floor(i/width))*W+x0+i%width;return maskAt(id);},frame:filmAt??Math.round(time*(asset.fps||24))});
         // Film changes colour only: each pixel keeps the source's alpha.
-        each(i=>{for(let c=0;c<3;c++)data[at*4+c]=rgb[i*3+c]*255;});
+        each(i=>{for(let c=0;c<3;c++)data[at*4+c]=out[i*3+c]*255;});
       }
       context.putImageData(pixels,0,0);
       canvas.dataset.sourceTimestamp=String(snapshot?snapshot.timestamp/1e6:video?Math.floor(video.currentTime*(asset.fps||24)+1e-6)/(asset.fps||24):0);

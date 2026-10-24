@@ -2,7 +2,8 @@ import {browserExecutable} from './browser-options.mjs';
 // Color page v3 on the real GPU against the CPU reference (docs/color-grading-v3.md): every new per-pixel tool on legacy and
 // nodes-v2 clips, windows on full, letterboxed and YUV pictures, film passes against applyFilm (transparent layers keep their
 // alpha), a spatial grade under a Stabilize warp, the key view, the node-input probe (layers drawn after the shot, bypassed
-// nodes, pasted grades), and the frame time of a 1920×1080 film grade.
+// nodes, pasted grades), Dehaze/Clarity against gradePicture (k = 0, 1, 2, film, windows, masks, letterbox, no float targets),
+// and the frame time of 1920×1080 film and detail grades.
 import assert from 'node:assert/strict';
 import {createServer} from 'vite';
 const {chromium}=await import(process.env.PLAYWRIGHT_MODULE||'playwright');
@@ -239,16 +240,96 @@ try{
    near('disposed renderer',await probeNodeInput('p2',.5,.5),null);
   }
 
+  // ---- Dehaze/Clarity against gradePicture (maps from the node input over the picture box, H = its height): k = 0, 1, 2 ----
+  const {gradePicture,encodeLog}=await import('/src/services/color.ts');
+  // final_detail.pattern (linear sky, a 1.6 cloud, a hazy textured ridge) and a hazy, noisy "footage" frame with deep shadows and a lamp.
+  const pattern=(H,W,i,j)=>{const v=(i+.5)/H,u=(j+.5)/W,ridge=.38+.06*Math.sin(6.1*u)+.02*Math.sin(31*u),fade=1-.6*Math.min(Math.max(v-ridge,0),1),tex=2**(.8*Math.sin(53*u+3*v)*Math.sin(41*v-2*u)+.4*Math.sin(170*u)*Math.sin(150*v));return (u-.3)**2*(W/H)**2+(v-.18)**2<.07**2?[1.6,1.6,1.6]:v<ridge?[.2,.28,.55].map(c=>c*(1+.25*v)):[1,.95,.86].map((c,k)=>.045*tex*c*.5+[.3,.33,.38][k]*.5*fade);};
+  const hash=(x,y,k)=>{let n=Math.imul(x,0x8da6b343)^Math.imul(y,0xd8163841)^Math.imul(k,0xcb1ab31f);n^=n>>>16;n=Math.imul(n,0x7feb352d);n^=n>>>15;return (n>>>8)/16777216;};
+  const footage=(H,W,i,j)=>{const v=(i+.5)/H,u=(j+.5)/W,haze=.3*(1-v)**2,tex=2**(1.2*Math.sin(23*u+7*Math.sin(5*v))*Math.sin(19*v+3*u)+.5*Math.sin(97*u)*Math.sin(83*v));if((u-.7)**2*(W/H)**2+(v-.6)**2<.015**2)return [3,2.8,2.4];const c=v<.3+.05*Math.sin(9*u)?[.35,.45,.7]:[.12,.1,.07].map(x=>x*tex*(v>.8?.25:1));return c.map((x,k)=>(x*(1-haze)+haze*[.8,.85,.95][k])*(1+.08*(hash(j,i,k)-.5)));};
+  const encoded=(width,height,lin,gamma,box={x0:0,y0:0,width,height})=>canvasOf(width,height,ctx=>{const image=ctx.createImageData(width,height);for(let y=0;y<box.height;y++)for(let x=0;x<box.width;x++)image.data.set([...lin(box.height,box.width,y,x).map(v=>Math.round(255*Math.min(1,Math.max(0,encodeLog(v,gamma))))),255],((box.y0+y)*width+box.x0+x)*4);ctx.putImageData(image,0,0);});
+  // gradePicture over `box` of a layer; `alphaAt(i, id)` answers masks and windows at layer pixel i; pixels outside the box stay transparent.
+  const cpuPicture=(clip,asset,nodes,picture,box={x0:0,y0:0,width:picture.width,height:picture.height},alphaAt,rgbAt=sourceOf(picture).rgb)=>{
+   const {x0,y0,width,height}=box,layer=i=>(y0+Math.floor(i/width))*picture.width+x0+i%width,rgb=new Float32Array(width*height*3);for(let i=0;i<width*height;i++)rgb.set(rgbAt(layer(i)),i*3);
+   const out=gradePicture(clip,asset,nodes,rgb,width,height,{maskAt:alphaAt&&((id,i)=>alphaAt(layer(i),id)),frame:0}),expected=Array(picture.width*picture.height).fill(null);
+   for(let i=0;i<width*height;i++)expected[layer(i)]=Array.from(out.subarray(i*3,i*3+3));return expected;
+  };
+  const detailLegacy=(parameters,resolution,more=[])=>{const clip={id:'dl',projectId:'p',properties:{}},node=(id,order,p)=>({id,clipId:'dl',projectId:'p',kind:'serial',name:id,enabled:true,order,parameters:p});return {clip,asset:{inputProfile:'Rec.709',resolution},nodes:[node('da',1,{exposure:.1,contrast:1.05}),node('db',2,{saturation:110,...parameters}),...more.map((p,i)=>node('dc'+i,3+i,p))]};};
+  // nodes-v2 in DaVinci Intermediate / Wide Gamut: detail on Balance runs at G = its exposure/temperature/tint gain.
+  const detailManaged=(balance,look={},resolution)=>{let id=0;const clip={id:'dm',projectId:'p',properties:{colorPipeline:'nodes-v2',inputProfile:'DaVinci Intermediate',inputGamut:'DaVinci Wide Gamut'}},asset={inputProfile:'DaVinci Intermediate',resolution},nodes=starterGrade(clip,asset,()=>'dm'+ ++id);nodes[1].parameters={...nodes[1].parameters,exposure:.3,temperature:400,tint:-8,...balance};nodes[2].parameters={...nodes[2].parameters,contrast:1.1,...look};return {clip,asset,nodes};};
+  const gpuDraw=async(picture,{clip,asset,nodes},...rest)=>{const renderer=createColorPreview();try{const rendered=await draw(renderer,picture,clip,asset,nodes,...rest);if(!rendered.getContext('webgl2'))throw Error('Detail check fell back to CPU');return pixelsOf(rendered);}finally{renderer.dispose();}};
+  const detailCase=async(name,pipeline,picture,grade,expected,...rest)=>results.push({group:'detail',pipeline,name,...compare(await gpuDraw(picture,grade,...rest),expected??cpuPicture(grade.clip,grade.asset,grade.nodes,picture))});
+  const settings=[[60,0],[-50,0],[0,60],[0,-60],[100,100],[35,-40]];
+  for(const [size,W,H] of [['k=1 641×401',641,401],['k=0 161×97',161,97]])for(const [frame,lin] of [['pattern',pattern],['footage',footage]])for(const [dehaze,clarity] of size.startsWith('k=0')?[[100,100],[-60,-60]]:settings){
+   const label=`${frame} ${size} dehaze ${dehaze} clarity ${clarity}`,resolution=`${W} × ${H}`;
+   await detailCase(label,'legacy',encoded(W,H,lin,'Gamma 2.4'),detailLegacy({dehaze,clarity},resolution));
+   await detailCase(label,'nodes-v2',encoded(W,H,lin,'DaVinci Intermediate'),detailManaged({dehaze,clarity},{},resolution));
+  }
+  for(const [frame,lin,dehaze,clarity] of [['pattern',pattern,60,30],['footage',footage,100,100],['footage',footage,-50,-40]]){
+   await detailCase(`${frame} k=2 1920×1080 dehaze ${dehaze} clarity ${clarity}`,'nodes-v2',encoded(1920,1080,lin,'DaVinci Intermediate'),detailManaged({dehaze,clarity},{},'1920 × 1080'));
+   if(dehaze===100)await detailCase(`${frame} k=2 1920×1080 dehaze ${dehaze} clarity ${clarity}`,'legacy',encoded(1920,1080,lin,'Gamma 2.4'),detailLegacy({dehaze,clarity},'1920 × 1080'));
+  }
+  {
+   const W=641,H=401,resolution=`${W} × ${H}`,v2=encoded(W,H,footage,'DaVinci Intermediate'),old=encoded(W,H,footage,'Gamma 2.4');
+   // Two detail points in a row (N0 → N1), one right after a film node (its output is the maps' input) and one on a film node itself.
+   await detailCase('dehaze on Balance, clarity on Look','nodes-v2',v2,detailManaged({dehaze:70},{clarity:40},resolution));
+   await detailCase('after a film node','nodes-v2',v2,detailManaged({filmHalation:60,filmHalationRadius:2,filmBloom:40,filmBloomRadius:6,filmVignette:30},{dehaze:60,clarity:30},resolution));
+   await detailCase('detail and film on one node','legacy',old,detailLegacy({dehaze:60,clarity:-30,filmVignette:40,filmGrain:30,filmGrainSeed:3},resolution,[{dehaze:-40}]));
+   // A gradient window and a Smart Mask limit both tools (the node blend), the qualifier keys on the pre-detail input.
+   const matte=new Uint8Array(W*H);for(let i=0;i<W*H;i++)matte[i]=Math.round(255*(.2+.8*(i%W)/W));const masks=new Map([['dmask',{key:'dmask',data:matte,width:W,height:H}]]);
+   for(const pipeline of ['legacy','nodes-v2']){
+    const keys={dehaze:80,clarity:50,gradOn:1,gradAngle:30,gradSoft:.4,qualOn:1,qualLumLow:5,qualLumHigh:95,qualLumSoft:10},grade=pipeline==='legacy'?detailLegacy(keys,resolution):detailManaged({},keys,resolution),picture=pipeline==='legacy'?old:v2;
+    grade.nodes.find(n=>n.parameters.gradOn).mask={id:'dmask',enabled:true,invert:false,amount:90};
+    await detailCase('gradient window + Smart Mask + qualifier',pipeline,picture,grade,cpuPicture(grade.clip,grade.asset,grade.nodes,picture,undefined,(i,id)=>id==='dmask'?matte[i]/255:windowAlpha((i%W+.5)/W,(Math.floor(i/W)+.5)/H,W/H,grade.nodes.find(n=>'window:'+n.id===id).parameters)),undefined,masks);
+   }
+   // Letterboxed 2.39:1 in 1280×720 (fractional edges): the maps cover the picture box only, H = its 536 rows.
+   const rect=[0,(720-1280*803/1920)/2,1280,1280*803/1920],box={x0:0,y0:Math.ceil(rect[1]-.5),width:1280,height:Math.ceil(rect[1]+rect[3]-.5)-Math.ceil(rect[1]-.5)};
+   for(const pipeline of ['legacy','nodes-v2']){const picture=encoded(1280,720,footage,pipeline==='legacy'?'Gamma 2.4':'DaVinci Intermediate',box),grade=pipeline==='legacy'?detailLegacy({dehaze:60,clarity:40},'1920 × 803'):detailManaged({dehaze:60,clarity:40},{},'1920 × 803');await detailCase(`letterbox 1280×720 (box ${box.width}×${box.height})`,pipeline,picture,grade,cpuPicture(grade.clip,grade.asset,grade.nodes,picture,box));}
+  }
+  {
+   // A transparent title keeps its alpha; under Stabilize the maps see the stabilized picture (export grades the stabilized bake).
+   const title=canvasOf(96,54,ctx=>{ctx.fillStyle='rgb(200,150,60)';ctx.fillRect(20,12,40,16);ctx.fillStyle='rgba(60,120,190,.5)';ctx.fillRect(50,30,30,14);}),{d}=sourceOf(title),grade=detailLegacy({dehaze:60,clarity:50},'96 × 54');
+   const got=await gpuDraw(title,grade,undefined,new Map(),undefined,5),expected=cpuPicture(grade.clip,grade.asset,grade.nodes,title);let alphaChanged=0;for(let i=0;i<96*54;i++)if(Math.abs(got[i*4+3]-d[i*4+3])>1)alphaChanged++;
+   results.push({group:'detail',pipeline:'legacy',name:'transparent title keeps its alpha',...compare(got,expected.map((rgb,i)=>d[i*4+3]===255?rgb:d[i*4+3]?undefined:null)),alphaChanged});
+   const {invert,apply}=await import('/src/services/colorKeys.ts'),W=256,H=144,picture=encoded(W,H,footage,'Gamma 2.4'),{d:src}=sourceOf(picture),s=1.1,phi=Math.PI/180,a=s*Math.cos(phi),b=s*Math.sin(phi),warp=[a,b,-b,a,W/2+2.25-a*W/2+b*H/2,H/2-1.25-b*W/2-a*H/2],back=invert(warp);
+   const bilinear=(x,y,c)=>{const u=Math.max(0,Math.min(W-1,x-.5)),v=Math.max(0,Math.min(H-1,y-.5)),x0=Math.floor(u),y0=Math.floor(v),x1=Math.min(W-1,x0+1),y1=Math.min(H-1,y0+1),fx=u-x0,fy=v-y0,at=(X,Y)=>src[(Y*W+X)*4+c];return ((at(x0,y0)*(1-fx)+at(x1,y0)*fx)*(1-fy)+(at(x0,y1)*(1-fx)+at(x1,y1)*fx)*fy)/255;};
+   const stab=detailLegacy({dehaze:70,clarity:40,circOn:1,circX:.4,circY:.5,circW:.3,circH:.25,circSoft:.1},`${W} × ${H}`),circle=stab.nodes[1].parameters;
+   results.push({group:'detail',pipeline:'legacy',name:'stabilize warp + window',...compare(await gpuDraw(picture,stab,undefined,new Map(),undefined,5,warp),cpuPicture(stab.clip,stab.asset,stab.nodes,picture,undefined,i=>windowAlpha((i%W+.5)/W,(Math.floor(i/W)+.5)/H,W/H,circle),i=>{const q=apply(back,i%W+.5,Math.floor(i/W)+.5);return [0,1,2].map(c=>bilinear(q.x,q.y,c));}))});
+  }
+  {
+   // Key view of a detail node: the matte is its window, the highlight the full grade over grey by it (the lamp is mixed unclamped: skipped).
+   const W=161,H=97,picture=encoded(W,H,footage,'Gamma 2.4'),grade=detailLegacy({dehaze:60,clarity:40,circOn:1,circX:.5,circY:.5,circW:.3,circH:.3,circSoft:.2},`${W} × ${H}`,[{gain:.95}]),p=grade.nodes[1].parameters,alpha=i=>windowAlpha((i%W+.5)/W,(Math.floor(i/W)+.5)/H,W/H,p);
+   const graded=cpuPicture(grade.clip,grade.asset,grade.nodes,picture),renderer=createColorPreview();
+   try{
+    setColorView({nodeId:'db',mode:'matte'});results.push({group:'detail',pipeline:'legacy',name:'key view matte',...compare(pixelsOf(await draw(renderer,picture,grade.clip,grade.asset,grade.nodes)),graded.map((_,i)=>Array(3).fill(alpha(i))))});
+    setColorView({nodeId:'db',mode:'highlight'});results.push({group:'detail',pipeline:'legacy',name:'key view highlight',...compare(pixelsOf(await draw(renderer,picture,grade.clip,grade.asset,grade.nodes)),graded.map((rgb,i)=>rgb.some(v=>v>=1)?undefined:rgb.map(v=>.5+(Math.max(0,v)-.5)*alpha(i))))});
+    setColorView({nodeId:null,mode:'off'});
+    // The probe of the node after it reads the detailed picture (5×5 mean, unclamped); of the detail node itself, its input.
+    const block=(rows,px,py)=>{const x=Math.max(0,Math.min(W-5,Math.floor(px*W)-2)),y=Math.max(0,Math.min(H-5,Math.floor(py*H)-2)),sum=[0,0,0];for(let j=0;j<5;j++)for(let i=0;i<5;i++)rows[(y+j)*W+x+i].forEach((v,c)=>sum[c]+=v/25);return sum;};
+    near('after a detail node',await probeNodeInput('dc0',.3,.6),block(cpuPicture(grade.clip,grade.asset,grade.nodes.slice(0,2),picture),.3,.6));
+    near('a detail node\'s own input',await probeNodeInput('db',.7,.4),block(cpuPicture(grade.clip,grade.asset,grade.nodes.slice(0,1),picture),.7,.4));
+   }finally{renderer.dispose();}
+  }
+  {
+   // Without float render targets a detail picture takes the exact software preview; other pictures stay on the GPU.
+   const native=WebGL2RenderingContext.prototype.getExtension;WebGL2RenderingContext.prototype.getExtension=function(name){return name==='EXT_color_buffer_float'?null:native.call(this,name);};
+   let renderer;try{renderer=createColorPreview();}finally{WebGL2RenderingContext.prototype.getExtension=native;}
+   try{
+    const picture=encoded(161,97,footage,'DaVinci Intermediate'),grade=detailManaged({dehaze:60,clarity:40},{},'161 × 97'),soft=await draw(renderer,picture,grade.clip,grade.asset,grade.nodes);
+    results.push({group:'detail',pipeline:'nodes-v2',name:'no float targets: software preview',...compare(pixelsOf(soft),cpuPicture(grade.clip,grade.asset,grade.nodes,picture)),wrongPath:!!soft.getContext('webgl2')});
+    const plain=detailManaged({},{},'161 × 97'),gpu=await draw(renderer,picture,plain.clip,plain.asset,plain.nodes);results.push({group:'detail',pipeline:'nodes-v2',name:'no float targets: no detail stays on the GPU',...compare(pixelsOf(gpu),cpuPicture(plain.clip,plain.asset,plain.nodes,picture)),wrongPath:!gpu.getContext('webgl2')});
+   }finally{renderer.dispose();}
+  }
+
   // ---- Frame time at 1920×1080 (each draw re-uploads the picture, as the RGB path does) ----
   const big=canvasOf(1920,1080,ctx=>{const g=ctx.createLinearGradient(0,0,1920,1080);g.addColorStop(0,'#203040');g.addColorStop(1,'#d0b080');ctx.fillStyle=g;ctx.fillRect(0,0,1920,1080);ctx.fillStyle='#fff';for(let i=0;i<40;i++){ctx.beginPath();ctx.arc((i*373)%1920,(i*211)%1080,6+i%5*3,0,7);ctx.fill();}});
   const timing=[],filmAll={filmHalation:50,filmHalationRadius:1,filmBloom:40,filmBloomRadius:4,filmGrain:40,filmVignette:30,filmWeave:50,filmAberration:50,filmBreath:30};
-  for(const [name,parameters,curves] of [['primaries only',{saturation:110,offset:.01}],['v3 per-pixel (log, tone, chroma, HSL, mixer, qualifier, windows)',{saturation:110,logMid:.01,shadows:20,highlights:-20,hue:5,boost:20,density:20,mixRG:.05,...key,circOn:1,rectOn:1,gradOn:1},hsl],['film (halation, bloom, grain, vignette, weave, aberration, breath)',{saturation:110,offset:.01,...filmAll}],['film + v3 per-pixel',{saturation:110,shadows:20,hue:5,boost:20,...key,circOn:1,...filmAll},hsl]]){
+  for(const [name,parameters,curves] of [['primaries only',{saturation:110,offset:.01}],['v3 per-pixel (log, tone, chroma, HSL, mixer, qualifier, windows)',{saturation:110,logMid:.01,shadows:20,highlights:-20,hue:5,boost:20,density:20,mixRG:.05,...key,circOn:1,rectOn:1,gradOn:1},hsl],['film (halation, bloom, grain, vignette, weave, aberration, breath)',{saturation:110,offset:.01,...filmAll}],['film + v3 per-pixel',{saturation:110,shadows:20,hue:5,boost:20,...key,circOn:1,...filmAll},hsl],['Dehaze + Clarity (primaries only + maps, split, apply)',{saturation:110,offset:.01,dehaze:60,clarity:40}]]){
    const renderer=createColorPreview(),clip={id:'perf',projectId:'p',properties:{}},asset={inputProfile:'Rec.709',resolution:'1920 × 1080'},nodes=[{id:'perf',clipId:'perf',projectId:'p',kind:'serial',name:'Perf',enabled:true,order:1,parameters,...curves?{curves}:{}}];
    try{
     const rendered=await draw(renderer,big,clip,asset,nodes),gl=rendered.getContext('webgl2'),pixel=new Uint8Array(4),sync=()=>gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);
     for(let i=0;i<5;i++){renderer.draw(big,clip,asset,nodes);sync();}
-    const times=[];for(let i=0;i<30;i++){const t=performance.now();renderer.draw(big,clip,asset,nodes);sync();times.push(performance.now()-t);}
-    times.sort((a,b)=>a-b);timing.push({name,medianMs:+times[15].toFixed(2),p90Ms:+times[27].toFixed(2)});
+    const times=[];for(let i=0;i<100;i++){const t=performance.now();renderer.draw(big,clip,asset,nodes);sync();times.push(performance.now()-t);}
+    times.sort((a,b)=>a-b);timing.push({name,medianMs:+times[50].toFixed(2),p90Ms:+times[90].toFixed(2)});
    }finally{renderer.dispose();}
   }
   return {gpuName,results,probes,timing,events,oracle};
@@ -260,11 +341,12 @@ try{
  for(const o of report.oracle){console.log(`oracle    ${o.name.padEnd(58)} clamped ${o.clamped}`);assert.equal(o.clamped,0,`${o.name}: the CPU oracle clamped values before a film stage; keep the test picture in range`);}
  for(const r of report.results){
   assert.equal(r.leaks,0,`${r.group} ${r.name}: pixels outside the picture must stay transparent and pixels inside opaque`);
-  assert.equal(r.alphaChanged??0,0,`${r.name}: every pixel keeps the source's alpha`);
-  if(r.group==='film'&&!r.name.startsWith('neutral'))assert.ok(r.meanError<=1&&r.maxError<=6,`${r.name}: film must match applyFilm (mean ≤ 1, max ≤ 6 codes)`);
+  assert.equal(r.alphaChanged??0,0,`${r.name}: every pixel keeps the source's alpha`);assert.ok(!r.wrongPath,`${r.name}: drawn by the wrong renderer`);
+  if(r.group==='detail')assert.ok(r.meanError<=.5&&r.maxError<=2,`${r.pipeline} ${r.name}: Dehaze/Clarity must match gradePicture (mean ≤ .5, max ≤ 2 codes)`);
+  else if(r.group==='film'&&!r.name.startsWith('neutral'))assert.ok(r.meanError<=1&&r.maxError<=6,`${r.name}: film must match applyFilm (mean ≤ 1, max ≤ 6 codes)`);
   else assert.ok(r.maxError<=2,`${r.group} ${r.pipeline} ${r.name}: GPU must match the CPU reference within 2 codes`);
  }
  for(const p of report.probes)assert.ok(p.error<=2e-3,`probe ${p.name}: ${JSON.stringify(p.actual)} vs ${JSON.stringify(p.expected)}`);
  assert.equal(report.events,10,'setColorView announces every change');
- console.log('PASS Color v3 GPU parity: log wheels, Shadows/Highlights, hue/boost/density, HSL curves, mixer, qualifier, windows, film, key view and probe.');
+ console.log('PASS Color v3 GPU parity: log wheels, Shadows/Highlights, hue/boost/density, HSL curves, mixer, qualifier, windows, film, Dehaze/Clarity, key view and probe.');
 }finally{await browser.close();await server.close();}

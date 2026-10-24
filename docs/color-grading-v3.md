@@ -18,6 +18,7 @@ formulas below. Any change here changes all three, plus a parity test.
 | Windows | **Gradient** (linear), **Circle** (radial/ellipse), **Rectangle**; softness, rotation, invert; handles on the viewer. |
 | Mixer | **RGB mixer** 3×3 and monochrome. |
 | Film | Dehancer-style **Halation, Bloom, Grain, Vignette, Gate weave, Breath, Chromatic aberration** (+ Density in Primaries). |
+| Detail | **Dehaze** and **Clarity** (Primaries, "Detail" section): spatial, inside the node, limited by its mask/windows/qualifier. |
 | Looks | Library of looks and film stocks, applied to the selected node (`applyColorLook`). |
 | MCP | Help generated from the parameter registry, richer `color-grade`, new `color-measure` (frame vs reference stats + hints). |
 
@@ -48,7 +49,7 @@ Opponent space (used by Hue, Boost, Density, HSL curves and the qualifier):
 
 Order inside a correction stage (new steps marked ★):
 
-1. exposure/temperature/tint (unchanged)
+1. exposure/temperature/tint (unchanged); on a node with Dehaze/Clarity this step is the detail point (see "Detail" below)
 2. contrast/pivot, offset, gamma, gain, lift per channel (unchanged)
 3. ★ Log wheels: `t = clamp(y,0,1)`, `wS = 1 − ss(lo − .1, lo + .1, t)`, `wH = ss(hi − .1, hi + .1, t)`, `wM = max(0, 1 − wS − wH)`
    with `lo = logLowRange`, `hi = logHighRange`, `ss` = smoothstep; `rgb_c += wS(logShadow + logShadowC) + wM(logMid + logMidC) + wH(logHighlight + logHighlightC)`.
@@ -135,21 +136,99 @@ Blur (shared): `σ = radius/100·H` px; σ < .5 → no blur. Level `k = max(0, �
 halvings (output size ⌈n/2⌉, input indices clamped); separable Gaussian at `σ/2ᵏ` with radius ⌈3σ'⌉ taps, normalised,
 clamped edges; bilinear upsample with half-pixel centres (`x = (i + .5)·m/n − .5`, clamped), the GPU's LINEAR filter.
 
+## Detail: Dehaze and Clarity (spatial, inside the node)
+
+Registry group **`detail`**: `dehaze`, `clarity`, −100..100, step 1, absent or 0 = identity. Not a look group, so applying a
+look keeps them, and the Color Assistant's Balance/Look proposals keep a node's values (`detailParams`). `detailActive(p)`
+(either ≠ 0) joins `spatialGrade`: such a clip always takes the per-frame colour worker (no LUT bake), and `write_cube` refuses it.
+Keyframable like every node parameter (sampled per frame, like film). Older builds refuse to render nodes carrying these keys:
+fix forward.
+
+**Placement.** No new stage type: a *detail point* is a correction stage with `nodeStart` and `detailActive(stage.extra)`
+(`detailPoint` in color.ts; the correction is always a node's first stage). It runs first thing in that stage, so the node
+blend `out = in + (graded − in)·mask·windows·qualifier` limits both tools and the qualifier keys on the pre-detail input.
+- nodes-v2: step 1 becomes `lin = decode(rgb, gamma)·G` → **dehaze → clarity** → `rgb = encode(lin, gamma)`, with
+  `G = 2^exposure·(1 + T/1e4, 1 − tint/200, 1 − T/1e4)` (`detailGain`; run even at G = 1).
+- legacy: at the very start of the stage, `lin = decode(rgb, 'Gamma 2.4')`, G = 1, then encode and the legacy stage as before.
+- The maps come from the whole node input decoded the same way and × the same G, so they see exactly the `lin` they are
+  applied to: Dehaze on Balance acts on the balanced picture, identical to Dehaze on its own node right after Balance.
+  Whole-frame renderers split *before* a detail point (film splits after its node); intermediate parts stay unclamped.
+
+Notation: `w` = stage.weights (DWG's blue weight is negative), `H` = height of the processed picture (the preview's picture
+box, the export's fitted picture; no letterbox bars), `ss` = smoothstep, `L(x) = log₂(max(x,0) + 2⁻¹⁰) − log₂(.18)` (stops re
+18 % grey, `detailStops`), `y = w·lin`, `mx = max(max_c lin_c, 0)`, `l = L(y)`, `lm = L(mx)`. Float32 throughout; powers as
+products (`x⁴ = (x²)²`).
+
+Constants (`DETAIL` in grading.ts, identical in GLSL and color-render.py): `R = 2` (% of H, every large blur), `RD = .5` (% of H,
+dark-channel blur), `M0 = 2⁻⁸`, guards `GLO, GHI = .25, .7` (level-k box mean of mx) and `LO, HI = .25, .7` (pixel luma),
+`EPS_D = .25`, `EPS_C = .0625`, `RM = EPS_C/EPS_M = .0625` (`EPS_M = 1`), `SMAX = .25` stop, `VEPS = 1e-3`, `OMEGA = .95`,
+`TMIN = 1/3`, `UMAX = .8`, `CHROMA = .6`, `KAPPA = .6`, `KN = .5`, `KH = 1`, `KAPPA_N = .4`, `D = .5` stop, `GATE = (.08/.25)²`.
+The airlight is a constant 1 (scene linear, after the node's exposure). There is no frame statistic, percentile, airlight
+search or previous-frame state anywhere: every map is a pure function of the current frame, so scrubbing, chunked export and
+a bright object entering the frame change the result only locally.
+
+**Maps** (`detailMaps` in filmLook.ts, once per detail point per frame, one pyramid level, the film blur's pieces):
+1. `σ = R/100·H`, `k = max(0, ⌊log₂(σ/4)⌋)`, `σ' = σ/2ᵏ` (no σ < .5 shortcut). 1080p and 2160p → 480×270 with σ' 5.4;
+   512 rows → ⌈W/2⌉×256, σ' 5.12; H < 400 → full size, σ' = .02H.
+2. Per full-resolution pixel `SA = (l, l², lm, mx)`, `SB = r⁴` per channel with `r = 1/clamp(lin_c, M0, 1)`; k 2×2 box halvings of both.
+3. `Gs` = the separable Gaussian at level k (radius ⌈3s⌉ taps, normalised, clamped edges), no upsample.
+4. Soft dark channel: `Pb = Gs(SB)` with `s = σ'·RD/R`, `sm_c = 1/√√Pb_c` (power-mean soft minimum), `dk = min_c sm_c`; veil
+   colour `vr = log₂(sm_r/sm_g)`, `vb = log₂(sm_b/sm_g)` scaled by `min(1, SMAX/max(√(vr² + vb²), 1e-6))`; bright guard per
+   level-k texel before any blur: `dk' = dk·(1 − ss(GLO, GHI, SA.mx))`.
+5. `B1 = Gσ'(l, l², lm, lm²)`, `B2 = Gσ'(dk', lm·dk', dk'·vr, dk'·vb)` (lm² and the products formed at level k).
+6. `vl = max(B1.y − B1.x², 0)`, `vm = max(B1.w − B1.z², 0)`; clarity base `a_c = vl/(vl + EPS_C)`, `b_c = (1 − a_c)·B1.x`;
+   haze map guided by lm: `α = (B2.y − B1.z·B2.x)/(vm + EPS_D)`, `β = B2.x − α·B1.z`.
+7. `M1 = Gσ'(a_c, b_c, α, β)`, `M2 = B2`, read at each pixel with the film blur's bilinear (half-pixel centres, clamped):
+   the 8 values `(a_c, b_c, α, β, μd, ·, dvr, dvb)` (`detailAt`).
+
+**Per pixel** (`applyDetail` in grading.ts; `a = dehaze/100`, `c = clarity/100`, `a_c`, `b_c`… from the maps):
+- `base = a_c·l + b_c`. Smooth local mean: `a_m = RM·a_c/(RM·a_c + 1 − a_c)`, `b_m = a_m·l + (1 − a_m)·b_c/max(1 − a_c, 1e-3)`,
+  `μ = .18·2^b_m` (only ≈1 stop edges, ridgelines, survive in it).
+- Haze map `h = clamp(α·(b_m + lm − l) + β, 0, 1)·(1 − ss(LO, HI, y))`, 0 where `y ≤ 1e-6` (read at the smooth base plus the
+  pixel's own max-over-luma offset, so texture is not copied into h). `softcap(u) = u/√√(1 + (u/UMAX)⁴)`.
+- **a > 0**: `t = max(1 − OMEGA·a·h, TMIN)`, `s = 1 − t`, `uc = softcap(s/max(y, 1e-6))`, `q = (1 − uc)/t`,
+  `gc = q·(1 − CHROMA) + CHROMA/t`, veil colour `col = (2^(dvr/(μd+VEPS)), 1, 2^(dvb/(μd+VEPS)))` divided by its luma `w·col`;
+  `out = q·y + gc·(lin − y − uc·y·(col − 1))`, then `out *= ((1 − softcap(s/max(μ, 1e-6)))/t)^−KAPPA`. That is
+  `J = (I − A(1 − t))/t` with A = 1 on luminance, the removed fraction soft-capped below 80 %, the veil's own colour (±.25 stop)
+  taken out of the chroma, 60 % of the physical chroma gain kept, 60 % of the darkening at the local mean given back.
+- **a < 0**: `v = |a|·(KN·max(μ − 2⁻¹⁰, 0)·(1 − ss(LO, HI, y)) + KH·h)`, `out = (lin + v)·(μ/(μ + v))^KAPPA_N` (a neutral veil,
+  stronger where there is haze already, bright areas kept).
+- **Clarity** after dehaze, its detail band from the pre-dehaze `l`: `d = l − base`, `f = d/√(1 + (d/D)²)`,
+  `mid = ss(−6, −1.5, base)·(1 − ss(2, 5, base))`, `g = a_c/(a_c + GATE·(1 − a_c))` (flat skies and noise left alone),
+  `out *= 2^(c·(c > 0 ? 2 : 1)·mid·g·f)`: one factor on R, G and B (hue and saturation ratios exact; +100 doubles midtone
+  detail, −100 removes it and never inverts it).
+
+**Edges and limits.** Alpha is ignored by the maps and passed through. Negative or huge channels stay finite (the clamps above);
+a black frame and a flat field under clarity come back unchanged (to 1e-9), a flat field stays flat. Every detail target is
+RGBA32F (`P` reaches 2³², `E[l²] − E[l]²` cancels in 16F); a GPU without float render targets never runs a detail point in 16F
+or 8-bit ("Dehaze and Clarity need a GPU with float render targets"). Only the guards are absolute: place Dehaze on or after
+Balance. Dehaze darkens hazy areas; lift Exposure on a later node. Recipe (hazy landscape): a node after Balance with dehaze
+50–70 and clarity 30–40, then Exposure +.3..+.5 and Contrast 1.1–1.2 on Look; −dehaze adds atmosphere; a gradient window or
+depth key confines it to the distance. Pinned vectors (final_detail.py's `pattern(H, W)` at 61×37, 480×270, 963×541,
+1920×1080, k = 0, 0, 1, 2): `src/services/detail.test.ts`; the reference rounds `a_c`, `b_c` to ~3e-5 (float32 variance), the
+rest and the output pixels agree to ~1e-6.
+
 ## Where each renderer runs it
 
 - **Preview** (WebGL2): per-pixel steps and the blend in the stage loop; the film stage splits the chain into passes
   (stages before → float texture → film passes → stages after). Windows use the picture rectangle inside the layer.
-  Film changes colour only: the layer keeps the source alpha. Under Stabilize, a grade with a window or film reads the
-  picture and its mattes through the stabilize warp, as export grades the stabilized bake.
+  Film changes colour only: the layer keeps the source alpha. Under Stabilize, a grade with a window, film or Dehaze/Clarity
+  reads the picture and its mattes through the stabilize warp, as export grades the stabilized bake. A detail point splits
+  the chain *before* its node into float targets (never film's 'A'); maps at the level-k grid, all RGBA32F, then the main
+  pass reads M1 and M2 at the detail point. The software fallback (no WebGL2) is `gradePicture` in color.ts.
 - **Export** (`color-render.py`): `grade()` runs per-pixel stages in stripes and computes window alphas from the stripe's
-  rows; `grade_frame()` runs film stages on the whole frame between segments. Clips whose grade has an active window or
-  film stage always take the per-frame path (no LUT bake). So does a qualifier when the worker is installed: the hue key
+  rows; `grade_frame()` runs film stages on the whole frame between segments and flushes before a detail point, storing its
+  level-k maps in `masks['detail:<node id>']` (each stripe upsamples only its rows). Clips whose grade has an active window,
+  film stage or Dehaze/Clarity always take the per-frame path (no LUT bake). So does a qualifier when the worker is installed: the hue key
   jumps at grey (grey reads hue 0), which a 33³/65³ table smears onto near-greys by up to 10 levels; without the worker
   (SharedCut Desktop) a qualifier grade falls back to a 65³ table. Stills and compositions keep their alpha through the
   worker. Grain counts frames as `round(source time × fps)` for footage and `round((in point + time into clip) × project
   fps)` for stills, titles and adjustment clips, in preview and export alike.
-- **CPU** (`colorTransform`): per-pixel steps and the qualifier; a window needs `maskAt('window:<node id>')`; film stages
-  are skipped (it bakes LUTs, which cannot hold them).
+- **CPU** (`colorTransform`): per-pixel steps and the qualifier; a window needs `maskAt('window:<node id>')`, a detail point
+  the 8 map values `maskAt('detail:<node id>:<0..7>')` (M1 then M2; without maskAt it throws: no LUT can hold it); film stages
+  are skipped (it bakes LUTs, which cannot hold them). `gradePicture(clip, asset, nodes, rgb, width, height, {base, maskAt,
+  frame})` is the whole-frame reference: parts split after film and before detail points, `detailMaps` from each part's
+  output, film between parts, unclamped until the end.
 
 ## Layout (MacBook first)
 

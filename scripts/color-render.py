@@ -1,6 +1,6 @@
 """Float scene processing; ACES display rendering is native OpenColorIO, not a baked LUT.
-The v3 grade (docs/color-grading-v3.md) ports src/services/grading.ts and filmLook.ts: per-pixel steps in grade(), film on whole
-frames in grade_frame(). Everything stays float32; gradingRender.test.ts holds it to the CPU reference."""
+The v3 grade (docs/color-grading-v3.md) ports src/services/grading.ts and filmLook.ts: per-pixel steps in grade(), film and the
+Dehaze/Clarity maps on whole frames in grade_frame(). Everything stays float32; gradingRender.test.ts holds it to the CPU reference."""
 import bisect, itertools, json, math, os, signal, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
@@ -191,7 +191,7 @@ def window_alpha(p,coords,shape):
 
 def grade(rgb,stages,masks=None,managed=True,coords=None):
     """Every per-pixel stage on rgb (any shape ending in 3). Film stages are skipped (grade_frame runs them on whole frames);
-    a window needs `coords`, a Smart Mask or depth key its alpha in `masks`."""
+    a window needs `coords`, a Smart Mask or depth key its alpha in `masks`, a detail node its level-k maps there too."""
     def blend(result,before,stage,keyed):
         node=stage.get('node') or {};binding=node.get('mask');windows=has_window(node.get('parameters') or {})
         masked=bool(binding and binding['enabled'])
@@ -225,9 +225,12 @@ def grade(rgb,stages,masks=None,managed=True,coords=None):
             if s['type']=='lut':
                 rgb=blend(lut(rgb,s['effect']),before,s,keyed);continue
             g=s['g'];p=s['extra'];gamma=s['gamma'];channels='RGB';w=[float(v) for v in s['weights']]
-            per=lambda key:np.array([p.get(key+c,0) for c in channels],np.float32)
+            per=lambda key:np.array([p.get(key+c,0) for c in channels],np.float32);detail=detail_point(s)
+            # Dehaze and Clarity first, in linear light: nodes-v2 inside the exposure/white balance step, legacy on Gamma 2.4.
+            if detail and not managed: rgb=encode(apply_detail(decode(rgb,'Gamma 2.4'),w,*detail_at(masks,s,coords,rgb.shape),p),'Gamma 2.4')
             if managed:
-                if g['exposure'] or g['temperature'] or g['tint']: rgb=encode(decode(rgb,gamma)*np.array([2**g['exposure']*(1+g['temperature']/10000),2**g['exposure']*(1-g['tint']/200),2**g['exposure']*(1-g['temperature']/10000)],np.float32),gamma)
+                if detail or g['exposure'] or g['temperature'] or g['tint']:
+                    lin=decode(rgb,gamma)*gain(g);rgb=encode(apply_detail(lin,w,*detail_at(masks,s,coords,rgb.shape),p) if detail else lin,gamma)
                 # Neutral primaries (a CST node's) are skipped: the same pixels, about 170 ms less CPU a 4K frame each.
                 if g['contrast']!=1 or g['offset'] or g['gamma'] or g['gain']!=1 or g['lift'] or any(p.get(k+c) for k in ('offset','gamma','gain','lift') for c in channels):
                     v=rgb;x=(v-g['pivot'])*g['contrast']+g['pivot']+g['offset']+per('offset')
@@ -392,11 +395,69 @@ def apply_film(rgb,stage,frame,pool=None):
     if not np.isfinite(out).all(): raise ValueError('Film stage produced non-finite pixels')
     return out
 
+# ---- Detail (filmLook.ts detailMaps/applyDetail): Dehaze and Clarity, docs/color-grading-v3.md -----------------------------
+def detail_point(s):
+    """A node whose correction (always its first stage) carries dehaze or clarity: its maps come from the whole picture entering it."""
+    p=s.get('extra') or {};return s['type']=='correction' and s.get('nodeStart',True) and bool(p.get('dehaze') or p.get('clarity'))
+def gain(g): e=2**g['exposure'];return np.array([e*(1+g['temperature']/10000),e*(1-g['tint']/200),e*(1-g['temperature']/10000)],np.float32)
+def stops(x): return np.log2(np.maximum(x,0)+2**-10)-math.log2(.18)
+def softcap(u): return u/np.sqrt(np.sqrt(1+(u/.8)**4))
+
+def detail_maps(rgb,s,managed,pool=None):
+    """Level-k maps of the node input: M1 = G(a_c, b_c, α, β), M2 = B2 = G(dk', lm·dk', dk'·vr, dk'·vb), from the linear picture
+    grade() applies them to (decode·G on nodes-v2, Gamma 2.4 on legacy stages). Level and blurs are filmBlur's at σ = 2 % of the
+    height. The source pass runs in even-row stripes halved at once (a 2×2 box never crosses one): a 4K frame never holds full-size maps."""
+    height,width=rgb.shape[:2];w=[float(v) for v in s['weights']];sigma=.02*height;k=max(0,math.floor(math.log2(sigma/4)));sg=sigma/2**k
+    SA=np.empty((-(-height//2),-(-width//2),4) if k else (height,width,4),np.float32);SB=np.empty((*SA.shape[:2],3),np.float32)
+    def source(r):
+        # SA = (l, l², lm, mx), SB = clamp(lin, 2⁻⁸, 1)⁻⁴ per channel (the soft dark channel's power mean), in log stops re 18 % grey.
+        with np.errstate(invalid='ignore',divide='ignore',over='ignore'): lin=decode(rgb[r:r+STRIPE],s['gamma'])*gain(s['g']) if managed else decode(rgb[r:r+STRIPE],'Gamma 2.4')
+        mx=np.maximum(lin.max(-1),0);l,lm=stops(luma(lin,w)),stops(mx);q=1/np.clip(lin,2**-8,1);q=q*q;a,b=np.stack([l,l*l,lm,mx],-1),q*q
+        if k: a,b,r=halve(a),halve(b),r//2
+        SA[r:r+len(a)]=a;SB[r:r+len(b)]=b
+    each(pool,source,height)
+    for _ in range(k-1): SA,SB=halve(SA,pool),halve(SB,pool)
+    # Soft minimum per channel (p = 4) on a quarter of the radius; the veil colour within ±.25 stop; bright texels out before any blur.
+    sm=1/np.sqrt(np.sqrt(gauss(SB,sg/4,pool)));dk=sm.min(-1);vr,vb=np.log2(sm[...,0]/sm[...,1]),np.log2(sm[...,2]/sm[...,1])
+    c=np.minimum(1,.25/np.maximum(np.sqrt(vr*vr+vb*vb),1e-6));vr,vb=vr*c,vb*c;dk=dk*(1-smoothstep(.25,.7,SA[...,3]));l,lm=SA[...,0],SA[...,2]
+    B1=gauss(np.stack([l,SA[...,1],lm,lm*lm],-1),sg,pool);B2=gauss(np.stack([dk,lm*dk,dk*vr,dk*vb],-1),sg,pool)
+    # Guided filters: clarity's base self-guided on l (eps (¼ stop)²), the haze map guided by lm (eps (½ stop)²).
+    vl=np.maximum(B1[...,1]-B1[...,0]**2,0);vm=np.maximum(B1[...,3]-B1[...,2]**2,0);ac=vl/(vl+.0625);al=(B2[...,1]-B1[...,2]*B2[...,0])/(vm+.25)
+    return gauss(np.stack([ac,(1-ac)*B1[...,0],al,B2[...,0]-al*B1[...,2]],-1),sg,pool),B2
+
+def detail_at(masks,s,coords,shape):
+    """This stripe's rows of the node's maps, bilinear from level k (half-pixel centres, clamped): only grade_frame has them."""
+    maps=(masks or {}).get('detail:'+str(s['node'].get('id')))
+    if maps is None or coords is None: raise ValueError('Dehaze and Clarity need whole frames; they cannot be baked into an RGB LUT.')
+    row,height,width=coords;resize=bilinear(height,width,*maps[0].shape[:2]);return resize(maps[0],slice(row,row+shape[0])),resize(maps[1],slice(row,row+shape[0]))
+
+def apply_detail(lin,w,U1,U2,p):
+    """applyDetail per pixel on linear light: dehaze (J = (I − A(1 − t))/t on luminance, A = 1, the veil's own colour taken out of the
+    chroma, the local mean partly re-exposed; − adds a neutral veil), then clarity (one 2^x gain on R, G and B) from the pre-dehaze l."""
+    a,c=p.get('dehaze',0)/100,p.get('clarity',0)/100;y=luma(lin,w);l=stops(y);ac,bc=U1[...,0],U1[...,1];base=ac*l+bc;out=lin
+    if a:
+        # The dehaze base keeps only edges over about a stop (eps_m = 1, from a_c); the haze map is read at it plus the pixel's own
+        # max-over-luma offset, so no texture is copied into h.
+        am=.0625*ac/(.0625*ac+1-ac);bm=am*l+(1-am)*bc/np.maximum(1-ac,1e-3);mu=.18*np.exp2(bm)
+        h=np.clip(U1[...,2]*(bm+stops(np.maximum(lin.max(-1),0))-l)+U1[...,3],0,1);h=np.where(y>1e-6,h*(1-smoothstep(.25,.7,y)),0)
+        if a>0:
+            t=np.maximum(1-.95*a*h,1/3);s=1-t;uc=softcap(s/np.maximum(y,1e-6));q=(1-uc)/t;gc=q*.4+.6/t;den=U2[...,0]+1e-3
+            col=np.stack([np.exp2(U2[...,2]/den),np.ones_like(y),np.exp2(U2[...,3]/den)],-1);col=col/luma(col,w)[...,None]
+            out=(q*y)[...,None]+gc[...,None]*(lin-y[...,None]-(uc*y)[...,None]*(col-1))
+            out=out*(((1-softcap(s/np.maximum(mu,1e-6)))/t)**-.6)[...,None]
+        else:
+            v=-a*(.5*np.maximum(mu-2**-10,0)*(1-smoothstep(.25,.7,y))+h);out=(lin+v[...,None])*((mu/(mu+v))**.4)[...,None]
+    if c:
+        # Midtones only, soft-limited to ½ stop, gated by the local variance (v/(v + .08²)): flat skies and noise are left alone.
+        d=l-base;f=d/np.sqrt(1+(d/.5)**2);mid=smoothstep(-6,-1.5,base)*(1-smoothstep(2,5,base));g=ac/(ac+.1024*(1-ac))
+        out=out*np.exp2(c*(2 if c>0 else 1)*mid*g*f)[...,None]
+    return out
+
 def grade_frame(rgb,stages,masks=None,managed=True,frame=0,pool=None,input_cube=None):
     """A whole (h, w, 3) frame: per-pixel segments in STRIPE-row stripes (window alphas from each stripe's rows), the input cube
-    first, film stages on the whole picture between segments. Each film stage follows its node's blend, so every segment
-    after one starts at a node's start."""
-    height,width=rgb.shape[:2];segment=[];first=True;masks=masks or {}
+    first, film stages on the whole picture between segments. Each film stage follows its node's blend and each detail node starts
+    a segment, its maps made from the whole picture entering it, so every segment after the first starts at a node's start."""
+    height,width=rgb.shape[:2];segment=[];first=True;masks=dict(masks or {})
     def flush():
         nonlocal first
         if not segment and not (first and input_cube): return
@@ -404,11 +465,12 @@ def grade_frame(rgb,stages,masks=None,managed=True,frame=0,pool=None,input_cube=
         def stripe(r):
             values=rgb[r:r+STRIPE]
             if cube: values=lut(values,{'cube':cube,'amount':1})
-            rgb[r:r+STRIPE]=grade(values,stages_,{k:a[r:r+STRIPE] for k,a in masks.items()},managed,(r,height,width))
+            rgb[r:r+STRIPE]=grade(values,stages_,{k:a if k.startswith('detail:') else a[r:r+STRIPE] for k,a in masks.items()},managed,(r,height,width))
         each(pool,stripe,height);segment.clear();first=False
     for s in stages:
-        if s['type']!='film': segment.append(s);continue
-        flush();first=False;rgb=apply_film(rgb,s,frame,pool)
+        if s['type']=='film': flush();first=False;rgb=apply_film(rgb,s,frame,pool);continue
+        if detail_point(s): flush();masks['detail:'+str(s['node'].get('id'))]=detail_maps(rgb,s,managed,pool)
+        segment.append(s)
     flush()
     return rgb
 
@@ -524,7 +586,7 @@ def render(job):
 
 def write_cube(job,size,path):
     """Sample the exact grade on a size^3 grid. Without masks every stage is per-pixel, so the export can apply it with lut3d."""
-    if any(s['type']=='film' or has_window((s.get('node') or {}).get('parameters') or {}) for s in job['stages']): raise ValueError('Windows and film effects need whole frames; they cannot be baked into a LUT.')
+    if any(s['type']=='film' or detail_point(s) or has_window((s.get('node') or {}).get('parameters') or {}) for s in job['stages']): raise ValueError('Windows, film effects, Dehaze and Clarity need whole frames; they cannot be baked into a LUT.')
     axis_=np.linspace(0,1,size,dtype=np.float32);b,g,r=np.meshgrid(axis_,axis_,axis_,indexing='ij')
     grid=np.stack([r,g,b],-1).reshape(size*size,size,3)  # .cube order: red varies fastest
     def rows(i):

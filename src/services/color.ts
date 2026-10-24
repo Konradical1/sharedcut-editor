@@ -2,7 +2,8 @@ import { nodeMaskId, validateNodeMask } from './smartMask.ts';
 import type { Clip, GradeNode, MediaAsset, ColorCurve, ColorEffect, ColorTransformEffect } from '../state/models.ts';
 import { acesMatrices } from './aces.generated.ts';
 import { gradeValues } from './grade.ts';
-import { identityCurve, curveSlope, sampleCurve, tonal, chroma, hslCurves, mixer, qualifierAlpha, hasWindow, hasQualifier, filmActive, filmParams, validateGradeParameters, V3_KEYS, CURVE_KEYS, HUE_CURVES } from './grading.ts';
+import { identityCurve, curveSlope, sampleCurve, tonal, chroma, hslCurves, mixer, qualifierAlpha, hasWindow, hasQualifier, filmActive, filmParams, validateGradeParameters, windowAlpha, detailActive, applyDetail, V3_KEYS, CURVE_KEYS, HUE_CURVES } from './grading.ts';
+import { applyFilm, detailAt, detailMaps, type DetailMaps } from './filmLook.ts';
 export { identityCurve, curveSlope, sampleCurve };
 
 export const profiles = ['Rec.709', 'S-Log3', 'Canon Log', 'Canon Log 2', 'Canon Log 3', 'S-Log2', 'S-Log', 'DaVinci Intermediate', 'Linear', 'Gamma 2.4', 'Apple Log'] as const;
@@ -127,16 +128,25 @@ export function colorStages(clip: Clip, nodes: GradeNode[]) {
   });
 }
 export function colorTransform(clip: Clip, asset: MediaAsset | undefined, nodes: GradeNode[], base?: Cube, maskAt?: (id:string)=>number) {
+  const run=stagesTransform(clip,asset,stagesOf(clip,asset,nodes),base,maskAt);
+  return (input: number[]): number[] => run(input).map(v=>clamp(v));
+}
+type Stages=ReturnType<typeof processingStages>;
+/** The clip's processing stages from its interpreted input (legacy stages ignore it and grade Gamma 2.4). */
+const stagesOf=(clip:Clip,asset:MediaAsset|undefined,nodes:GradeNode[])=>{const {profile,gamut}=interpretation(clip,asset);return processingStages({...clip,properties:{...clip.properties,inputProfile:profile,inputGamut:gamut}},nodes);};
+/** `stages` on one pixel, unclamped. `first`: they start at the source, so the camera exposure and the base look (legacy) apply. */
+function stagesTransform(clip: Clip, asset: MediaAsset | undefined, stages: Stages, base?: Cube, maskAt?: (id:string)=>number, first=true) {
+  if(clip.properties.colorPipeline==='nodes-v2') return managedColorTransform(stages,maskAt);
   const {profile}=interpretation(clip,asset);
-  if(clip.properties.colorPipeline==='nodes-v2') return managedColorTransform(clip,asset,nodes,maskAt);
-  const stages=processingStages(clip,nodes);
   return (input: number[]): number[] => {
     let rgb=input;
-    const stops=Number(clip.properties.inputExposure??0), temperature=Number(clip.properties.inputTemperature??0);
-    if(!Number.isFinite(stops)||Math.abs(stops)>8||!Number.isFinite(temperature)||Math.abs(temperature)>2000)throw new Error('Camera exposure or white balance is out of range.');
-    if(stops||temperature)rgb=rgb.map((v,c)=>encodeLog(decodeLog(v,profile)*2**stops*[1+temperature/10000,1,1-temperature/10000][c],profile));
-    // Ungraded footage is shown as recorded, log included; a grade or an imported look does the converting.
-    if(base && clip.properties.bypassResolveLook!==true) rgb=sampleCube(base,rgb);
+    if(first){
+      const stops=Number(clip.properties.inputExposure??0), temperature=Number(clip.properties.inputTemperature??0);
+      if(!Number.isFinite(stops)||Math.abs(stops)>8||!Number.isFinite(temperature)||Math.abs(temperature)>2000)throw new Error('Camera exposure or white balance is out of range.');
+      if(stops||temperature)rgb=rgb.map((v,c)=>encodeLog(decodeLog(v,profile)*2**stops*[1+temperature/10000,1,1-temperature/10000][c],profile));
+      // Ungraded footage is shown as recorded, log included; a grade or an imported look does the converting.
+      if(base && clip.properties.bypassResolveLook!==true) rgb=sampleCube(base,rgb);
+    }
     let nodeInput=rgb,keyed=1;
     for(const stage of stages) {
       if(stage.type==='film')continue;
@@ -144,6 +154,7 @@ export function colorTransform(clip: Clip, asset: MediaAsset | undefined, nodes:
       if(stage.type==='cst'){rgb=transformSpace(rgb,stage.effect);continue;}
       if(stage.type==='lut'){rgb=blendNode(applyLut(rgb,stage.effect),nodeInput,stage,maskAt,keyed);continue;}
       const {g,extra:p,node}=stage;
+      if(detailPoint(stage))rgb=detailPixel(rgb,stage,[1,1,1],maskAt);
       rgb=rgb.map((value,c)=>{
         const channel='RGB'[c], v=Math.max(0,value*2**g.exposure);
         return Math.max(0,(v-g.pivot)*g.contrast+g.pivot+g.offset+(p['offset'+channel]??0))**(1/2**(g.gamma+(p['gamma'+channel]??0)))*(g.gain+(p['gain'+channel]??0))+(g.lift+(p['lift'+channel]??0))*(1-Math.min(1,v));
@@ -155,8 +166,52 @@ export function colorTransform(clip: Clip, asset: MediaAsset | undefined, nodes:
       else if(Object.keys(p).some(k=>k.startsWith('curve'))) rgb=rgb.map(v=>curveValue(v,p));
       rgb=blendNode(mixer(hslCurves(rgb,W709,node.curves),p),nodeInput,stage,maskAt,keyed);
     }
-    return rgb.map(v=>clamp(v));
+    return rgb;
   };
+}
+/** A correction stage whose node has Dehaze or Clarity (docs/color-grading-v3.md, "Detail"): whole-frame maps from its node input. */
+export const detailPoint=(stage:Stages[number]):stage is Extract<Stages[number],{type:'correction'}>=>stage.type==='correction'&&stage.nodeStart&&detailActive(stage.extra);
+/** G of a detail point: the nodes-v2 exposure/temperature/tint gain (step 1), 1 on legacy stages. Maps and tools see decode × G. */
+export const detailGain=(g:{exposure:number;temperature:number;tint:number},managed:boolean)=>managed?[2**g.exposure*(1+g.temperature/10000),2**g.exposure*(1-g.tint/200),2**g.exposure*(1-g.temperature/10000)]:[1,1,1];
+/** Dehaze/Clarity first thing in the stage: decode × G, the node's 8 map values at this pixel from maskAt('detail:<node id>:<0..7>'), encode. */
+function detailPixel(rgb:number[],stage:{node:GradeNode;gamma:string;weights:number[];extra:Record<string,number>},gain:number[],maskAt?:(id:string)=>number){
+  if(!maskAt)throw Error('Dehaze and Clarity need whole frames; they cannot be baked into an RGB LUT.');
+  const u=[0,1,2,3,4,5,6,7].map(i=>maskAt(`detail:${stage.node.id}:${i}`));if(!u.every(Number.isFinite))throw Error('Invalid Dehaze/Clarity map.');
+  return applyDetail(rgb.map((v,c)=>decodeLog(v,stage.gamma)*gain[c]),stage.weights,stage.extra,u).map(v=>encodeLog(v,stage.gamma));
+}
+/**
+ * A whole width×height picture (interleaved RGB in the clip's input encoding, the preview's picture box or the export's fitted frame)
+ * through the clip's grade, film and Dehaze/Clarity included: per-pixel parts split after film stages and before detail points, whose
+ * maps come from that part's output; unclamped between parts as the GPU and color-render.py keep them, clamped at the end like
+ * colorTransform. `maskAt(id, i)` answers Smart Masks and depth keys (and windows, when given) at pixel i = y·width + x; windows
+ * otherwise read the picture position. `frame` is the film frame number.
+ */
+export function gradePicture(clip: Clip, asset: MediaAsset | undefined, nodes: GradeNode[], rgb: Float32Array, width: number, height: number, opts: { base?: Cube; maskAt?: (id: string, i: number) => number; frame?: number } = {}): Float32Array {
+  const stages=stagesOf(clip,asset,nodes),managed=clip.properties.colorPipeline==='nodes-v2',windows=new Map(nodes.map(n=>[`window:${n.id}`,n.parameters])),maps=new Map<string,DetailMaps>();
+  let at=0,cached='',values:number[]=[],out=rgb,from=0,first=true;
+  const maskAt=(id:string)=>{
+    if(id.startsWith('detail:')){
+      const j=id.lastIndexOf(':'),key=`${id.slice(7,j)}@${at}`;
+      if(key!==cached){const m=maps.get(id.slice(7,j));if(!m)throw Error('Missing Dehaze/Clarity maps.');values=detailAt(m,width,height,at%width,Math.floor(at/width));cached=key;}
+      return values[+id.slice(j+1)];
+    }
+    if(opts.maskAt)return opts.maskAt(id,at);
+    const p=windows.get(id);if(p)return windowAlpha((at%width+.5)/width,(Math.floor(at/width)+.5)/height,width/height,p);
+    throw Error('A spatial node mask requires per-pixel alpha.');
+  };
+  // Every part starts at a node's start (film follows its node's blend; a detail point is its node's first stage), so none carries state.
+  const run=(to:number)=>{
+    if(to===from&&!first)return;
+    const transform=stagesTransform(clip,asset,stages.slice(from,to),first?opts.base:undefined,maskAt,first),next=new Float32Array(out.length);
+    for(at=0;at<width*height;at++)next.set(transform(Array.from(out.subarray(at*3,at*3+3))),at*3);
+    out=next;first=false;
+  };
+  stages.forEach((stage,i)=>{
+    if(stage.type==='film'){run(i);out=applyFilm(out,width,height,stage,opts.frame??0);from=i+1;}
+    else if(detailPoint(stage)){run(i);maps.set(stage.node.id,detailMaps(out,width,height,{gamma:stage.gamma,weights:stage.weights,gain:detailGain(stage.g,managed)}));from=i;}
+  });
+  run(stages.length);
+  return out.map(v=>clamp(v));
 }
 export function makeCube(transform: (rgb:number[])=>number[], size=33): Cube {
   const data=new Float32Array(size**3*3); let index=0;
@@ -314,8 +369,7 @@ function blendNode(rgb:number[],input:number[],stage:{node:GradeNode;nodeEnd:boo
   }
   return input.map((v,c)=>v+(rgb[c]-v)*amount);
 }
-function managedColorTransform(clip:Clip,asset:MediaAsset|undefined,nodes:GradeNode[],maskAt?: (id:string)=>number){
-  const source=interpretation(clip,asset),stages=processingStages({...clip,properties:{...clip.properties,inputProfile:source.profile,inputGamut:source.gamut}},nodes);
+function managedColorTransform(stages:Stages,maskAt?: (id:string)=>number){
   return(input:number[])=>{
     let rgb=input,nodeInput=input,keyed=1;
     for(const stage of stages){
@@ -324,7 +378,8 @@ function managedColorTransform(clip:Clip,asset:MediaAsset|undefined,nodes:GradeN
       if(stage.type==='cst'){rgb=transformSpace(rgb,stage.effect,stage.matrix,stage.weights);continue;}
       if(stage.type==='lut'){rgb=blendNode(applyLut(rgb,stage.effect),nodeInput,stage,maskAt,keyed);continue;}
       const {g,extra:p,node,gamma}=stage,w=stage.weights;
-      if(g.exposure||g.temperature||g.tint)rgb=rgb.map((v,c)=>encodeLog(decodeLog(v,gamma)*2**g.exposure*[1+g.temperature/10000,1-g.tint/200,1-g.temperature/10000][c],gamma));
+      if(detailPoint(stage))rgb=detailPixel(rgb,stage,detailGain(g,true),maskAt);
+      else if(g.exposure||g.temperature||g.tint)rgb=rgb.map((v,c)=>encodeLog(decodeLog(v,gamma)*2**g.exposure*[1+g.temperature/10000,1-g.tint/200,1-g.temperature/10000][c],gamma));
       rgb=rgb.map((v,c)=>{const ch='RGB'[c],x=(v-g.pivot)*g.contrast+g.pivot+g.offset+(p['offset'+ch]??0);return Math.sign(x)*Math.abs(x)**(1/2**(g.gamma+(p['gamma'+ch]??0)))*(g.gain+(p['gain'+ch]??0))+(g.lift+(p['lift'+ch]??0))*(1-v);});
       rgb=tonal(rgb,w,p,g.pivot);
       const y=multiply([w],rgb)[0];rgb=chroma(rangeSaturation(rgb.map(v=>y+(v-y)*g.saturation),w,p),w,p);
@@ -332,7 +387,7 @@ function managedColorTransform(clip:Clip,asset:MediaAsset|undefined,nodes:GradeN
       else if(Object.keys(p).some(k=>k.startsWith('curve')))rgb=rgb.map(v=>curveValue(v,p));
       rgb=blendNode(mixer(hslCurves(rgb,w,node.curves),p),nodeInput,stage,maskAt,keyed);
     }
-    return rgb.map(v=>clamp(v));
+    return rgb;
   };
 }
 

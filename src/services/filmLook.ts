@@ -1,9 +1,9 @@
 import { decodeLog, encodeLog } from './color.ts';
-import { filmMotion, grainKey, grainNoise, halationTint, sse } from './grading.ts';
+import { DETAIL, detailStops, filmMotion, grainKey, grainNoise, halationTint, smoothstep, sse } from './grading.ts';
 
 /**
  * CPU reference of the film stage (docs/color-grading-v3.md, "Film stage"): gate weave, aberration, halation, bloom,
- * breath, vignette and grain on a whole picture. The GPU preview and color-render.py implement the same steps; tests
+ * breath, vignette and grain on a whole picture, and of the Dehaze/Clarity maps on the same blur pieces. The GPU preview and color-render.py implement the same steps; tests
  * hold all three to this. `rgb` is interleaved RGB of a width×height picture in the stage's encoding.
  */
 export interface FilmStage { p: Record<string, number>; gamma: string; weights: number[] }
@@ -17,20 +17,18 @@ function sample(data: Float32Array, width: number, height: number, channels: num
   return top + (bottom - top) * fy;
 }
 
-/** The shared blur: 2×2 box halvings until σ' ∈ [4, 8), a separable Gaussian (radius ⌈3σ'⌉, clamped edges), bilinear upsample. */
-export function filmBlur(src: Float32Array, width: number, height: number, channels: number, sigma: number): Float32Array {
-  if (sigma < .5) return src;
-  const levels = Math.max(0, Math.floor(Math.log2(sigma / 4)));
-  let data = src, w = width, h = height;
-  for (let level = 0; level < levels; level++) {
-    const nw = Math.ceil(w / 2), nh = Math.ceil(h / 2), next = new Float32Array(nw * nh * channels);
-    for (let y = 0; y < nh; y++) for (let x = 0; x < nw; x++) {
-      const x0 = 2 * x, x1 = Math.min(2 * x + 1, w - 1), y0 = 2 * y, y1 = Math.min(2 * y + 1, h - 1);
-      for (let c = 0; c < channels; c++) next[(y * nw + x) * channels + c] = (data[(y0 * w + x0) * channels + c] + data[(y0 * w + x1) * channels + c] + data[(y1 * w + x0) * channels + c] + data[(y1 * w + x1) * channels + c]) / 4;
-    }
-    data = next; w = nw; h = nh;
+/** filmBlur's 2×2 box halving: ⌈w/2⌉ × ⌈h/2⌉ texels, input indices clamped. */
+export function halve(data: Float32Array, w: number, h: number, channels: number): Float32Array {
+  const nw = Math.ceil(w / 2), nh = Math.ceil(h / 2), next = new Float32Array(nw * nh * channels);
+  for (let y = 0; y < nh; y++) for (let x = 0; x < nw; x++) {
+    const x0 = 2 * x, x1 = Math.min(2 * x + 1, w - 1), y0 = 2 * y, y1 = Math.min(2 * y + 1, h - 1);
+    for (let c = 0; c < channels; c++) next[(y * nw + x) * channels + c] = (data[(y0 * w + x0) * channels + c] + data[(y0 * w + x1) * channels + c] + data[(y1 * w + x0) * channels + c] + data[(y1 * w + x1) * channels + c]) / 4;
   }
-  const s = sigma / 2 ** levels, radius = Math.ceil(3 * s), kernel = Array.from({ length: 2 * radius + 1 }, (_, i) => Math.exp(-((i - radius) ** 2) / (2 * s * s))), total = kernel.reduce((a, b) => a + b);
+  return next;
+}
+/** filmBlur's separable Gaussian at σ' = s on a w×h picture: radius ⌈3s⌉ taps, weights exp(−i²/2s²) normalised, edges clamped. */
+export function gaussian(data: Float32Array, w: number, h: number, channels: number, s: number): Float32Array {
+  const radius = Math.ceil(3 * s), kernel = Array.from({ length: 2 * radius + 1 }, (_, i) => Math.exp(-((i - radius) ** 2) / (2 * s * s))), total = kernel.reduce((a, b) => a + b);
   const pass = (input: Float32Array, horizontal: boolean) => {
     const out = new Float32Array(input.length);
     for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) for (let c = 0; c < channels; c++) {
@@ -40,11 +38,61 @@ export function filmBlur(src: Float32Array, width: number, height: number, chann
     }
     return out;
   };
-  const blurred = pass(pass(data, true), false);
-  if (!levels) return blurred;
+  return pass(pass(data, true), false);
+}
+/** filmBlur's upsample of a w×h picture to width×height: bilinear, half-pixel centres, edges clamped. */
+export function upsample(data: Float32Array, w: number, h: number, channels: number, width: number, height: number): Float32Array {
   const out = new Float32Array(width * height * channels);
-  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) for (let c = 0; c < channels; c++) out[(y * width + x) * channels + c] = sample(blurred, w, h, channels, c, (x + .5) * w / width - .5, (y + .5) * h / height - .5);
+  for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) for (let c = 0; c < channels; c++) out[(y * width + x) * channels + c] = sample(data, w, h, channels, c, (x + .5) * w / width - .5, (y + .5) * h / height - .5);
   return out;
+}
+/** The shared blur: 2×2 box halvings until σ' ∈ [4, 8), a separable Gaussian (radius ⌈3σ'⌉, clamped edges), bilinear upsample. */
+export function filmBlur(src: Float32Array, width: number, height: number, channels: number, sigma: number): Float32Array {
+  if (sigma < .5) return src;
+  const levels = Math.max(0, Math.floor(Math.log2(sigma / 4)));
+  let data = src, w = width, h = height;
+  for (let level = 0; level < levels; level++) { data = halve(data, w, h, channels); w = Math.ceil(w / 2); h = Math.ceil(h / 2); }
+  const blurred = gaussian(data, w, h, channels, sigma / 2 ** levels);
+  return levels ? upsample(blurred, w, h, channels, width, height) : blurred;
+}
+
+/** Dehaze/Clarity maps at pyramid level k (wk×hk, RGBA): M1 = blurred (a_c, b_c, α, β), M2 = B2 = blurred (μd, c_md, dvr, dvb). */
+export interface DetailMaps { k: number; wk: number; hk: number; m1: Float32Array; m2: Float32Array }
+/**
+ * The maps of a detail point (docs/color-grading-v3.md, "Detail") from the whole width×height node input in the stage's encoding:
+ * lin = decode(rgb, gamma) × gain (G; 1 when absent), sources halved k times, the soft dark channel on the small Gaussian, the
+ * guided filters on the large one. One level, no frame statistic: every value depends only on pixels within the blur support.
+ */
+export function detailMaps(rgb: Float32Array, width: number, height: number, stage: { gamma: string; weights: number[]; gain?: number[] }): DetailMaps {
+  const K = DETAIL, w = stage.weights, gain = stage.gain ?? [1, 1, 1], sigma = K.R / 100 * height, k = Math.max(0, Math.floor(Math.log2(sigma / 4))), s = sigma / 2 ** k, n = width * height;
+  // Per pixel SA = (l, l², lm, mx), SB = 1/clamp(lin, M0, 1)⁴ (products, never pow), then filmBlur's halvings.
+  let sa: Float32Array = new Float32Array(n * 4), sb: Float32Array = new Float32Array(n * 3), wk = width, hk = height;
+  for (let i = 0; i < n; i++) {
+    const lin = [0, 1, 2].map(c => decodeLog(rgb[i * 3 + c], stage.gamma) * gain[c]), l = detailStops(w[0] * lin[0] + w[1] * lin[1] + w[2] * lin[2]), mx = Math.max(...lin, 0), lm = detailStops(mx);
+    sa[i * 4] = l; sa[i * 4 + 1] = l * l; sa[i * 4 + 2] = lm; sa[i * 4 + 3] = mx;
+    for (let c = 0; c < 3; c++) { const r = 1 / clamp(lin[c], K.M0, 1); sb[i * 3 + c] = r * r * (r * r); }
+  }
+  for (let level = 0; level < k; level++) { sa = halve(sa, wk, hk, 4); sb = halve(sb, wk, hk, 3); wk = Math.ceil(wk / 2); hk = Math.ceil(hk / 2); }
+  const m = wk * hk, pb = gaussian(sb, wk, hk, 3, s * K.RD / K.R), t1 = new Float32Array(m * 4), t2 = new Float32Array(m * 4);
+  for (let i = 0; i < m; i++) {
+    // Soft dark channel: the power-mean soft minimum per channel, its veil colour within SMAX stops of neutral, and sky and clouds
+    // (the level-k box mean of the max channel) taken out before any blur.
+    const sm = [0, 1, 2].map(c => 1 / Math.sqrt(Math.sqrt(pb[i * 3 + c]))), vr = Math.log2(sm[0] / sm[1]), vb = Math.log2(sm[2] / sm[1]), sc = Math.min(1, K.SMAX / Math.max(Math.sqrt(vr * vr + vb * vb), 1e-6));
+    const dk = Math.min(...sm) * (1 - smoothstep(K.GLO, K.GHI, sa[i * 4 + 3])), lm = sa[i * 4 + 2], j = i * 4;
+    t1[j] = sa[j]; t1[j + 1] = sa[j + 1]; t1[j + 2] = lm; t1[j + 3] = lm * lm; t2[j] = dk; t2[j + 1] = lm * dk; t2[j + 2] = dk * vr * sc; t2[j + 3] = dk * vb * sc;
+  }
+  const b1 = gaussian(t1, wk, hk, 4, s), b2 = gaussian(t2, wk, hk, 4, s), coefficients = new Float32Array(m * 4);
+  for (let j = 0; j < m * 4; j += 4) {
+    // Clarity: the self-guided base of l; Dehaze: the haze map guided by lm, so it snaps to ridgelines.
+    const vl = Math.max(b1[j + 1] - b1[j] ** 2, 0), vm = Math.max(b1[j + 3] - b1[j + 2] ** 2, 0), ac = vl / (vl + K.EPS_C), al = (b2[j + 1] - b1[j + 2] * b2[j]) / (vm + K.EPS_D);
+    coefficients[j] = ac; coefficients[j + 1] = (1 - ac) * b1[j]; coefficients[j + 2] = al; coefficients[j + 3] = b2[j] - al * b1[j + 2];
+  }
+  return { k, wk, hk, m1: gaussian(coefficients, wk, hk, 4, s), m2: b2 };
+}
+/** The 8 map values (M1 then M2) at pixel (x, y) of the width×height picture: filmBlur's half-pixel-centre bilinear, clamped. */
+export function detailAt(maps: DetailMaps, width: number, height: number, x: number, y: number): number[] {
+  const { wk, hk } = maps, sx = (x + .5) * wk / width - .5, sy = (y + .5) * hk / height - .5;
+  return [0, 1, 2, 3, 4, 5, 6, 7].map(i => sample(i < 4 ? maps.m1 : maps.m2, wk, hk, 4, i % 4, sx, sy));
 }
 
 export function applyFilm(rgb: Float32Array, width: number, height: number, stage: FilmStage, frame: number): Float32Array {

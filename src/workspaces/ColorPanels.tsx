@@ -13,13 +13,13 @@ const reset=(keys:string[])=>Object.fromEntries(keys.map(k=>[k,PARAM[k].initial]
 // ---- Primaries: wheels beside grouped sliders ------------------------------------------------------------------------------
 const WHEELS:[string,string,string][]=[['Shadows','lift','Shadows (DaVinci Lift): moves the dark tones; white stays put'],['Midtones','gamma','Midtones (DaVinci Gamma): bends the middle tones; black and white stay put'],['Highlights','gain','Highlights (DaVinci Gain): scales the bright tones; black stays put'],['Offset','offset','Offset: shifts every level by the same amount']];
 const LOG_WHEELS:[string,string,string][]=[['Shadow','logShadow','Log Shadow: below the Low range'],['Midtone','logMid','Log Midtone: between the Low and High ranges'],['Highlight','logHighlight','Log Highlight: above the High range'],WHEELS[3]];
-const BALANCE:[string,string[]]=['Balance',['exposure','temperature','tint']],TONE:[string,string[]]=['Tone',['contrast','pivot','shadows','highlights']],COLOR:[string,string[]]=['Color',['saturation','hue','boost','density']];
-// Two columns of two groups: side by side on a wide tool area, stacked in two columns on a narrow one.
-const GROUPS:[string,string[]][]=[BALANCE,TONE,COLOR,['Range saturation',['saturationShadows','saturationMidtones','saturationHighlights']]],LOG_GROUPS:[string,string[]][]=[BALANCE,TONE,['Log ranges',['logLowRange','logHighRange']],COLOR];
+const BALANCE:[string,string[]]=['Balance',['exposure','temperature','tint']],TONE:[string,string[]]=['Tone',['contrast','pivot','shadows','highlights']],COLOR:[string,string[]]=['Color',['saturation','hue','boost','density']],DETAIL:[string,string[]]=['Detail',['dehaze','clarity']];
+// Two columns of groups, Detail last: all five side by side on a wide tool area; on a narrow one two stacked columns and Detail in a slim third.
+const GROUPS:[string,string[]][]=[BALANCE,TONE,COLOR,['Range saturation',['saturationShadows','saturationMidtones','saturationHighlights']],DETAIL],LOG_GROUPS:[string,string[]][]=[BALANCE,TONE,['Log ranges',['logLowRange','logHighRange']],COLOR,DETAIL];
 export function PrimariesPanel({node,update,log,pivot}:{node:GradeNode;update:Update;log:boolean;pivot:number}){
   return <div className="primaries-tool">
     <div className="color-wheels">{(log?LOG_WHEELS:WHEELS).map(([name,base,title])=><ColorWheel key={base} name={name} base={base} title={title} node={node} update={update}/>)}</div>
-    <div className="slider-groups">{[0,2].map(i=><div key={i} className="slider-column">{(log?LOG_GROUPS:GROUPS).slice(i,i+2).map(([title,keys])=><section key={title} className="slider-group"><h4>{title}</h4>{keys.map(k=><GradeSlider key={k} k={k} className={`track-${k}`} value={node.parameters[k]} initial={k==='pivot'?pivot:undefined} onChange={v=>update({[k]:v})}/>)}</section>)}</div>)}</div>
+    <div className="slider-groups">{[0,2].map(i=><div key={i} className="slider-column">{(log?LOG_GROUPS:GROUPS).slice(i,i?undefined:2).map(([title,keys])=><section key={title} className="slider-group"><h4>{title}</h4>{keys.map(k=><GradeSlider key={k} k={k} className={`track-${k}`} value={node.parameters[k]} initial={k==='pivot'?pivot:undefined} onChange={v=>update({[k]:v})}/>)}</section>)}</div>)}</div>
   </div>;
 }
 

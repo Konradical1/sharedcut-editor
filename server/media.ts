@@ -943,8 +943,8 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
   // One pass holds every clip it renders; a split export keeps each pass far below this.
   if ((request.only ? clips.filter(clip => request.only!.has(clip.id)) : clips).length > 128) throw new Error('This render range stacks more than 128 clips at once. Export shorter ranges.');
   const keyedGrade = (clip: Clip) => request.nodes.some(n => n.clipId === clip.id && n.enabled && hasQualifier(n.parameters)) && existsSync(colorPython());
-  // Per frame: a matte, a depth key, a window or film (spatialGrade) needs the colour worker on every frame. So does a
-  // qualifier where the worker exists: its hue key jumps at grey, which no table holds (65³ drifted up to 10 levels).
+  // Per frame: a matte, a depth key, a window, film, dehaze or clarity (spatialGrade) needs the colour worker on every
+  // frame. So does a qualifier where the worker exists: its hue key jumps at grey, which no table holds (65³ drifted up to 10 levels).
   const perFrameColor = (clip: Clip) => activeSmartMasks(clip, request.nodes).length > 0 || activeDepthKeys(clip, request.nodes).length > 0 || spatialGrade(clip.id, request.nodes) || keyedGrade(clip);
   const colorClips = clips.filter(clip => {
     const track = tracks.find(track => track.id === clip.trackId);
@@ -1192,12 +1192,12 @@ export async function renderTimeline(request: RenderRequest): Promise<void> {
       const fitFirst = !clip.effects.some(e => effectEnabled(clip, e) && Number(e.amount) > 0 && ![...audioEffectNames, 'Stabilize', 'Depth', 'Noise Reduction'].includes(e.name));
       let videoIndex=index,acesCube:string|undefined,acesInterpolation='trilinear';
       const usedMasks=activeSmartMasks(clip,request.nodes),depthKeys=activeDepthKeys(clip,request.nodes),maskStreams=new Map<string,{index:number;timing:string[]}>();
-      // Windows need pixel positions and film whole frames (docs/color-grading-v3.md): no table can hold either, nor a
-      // qualifier exactly (keyedGrade, when the worker exists).
+      // Windows need pixel positions, film, dehaze and clarity whole frames (docs/color-grading-v3.md): no table can hold
+      // them, nor a qualifier exactly (keyedGrade, when the worker exists).
       const spatial=spatialGrade(clip.id,request.nodes)||keyedGrade(clip),baked=adjust&&spatial;
       const exactColor=usedMasks.length>0||depthKeys.length>0||spatial||clip.properties.colorPipeline==='nodes-v2'&&hasACES(request.nodes,clip.id);
       if(exactColor&&adjust&&(usedMasks.length||depthKeys.length))throw Error(`${clip.name}: Smart Masks and depth keys need source footage. Grade masked looks on the clips themselves, not on an adjustment clip.`);
-      if(exactColor&&!existsSync(colorPython()))throw Error(`${clip.name}: this grade (film, windows, ACES or a mask) exports through the colour worker, which is not installed here. On a server run npm run setup:color; SharedCut Desktop cannot export it yet.`);
+      if(exactColor&&!existsSync(colorPython()))throw Error(`${clip.name}: this grade (film, dehaze, clarity, windows, ACES or a mask) exports through the colour worker, which is not installed here. On a server run npm run setup:color; SharedCut Desktop cannot export it yet.`);
       let colorInput=source.path;
       if(baked){
         // An adjustment clip with windows or film grades the picture under it frame by frame: the clips before it in this

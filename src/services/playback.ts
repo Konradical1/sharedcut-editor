@@ -1065,8 +1065,8 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
         if(!denoised?.noise && (maskCount || nodes.length || probeWaiting(graded) || clip.properties.resolveLookUrl || Number(clip.properties.inputExposure) || Number(clip.properties.inputTemperature) || clip.properties.yuvMatrix || clip.properties.dataLevels&&clip.properties.dataLevels!=='Auto')) {
           color ??= createColorPreview(()=>{dirty=true;});
           const previewAsset=element?.src.includes('/files/')?{...asset,colorMatrix:'bt709'}:asset;
-          // Windows and film are placed on the frame export grades, the stabilized bake: under Stabilize the renderer reads the
-          // stabilized picture itself. A per-pixel grade commutes with the warp and keeps the warp below.
+          // Windows, film and Dehaze/Clarity maps are placed on the frame export grades, the stabilized bake: under Stabilize the
+          // renderer reads the stabilized picture itself. A per-pixel grade commutes with the warp and keeps the warp below.
           const colorWarp = warp && spatialGrade(clip.id,nodes) ? warpTransform(warp) : undefined;
           // Film grain on a picture without a source clock counts timeline frames from the clip's in point, as export does.
           const result = color.draw(layer,clip,previewAsset,graded,element,sampleTime=>loadMasks(element?sampleTime+offset:sourceTime(clip,time,asset.fps||24,asset.duration)),snapshot,asset.kind==='video'&&element?undefined:Math.round((clip.sourceIn+time-clip.start)*(project?.fps||24)),colorWarp);

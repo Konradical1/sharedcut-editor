@@ -1,7 +1,8 @@
 // Browser check for the Color page v3 layout and tools (ColorWorkspace.tsx, ColorPanels.tsx, ColorTools.tsx, color.css): it fits a
-// MacBook Air (1470×760) and 1280×720 with no page scroll and no clipped control, every tool tab renders, sliders, wheels, HSL
-// curves, the mixer, film and a library look change the selected node, a slider drag is one undo, New Node makes a Film node,
-// and the tool area keeps its dragged height after a reload. Needs FFmpeg for the test clip.
+// MacBook Air (1470×760) and 1280×720 with no page scroll and no clipped control (Primaries in both modes), every tool tab renders,
+// sliders, wheels, HSL curves, the mixer, film and a library look change the selected node, a slider drag is one undo, Detail
+// (Dehaze, Clarity) is in both Primaries modes and resets, undoes and keyframes, New Node makes a Film node, and the tool area
+// keeps its dragged height after a reload. Needs FFmpeg for the test clip.
 // Run: node --experimental-strip-types --test src/workspaces/colorPage.browser.test.ts
 // DIST=<built dist> skips the build; PLAYWRIGHT_CHROME_PATH picks a Chrome binary (default: installed Chrome); SHOTS=<dir> saves screenshots.
 import assert from 'node:assert/strict';
@@ -53,7 +54,7 @@ test('Color page v3: fits a MacBook, every tool works and saves to the selected 
   const context = await browser.newContext({ viewport: { width: 1470, height: 760 } }), page = await context.newPage(), errors: string[] = [];
   page.on('pageerror', e => errors.push(e.message));
   t.after(async () => { await context.close(); await app.close(); await rm(temp, { recursive: true, force: true, maxRetries: 10 }); });
-  type View = { revision: number; state: { projects: { id: string }[]; timelines: { id: string }[]; media: MediaAsset[]; clips: Clip[]; nodes: GradeNode[] } };
+  type View = { revision: number; state: { projects: { id: string }[]; timelines: { id: string }[]; tracks: { id: string; name: string }[]; media: MediaAsset[]; clips: Clip[]; nodes: GradeNode[] } };
   const server = async () => (await (await context.request.get(`${url}/api/state`)).json()) as View;
   const node = async (name: string) => (await server()).state.nodes.find(n => n.name === name)!;
   const until = async (check: (view: View) => boolean, what: string) => { for (let i = 0; i < 80; i++) { if (check(await server())) return; await page.waitForTimeout(100); } assert.fail(what); };
@@ -99,6 +100,10 @@ test('Color page v3: fits a MacBook, every tool works and saves to the selected 
       assert.deepEqual(await misfit(page, tab), [], `${tab} at ${width}×${height}`);
       if (shots) await page.screenshot({ path: join(shots, `colorpage-${tab}-${width}x${height}.png`) });
     }
+    await tool('Primaries').click();
+    await page.getByRole('button', { name: 'Log', exact: true }).click();
+    assert.deepEqual(await misfit(page, 'Primaries'), [], `Log Primaries at ${width}×${height}`);
+    await page.getByRole('button', { name: 'Primary', exact: true }).click();
   }
   await page.setViewportSize({ width: 1470, height: 760 });
 
@@ -136,7 +141,32 @@ test('Color page v3: fits a MacBook, every tool works and saves to the selected 
   await page.getByLabel('Shadow R', { exact: true }).press('Tab');
   await until(view => param('Balance', 'logShadowR')(view) === .02, 'Log Shadow R saves');
   assert.ok(await page.getByRole('slider', { name: 'Low range', exact: true }).isVisible());
+  for (const label of ['Dehaze', 'Clarity']) assert.ok(await page.getByRole('slider', { name: label, exact: true }).isVisible(), `Log ${label}`);
   await page.getByRole('button', { name: 'Primary', exact: true }).click();
+
+  // Detail: Dehaze saves to the node, double-click resets it, undo brings it back; a keyframe on it takes later changes.
+  for (const label of ['Dehaze', 'Clarity']) assert.ok(await page.getByRole('slider', { name: label, exact: true }).isVisible(), label);
+  await page.getByLabel('Dehaze value', { exact: true }).fill('40');
+  await page.getByLabel('Dehaze value', { exact: true }).press('Tab');
+  await until(view => param('Balance', 'dehaze')(view) === 40, 'Dehaze saves');
+  await page.locator('.grade-slider', { has: page.getByRole('slider', { name: 'Dehaze', exact: true }) }).locator('span').first().dblclick();
+  await until(view => param('Balance', 'dehaze')(view) === 0, 'double-click resets Dehaze');
+  await page.keyboard.press('Control+z');
+  await until(view => param('Balance', 'dehaze')(view) === 40, 'undo restores Dehaze');
+  const view = await server(), path = `nodes.${view.state.nodes.find(n => n.name === 'Balance')!.id}.parameters.dehaze`, keys = (view: View) => view.state.clips.find(c => c.id === 'shot')?.keyframes?.[path];
+  const track = view.state.tracks.find(t => t.id === view.state.clips.find(c => c.id === 'shot')!.trackId)!.name;
+  await page.getByRole('navigation', { name: 'Editor workspaces' }).getByRole('button', { name: 'Edit', exact: true }).click();
+  await page.getByRole('button', { name: `Expand keyframes for ${track}`, exact: true }).click();
+  await page.getByRole('combobox', { name: 'Animate property on Bars' }).selectOption(path);
+  await until(view => keys(view)?.length === 1 && keys(view)![0].value === 40, 'a Dehaze keyframe');
+  await page.getByRole('navigation', { name: 'Editor workspaces' }).getByRole('button', { name: 'Color', exact: true }).click();
+  await page.getByRole('button', { name: /^Node 2: Balance/ }).click();
+  await tool('Primaries').click();
+  await page.getByLabel('Dehaze value', { exact: true }).fill('70');
+  await page.getByLabel('Dehaze value', { exact: true }).press('Tab');
+  await until(view => keys(view)?.[0].value === 70 && param('Balance', 'dehaze')(view) === 40, 'a keyed Dehaze change goes into its keyframe');
+  await page.keyboard.press('Control+z');
+  await until(view => keys(view)?.[0].value === 40, 'undo restores the keyframe');
 
   // Curves: a hue curve starts with the six hue points; dragging green up and clicking adds a point.
   await tool('Curves').click();

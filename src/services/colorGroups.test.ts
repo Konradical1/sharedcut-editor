@@ -48,6 +48,14 @@ test('a wide-gamut grade keeps its Look and extra nodes; the Input CST is reset 
   assert.equal(nodes[0].parameters.exposure, 1, 'the input nodes are not changed');
 });
 
+test('Normalize keeps Dehaze and Clarity on the nodes it resets', () => {
+  const { clip, nodes } = graded();
+  Object.assign(nodes[0].parameters, { exposure: 1, dehaze: 20 }); Object.assign(nodes[1].parameters, { temperature: 300, dehaze: 60, clarity: 35 });
+  const { next, ids } = normalizedGrade(clip, asset(), nodes, { balance }, id), at = (nodeId: string) => next.find(n => n.id === nodeId)!.parameters;
+  assert.deepEqual(at(nodes[0].id), { ...primaryDefaults, dehaze: 20 });
+  assert.deepEqual([at(ids.balance).temperature, at(ids.balance).dehaze, at(ids.balance).clarity], [-800, 60, 35]);
+});
+
 test('clean rebuilds every node', () => {
   const { clip, nodes } = graded();
   const { next, removed } = normalizedGrade(clip, asset(), nodes, { balance, clean: true }, id);

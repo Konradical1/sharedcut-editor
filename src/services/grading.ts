@@ -2,11 +2,12 @@ import type { ColorCurve, ColorCurves, GradeNode } from '../state/models.ts';
 
 /**
  * Color page v3 (docs/color-grading-v3.md): the grade parameter registry and the CPU reference for log wheels, tone
- * sliders, hue/boost/density, HSL curves, the RGB mixer, the HSL qualifier, windows and the film noise. The GPU preview
+ * sliders, hue/boost/density, HSL curves, the RGB mixer, the HSL qualifier, windows, the film noise and the per-pixel half of
+ * Dehaze/Clarity (its maps are in filmLook.ts). The GPU preview
  * (colorPreview.ts) and the export worker (scripts/color-render.py) implement these formulas exactly. Every key lives
  * in GradeNode.parameters and an absent key is identity, so a node only stores the tools it uses.
  */
-export type GradeGroup = 'primaries' | 'wheels' | 'log' | 'mixer' | 'qualifier' | 'circle' | 'rectangle' | 'gradient' | 'film';
+export type GradeGroup = 'primaries' | 'wheels' | 'log' | 'mixer' | 'qualifier' | 'circle' | 'rectangle' | 'gradient' | 'film' | 'detail';
 /** `limit` is what preview and export accept (default min..max); the UI offers min..max. */
 export interface GradeParam { key: string; group: GradeGroup; label: string; initial: number; min: number; max: number; step: number; unit?: string; doc: string; limit?: [number, number] }
 const param = (group: GradeGroup, key: string, label: string, initial: number, min: number, max: number, step: number, doc: string, unit?: string, limit?: [number, number]): GradeParam => ({ key, group, label, initial, min, max, step, doc, ...(unit ? { unit } : {}), ...(limit ? { limit } : {}) });
@@ -26,6 +27,8 @@ export const GRADE_PARAMS: GradeParam[] = [
   param('primaries', 'highlights', 'Highlights', 0, -100, 100, 1, 'Brightens (+) or recovers (−) the bright tones; white stays put.'),
   param('primaries', 'density', 'Density', 0, 0, 100, 1, 'Film-style subtractive saturation: saturated colours get deeper, not brighter.'),
   ...(['Shadows', 'Midtones', 'Highlights'] as const).map(r => param('primaries', `saturation${r}`, `${r.slice(0, -1)} sat`, 100, 0, 200, 1, `Saturation of the ${r.toLowerCase()} after Saturation (100 = unchanged).`, '%', [0, 400])),
+  param('detail', 'dehaze', 'Dehaze', 0, -100, 100, 1, 'Removes (+) or adds (−) haze in linear light; skies and bright areas are kept; + darkens hazy areas, so lift Exposure on a later node.'),
+  param('detail', 'clarity', 'Clarity', 0, -100, 100, 1, 'Midtone local contrast on luminance: + punchier texture, − smoother; no hue shift, shadows and highlights kept.'),
   ...WHEELS.flatMap(([key, label, davinci]) => [
     param('wheels', key, label, key === 'gain' ? 1 : 0, key === 'gain' ? 0 : -1, key === 'gain' ? 2 : 1, .001, `${label} wheel master (DaVinci ${davinci}).`, '', key === 'lift' || key === 'offset' ? [-4, 4] : [-8, 8]),
     ...['R', 'G', 'B'].map(c => param('wheels', key + c, `${label} ${c}`, 0, -1, 1, .001, `${label} wheel, ${c} channel (added to the master).`, '', [-2, 2])),
@@ -117,8 +120,12 @@ export const hasQualifier = (p: Params = {}) => on(p.qualOn);
 export const filmActive = (p: Params = {}) => FILM_AMOUNTS.some(k => (p[k] ?? 0) !== 0);
 /** Every film key with its default filled in: what a film stage carries to the renderers. */
 export const filmParams = (p: Params) => Object.fromEntries(FILM_KEYS.map(k => [k, val(p, k)]));
-/** A clip whose grade needs pixel positions (windows) or whole frames (film): no LUT can hold it. */
-export const spatialGrade = (clipId: string, nodes: GradeNode[]) => nodes.some(n => n.clipId === clipId && n.enabled && (hasWindow(n.parameters) || filmActive(n.parameters)));
+/** Dehaze or Clarity is on: the node's correction stage is a detail point (whole-frame maps, docs/color-grading-v3.md "Detail"). */
+export const detailActive = (p: Params = {}) => (p.dehaze ?? 0) !== 0 || (p.clarity ?? 0) !== 0;
+/** A node's Dehaze/Clarity keys: Balance, Look and Normalize rewrites keep them (they are neither a balance nor a look). */
+export const detailParams = (p: Params = {}) => Object.fromEntries(Object.entries(p).filter(([k]) => PARAM[k]?.group === 'detail'));
+/** A clip whose grade needs pixel positions (windows) or whole frames (film, Dehaze/Clarity): no LUT can hold it. */
+export const spatialGrade = (clipId: string, nodes: GradeNode[]) => nodes.some(n => n.clipId === clipId && n.enabled && (hasWindow(n.parameters) || filmActive(n.parameters) || detailActive(n.parameters)));
 
 /** Throws for a v3 key outside what preview and export accept. */
 export function validateGradeParameters(name: string, p: Params) {
@@ -256,6 +263,41 @@ export function windowAlpha(px: number, py: number, aspect: number, p: Params) {
     add(sse(-soft / 2, soft / 2, X * Math.sin(a) - Y * Math.cos(a)), on(p.gradInvert));
   }
   return any ? 1 - keep : 1;
+}
+
+// ---- Detail: Dehaze and Clarity, per pixel (docs/color-grading-v3.md, "Detail"; the maps are detailMaps in filmLook.ts) ----
+
+/** Every Detail constant, identical in GLSL and color-render.py: blur sigmas R, RD in % of picture height, eps in stops². */
+export const DETAIL = { R: 2, RD: .5, TOE: 2 ** -10, M0: 2 ** -8, GLO: .25, GHI: .7, LO: .25, HI: .7, EPS_D: .25, EPS_C: .0625, RM: .0625, SMAX: .25, VEPS: 1e-3, OMEGA: .95, TMIN: 1 / 3, UMAX: .8, CHROMA: .6, KAPPA: .6, KN: .5, KH: 1, KAPPA_N: .4, D: .5, GATE: (.08 / .25) ** 2 } as const;
+/** Linear light in stops re 18 % grey, with a toe at 2⁻¹⁰. */
+export const detailStops = (x: number) => Math.log2(Math.max(x, 0) + DETAIL.TOE) - Math.log2(.18);
+const softcap = (u: number) => u / Math.sqrt(Math.sqrt(1 + (u / DETAIL.UMAX) ** 4));
+/** Dehaze then Clarity on one linear pixel (`lin` = decode × G); `u` = the node's 8 map values there (detailAt: M1, then M2). */
+export function applyDetail(lin: number[], w: number[], p: Params, u: ArrayLike<number>): number[] {
+  const K = DETAIL, a = (p.dehaze ?? 0) / 100, c = (p.clarity ?? 0) / 100, y = dot(w, lin), l = detailStops(y), ac = u[0], bc = u[1], base = ac * l + bc;
+  let out = lin;
+  if (a) {
+    // The haze map is read at a smoother base (only ~1 stop edges survive) plus the pixel's own max-over-luma offset: no texture in it.
+    const am = K.RM * ac / (K.RM * ac + 1 - ac), bm = am * l + (1 - am) * bc / Math.max(1 - ac, 1e-3), mu = .18 * 2 ** bm;
+    const h = y > 1e-6 ? clamp(u[2] * (bm + detailStops(Math.max(...lin, 0)) - l) + u[3]) * (1 - smoothstep(K.LO, K.HI, y)) : 0;
+    if (a > 0) {
+      // J = (I − A(1 − t))/t with A = 1 on luminance, the removed fraction soft-capped, the veil's own colour taken out of the chroma,
+      // then part of the darkening at the local mean given back.
+      const t = Math.max(1 - K.OMEGA * a * h, K.TMIN), s = 1 - t, uc = softcap(s / Math.max(y, 1e-6)), q = (1 - uc) / t, gc = q * (1 - K.CHROMA) + K.CHROMA / t, den = u[4] + K.VEPS;
+      const col = [2 ** (u[6] / den), 1, 2 ** (u[7] / den)], cy = dot(w, col), back = ((1 - softcap(s / Math.max(mu, 1e-6))) / t) ** -K.KAPPA;
+      out = lin.map((v, i) => (q * y + gc * (v - y - uc * y * (col[i] / cy - 1))) * back);
+    } else {
+      // A neutral veil, stronger where there is haze already, bright areas kept, partly re-darkened at the local mean.
+      const v = -a * (K.KN * Math.max(mu - K.TOE, 0) * (1 - smoothstep(K.LO, K.HI, y)) + K.KH * h), back = (mu / (mu + v)) ** K.KAPPA_N;
+      out = lin.map(x => (x + v) * back);
+    }
+  }
+  if (c) {
+    // One gain on all channels from the soft-limited detail band of the pre-dehaze luma; flat areas and noise gated out.
+    const d = l - base, f = d / Math.sqrt(1 + (d / K.D) ** 2), mid = smoothstep(-6, -1.5, base) * (1 - smoothstep(2, 5, base)), g = ac / (ac + K.GATE * (1 - ac)), gain = 2 ** (c * (c > 0 ? 2 : 1) * mid * g * f);
+    out = out.map(x => x * gain);
+  }
+  return out;
 }
 
 // ---- Film noise (identical in GLSL and numpy: uint32 arithmetic) --------------------------------------------------------

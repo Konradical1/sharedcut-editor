@@ -133,8 +133,9 @@ Only one server may open a data folder: a second `npm start` beside the live one
   refuses any export that has one: do not roll back past it, fix forward.
 - Color page v3 (`docs/color-grading-v3.md`) stores qualifier, window, log wheel, mixer and film keys in node parameters
   and HSL curves (`HueHue`…`SatLum`) in node curves. A build without v3 refuses to render those nodes and its save check
-  rejects the curves: do not roll back past it, fix forward. Preview, export and `grading.ts` must stay identical: change
-  all three (and the pinned vectors in `src/services/grading.test.ts`) together.
+  rejects the curves: do not roll back past it, fix forward. Dehaze and Clarity add the `dehaze`/`clarity` node keys: a
+  build without them refuses to render such nodes, so the same applies, fix forward. Preview, export and `grading.ts` must
+  stay identical: change all three (and the pinned vectors in `src/services/grading.test.ts` and `detail.test.ts`) together.
 - `node scripts/remote-playback-check.mjs` plays a timeline on sharedcut.com as a signed-in user and
   reports pictures/s, freezes and loading time; run it before and after any playback change.
 

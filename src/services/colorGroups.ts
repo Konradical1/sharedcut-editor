@@ -1,5 +1,6 @@
 import { interpretation, primaryDefaults, processingStages, starterGrade } from './color.ts';
 import { findGradeNodes } from './colorAssistant.ts';
+import { detailParams } from './grading.ts';
 import type { Clip, ColorCurves, ColorTransformEffect, GradeNode, MediaAsset } from '../state/models.ts';
 
 /**
@@ -92,14 +93,14 @@ export function normalizedGrade(clip: Clip, asset: MediaAsset | undefined, nodes
     next = own.map(n => structuredClone(n));
     const at = (n: GradeNode) => next.find(x => x.id === n.id)!;
     input = at(found.input); balance = at(found.balance); output = at(found.output);
-    input.parameters = { ...primaryDefaults }; delete input.curves; reset.add(input.id);
+    input.parameters = { ...primaryDefaults, ...detailParams(input.parameters) }; delete input.curves; reset.add(input.id);
   }
   const into = cstOf(input)!;
   Object.assign(into, { inputGamma: source.profile, inputGamut: source.gamut, outputGamma: 'DaVinci Intermediate', outputGamut: 'DaVinci Wide Gamut', toneMapping: 'none', gamutMapping: 'none' });
   const out = cstOf(output)!;
   if (log) Object.assign(out, { outputGamma: 'Gamma 2.4', outputGamut: 'Rec.709', toneMapping: 'aces2', gamutMapping: 'none' });
   else if (!found) Object.assign(out, { toneMapping: 'none', gamutMapping: 'none' });
-  if (change.balance) { balance.parameters = autoBalanceParameters(change.balance); delete balance.curves; balance.enabled = true; reset.add(balance.id); }
+  if (change.balance) { balance.parameters = { ...autoBalanceParameters(change.balance), ...detailParams(balance.parameters) }; delete balance.curves; balance.enabled = true; reset.add(balance.id); }
   if (change.group !== undefined) {
     const current = next.find(n => isGroupNode(n));
     if (change.group === null) { if (current) { next = next.filter(n => n !== current); if (!removed.includes(current.id)) removed.push(current.id); } unset.push('colorGroup'); }
