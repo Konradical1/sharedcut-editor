@@ -40,6 +40,7 @@ export const ROUTES: Record<string, string> = {
   '/api/media': 'job:upload',
   '/api/media/([a-zA-Z0-9_-]+)(?:/(.*))?': 'job:upload', // upload, replace, original, files; PATCH/retry/DELETE are act renameMedia/retryMedia/removeMedia; raw is act setCameraRaw; raw-frame is the viewer's Camera Raw still
   '/api/media/import-link': 'job:link',
+  '/api/media/link': 'store:pasteClip',
   '/api/media/still': 'job:still',
   '/api/media/move': 'store:moveMedia',
   // Projects and sharing

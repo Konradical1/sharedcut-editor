@@ -75,6 +75,7 @@ export function useEditorShortcuts(enabled: boolean) {
       else if(command&&e.key.toLowerCase()==='z'){e.preventDefault();if(e.shiftKey)s.redo();else s.undo();}
       else if(e.ctrlKey&&!e.metaKey&&e.key.toLowerCase()==='y'){e.preventDefault();s.redo();}
       else if(command&&e.key.toLowerCase()==='b'&&s.selectedClipId){e.preventDefault();s.splitClip(s.selectedClipId);}
+      else if(command&&e.key.toLowerCase()==='c'&&s.selectedMediaIds.length){e.preventDefault();s.copyMedia(s.selectedMediaIds);}
       else if(command&&e.key.toLowerCase()==='c'&&s.selectedClipId){e.preventDefault();s.copyClip(s.selectedClipId);}
       else if(command&&e.key.toLowerCase()==='x'&&s.selectedClipId){e.preventDefault();s.copyClip(s.selectedClipId);s.deleteClip(s.selectedClipId);}
       else if(command&&e.key.toLowerCase()==='v'){e.preventDefault();s.pasteClip(e.shiftKey);}

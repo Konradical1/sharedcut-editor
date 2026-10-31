@@ -1,3 +1,4 @@
+import { saveClipClipboard, readClipClipboard } from '../services/clipClipboard.ts';
 import { createSmartMask, isDepthKey, validateSmartMask, smartMaskSignature, type SmartMaskDocument } from '../services/smartMask.ts';
 import { createMotionTracker, MAX_TRACKERS, validateMotionTracker, type MotionTracker, type MotionTrackerLink } from '../services/motionTracker.ts';
 import { primaryDefaults, interpretation, validateGradeNode, acesOutputUpgrade } from '../services/color.ts';
@@ -113,9 +114,13 @@ export interface EditorStore extends PersistedState {
   splitClip(id: string): void;
   /** `ripple` also closes the time the clips held on their tracks. */
   deleteClip(id: string, ripple?: boolean): void;
-  duplicateClip(id: string): void; copyClip(id: string): void;
+  duplicateClip(id: string): void;
+  /** Copies selected timeline clips, preserving media references across projects and navigation. */
+  copyClip(id: string): void;
+  /** Copies ready bin media for paste into this or another project's timeline. */
+  copyMedia(ids: string[]): void;
   /** Pastes at the playhead; `insert` pushes later clips right instead of overwriting them. */
-  pasteClip(insert?: boolean): void;
+  pasteClip(insert?: boolean): void | Promise<void>;
   /** Places ready media (one id, or several laid end to end) at `start` on `trackId`; video brings its linked audio; `insert` pushes later clips right. */
   addMediaToTimeline(mediaId: string | string[], start?: number, trackId?: string, insert?: boolean): void;
   updateTrack(id: string, patch: Partial<Track>, gesture?: string): void; moveTrack(id: string, direction: 'up' | 'down'): void; deleteTrack(id: string): void; createTrack(kind: 'video' | 'audio'): void; setTimeline(id: string): void;
@@ -659,7 +664,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       group.push({...structuredClone(clip),id:createId('clip'),trackId:audioTrack.id,color:'#427A68',properties:{...defaultProperties},effects:[]});
     }else for(const peer of sourceGroup.filter(c=>c.id!==source.id)){
       if(copied ? !state.tracks.some(t=>t.id===peer.trackId&&!t.locked) : !editableClip(peer.id))return;
-      const original=state.tracks.find(t=>t.id===peer.trackId);if(!original)return;const target=original.timelineId===state.timelineId?original:state.tracks.find(t=>t.timelineId===state.timelineId&&t.kind===original.kind&&t.number===original.number&&!t.locked);if(!target)return;group.push({...structuredClone(peer),id:createId('clip'),timelineId:state.timelineId,trackId:target.id,start:Math.max(0,clip.start+peer.start-source.start)});
+      const original=state.tracks.find(t=>t.id===peer.trackId);if(!original)return;const target=original.timelineId===state.timelineId?original:state.tracks.find(t=>t.timelineId===state.timelineId&&t.kind===original.kind&&t.number===original.number&&!t.locked);if(!target)return;group.push({...structuredClone(peer),id:createId('clip'),projectId:state.projectId,timelineId:state.timelineId,trackId:target.id,start:Math.max(0,clip.start+peer.start-source.start)});
     }
     if(!source.id&&group.length>1)for(const c of group)c.properties.linkGroup=link;
     else {const links=new Map<string,string>();for(let i=0;i<group.length;i++){const old=sourceGroup[i]?.properties.linkGroup;delete group[i].properties.linkGroup;if(old){if(!links.has(String(old)))links.set(String(old),createId('link'));group[i].properties.linkGroup=links.get(String(old))!;}}}
@@ -985,7 +990,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     selectClips(ids) {
       const state=get(),clips=state.clips.filter(c=>c.timelineId===state.timelineId&&ids.includes(c.id));
       const id=ids.filter(id=>clips.some(c=>c.id===id)).at(-1)??null;
-      set({...(clips.length?{selectedMarkerIds:[]}:{}),selectedTransition:null,selectedClipIds:clips.map(c=>c.id),selectedClipId:id,selectedTextIds:clips.filter(isTitle).map(c=>c.id),textSelection:null,textPreview:[],selectedNodeId:state.nodes.find(n=>n.clipId===id)?.id??null, ...(id?{sidePanel:'inspector' as const,inspectorTab:isTitle(clips.find(c=>c.id===id)!)?'Text':isShape(clips.find(c=>c.id===id)!)?'Shape':'Video'}:{})});
+      set({...(clips.length?{selectedMarkerIds:[]}:{}),selectedMediaIds:[],selectedTransition:null,selectedClipIds:clips.map(c=>c.id),selectedClipId:id,selectedTextIds:clips.filter(isTitle).map(c=>c.id),textSelection:null,textPreview:[],selectedNodeId:state.nodes.find(n=>n.clipId===id)?.id??null, ...(id?{sidePanel:'inspector' as const,inspectorTab:isTitle(clips.find(c=>c.id===id)!)?'Text':isShape(clips.find(c=>c.id===id)!)?'Shape':'Video'}:{})});
     },
     selectClip(id,additive=false) {
       const state=get();
@@ -1256,9 +1261,48 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if(state.selectedClipId&&ids.has(state.selectedClipId))set({selectedClipId:null,selectedClipIds:[],selectedTextIds:[],textSelection:null,textPreview:[],selectedNodeId:null});
     },
     duplicateClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) {const group=selectedGroup(clip)??[clip];insertClip(clip,clip.start+Math.max(...group.map(c=>c.start+c.duration))-Math.min(...group.map(c=>c.start)),`${clip.name} copy`);} },
-    copyClip(id) { const clip = get().clips.find(item => item.id === id && item.projectId === get().projectId); if (clip) { const group=selectedGroup(clip)??[clip],ids=new Set(group.map(c=>c.id));set({ markerClipboard: null, clipboard: structuredClone(clip),clipboardClips:structuredClone([clip,...group.filter(c=>c.id!==clip.id)]),clipboardNodes:structuredClone(get().nodes.filter(n=>ids.has(n.clipId))) }); get().notify('Clip copied'); } },
-    pasteClip(insert = false) { const state = get(); if (!state.clipboard) return; if (state.clipboard.projectId !== state.projectId || (!isTitle(state.clipboard) && !isShape(state.clipboard) && !isComposition(state.clipboard) && !isAdjustment(state.clipboard) && !state.media.some(media => media.id === state.clipboard!.mediaId && media.projectId === state.projectId))) { state.notify('Copy a clip from this project first', 'info'); return; } // The earliest copied clip lands on the playhead, the rest keep their offsets from it.
-      const first=Math.min(state.clipboard.start,...state.clipboardClips.map(c=>c.start));insertClip(state.clipboard, state.playhead+state.clipboard.start-first,state.clipboard.name,true,undefined,insert); },
+    copyClip(id) {
+      const state=get(), clip=state.clips.find(c=>c.id===id&&c.projectId===state.projectId); if(!clip)return;
+      const group=selectedGroup(clip)??[clip],ids=new Set(group.map(c=>c.id));
+      const value={userId:state.currentUserId,clipboard:structuredClone(clip),clipboardClips:structuredClone([clip,...group.filter(c=>c.id!==id)]),clipboardNodes:structuredClone(state.nodes.filter(n=>ids.has(n.clipId))),tracks:structuredClone(state.tracks.filter(t=>group.some(c=>c.trackId===t.id)))};
+      set({clipboard:value.clipboard,clipboardClips:value.clipboardClips,clipboardNodes:value.clipboardNodes,markerClipboard:null});saveClipClipboard(value);state.notify('Clip copied');
+    },
+    copyMedia(ids) {
+      const state=get(),assets=state.media.filter(m=>ids.includes(m.id)&&m.projectId===state.projectId&&m.status==='ready');if(!assets.length)return;
+      let start=0; const clips=assets.map(m=>{const clip:Clip={id:createId('clipboard'),projectId:state.projectId,timelineId:state.timelineId,trackId:state.tracks.find(t=>t.timelineId===state.timelineId&&t.kind===(m.kind==='audio'?'audio':'video'))?.id??'',mediaId:m.id,name:m.name,start,duration:assetDuration(m),sourceIn:0,color:'#427A68',disabled:false,properties:{...defaultProperties},effects:[]};start+=clip.duration;return clip;});
+      const copiedTracks=structuredClone(state.tracks);
+      for(const c of [...clips]){const asset=assets.find(m=>m.id===c.mediaId)!;if(asset.kind!=='video'||!asset.hasAudio)continue;
+        let audio=copiedTracks.find(t=>t.timelineId===state.timelineId&&t.kind==='audio'&&t.number===1);
+        if(!audio){audio={id:createId('clipboard-track'),timelineId:state.timelineId,name:'Audio 1',kind:'audio',number:1,muted:false,solo:false,locked:false,hidden:false,gain:0,pan:0};copiedTracks.push(audio);}
+        const link=createId('link');c.properties={...c.properties,audioDetached:true,linkGroup:link};clips.push({...structuredClone(c),id:createId('clipboard'),trackId:audio.id,properties:{...defaultProperties,linkGroup:link}});
+      }
+      const value={userId:state.currentUserId,clipboard:clips[0],clipboardClips:clips,clipboardNodes:[],tracks:copiedTracks.filter(t=>clips.some(c=>c.trackId===t.id))};
+      set({clipboard:value.clipboard,clipboardClips:value.clipboardClips,clipboardNodes:value.clipboardNodes,markerClipboard:null});saveClipClipboard(value);state.notify('Media copied');
+    },
+    pasteClip(insert = false) {
+      let state=get(); const saved=readClipClipboard(state.currentUserId);
+      if(saved){set({clipboard:saved.clipboard,clipboardClips:saved.clipboardClips,clipboardNodes:saved.clipboardNodes});state=get();}
+      if(!state.clipboard||!writable())return;
+      const projectId=state.projectId,timelineId=state.timelineId,playhead=state.playhead,source=structuredClone(state.clipboard),clips=structuredClone(state.clipboardClips.length?state.clipboardClips:[source]),nodes=structuredClone(state.clipboardNodes);
+      const place=()=>{const first=Math.min(source.start,...clips.map(c=>c.start));insertClip(source,playhead+source.start-first,source.name,true,undefined,insert);};
+      if(source.projectId===projectId&&clips.every(c=>state.tracks.some(t=>t.id===c.trackId))){place();return;}
+      if(clips.some(c=>isComposition(c))){state.notify('Open the composition and copy its clips first','info');return;}
+      const tracks=saved?.tracks??state.tracks;
+      const finish=(mapping:Record<string,string>)=>{
+        if(get().projectId!==projectId||get().timelineId!==timelineId||get().currentUserId!==state.currentUserId)return;
+        const trackMap=new Map<string,string>(),gradeGroups=new Map<string,string>();
+        const remapGroup=(id:string)=>{if(!gradeGroups.has(id))gradeGroups.set(id,createId('group'));return gradeGroups.get(id)!;};
+        for(const c of clips){const old=tracks.find(t=>t.id===c.trackId),kind=old?.kind??(get().media.find(m=>m.id===mapping[c.mediaId])?.kind==='audio'?'audio':'video');
+          if(!trackMap.has(c.trackId)){let target=get().tracks.find(t=>t.timelineId===timelineId&&t.kind===kind&&t.number===old?.number&&!t.locked)??get().tracks.find(t=>t.timelineId===timelineId&&t.kind===kind&&!t.locked&&!Array.from(trackMap.values()).includes(t.id));if(!target){get().createTrack(kind);target=get().tracks.filter(t=>t.timelineId===timelineId&&t.kind===kind).at(-1);}if(!target)return;trackMap.set(c.trackId,target.id);}
+          if(typeof c.properties.colorGroup==='string')c.properties.colorGroup=remapGroup(c.properties.colorGroup);
+          c.projectId=projectId;c.timelineId=timelineId;c.trackId=trackMap.get(c.trackId)!;c.mediaId=mapping[c.mediaId]??c.mediaId;
+        }
+        Object.assign(source,clips[0]);set({clipboard:source,clipboardClips:clips,clipboardNodes:nodes.map(n=>{return {...n,projectId,...(n.group?{group:remapGroup(n.group)}:{})};})});place();
+      };
+      const mediaIds=[...new Set(clips.filter(c=>!isTitle(c)&&!isShape(c)&&!isAdjustment(c)).map(c=>c.mediaId))];
+      if(!mediaIds.length){finish({});return;}
+      return (async()=>{try{await connection.flush();const response=await api<{mapping:Record<string,string>;assets:MediaAsset[];revision:number}>('/media/link',{method:'POST',body:JSON.stringify({projectId,mediaIds})});for(const asset of response.assets)connection.receiveMedia(asset,response.revision);finish(response.mapping);}catch(error){get().notify('Could not paste clips','error',error instanceof Error?error.message:String(error));}})();
+    },
     // A drop can carry the whole bin. Ready clips land end to end from the drop point, sharing one
     // gesture id so the hundred-clip drop is a single undo.
     addMediaToTimeline(mediaId, start, trackId, insert = false) {

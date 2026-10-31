@@ -33,7 +33,7 @@ export const ACTIONS: Record<string, 'edit' | 'context' | 'hidden' | `job:${stri
   updateProperty: 'edit', setKeyframes: 'edit', keyframeProperty: 'edit', unlinkClip: 'edit', linkClip: 'edit',
   moveClip: 'edit', trimClip: 'edit', fitTrim: 'context', planTrimEdit: 'context', trimEdit: 'edit',
   setMarkers: 'edit', addMarker: 'edit', deleteMarkers: 'edit', copyMarkers: 'context', pasteMarkers: 'edit',
-  deleteGaps: 'edit', deleteGap: 'edit', splitClip: 'edit', deleteClip: 'edit', duplicateClip: 'edit', copyClip: 'context', pasteClip: 'edit',
+  deleteGaps: 'edit', deleteGap: 'edit', splitClip: 'edit', deleteClip: 'edit', duplicateClip: 'edit', copyClip: 'context', copyMedia: 'context', pasteClip: 'edit',
   addMediaToTimeline: 'edit', updateTrack: 'edit', moveTrack: 'edit', deleteTrack: 'edit', createTrack: 'edit', setTimeline: 'context',
   addTransition: 'edit', updateTransition: 'edit', removeTransition: 'edit', expandTransitionAudio: 'edit', applyTransitionAtPlayhead: 'edit',
   addSmartMask: 'edit', updateSmartMask: 'edit', attachSmartMask: 'edit',

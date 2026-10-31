@@ -1,3 +1,4 @@
+import { linkMediaFiles, linkedAsset } from './linkMedia.ts';
 import { projectActivity } from './projectActivity.ts';
 import { createPreviewCache, createStillCache, mediaStill, stillSettings, StillSkipped, PreviewBusyError, PREVIEW_SLOTS, type PreviewAdmission } from './previewCache.ts';
 import { createHostGuard, JOB_COST_BYTES, VICTIM_ORDER, type HostGuard } from './hostGuard.ts';
@@ -1528,6 +1529,29 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             else {mkdirSync(resolveDir(projectId),{recursive:true,mode:0o700});writeFileSync(target,data,{mode:0o600,flag:'wx'});}
             send(res,200,{ok:true});return;
           }
+        }
+        if (path === '/api/media/link' && method === 'POST') {
+          const body = await jsonBody(req), project = requireProject(textField(body.projectId, 160, true), userId, true);
+          if (!Array.isArray(body.mediaIds) || !body.mediaIds.length || body.mediaIds.length > 1000) fail(400, 'Choose media to paste.');
+          const sources = [...new Set(body.mediaIds as string[])].map(id => {
+            const asset = state.media.find(m => m.id === id) ?? fail(404, 'Copied media no longer exists.');
+            requireProject(asset.projectId, userId);
+            if (asset.status !== 'ready' || !existsSync(originalPath(asset.id))) fail(409, 'Wait for copied media to finish processing.');
+            return asset;
+          });
+          const added: MediaAsset[] = [], mapping: Record<string, string> = {};
+          try {
+            for (const source of sources) {
+              if (source.projectId === project.id) { mapping[source.id] = source.id; continue; }
+              const id = `media-link-${createHash('sha256').update(`${project.id}:${source.id}:${JSON.stringify(source)}`).digest('hex').slice(0, 32)}`;
+              mapping[source.id] = id;
+              if (state.media.some(m => m.id === id)) continue;
+              linkMediaFiles(mediaDir(source.id), mediaDir(id));
+              added.push(linkedAsset(source, id, project.id));
+            }
+            if (added.length) { state.media = [...added, ...state.media]; persist(); recentActivity.record(project.id, userId, 'edited'); }
+          } catch (error) { state.media = state.media.filter(m => !added.some(a => a.id === m.id)); for (const asset of added) rmSync(mediaDir(asset.id), { recursive: true, force: true }); throw error; }
+          send(res, 200, { mapping, assets: Object.values(mapping).map(id => state.media.find(m => m.id === id)), revision }); return;
         }
         if (path === '/api/media/still' && method === 'POST') {
           // Grab still: the timeline frame at t through the export renderer at the project's full size, saved as a PNG image in Stills.

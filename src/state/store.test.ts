@@ -2153,3 +2153,21 @@ test('a film stock on a legacy (Gamma 2.4) node keeps the legacy pivot .5, even 
   const p = state().nodes.find(n => n.id === id)!.parameters;
   assert.equal(p.pivot, .5); assert.equal(p.contrast, 1.16);
 });
+
+test('cross-project paste after navigation and reload links media and remaps every selected clip and grade', async()=>{
+  const { connection }=await import('../services/api.ts');
+  const oldStorage=Object.getOwnPropertyDescriptor(globalThis,'localStorage'),oldFetch=globalThis.fetch,oldConnection={...connection};const memory=new Map<string,string>();
+  Object.defineProperty(globalThis,'localStorage',{configurable:true,value:{getItem:(k:string)=>memory.get(k)??null,setItem:(k:string,v:string)=>memory.set(k,v)}});
+  try{
+    store.setState({...createDemoProject(),locks:[]});
+    const original=structuredClone(clip('c3'));
+    store.setState(s=>({clips:[...s.clips,{...structuredClone(original),id:'clipboard-peer',trackId:'a1',start:original.start+1}],selectedClipIds:[original.id,'clipboard-peer']}));state().copyClip(original.id);
+    const target=state().createProject({name:'Paste destination',description:'',shared:false});state().openProject(target);
+    store.setState({clipboard:null,clipboardClips:[],clipboardNodes:[],playhead:5});
+    connection.enabled=true;connection.flush=async()=>{};connection.receiveMedia=asset=>store.setState(s=>({media:[asset,...s.media]}));
+    const sourceMedia=state().media.find(m=>m.id===original.mediaId)!;
+    globalThis.fetch=async(_url,options)=>{assert.equal(_url,'/api/media/link');assert.equal(JSON.parse(options!.body as string).projectId,target);return new Response(JSON.stringify({mapping:{[original.mediaId]:'linked'},assets:[{...sourceMedia,id:'linked',projectId:target}],revision:1}),{status:200,headers:{'content-type':'application/json'}});};
+    await state().pasteClip();const placed=state().clips.filter(c=>state().selectedClipIds.includes(c.id));assert.equal(placed.length,2);assert.equal(placed[1].start,6);assert.ok(placed.every(c=>c.projectId===target&&c.timelineId===state().timelineId));assert.equal(placed[0].mediaId,'linked');assert.equal(placed[0].start,5);assert.equal(placed[0].sourceIn,original.sourceIn);
+    const count=placed.length;state().undo();assert.ok(placed.every(c=>!state().clips.some(x=>x.id===c.id)));state().redo();assert.equal(state().clips.filter(c=>placed.some(x=>x.id===c.id)).length,count);
+  }finally{Object.assign(connection,oldConnection);globalThis.fetch=oldFetch;if(oldStorage)Object.defineProperty(globalThis,'localStorage',oldStorage);else Reflect.deleteProperty(globalThis,'localStorage');}
+});
