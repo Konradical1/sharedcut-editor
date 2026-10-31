@@ -403,3 +403,22 @@
 .color-effects-panel{width:min(310px,calc(100% - 12px))}
 .scrub-clip-name{max-width:75px}
 }
+
+/* Camera Raw (CameraRaw.tsx): a Blackmagic RAW clip's decode settings, in the tool area like Resolve's palette. */
+.camera-raw-tool{display:flex;flex-direction:column;gap:10px;min-height:100%}
+.camera-raw-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:11px}
+.camera-raw-bar .segmented>span{color:#80858f;margin:0 6px 0 2px;font-size:10px}
+.camera-raw-camera{color:#8e95a2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;max-width:42%}
+.camera-raw-state{color:#9fcfa6;white-space:nowrap}.camera-raw-state.busy{color:#e9c8bd}.camera-raw-state.failed{color:#f09090;white-space:normal}
+.camera-raw-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;align-items:start}
+.raw-section{display:flex;flex-direction:column;gap:4px;min-width:0}
+.raw-section h4{display:flex;align-items:center;gap:6px;height:18px;margin:0 0 2px;font-size:9px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:#80858f}
+.raw-section h4 small{font-weight:400;letter-spacing:0;text-transform:none}
+.camera-raw-grid .grade-slider{grid-template-columns:96px minmax(28px,1fr) 50px;grid-template-areas:"name track value";column-gap:6px;min-height:22px}
+.color-overhaul .camera-raw-grid .grade-slider>input[inputmode=decimal]{width:50px;height:18px}
+.raw-select{display:grid;grid-template-columns:96px minmax(0,1fr);align-items:center;column-gap:6px;min-height:24px;font-size:10.5px}
+.raw-select>span{color:var(--label,#b4b9c4);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.raw-select select{width:100%;min-width:0;height:22px;padding:2px 6px;font-size:10.5px}
+.camera-raw-grid .grade-toggle{min-height:22px}
+.camera-raw-grid .raw-off .grade-slider,.camera-raw-grid .raw-off .grade-toggle,.camera-raw-grid .grade-slider.disabled{opacity:.45}
+@media (max-width:1100px){.camera-raw-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}

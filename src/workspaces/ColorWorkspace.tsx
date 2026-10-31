@@ -6,7 +6,7 @@ import { isDepthKey } from '../services/smartMask';
 import { isAdjustment } from '../services/adjustment';
 import { adjacentShot } from '../services/selection';
 import {memo,useEffect,useLayoutEffect,useRef,useState,type CSSProperties,type PointerEvent,type ReactNode} from 'react';
-import {Plus,RotateCcw,Trash2,ChevronUp,ChevronDown,Power,Search,PanelRightClose,PanelRightOpen,Sparkles,GitBranch,SlidersHorizontal,Spline,ArrowRightLeft,Layers2,Wand2,Ungroup,Images,Maximize2,Minimize2,X,Pipette,CircleDashed,Blend,Film,Palette} from 'lucide-react';
+import {Plus,RotateCcw,Trash2,ChevronUp,ChevronDown,Power,Search,PanelRightClose,PanelRightOpen,Sparkles,GitBranch,SlidersHorizontal,Spline,ArrowRightLeft,Layers2,Wand2,Ungroup,Images,Maximize2,Minimize2,X,Pipette,CircleDashed,Blend,Film,Palette,Aperture} from 'lucide-react';
 import {createId} from '../services';
 import {useEditorStore,usePanelPlayhead,usePausedPlayhead,useStoreWithoutPlayhead} from '../state/store';
 import {onPicture} from '../components/LiveTimecode';
@@ -27,6 +27,7 @@ import {CurvesPanel,FilmPanel,LooksLibrary,MixerPanel,PrimariesPanel,type CurveK
 import {QualifierPanel} from './ColorQualifier';
 import {WindowsPanel} from './ColorWindows';
 import {COLOR_TOOLS,useColorUi,type ColorTool} from './colorUi';
+import {CameraRawPanel} from './CameraRaw';
 import './workspaces.css';
 import './color.css';
 const presets=[
@@ -77,8 +78,8 @@ const ColorReference=memo(function ColorReference(){
   const src=(asset.kind==='image'&&asset.proxyUrl)||asset.thumbnail;
   return <aside className={`color-reference${large?' large':''}`} aria-label="Mood board reference picture"><header><Images size={12}/><span title={asset.name}>Reference</span><span className="spacer"/><IconButton label={large?'Smaller reference':'Larger reference'} onClick={()=>setLarge(!large)}>{large?<Minimize2 size={12}/>:<Maximize2 size={12}/>}</IconButton><IconButton label="Close reference picture" onClick={()=>useEditorStore.getState().setColorReference(null)}><X size={13}/></IconButton></header>{src?<img src={src} alt={asset.name} title={asset.name} draggable={false}/>:<p>Preparing the picture…</p>}</aside>;
 });
-const TOOL_ICONS:Record<ColorTool,ReactNode>={Primaries:<SlidersHorizontal size={14}/>,Curves:<Spline size={14}/>,Qualifier:<Pipette size={14}/>,Windows:<CircleDashed size={14}/>,Mixer:<Blend size={14}/>,Film:<Film size={14}/>};
-const TOOL_HINTS:Record<ColorTool,string>={Primaries:'Wheels, exposure, white balance, contrast and saturation',Curves:'Custom curves, and hue, saturation and luma curves',Qualifier:'Grade one range of colours (HSL key)',Windows:'Grade inside or outside a circle, rectangle or gradient',Mixer:'RGB mixer and black and white',Film:'Halation, bloom, grain, vignette, gate weave and breath'};
+const TOOL_ICONS:Record<ColorTool,ReactNode>={'Camera Raw':<Aperture size={14}/>,Primaries:<SlidersHorizontal size={14}/>,Curves:<Spline size={14}/>,Qualifier:<Pipette size={14}/>,Windows:<CircleDashed size={14}/>,Mixer:<Blend size={14}/>,Film:<Film size={14}/>};
+const TOOL_HINTS:Record<ColorTool,string>={'Camera Raw':'Blackmagic RAW decode: ISO, white balance, exposure, gamma and gamut, as in DaVinci Resolve',Primaries:'Wheels, exposure, white balance, contrast and saturation',Curves:'Custom curves, and hue, saturation and luma curves',Qualifier:'Grade one range of colours (HSL key)',Windows:'Grade inside or outside a circle, rectangle or gradient',Mixer:'RGB mixer and black and white',Film:'Halation, bloom, grain, vignette, gate weave and breath'};
 /** New Node's kinds: starting parameters (over the primaries defaults) and the tool each one opens. */
 const NODE_KINDS:Record<NodeKind,[Record<string,number>,ColorTool|null]>={Correction:[{},null],Window:[{circOn:1},'Windows'],Qualifier:[{qualOn:1,qualHueWidth:40},'Qualifier'],Film:[{filmGrain:20,filmHalation:15,filmVignette:10},'Film']};
 // The tool area's height is this browser's own (a laptop and a desktop want different splits), so it lives in localStorage.
@@ -158,8 +159,8 @@ export default function ColorWorkspace(){
       if(job.skipped.length)st.notify(`Skipped ${job.skipped.length} shot${job.skipped.length===1?'':'s'}`,'info',job.skipped.map(k=>`${st.clips.find(c=>c.id===k.clipId)?.name??'Removed shot'}: ${k.text}`).join(' · '));});};
   const autoButton=<Button className="auto-balance" disabled={!balance.busy&&(!targets.length||tooMany)} title={balance.busy?'Cancel auto balance':tooMany?'Pick at most 200 shots for Auto balance':!targets.length?'Pick a video shot':balance.where?.available===false?balance.where.reason:`Set exposure, white balance and black level of ${targets.length===1?'this shot':`${targets.length} shots`} automatically${balance.where?.remote?' on sharedcut.com':''}`} onClick={autoBalance}><Wand2 size={13}/><span>{balance.busy?`Balancing… ${Math.round(balance.job?.progress??0)}%`:'Auto balance'}</span></Button>;
   const nodeIndex=node?nodes.findIndex(n=>n.id===node.id)+1:0;
-  const toolBody=!node||!clip?<EmptyState icon={<Palette size={22}/>} title="Shape this shot" description="Start a wide-gamut grade or add a correction node." action={<div className="empty-actions"><Button disabled={!clip} onClick={()=>s.initializeColorGrade(clip!.id)}>Start wide-gamut grade</Button><Button disabled={!clip} onClick={()=>add()}>Add correction</Button>{autoButton}</div>}/>
-    :tool==='Primaries'?<PrimariesPanel node={node} update={update} log={log} pivot={defaults.pivot}/>
+  const toolBody=tool==='Camera Raw'&&asset?.braw?<CameraRawPanel key={asset.id} asset={asset}/>:!node||!clip?<EmptyState icon={<Palette size={22}/>} title="Shape this shot" description="Start a wide-gamut grade or add a correction node." action={<div className="empty-actions"><Button disabled={!clip} onClick={()=>s.initializeColorGrade(clip!.id)}>Start wide-gamut grade</Button><Button disabled={!clip} onClick={()=>add()}>Add correction</Button>{autoButton}</div>}/>
+    :tool==='Primaries'||tool==='Camera Raw'?<PrimariesPanel node={node} update={update} log={log} pivot={defaults.pivot}/>
     :tool==='Curves'?<CurvesPanel node={node} kind={curveKind} setKind={setCurveKind} update={curves=>patchNode({curves})}/>
     :tool==='Qualifier'?<QualifierPanel node={node} clip={clip} update={update}/>
     :tool==='Windows'?<WindowsPanel node={node} clip={clip} update={update}/>
@@ -180,7 +181,7 @@ export default function ColorWorkspace(){
     <div role="separator" tabIndex={0} aria-label="Resize tool area" aria-orientation="horizontal" title="Drag to resize the tools · Double-click for the default height" className="color-row-resizer"
       onPointerDown={e=>startResize(e,'tools',bottom.current?.offsetHeight??300)} onDoubleClick={()=>resizeTools(null)} onKeyDown={e=>{if(e.key!=='ArrowUp'&&e.key!=='ArrowDown')return;e.preventDefault();resizeTools((bottom.current?.offsetHeight??300)+(e.key==='ArrowUp'?16:-16));}}/>
     <div ref={bottom} className="color-bottom"><section className="panel grade-controls" data-cursor-clip={clip?.id} data-cursor-context={node?.id}>
-      <div className="panel-header tool-header"><div className="color-tabs tool-tabs" aria-label="Color tools">{COLOR_TOOLS.map(t=><button key={t} aria-pressed={tool===t} title={TOOL_HINTS[t]} onClick={()=>chooseTool(t)}>{TOOL_ICONS[t]}<span>{t}</span></button>)}</div>
+      <div className="panel-header tool-header"><div className="color-tabs tool-tabs" aria-label="Color tools">{(asset?.braw?['Camera Raw' as const,...COLOR_TOOLS]:COLOR_TOOLS).map(t=><button key={t} aria-pressed={tool===t} title={TOOL_HINTS[t]} onClick={()=>chooseTool(t)}>{TOOL_ICONS[t]}<span>{t}</span></button>)}</div>
         {node&&tool==='Primaries'&&<div className="segmented" role="group" aria-label="Wheel mode" title="Primary wheels work on the whole tonal range; Log wheels work on separate shadow, midtone and highlight ranges"><button aria-pressed={!log} onClick={()=>setLog(false)}>Primary</button><button aria-pressed={log} onClick={()=>setLog(true)}>Log</button></div>}
         <span className="spacer"/>
         {node&&<>{!managed&&<Button className="start-grade" onClick={()=>s.initializeColorGrade(clip!.id)} title="Rebuild this shot as Input CST, Balance, Look and Output CST nodes (a snapshot keeps the current grade)">Start wide-gamut grade</Button>}{autoButton}{legacyOutput&&<Button onClick={()=>s.useAcesOutput(clip!.id)} title="This log grade has no highlight roll-off, so bright areas clip. ACES 2 renders them into SDR; a snapshot keeps the current grade.">Use ACES 2 output</Button>}

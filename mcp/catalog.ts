@@ -47,7 +47,7 @@ export const ACTIONS: Record<string, 'edit' | 'context' | 'hidden' | `job:${stri
   undo: 'edit', redo: 'edit', saveSnapshot: 'edit', restoreSnapshot: 'edit',
   addComment: 'edit', replyComment: 'edit', resolveComment: 'edit',
   enqueueRender: 'job:export', updateRender: 'job:exports',
-  uploadMedia: 'job:upload', renameMedia: 'edit', removeMedia: 'edit', retryMedia: 'edit', revealMedia: 'hidden', replaceMedia: 'job:replace',
+  uploadMedia: 'job:upload', renameMedia: 'edit', removeMedia: 'edit', retryMedia: 'edit', setCameraRaw: 'edit', revealMedia: 'hidden', replaceMedia: 'job:replace',
   createBin: 'edit', renameBin: 'edit', deleteBin: 'edit', moveMedia: 'edit',
   setUserColor: 'edit', setUserProfile: 'edit', setCurrentUser: 'hidden',
   setSettings: 'edit', notify: 'hidden', dismissNotification: 'hidden',

@@ -28,6 +28,7 @@ import * as footageCache from './footageCache.ts';
 import { flowChunkSeconds, type FlowPreview } from './opticalFlow.ts';
 import { shownSourceTime, sourceSize } from './motionTracker.ts';
 import { denoiseEffect, type DenoisePreview } from './denoise.ts';
+import { effectiveRaw, rawColorSpace, rawKey, rawPending } from './braw.ts';
 import { createDenoisePreview, denoiseStatus, denoiseStatusText, noiseUi, subscribeDenoise } from './denoisePreview.ts';
 import { isPhone } from './device.ts';
 
@@ -88,7 +89,8 @@ export function efficientPlayback(mode: Settings['performanceMode'] | undefined,
 }
 
 export function playbackUrl(asset: MediaAsset, options: Pick<PreviewOptions, 'original' | 'quality'>, visual: boolean) {
-  if (options.original) return asset.sourceUrl || asset.proxyUrl;
+  // A .braw original is no browser's format: Original plays its full-resolution develop's full-v3.
+  if (options.original) return (asset.braw ? undefined : asset.sourceUrl) || asset.proxyUrl;
   if (!visual && asset.audioProxyUrl) return asset.audioProxyUrl;
   // A graphic's grading proxy (if an older import made one) is opaque, and its ProRes original will not play in a browser.
   if(asset.hasAlpha&&(options.quality==='Full'||options.quality==='Color'))return asset.proxyUrl||asset.sourceUrl;
@@ -870,6 +872,27 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
           }
         }
       }
+      // Camera Raw: while a Blackmagic RAW clip develops new settings on the server, the paused picture is the SDK's own frame
+      // at the playhead with those settings, a one-frame file read like a Noise Reduction chunk, so the grade still applies.
+      // `shown` is the source as the colour pipeline reads it then: the new settings' gamma and gamut.
+      let shown = asset;
+      if (!denoised && visual && asset.braw && rawPending(asset.braw)) {
+        const raw = asset.braw;
+        warning = raw.error ? `Camera Raw · ${raw.error}` : `Camera Raw · Developing ${raw.developing ?? 0}%`;
+        const color = rawColorSpace(effectiveRaw(raw));
+        shown = { ...asset, inputProfile: color.inputProfile, inputGamut: color.inputGamut };
+        if (!state.playing) {
+          const at = sourceTime(original, time, sourceFps, asset.duration || Infinity), frame = Math.max(0, Math.min(raw.info.frames - 1, Math.floor(at * sourceFps + 1e-6))), key = rawKey(raw.settings);
+          const url = `/api/media/${encodeURIComponent(asset.id)}/raw-frame?frame=${frame}&key=${key}`, id = `${clip.id}:raw:${key}:${frame}`, from = frame / sourceFps;
+          const still: MediaAsset = { ...shown, id: `${asset.id}:raw:${key}:${frame}`, hasAudio: false, colorProxyUrl: url, sourceUrl: url, proxyUrl: url, proxyVariants: {}, duration: 1 / sourceFps, fps: sourceFps };
+          const decoder = decoderFor({ ...clip, id }, still, true, options);
+          if (decoder && !failedDecoder(id, decoder)) {
+            activeIds.add(id);
+            const media = decoder.element as HTMLVideoElement; media.preload = 'auto';
+            if (media.readyState >= 2 && !media.seeking) denoised = { decoder, id, asset: still, clip: { ...original, sourceIn: original.sourceIn - from }, from, noise: false };
+          }
+        }
+      }
       const interpolated = flowDecoder(flow);
       if(original.properties.opticalFlow&&visual&&time-original.start+flowChunkSeconds<original.duration) {
         const next=flowPreview.get(original,time+flowChunkSeconds,project?.fps||24,options.original?'Original':options.quality);
@@ -1013,7 +1036,7 @@ export function attachPlayback(canvas: HTMLCanvasElement, getState: () => Playba
       // While the analysis runs, hold the original at the crop the solve will apply so the framing never jumps.
       const framed = stabilizeFx && !stabilizeSolveFor ? {...clip, properties:{...clip.properties, zoom: Number(clip.properties.zoom ?? 100) * stabilizeZoom(stabilizeSettings(original, stabilizeFx))}} : clip;
       const warp = stabilizeSolveFor ? {solve:stabilizeSolveFor,time:sourceTime(original,time,sourceFps,asset.duration||Infinity),sourceWidth,sourceHeight,blend:decoder===interpolated} : undefined;
-      beginSide();finishLayer(framed,asset,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip,stampAt,denoised);
+      beginSide();finishLayer(framed,shown,time,layerTarget,element instanceof HTMLVideoElement?element:undefined,warp,queuedFrame,flip,stampAt,denoised);
     }
     flush(Infinity);
     // Without the picture (smooth playback shows the server's render) a light leak's own sound still plays.

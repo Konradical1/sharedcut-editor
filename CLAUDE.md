@@ -136,6 +136,9 @@ Only one server may open a data folder: a second `npm start` beside the live one
   rejects the curves: do not roll back past it, fix forward. Dehaze and Clarity add the `dehaze`/`clarity` node keys: a
   build without them refuses to render such nodes, so the same applies, fix forward. Preview, export and `grading.ts` must
   stay identical: change all three (and the pinned vectors in `src/services/grading.test.ts` and `detail.test.ts`) together.
+- Blackmagic RAW (`server/braw.ts`, `npm run setup:braw` per host) adds the `Blackmagic Film Gen 5` gamma and `Blackmagic Wide Gamut`
+  gamut, which a CST node can hold; a build without them refuses such nodes and exports `.braw` clips from the undecodable original:
+  do not roll back past it, fix forward.
 - `node scripts/remote-playback-check.mjs` plays a timeline on sharedcut.com as a signed-in user and
   reports pictures/s, freezes and loading time; run it before and after any playback change.
 

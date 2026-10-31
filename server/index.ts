@@ -35,7 +35,7 @@ import { createCanvas } from '@napi-rs/canvas';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual, createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { linkSync, copyFileSync, mkdirSync, existsSync, createReadStream, createWriteStream, statSync, statfsSync, renameSync, rmSync, chmodSync, readFileSync, writeFileSync, appendFileSync, truncateSync } from 'node:fs';
+import { linkSync, copyFileSync, mkdirSync, existsSync, createReadStream, createWriteStream, statSync, statfsSync, renameSync, rmSync, chmodSync, readFileSync, readdirSync, writeFileSync, appendFileSync, truncateSync } from 'node:fs';
 import { resolve, join, extname, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
@@ -43,7 +43,7 @@ import { createGzip } from 'node:zlib';
 import { Readable, Transform } from 'node:stream';
 import { promisify, isDeepStrictEqual } from 'node:util';
 import { LOCK_TTL, MOVEMENT_FIELDS, lockConflict, type PersistedState } from '../src/services/index.ts';
-import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock, FcpImport } from '../src/state/models.ts';
+import type { User, Project, MediaAsset, RenderJob, Presence, CollaborativeLock, FcpImport, BrawInfo, RawValue } from '../src/state/models.ts';
 import { exportResolveTimeline, importResolve } from './resolve.ts';
 import { fcpProjectId, importFcpxml, importStatus } from './fcpxml.ts';
 import { parseCube, validateGradeNode } from '../src/services/color.ts';
@@ -57,6 +57,8 @@ import { aiColorAllowed, colorAssistantCapabilities, colorAssistantService } fro
 import { colorNormalizeService } from './colorNormalize.ts';
 import { validateMotionTrackers } from '../src/services/motionTracker.ts';
 import { CAMERA_METADATA_VERSION, cameraLabels } from './cameraMetadata.ts';
+import { BRAW_MISSING, brawFrame, brawInfo, brawReady, developBraw, masterName, removeMasters } from './braw.ts';
+import { effectiveRaw, isBrawName, rawColorSpace, rawKey, rawPending, rawSignature, validateRawSettings } from '../src/services/braw.ts';
 import { FILMSTRIP_VERSION, FULL_VARIANT, MEDIA_CONCURRENCY, STREAM_VARIANT, STREAM_LOW_VARIANT, getMediaCapabilities, exportAspect, PROBE_VERSION, prepareMedia, prepareMediaFilmstrip, prepareMediaThumbnail, probeMedia, probeCameraColor, prepareWaveform, renderTimeline, renderSoundEffect, depthRuns, depthSpan } from './media.ts';
 import { migrateAsset, needsMigration, removeLeftovers, sweepPreparedTemp } from './mediaMigration.ts';
 
@@ -485,6 +487,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const fcpDir = (id: string) => join(dataDir, 'fcp', id);
   const mediaDir = (id: string) => join(dataDir, 'media', id);
   const originalPath = (id: string) => join(mediaDir(id), 'original');
+  /** The file decoders read: a Blackmagic RAW clip's developed master (FFmpeg reads no .braw picture), else the original. */
+  const rawFrames = new Map<string, Promise<void>>();
+  const sourcePath = (asset: Pick<MediaAsset, 'id' | 'braw'>) => asset.braw?.developed ? join(mediaDir(asset.id), masterName(asset.braw.developed)) : originalPath(asset.id);
   const replacedVersion = (id: string) => { try { return readFileSync(join(mediaDir(id), 'replaced'), 'utf8'); } catch { return ''; } };
   // A deleted project, media included, stays restorable for a week before purgeExpiredProjects removes its files.
   const PROJECT_RECOVERY_MS = 7 * 86400_000;
@@ -656,13 +661,24 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     db.prepare('DELETE FROM render_snapshots WHERE id=?').run(job.id);
     aborters.get(job.id)?.abort();
   };
+  /** An export renders what the Color page shows: a Blackmagic RAW clip still developing newer Camera Raw settings is waited for
+   *  (outside the render queue, which that develop may itself wait behind), then read from its new master. */
+  const awaitRaw = async (job: RenderJob, snapshot: Omit<Parameters<typeof renderTimeline>[0], 'outputPath'>, signal: AbortSignal) => {
+    for (const entry of snapshot.assets) {
+      if (!entry.asset.braw) continue;
+      const waiting = () => { const now = state.media.find(item => item.id === entry.asset.id); return !!now && (rawPending(now.braw) || now.status === 'processing') && aborters.has(now.id); };
+      while (waiting() && !signal.aborted && !closed) { updateJob(job.id, { remaining: `Developing ${entry.asset.name}` }, false); await assetJobs(entry.asset.id); }
+      const now = state.media.find(item => item.id === entry.asset.id);
+      if (now) { entry.asset = structuredClone(now); entry.path = sourcePath(now); }
+    }
+  };
   // No depth service: a preview never reads depth (readsDepth skips those ranges), and must never start a run for a viewer.
   // One log line per new preview job names who asked. The host guard refuses a preview while memory is short (429, the browser backs off).
   // Live state, not a copy: the caches keep only what can reach the range and copy just that (the media rows alone
   // were 6.6 MB a poll), then ask for it again every second per chunk.
   const previewSnapshot=(project:Project,timeline:typeof state.timelines[number],settings:Record<string,string>)=>{
     const clips=state.clips.filter(c=>c.projectId===project.id),ids=new Set(clips.map(c=>c.mediaId));
-    return {project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips,tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:state.nodes.filter(n=>n.projectId===project.id),assets:state.media.filter(m=>m.projectId===project.id&&ids.has(m.id)).map(asset=>({asset,path:originalPath(asset.id)})),settings,smartMaskDir:join(dataDir,'smart-masks'),stabilizeDir:stabilizeDirectory,resolveDir:resolveDir(project.id)};
+    return {project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips,tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:state.nodes.filter(n=>n.projectId===project.id),assets:state.media.filter(m=>m.projectId===project.id&&ids.has(m.id)).map(asset=>({asset,path:sourcePath(asset)})),settings,smartMaskDir:join(dataDir,'smart-masks'),stabilizeDir:stabilizeDirectory,resolveDir:resolveDir(project.id)};
   };
   const stills=createStillCache(join(dataDir,'frames'),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)}),{log:line=>console.warn(line),admit:admitPreview});
   const timelinePreviews=createPreviewCache(join(dataDir,'timeline-previews'),(id,work)=>addWork(id,work),request=>renderTimeline({...request,overlayPath:id=>overlays.path(id)} ),{log:line=>console.warn(line),admit:admitPreview});
@@ -689,10 +705,12 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             try { let previous = -1; await renderTimeline({ ...snapshot, depth, freeGpu: () => { masks.stopIdlePreview(); denoise.stopIdle(); }, smartMaskDir:join(dataDir, 'smart-masks'), stabilizeDir:stabilizeDirectory, denoiseDir:join(dataDir, 'denoise'), resolveDir:resolveDir(job.projectId), overlayPath: id => overlays.path(id), outputPath, signal, onStage: next => { if (stage !== next) { clock.enter(next); stage = next; advancedAt = Date.now(); report(); } }, onProgress: progress => { if (progress > previous) advancedAt = Date.now(); previous = progress; progressValue = Math.max(progressValue, Math.min(99, Math.floor(progress))); report(); } }); if (!signal.aborted) updateJob(job.id, { status: 'complete', progress: 100, remaining: 'Complete', outputUrl: `/api/renders/${job.id}/download` }); logTimes('finished'); }
             catch (error) { logTimes(signal.aborted ? 'cancelled' : 'failed'); rmSync(outputPath, { force: true }); if (!closed) updateJob(job.id, { status: 'failed', remaining: signal.aborted ? 'Cancelled' : 'Export failed', error: signal.aborted ? 'Cancelled by user.' : error instanceof Error ? error.message : 'Export failed.' }); }
             finally { clearInterval(heartbeat); if (!closed) db.prepare('DELETE FROM render_snapshots WHERE id=?').run(job.id); }
-    }, true, () => { for (const release of releases) release(); }, signal => awaitDepth(job, snapshot, signal, releases));
+    }, true, () => { for (const release of releases) release(); }, signal => awaitRaw(job, snapshot, signal).then(() => awaitDepth(job, snapshot, signal, releases)));
   };
 
   const processAsset = (id: string, refresh = false) => addWork(id, async signal => {
+    // A Blackmagic RAW clip that already plays and gets new Camera Raw settings develops again behind the look it plays.
+    let redevelop = false;
     try {
       const asset = state.media.find(item => item.id === id);
       if (!asset) return;
@@ -702,7 +720,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
         updateAsset(id, result);
       }
       if (signal.aborted) throw new Error('Import cancelled.');
-      updateAsset(id, { status: 'processing', progress: 0, error: undefined });
+      const braw = asset.kind === 'video' && isBrawName(asset.name);
+      redevelop = braw && asset.status === 'ready' && !!asset.braw?.developed;
+      if (!redevelop) updateAsset(id, { status: 'processing', progress: 0, error: undefined });
       let previous = -1;
       // Prepared files are served immutable and footage caches key on the URL, so any re-prepare (a refresh, a Retry: an
       // encoder upgrade or another host changes the bytes) needs new URLs or browsers mix old pieces with new ones.
@@ -715,22 +735,55 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           for (const key of ['proxyUrl', 'thumbnail', 'audioProxyUrl', 'colorProxyUrl', 'filmstrip'] as const) if (metadata[key]) metadata[key] = bust(metadata[key])!;
           if (metadata.proxyVariants) metadata.proxyVariants = Object.fromEntries(Object.entries(metadata.proxyVariants).map(([k, url]) => [k, bust(url)!]));
         }
-        updateAsset(id, { ...metadata, ...(asset.importLink ? { thumbnail: state.media.find(item => item.id === id)?.thumbnail || metadata.thumbnail } : {}), size: size >= 1e9 ? `${(size / 1e9).toFixed(1)} GB` : `${(size / 1e6).toFixed(1)} MB`, sourceUrl: `/api/media/${id}/original${replaced}`, status: 'ready', progress: 100 });
+        const bytes = raw?.size ?? size, current = state.media.find(item => item.id === id)?.braw;
+        // The developed master is what was probed; the row describes the camera's own clip and the settings it was developed with.
+        const developed = raw && current ? { ...raw.color, camera: raw.camera, braw: { ...current, info: raw.info, developed: raw.signature, developing: undefined, error: undefined } } : {};
+        updateAsset(id, { ...metadata, ...(asset.importLink ? { thumbnail: state.media.find(item => item.id === id)?.thumbnail || metadata.thumbnail } : {}), ...developed, size: bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${(bytes / 1e6).toFixed(1)} MB`, sourceUrl: `/api/media/${id}/original${replaced}`, status: 'ready', progress: 100 });
       };
-      const result = await prepareMedia({ inputPath: originalPath(id), outputDir: join(mediaDir(id), 'prepared'), baseUrl: `/api/media/${id}/files`, signal, refresh,
+      const prepared = join(mediaDir(id), 'prepared');
+      let input = originalPath(id), raw: { info: BrawInfo; signature: string; size: number; camera: string; color: Partial<Asset> } | undefined;
+      if (braw) {
+        if (!brawReady()) throw new Error(BRAW_MISSING);
+        if (!redevelop) updateAsset(id, { preparationStage: 'Reading Blackmagic RAW' });
+        const info = asset.braw?.info ?? await brawInfo(originalPath(id), signal);
+        if (!asset.braw) updateAsset(id, { braw: { info, settings: {} } });
+        const settings = state.media.find(item => item.id === id)?.braw?.settings ?? {}, signature = rawSignature(settings);
+        // FFmpeg reads the .braw container (not its picture): its sound, and the exact rate the master keeps.
+        const container = await probeMedia(originalPath(id), signal), master = join(mediaDir(id), masterName(signature));
+        mkdirSync(prepared, { recursive: true });
+        if (!redevelop) updateAsset(id, { preparationStage: 'Developing Blackmagic RAW' });
+        let shown = -1;
+        await developBraw({ original: originalPath(id), output: master, full: join(prepared, FULL_VARIANT), info, settings, frameRate: container.frameRate, audio: container.hasAudio, alone: redevelop, signal,
+          onProgress: percent => {
+            const next = Math.floor(percent), current = state.media.find(item => item.id === id);
+            if (!current?.braw || signal.aborted || next === shown || Date.now() - (progressAt.get(id) ?? 0) < 2000) return;
+            shown = next; progressAt.set(id, Date.now());
+            updateAsset(id, redevelop ? { braw: { ...current.braw, developing: next } } : { progress: Math.floor(next * .6) });
+          } });
+        const color = rawColorSpace(effectiveRaw({ info, settings }));
+        raw = { info, signature, size: statSync(originalPath(id)).size, camera: [info.camera, info.lens].filter(Boolean).join(' · '), color: { inputProfile: color.inputProfile, inputGamut: color.inputGamut, colorEvidence: color.colorEvidence } };
+        input = master;
+      }
+      const result = await prepareMedia({ inputPath: input, outputDir: prepared, baseUrl: `/api/media/${id}/files`, signal, refresh: refresh || braw, fullReady: braw,
         onStage: preparationStage => { if (!signal.aborted) updateAsset(id, { preparationStage }); },
         onPlayable: result => { if (!signal.aborted) publish(result); },
         onThumbnail: thumbnail => { if (!asset.importLink) updateAsset(id, { thumbnail: bust(thumbnail) }); },
-        onProgress: progress => { const next = Math.floor(progress); if (state.media.find(item => item.id === id)?.status !== 'ready' && next !== previous && Date.now() - (progressAt.get(id) ?? 0) >= 5000) { previous = next; progressAt.set(id, Date.now()); updateAsset(id, { progress: next }); } }
+        onProgress: progress => { const next = Math.floor(braw ? 60 + progress * .4 : progress); if (state.media.find(item => item.id === id)?.status !== 'ready' && next !== previous && Date.now() - (progressAt.get(id) ?? 0) >= 5000) { previous = next; progressAt.set(id, Date.now()); updateAsset(id, { progress: next }); } }
       });
       if (!signal.aborted) {
         publish(result); updateAsset(id, { preparationStage: undefined, error: undefined });
         // A re-prepared older import writes the v3 set; what it replaces goes now rather than at the next start.
-        const prepared = state.media.find(item => item.id === id);
-        if (prepared) await removeLeftovers(prepared, join(mediaDir(id), 'prepared'));
+        const done = state.media.find(item => item.id === id);
+        if (done) await removeLeftovers(done, prepared);
+        if (raw) await removeMasters(mediaDir(id), masterName(raw.signature));
       }
     } catch (error) {
       if (!closed) {
+        // Newer Camera Raw settings started another develop of this clip: that one owns the row now.
+        const newer = aborters.get(id);
+        if (signal.aborted && newer && newer.signal !== signal) return;
+        const current = state.media.find(asset => asset.id === id);
+        if (redevelop && current?.braw) { updateAsset(id, { braw: { ...current.braw, developing: undefined, error: signal.aborted ? undefined : error instanceof Error ? error.message : 'Developing failed.' } }); return; }
         const playable = state.media.find(asset => asset.id === id)?.status === 'ready';
         updateAsset(id, { status: playable ? 'ready' : 'failed', preparationStage: playable ? 'Additional previews failed · original and playable preview are safe' : undefined, error: signal.aborted ? 'Processing cancelled.' : error instanceof Error ? error.message : 'Media processing failed.', progress: playable ? 100 : 0 });
       }
@@ -1023,8 +1076,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           // Pin source bytes immediately: deleting the source project must not break a queued save.
           const folder = join(dataDir, 'sfx', sound.id), source = join(folder, 'source'), output = join(folder, 'baked.wav');
           try {
-            try { linkSync(originalPath(asset.id), source); }
-            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error; copyFileSync(originalPath(asset.id), source); }
+            try { linkSync(sourcePath(asset), source); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error; copyFileSync(sourcePath(asset), source); }
           }
           catch (error) { sounds.fail(sound.id, error); throw error; }
           addWork(sound.id, async signal => {
@@ -1623,6 +1676,38 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             if (!Object.keys(patch).length) fail(400, 'Nothing to change.');
             updateAsset(id, patch); send(res, 200, { asset: state.media.find(item => item.id === id) }); return;
           }
+          // Camera Raw (Blackmagic RAW): the clip's own settings, checked against what its camera offers. New ones develop the clip
+          // again behind the look it plays; meanwhile the Color page shows the SDK's stills of the new one (raw-frame).
+          if (method === 'POST' && suffix === 'raw') {
+            const braw = asset.braw ?? fail(409, 'Only a Blackmagic RAW clip has Camera Raw settings.');
+            const body = await jsonBody(req); let settings: Record<string, RawValue> = {};
+            try { settings = validateRawSettings(braw.info, body.settings ?? {}); } catch (error) { fail(400, (error as Error).message); }
+            updateAsset(id, { braw: { ...braw, settings, error: undefined } });
+            const current = state.media.find(item => item.id === id)!, running = aborters.get(id);
+            if (current.status === 'ready') { running?.abort(); if (rawPending(current.braw)) processAsset(id, true); }
+            else if (current.status === 'processing' && running) { running.abort(); processAsset(id); }
+            send(res, 200, { asset: current }); return;
+          }
+          if (['GET', 'HEAD'].includes(method) && suffix === 'raw-frame') {
+            const braw = asset.braw ?? fail(409, 'Only a Blackmagic RAW clip has Camera Raw settings.');
+            if (!brawReady()) fail(503, BRAW_MISSING);
+            const key = rawKey(braw.settings); if (url.searchParams.get('key') !== key) fail(409, 'The Camera Raw settings changed. Ask again.');
+            const frame = Math.min(braw.info.frames - 1, Math.floor(numberField(Number(url.searchParams.get('frame') ?? 0), 0, 1e7)));
+            const directory = join(mediaDir(id), 'raw-frames'), file = join(directory, `${key}-${frame}.mp4`);
+            if (!existsSync(file)) {
+              let made = rawFrames.get(file);
+              if (!made) {
+                mkdirSync(directory, { recursive: true });
+                made = brawFrame({ original: originalPath(id), output: file, info: braw.info, settings: braw.settings, frame }).finally(() => rawFrames.delete(file));
+                rawFrames.set(file, made);
+              }
+              await made;
+              // ponytail: newest 48 stills per clip; they are 100 kB each and only matter while a develop runs.
+              const kept = readdirSync(directory).map(name => ({ name, at: statSync(join(directory, name)).mtimeMs })).sort((a, b) => b.at - a.at);
+              for (const { name } of kept.slice(48)) rmSync(join(directory, name), { force: true });
+            }
+            streamFile(req, res, file, 'video/mp4', undefined, true); return;
+          }
           if (method === 'POST' && suffix === 'retry') { if (!existsSync(originalPath(id)) && !asset.importLink) fail(409, 'The original upload is missing. Upload the file again.'); if (aborters.has(id)) fail(409, 'This file is already processing.'); updateAsset(id, { status: 'processing', progress: 0, error: undefined }); processAsset(id); send(res, 202, { asset: state.media.find(item => item.id === id) }); return; }
           // Relink: the asset keeps its id, binId and every clip on it. This only stages the replacement; the upload routes
           // swap it in once its last byte is accepted. Until then, and if it never arrives, the original stays in use.
@@ -1666,7 +1751,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const removeSets=body.removeSets??[];
           if(!Array.isArray(removeSets)||removeSets.length>200||removeSets.some((id:unknown)=>typeof id!=='string'||!state.tracks.some(t=>t.timelineId===timeline.id&&t.captionSets?.some(meta=>meta.id===id))))fail(400,'Choose existing caption sets on this timeline to replace.');
           const job:CaptionJob={wordsPerLine,removeSets,preset:body.preset??'highlight',...(body.replaceSet?{replaceSet:textField(body.replaceSet,160,true)}:{}),id:`caption-${randomUUID()}`,projectId:project.id,timelineId:timeline.id,start,end,trackIds:body.trackIds,signature:body.signature===undefined?captionSignature(state.clips,state.tracks,timeline.id,start,end,body.trackIds):textField(body.signature,100,true),status:'waiting',stage:'Queued',progress:0};
-          const snapshot=structuredClone({project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips:state.clips.filter(c=>c.projectId===project.id),tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:[],assets:state.media.filter(a=>a.projectId===project.id).map(asset=>({asset,path:originalPath(asset.id)})),settings:{rangeIn:String(start),rangeOut:String(end)}});
+          const snapshot=structuredClone({project,timeline,timelines:state.timelines.filter(t=>t.projectId===project.id),clips:state.clips.filter(c=>c.projectId===project.id),tracks:state.tracks.filter(t=>state.timelines.some(tl=>tl.id===t.timelineId&&tl.projectId===project.id)),nodes:[],assets:state.media.filter(a=>a.projectId===project.id).map(asset=>({asset,path:sourcePath(asset)})),settings:{rangeIn:String(start),rangeOut:String(end)}});
           saveCaptionJob(job);
           // The media slot is held only while the audio renders: the transcription then waits for the GPU (behind a depth run
           // or a Smart Mask) outside the queue, still cancellable under the job's id.
@@ -1699,28 +1784,28 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const clip = state.clips.find(item => item.id === url.searchParams.get('clipId')) ?? fail(404, 'Clip not found.');
           requireProject(clip.projectId, userId);
           const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId) ?? fail(404, 'Media not found.');
-          if (asset.kind !== 'video' || !existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
+          if (asset.kind !== 'video' || !existsSync(sourcePath(asset))) fail(409, 'Original video is unavailable.');
           // The editor asks for timing as it opens; start the preview model now so the first click is quick.
           if (path.endsWith('source-times')) masks.warm();
-          const sourceTimes = await masks.sourceTimes(clip, asset, originalPath(asset.id));
+          const sourceTimes = await masks.sourceTimes(clip, asset, sourcePath(asset));
           if (path.endsWith('source-times')) { send(res, 200, { sourceTimes }); return; }
           const frame = Number(url.searchParams.get('frame'));
           if (!Number.isSafeInteger(frame) || frame < 0 || frame >= sourceTimes.length) fail(400, 'Invalid source frame.');
           res.setHeader('X-Smart-Mask-Time', String(sourceTimes[frame])); res.setHeader('X-Smart-Mask-Frame', String(frame));
-          const image = await masks.source(clip, asset, originalPath(asset.id), frame, url.searchParams.get('size') === 'display' ? 'display' : 'native');
+          const image = await masks.source(clip, asset, sourcePath(asset), frame, url.searchParams.get('size') === 'display' ? 'display' : 'native');
           streamFile(req, res, image, 'image/jpeg'); return;
         }
         if (path === '/api/smart-masks/preview' && method === 'POST') {
           const body = await jsonBody(req), clip = state.clips.find(item => item.id === textField(body.clipId, 160, true)) ?? fail(404, 'Clip not found.');
           requireProject(clip.projectId, userId, true);
           const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId) ?? fail(404, 'Media not found.');
-          if (asset.kind !== 'video' || !existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
+          if (asset.kind !== 'video' || !existsSync(sourcePath(asset))) fail(409, 'Original video is unavailable.');
           const mask = clip.smartMasks?.find(item => item.id === textField(body.maskId, 160, true)) ?? fail(404, 'Mask not found.');
           // Guides come from the request so a click previews before the workspace save lands.
           const candidate = { ...structuredClone(mask), prompts: body.prompts, repairs: [] }; validateSmartMask(candidate);
           if (!candidate.prompts.length || candidate.prompts.length > 64) fail(400, 'Preview one frame of guides at a time.');
           const frame = Number(body.frame); if (!Number.isSafeInteger(frame) || frame < 0) fail(400, 'Invalid source frame.');
-          const image = await masks.preview(structuredClone(clip), asset, originalPath(asset.id), candidate, frame, candidate.prompts);
+          const image = await masks.preview(structuredClone(clip), asset, sourcePath(asset), candidate, frame, candidate.prompts);
           maskPreviews.add(`${clip.projectId}:${basename(image, '.png')}`); if (maskPreviews.size > 10_000) maskPreviews.delete(maskPreviews.values().next().value!);
           send(res, 200, { url: `/api/smart-masks/preview/${basename(image, '.png')}.png?projectId=${encodeURIComponent(clip.projectId)}` }); return;
         }
@@ -1734,9 +1819,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const body = await jsonBody(req), clip = state.clips.find(item => item.id === textField(body.clipId, 160, true)) ?? fail(404, 'Clip not found.');
           requireProject(clip.projectId, userId, true);
           const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId) ?? fail(404, 'Media not found.');
-          if (asset.kind !== 'video' || !existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
+          if (asset.kind !== 'video' || !existsSync(sourcePath(asset))) fail(409, 'Original video is unavailable.');
           const mask = clip.smartMasks?.find(item => item.id === textField(body.maskId, 160, true)) ?? fail(404, 'Mask not found.');
-          const job = await masks.enqueue({ clip: structuredClone(clip), asset, mask: structuredClone(mask), sourcePath: originalPath(asset.id), signature: textField(body.signature, 8_000_000, true), direction: body.direction, anchorTime: body.anchorTime });
+          const job = await masks.enqueue({ clip: structuredClone(clip), asset, mask: structuredClone(mask), sourcePath: sourcePath(asset), signature: textField(body.signature, 8_000_000, true), direction: body.direction, anchorTime: body.anchorTime });
           send(res, job.status === 'ready' ? 200 : 202, job); return;
         }
         const maskRoute = /^\/api\/smart-masks\/([a-f0-9]{64})(?:\/(manifest|frames|preview|source)(?:\/(\d+)\.(png|jpg))?)?$/.exec(path);
@@ -1751,8 +1836,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
               const clip = state.clips.find(item => item.id === url.searchParams.get('clipId') && item.projectId === projectId) ?? fail(404, 'Clip not found.');
               const mask = clip.smartMasks?.find(item => item.result?.key === key) ?? fail(409, 'This mask is no longer attached to the clip.');
               const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === projectId) ?? fail(404, 'Media not found.');
-              if (!existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
-              resolveSmartMaskArtifact(join(dataDir, 'smart-masks'), clip, mask, originalPath(asset.id), asset);
+              if (!existsSync(sourcePath(asset))) fail(409, 'Original video is unavailable.');
+              resolveSmartMaskArtifact(join(dataDir, 'smart-masks'), clip, mask, sourcePath(asset), asset);
             }
             streamFile(req, res, masks.file(projectId, key, kind as 'manifest' | 'frames' | 'preview' | 'source', frame === undefined ? undefined : Number(frame)), undefined, undefined, !currentClip); return;
           }
@@ -1764,10 +1849,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const editor = ['Owner', 'Editor'].includes(roleFor(requireProject(clip.projectId, userId), userId) ?? '');
           const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId);
           if (!asset || !['video', 'image'].includes(asset.kind)) fail(400, 'Depth works on video and image clips.');
-          if (!existsSync(originalPath(asset!.id))) fail(409, 'Depth reads the original media, which is not on this server.');
+          if (!existsSync(sourcePath(asset!))) fail(409, 'Depth reads the original media, which is not on this server.');
           let range = { from: 0, to: 1 };
           try { range = depthSpan(clip, asset!, state.clips, state.media); } catch (error) { fail(400, (error as Error).message); }
-          const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: originalPath(asset!.id), ...range, joinOnly: !editor, bind: editor });
+          const run = await depth.enqueue({ clip: structuredClone(clip), asset: asset!, sourcePath: sourcePath(asset!), ...range, joinOnly: !editor, bind: editor });
           send(res, run.status === 'ready' ? 200 : 202, run); return;
         }
         const depthRoute = /^\/api\/depth\/([a-f0-9]{64})(?:\/preview\/(\d+)\.mp4|\/(focus))?$/.exec(path);
@@ -1780,8 +1865,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             const maskKey = textField(url.searchParams.get('maskKey'), 64, true);
             const mask = clip.smartMasks?.find(item => item.result?.key === maskKey) ?? fail(409, 'This subject mask is no longer on the clip, or was analyzed again.');
             const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === projectId) ?? fail(404, 'Media not found.');
-            if (!existsSync(originalPath(asset.id))) fail(409, 'Original video is unavailable.');
-            const subject = resolveSmartMaskArtifact(join(dataDir, 'smart-masks'), clip, mask, originalPath(asset.id), asset);
+            if (!existsSync(sourcePath(asset))) fail(409, 'Original video is unavailable.');
+            const subject = resolveSmartMaskArtifact(join(dataDir, 'smart-masks'), clip, mask, sourcePath(asset), asset);
             if (depth.get(projectId, depthRoute[1], 0, false).mediaId !== asset.id) fail(409, 'This depth analysis belongs to other media.');
             // A long run takes a while to measure: answer 202 and let the editor ask again rather than hold the tunnel.
             const task = depth.focus(projectId, depthRoute[1], subject); task.catch(() => {});
@@ -1815,7 +1900,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           // an older import not yet migrated (or a missing file) reads the original too.
           const previewName = asset!.hasAlpha || quality === 'Original' ? undefined : quality === '1/4' ? STREAM_LOW_VARIANT : quality === '1/2' || quality === 'Stream' ? STREAM_VARIANT : FULL_VARIANT;
           const proxy = previewName && join(mediaDir(asset!.id),'prepared',previewName);
-          const input = proxy && existsSync(proxy) ? proxy : originalPath(asset!.id);
+          const input = proxy && existsSync(proxy) ? proxy : sourcePath(asset!);
           if (!existsSync(input)) fail(409,'The source preview is still being prepared.');
           const generation=JSON.stringify([flowTiming(geometry),fps,quality]);
           const key = await flowIdentity(geometry,input,fps,from,duration,true);
@@ -1854,8 +1939,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const quality = textField(body.quality,20,true); if (!denoiseQualities.includes(quality)) fail(400,'Invalid preview quality.');
           const view = body.view === undefined || body.view === 'denoised' ? 'denoised' : body.view === 'noise' ? 'noise' : fail(400,'Invalid Noise Reduction view.');
           const chunk = numberField(body.chunk,0,1e6); if (!Number.isInteger(chunk)) fail(400,'Invalid preview chunk.');
-          if (!existsSync(originalPath(asset!.id))) fail(409,'Noise Reduction reads the original media, which is not on this server.');
-          send(res,200,await denoise.preview({projectId:project.id,clipId:clip.id,input:originalPath(asset!.id),asset:asset!,chunk,quality,view,settings:denoiseSettingsOf(body.settings)})); return;
+          if (!existsSync(sourcePath(asset!))) fail(409,'Noise Reduction reads the original media, which is not on this server.');
+          send(res,200,await denoise.preview({projectId:project.id,clipId:clip.id,input:sourcePath(asset!),asset:asset!,chunk,quality,view,settings:denoiseSettingsOf(body.settings)})); return;
         }
         if (path === '/api/denoise/all') {
           if (method === 'GET') { const project = requireProject(textField(url.searchParams.get('projectId'),160,true),userId); send(res,200,denoise.allStatus(project.id)); return; }
@@ -1866,8 +1951,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             // Every clip of the timeline the viewer would denoise, left to right; optical flow previews instead (denoisePreview.ts).
             const clips = state.clips.filter(c => c.projectId === project.id && c.timelineId === timelineId && !c.disabled && !c.properties.opticalFlow && denoiseEffect(c) && state.tracks.find(t => t.id === c.trackId)?.kind === 'video').sort((a, b) => a.start - b.start).flatMap(c => {
               const asset = state.media.find(a => a.id === c.mediaId && a.projectId === project.id);
-              if (asset?.kind !== 'video' || asset.hasAlpha || !(asset.fps > 0) || !existsSync(originalPath(asset.id))) return [];
-              return [{ clipId: c.id, input: originalPath(asset.id), asset, settings: denoiseSettingsOf(denoiseSettings(c, denoiseEffect(c)!)), chunks: denoiseClipChunks(c, asset) }];
+              if (asset?.kind !== 'video' || asset.hasAlpha || !(asset.fps > 0) || !existsSync(sourcePath(asset))) return [];
+              return [{ clipId: c.id, input: sourcePath(asset), asset, settings: denoiseSettingsOf(denoiseSettings(c, denoiseEffect(c)!)), chunks: denoiseClipChunks(c, asset) }];
             });
             if (!clips.length) fail(400,'No clip on this timeline has Noise Reduction to denoise.');
             const capabilities = await denoiseCapabilities(); if (!capabilities.available) fail(503, capabilities.reason || 'Noise Reduction is not available on this server.');
@@ -1912,7 +1997,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const mediaId=q.get('mediaId'),asset=mediaId?state.media.find(m=>m.id===mediaId&&m.projectId===project.id)??fail(404,'Media not found.'):undefined;
           if(asset?.kind==='audio')fail(409,'Audio has no picture.');
           const timeline=asset?undefined:state.timelines.find(t=>t.id===q.get('timelineId')&&t.projectId===project.id)??fail(404,'Timeline not found.');
-          const base=asset?mediaStill(project,asset,originalPath(asset.id)):previewSnapshot(project,timeline!,{});
+          const base=asset?mediaStill(project,asset,sourcePath(asset)):previewSnapshot(project,timeline!,{});
           const still=stillSettings(project,base.timeline.duration,numberField(Number(q.get('t')??0),0,86400),numberField(Number(q.get('w')??512),64,1920));
           const aborted=new AbortController();res.on('close',()=>{if(!res.writableFinished)aborted.abort();});
           try{
@@ -1939,25 +2024,25 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             const clip = state.clips.find(item => item.id === textField(id, 160, true)) ?? fail(404, 'Clip not found.');
             requireProject(clip.projectId, userId, write);
             const asset = state.media.find(item => item.id === clip.mediaId && item.projectId === clip.projectId) ?? fail(404, 'Media not found.');
-            if (asset.kind !== 'video' || !existsSync(originalPath(asset.id))) fail(409, 'Tracking reads the original video, which is not on this server.');
+            if (asset.kind !== 'video' || !existsSync(sourcePath(asset))) fail(409, 'Tracking reads the original video, which is not on this server.');
             return { clip, asset };
           };
           const tracker = (clip: typeof state.clips[number], id: unknown) => clip.motionTrackers?.find(item => item.id === textField(id, 160, true)) ?? fail(409, 'This tracker is still saving. Try again in a moment.');
           if (path === '/api/motion-trackers/source-times' && method === 'GET') {
             const { clip, asset } = trackedClip(url.searchParams.get('clipId'), false);
-            send(res, 200, { sourceTimes: await masks.sourceTimes(clip, asset, originalPath(asset.id)) }); return;
+            send(res, 200, { sourceTimes: await masks.sourceTimes(clip, asset, sourcePath(asset)) }); return;
           }
           if (path === '/api/motion-trackers/track' && method === 'POST') {
             const body = await jsonBody(req), { clip, asset } = trackedClip(body.clipId, true);
             if (!Array.isArray(body.trackerIds) || !body.trackerIds.length || body.trackerIds.length > 16) fail(400, 'Choose which trackers to track.');
             if (body.direction !== 'forward' && body.direction !== 'backward') fail(400, 'Track forward or backward.');
             const frames = body.frames === undefined ? undefined : numberField(body.frames, 1, 1_000_000);
-            const job = await motionTrackers.start({ projectId: clip.projectId, clip: structuredClone(clip), asset, sourcePath: originalPath(asset.id), times: await masks.sourceTimes(clip, asset, originalPath(asset.id)), trackers: body.trackerIds.map((id: unknown) => structuredClone(tracker(clip, id))), time: numberField(body.time, 0, 86400), direction: body.direction === 'forward' ? 1 : -1, frames });
+            const job = await motionTrackers.start({ projectId: clip.projectId, clip: structuredClone(clip), asset, sourcePath: sourcePath(asset), times: await masks.sourceTimes(clip, asset, sourcePath(asset)), trackers: body.trackerIds.map((id: unknown) => structuredClone(tracker(clip, id))), time: numberField(body.time, 0, 86400), direction: body.direction === 'forward' ? 1 : -1, frames });
             send(res, 202, job); return;
           }
           if (path === '/api/motion-trackers/clear' && method === 'POST') {
             const body = await jsonBody(req), { clip, asset } = trackedClip(body.clipId, true);
-            const key = await motionTrackers.clear(tracker(clip, body.trackerId), await masks.sourceTimes(clip, asset, originalPath(asset.id)), numberField(body.from, 0, 86400), numberField(body.to, 0, 86400));
+            const key = await motionTrackers.clear(tracker(clip, body.trackerId), await masks.sourceTimes(clip, asset, sourcePath(asset)), numberField(body.from, 0, 86400), numberField(body.to, 0, 86400));
             send(res, 200, { key }); return;
           }
           const jobRoute = /^\/api\/motion-trackers\/jobs\/([a-f0-9-]{36})$/.exec(path);
@@ -2011,7 +2096,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const records = timelineTransitions(state.clips.filter(c=>c.projectId===project.id),clip.timelineId,state.media);
           const span = clipSpan(clip,records), geometry = extendClip(clip,Math.max(0,span.start),span.end-Math.max(0,span.start));
           const sourceFps = asset!.fps || numberField(body.fps,1,120), range = stabilizeRange(geometry,sourceFps,asset!.duration);
-          const original = originalPath(asset!.id);
+          const original = sourcePath(asset!);
           if (!existsSync(original)) fail(409,'Original media is missing.');
           // The editor warps the picture it already decodes, so one solve serves every frame, quality and section.
           // A replaced original (Replace Media keeps the id) is a new source: its version keeps the old solve from being served.
@@ -2050,7 +2135,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const clips = state.clips.filter(clip => clip.timelineId === timeline.id); if (!clips.some(clip => !clip.disabled)) fail(400, 'Add a clip to the timeline before exporting.');
           if (state.renderJobs.filter(job => ['waiting', 'rendering'].includes(job.status)).length >= 20) fail(429, 'The render queue is full.');
           const job: RenderJob = { id: `render-${randomUUID()}`, projectId: project.id, name: textField(body.name, 160, true).trim(), preset: textField(body.preset, 80, true), status: 'waiting', progress: 0, remaining: 'Waiting', settings };
-          const snapshot = structuredClone({ project, timeline, timelines:state.timelines.filter(t=>t.projectId===project.id), clips:state.clips.filter(c=>c.projectId===project.id), tracks: state.tracks.filter(track => state.timelines.some(t=>t.id===track.timelineId&&t.projectId===project.id)), nodes: state.nodes.filter(node => node.projectId === project.id), assets: state.media.filter(asset => asset.projectId === project.id).map(asset => ({ asset, path: originalPath(asset.id) })), settings });
+          const snapshot = structuredClone({ project, timeline, timelines:state.timelines.filter(t=>t.projectId===project.id), clips:state.clips.filter(c=>c.projectId===project.id), tracks: state.tracks.filter(track => state.timelines.some(t=>t.id===track.timelineId&&t.projectId===project.id)), nodes: state.nodes.filter(node => node.projectId === project.id), assets: state.media.filter(asset => asset.projectId === project.id).map(asset => ({ asset, path: sourcePath(asset) })), settings });
           mkdirSync(join(dataDir, 'renders'), { recursive: true, mode: 0o700 }); state.renderJobs = [job, ...state.renderJobs]; persist();
           startRender(job, snapshot);
           send(res, 202, { job }); return;
@@ -2100,7 +2185,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const timeline = state.timelines.find(t => t.projectId === job.projectId && (!job.settings.timelineId || t.id === job.settings.timelineId));
     if (!savedSnapshot && !(job.status === 'waiting' && project && timeline)) return { ...job, status: 'failed', remaining: 'Interrupted by server restart', error: 'The server restarted. Submit the export again.' };
     const queued: RenderJob = { ...job, status: 'waiting', progress: 0, remaining: 'Queued for export' };
-    restarts.push([queued, savedSnapshot ? JSON.parse(String(savedSnapshot.data)) : structuredClone({ project: project!, timeline: timeline!, timelines: state.timelines.filter(t => t.projectId === job.projectId), clips: state.clips.filter(c => c.projectId === job.projectId), tracks: state.tracks.filter(t => state.timelines.some(tl => tl.id === t.timelineId && tl.projectId === job.projectId)), nodes: state.nodes.filter(n => n.projectId === job.projectId), assets: state.media.filter(a => a.projectId === job.projectId).map(asset => ({ asset, path: originalPath(asset.id) })), settings: job.settings })]);
+    restarts.push([queued, savedSnapshot ? JSON.parse(String(savedSnapshot.data)) : structuredClone({ project: project!, timeline: timeline!, timelines: state.timelines.filter(t => t.projectId === job.projectId), clips: state.clips.filter(c => c.projectId === job.projectId), tracks: state.tracks.filter(t => state.timelines.some(tl => tl.id === t.timelineId && tl.projectId === job.projectId)), nodes: state.nodes.filter(n => n.projectId === job.projectId), assets: state.media.filter(a => a.projectId === job.projectId).map(asset => ({ asset, path: sourcePath(asset) })), settings: job.settings })]);
     return queued;
   });
   if (jobs.some((job, i) => job !== state.renderJobs[i])) state.renderJobs = jobs;
@@ -2113,6 +2198,8 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   if (media.some((asset, i) => asset !== state.media[i])) state.media = media;
   if (store.dirty(state)) persist();
   for (const id of again) processAsset(id);
+  // A Camera Raw develop the restart cut short starts again, behind the look the clip already plays.
+  for (const asset of state.media as Asset[]) if (asset.status === 'ready' && rawPending(asset.braw) && existsSync(originalPath(asset.id))) processAsset(asset.id, true);
   // An upload nobody has sent a chunk to for a day is abandoned: it stops holding a queue slot and its partial file goes.
   // A Final Cut import's files wait a week for its importer's Mac to come back; after that the import stops and they go too.
   const expireUploads = () => {
@@ -2167,7 +2254,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     }
   };
   const queueMigration = (id: string) => { if (!migrations.includes(id)) migrations.push(id); if (!migrating) migrateNext(); };
-  const cameraDue = (asset: Asset) => asset.kind === 'video' && asset.status === 'ready' && (asset.cameraMetadataVersion ?? 0) < CAMERA_METADATA_VERSION && existsSync(originalPath(asset.id));
+  const cameraDue = (asset: Asset) => asset.kind === 'video' && asset.status === 'ready' && (asset.cameraMetadataVersion ?? 0) < CAMERA_METADATA_VERSION && existsSync(sourcePath(asset));
   // Imports before version 2 read only the file's first 2 MB (Sony can write its profile at the end) and guessed Canon Log 3.
   // An untagged stream then fell back to a BT.601 matrix, which the grading proxy baked in. The files that carry it go
   // before the correction is saved, so the migration rebuilds full-v3 from the original whenever it gets there, even
@@ -2175,7 +2262,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   // a label only, previews keep the recorded signal through the stream's own matrix. A clip's own input choice always wins over it.
   for (const asset of state.media) if (cameraDue(asset)) addWork(`camera-${asset.id}`, async signal => {
     try {
-      const found = await probeCameraColor(originalPath(asset.id), signal), current = state.media.find(m => m.id === asset.id);
+      const found = await probeCameraColor(sourcePath(asset), signal), current = state.media.find(m => m.id === asset.id);
       if (!current || signal.aborted || closed) return;
       const stale = current.colorMatrix === 'auto' ? found?.colorMatrix : undefined;
       let matrix = stale;
@@ -2191,10 +2278,10 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   for (const asset of due) queueMigration(asset.id);
   // Older probes missed display rotation (portrait phone clips read as landscape) and HDR transfer.
   // Re-probing is cheap; an HDR clip then prepares again so its previews are tone-mapped.
-  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && asset.probeVersion !== PROBE_VERSION && existsSync(originalPath(asset.id))) {
+  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && asset.probeVersion !== PROBE_VERSION && existsSync(sourcePath(asset))) {
     addWork(`probe-${asset.id}`, async signal => {
       try {
-        const { resolution, width, height, colorTransfer, colorMatrix, probeVersion, hasAlpha } = await probeMedia(originalPath(asset.id), signal);
+        const { resolution, width, height, colorTransfer, colorMatrix, probeVersion, hasAlpha } = await probeMedia(sourcePath(asset), signal);
         if (signal.aborted || closed) return;
         updateAsset(asset.id, { resolution, width, height, colorTransfer, colorMatrix, probeVersion, hasAlpha } as Partial<Asset>);
         // Graphics with alpha were proxied to opaque H.264 (a black backdrop); they prepare again as alpha WebM. The refresh
@@ -2204,17 +2291,17 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     });
   }
   // Media imported before filmstrips existed still shows one repeated still until this lands.
-  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && asset.filmstripVersion !== FILMSTRIP_VERSION && existsSync(originalPath(asset.id))) {
+  for (const asset of state.media) if (asset.kind === 'video' && asset.status === 'ready' && asset.filmstripVersion !== FILMSTRIP_VERSION && existsSync(sourcePath(asset))) {
     addWork(`filmstrip-${asset.id}`, async signal => {
       try {
-        const frames = await prepareMediaFilmstrip(originalPath(asset.id), join(mediaDir(asset.id), 'prepared'), asset.duration, signal);
+        const frames = await prepareMediaFilmstrip(sourcePath(asset), join(mediaDir(asset.id), 'prepared'), asset.duration, signal);
         if (!signal.aborted && !closed) updateAsset(asset.id, { filmstrip: `/api/media/${asset.id}/files/filmstrip.jpg`, filmstripFrames: frames, filmstripVersion: FILMSTRIP_VERSION });
       } catch (error) { if (!signal.aborted) console.error(`Filmstrip build failed for ${asset.name}:`, error); }
     });
   }
-  for (const asset of state.media) if (asset.status === 'ready' && asset.hasAudio && asset.waveformVersion !== 2 && existsSync(originalPath(asset.id))) {
+  for (const asset of state.media) if (asset.status === 'ready' && asset.hasAudio && asset.waveformVersion !== 2 && existsSync(sourcePath(asset))) {
     addWork(`waveform-${asset.id}`, async signal => {
-      try { const peaks = await prepareWaveform(originalPath(asset.id), asset.duration, signal); if (!signal.aborted && !closed) updateAsset(asset.id, peaks); }
+      try { const peaks = await prepareWaveform(sourcePath(asset), asset.duration, signal); if (!signal.aborted && !closed) updateAsset(asset.id, peaks); }
       catch (error) { if (!signal.aborted) console.error(`Waveform upgrade failed for ${asset.name}:`, error); }
     });
   }

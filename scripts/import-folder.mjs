@@ -35,7 +35,7 @@ if (!args[0]) throw new Error('Pass the folder holding the footage.');
 if (!['private', 'people', 'class'].includes(access)) throw new Error('--access must be private, people, or class.');
 const root = resolvePath(args[0]);
 
-const MEDIA = new Set(['.mp4', '.mov', '.m4v', '.mxf', '.avi', '.mkv', '.webm', '.wav', '.mp3', '.aac', '.aiff', '.aif', '.flac', '.m4a', '.ogg', '.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff', '.heic']);
+const MEDIA = new Set(['.mp4', '.mov', '.m4v', '.mxf', '.avi', '.braw', '.mkv', '.webm', '.wav', '.mp3', '.aac', '.aiff', '.aif', '.flac', '.m4a', '.ogg', '.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff', '.heic']);
 const CHUNK = 8 * 1024 * 1024, ATTEMPTS = 5;
 const id = (prefix, value) => `${prefix}-${createHash('sha1').update(value).digest('hex')}`;
 const gb = bytes => `${(bytes / 1024 ** 3).toFixed(1)} GB`;

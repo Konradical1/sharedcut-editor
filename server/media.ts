@@ -424,6 +424,8 @@ const previewRecipes = (fps: number) => ({
   stream: { name: STREAM_VARIANT, scale: 960, tag: bt709, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '16', '-g', gop(fps, 2), '-pix_fmt', 'yuv420p'] },
   low: { name: STREAM_LOW_VARIANT, scale: 480, tag: bt709, codec: ['-c:v', 'libx264', '-threads', '2', '-preset', 'veryfast', '-crf', '20', '-maxrate', '900k', '-bufsize', '1800k', '-g', gop(fps, .5), '-pix_fmt', 'yuv420p'] },
 });
+/** full-v3's encode, for a picture made elsewhere at its size and levels (Blackmagic RAW develops it from the SDK's frames). */
+export const fullPreview = (fps: number) => { const { tag, codec } = previewRecipes(fps).full; return { tag, codec }; };
 /** What one file adds after the shared 4:2:2 frames: its own size, then its tags. */
 const previewTail = (recipe: ReturnType<typeof previewRecipes>[keyof ReturnType<typeof previewRecipes>]) => `${recipe.scale ? `scale=w='min(${recipe.scale},iw)':h=-2:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv:${sizing},format=yuv420p,setsar=1,` : ''}${recipe.tag}`;
 /** One preview file's exact conversion and encode for an original's own Y′CbCr frames: a Noise Reduction chunk stands in for
@@ -549,7 +551,8 @@ async function clipLoudness(inputPath: string, seek: number, duration: number, f
   return measured;
 }
 
-export async function prepareMedia(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; refresh?: boolean; onProgress?: (percent: number) => void; onThumbnail?: (url: string) => void; onStage?: (stage: string) => void; onPlayable?: (asset: Awaited<ReturnType<typeof probeMedia>> & {proxyUrl: string; thumbnail: string; colorProxyUrl?: string}) => void }) {
+/** `fullReady`: full-v3 is already in `outputDir`, made from this input (a Blackmagic RAW develop writes it with its master). */
+export async function prepareMedia(options: { inputPath: string; outputDir: string; baseUrl: string; signal?: AbortSignal; refresh?: boolean; fullReady?: boolean; onProgress?: (percent: number) => void; onThumbnail?: (url: string) => void; onStage?: (stage: string) => void; onPlayable?: (asset: Awaited<ReturnType<typeof probeMedia>> & {proxyUrl: string; thumbnail: string; colorProxyUrl?: string}) => void }) {
   const { inputPath, outputDir, baseUrl, signal, onProgress, onThumbnail, onStage, onPlayable } = options;
   onStage?.('Reading camera metadata');
   const metadata = await probeMedia(inputPath, signal);
@@ -580,10 +583,10 @@ export async function prepareMedia(options: { inputPath: string; outputDir: stri
       await run(ffmpeg(), [...common, ...input, '-vf', 'scale=w=1920:h=1920:force_original_aspect_ratio=decrease', '-frames:v', '1', staged], { signal });
     } else if (metadata.kind === 'audio') {
       await run(ffmpeg(), [...common, ...input, '-vn', '-map', '0:a:0?', '-c:a', 'aac', '-ac', '2', '-ar', '48000', '-b:a', '128k', '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', staged], { signal, duration: metadata.duration, onProgress: value => onProgress?.(5 + value * .7) });
-    } else {
+    } else if (!options.fullReady) {
       await encodePreviews({ video: inputPath, prepared: false, audio: metadata.hasAudio ? inputPath : undefined, metadata, outputs: ['full'], temp, signal, onProgress: value => onProgress?.(5 + value * .7) });
     }
-    await rename(staged, proxy);
+    if (!options.fullReady || !opaque) await rename(staged, proxy);
     onProgress?.(80);
     onStage?.('Preparing audio waveform');
     const peaks = metadata.hasAudio ? await prepareWaveform(inputPath, metadata.duration, signal) : { waveform: [], waveformVersion: 2 };

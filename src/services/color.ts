@@ -6,8 +6,8 @@ import { identityCurve, curveSlope, sampleCurve, tonal, chroma, hslCurves, mixer
 import { applyFilm, detailAt, detailMaps, type DetailMaps } from './filmLook.ts';
 export { identityCurve, curveSlope, sampleCurve };
 
-export const profiles = ['Rec.709', 'S-Log3', 'Canon Log', 'Canon Log 2', 'Canon Log 3', 'S-Log2', 'S-Log', 'DaVinci Intermediate', 'Linear', 'Gamma 2.4', 'Apple Log'] as const;
-export const gamuts = ['Rec.709', 'S-Gamut3.Cine', 'S-Gamut3', 'Cinema Gamut', 'Rec.2020', 'DaVinci Wide Gamut', 'S-Gamut'] as const;
+export const profiles = ['Rec.709', 'S-Log3', 'Canon Log', 'Canon Log 2', 'Canon Log 3', 'S-Log2', 'S-Log', 'DaVinci Intermediate', 'Linear', 'Gamma 2.4', 'Apple Log', 'Blackmagic Film Gen 5'] as const;
+export const gamuts = ['Rec.709', 'S-Gamut3.Cine', 'S-Gamut3', 'Cinema Gamut', 'Rec.2020', 'DaVinci Wide Gamut', 'S-Gamut', 'Blackmagic Wide Gamut'] as const;
 export type Cube = { size: number; data: Float32Array; min: number[]; max: number[] };
 const clamp = (v: number, min = 0, max = 1) => Math.max(min, Math.min(max, v));
 /** Legacy (Gamma 2.4 / Rec.709) nodes grade on these luma weights. */
@@ -29,6 +29,8 @@ export function decodeLog(v: number, profile: string): number {
   // Apple Log Profile (Apple, 2023) on the video-range scale like Sony, scene-linear (grey .18 at P .488, black at code 196). Pt = c·(Rt−R0)² = .208555316.
   // Below code 64 the square segment is mirrored (Apple clamps it to R0), so the curve stays monotonic and invertible like the others.
   if (profile === 'Apple Log') { const x = (v * 1023 - 64) / 876; return x >= .208555316 ? 2 ** ((x - .69336945) / .08550479) - .00964052 : Math.sign(x) * Math.sqrt(Math.abs(x) / 47.28711236) - .05641088; }
+  // Blackmagic Generation 5 Color Science technical reference (2021): a full-range curve like DaVinci Intermediate, grey .18 at .3835616.
+  if (profile === 'Blackmagic Film Gen 5') return v < .13388378308667 ? (v - .09246575342465753) / 8.283605932402494 : Math.exp((v - .5300133392291939) / .08692876065491224) - .005494072432257808;
   if (profile !== 'Rec.709') throw new Error(`Unsupported input profile: ${profile}`);
   return Math.max(0, v) ** 2.4;
 }
@@ -44,6 +46,7 @@ export function encodeLog(v: number, profile: string): number {
   }
   if(profile==='Canon Log 3'){const x=v/.9,ire=x<-.014?-.42889912*Math.log10(-x*14.98325+1)+.07623209:x<=.014?2.3069815*x+.073059361:.42889912*Math.log10(x*14.98325+1)+.069886632;return (ire*876+64)/1023;}
   if(profile==='Apple Log'){const d=v+.05641088;return ((v>=.01?.08550479*Math.log2(v+.00964052)+.69336945:47.28711236*d*Math.abs(d))*876+64)/1023;}
+  if(profile==='Blackmagic Film Gen 5')return v<.005?8.283605932402494*v+.09246575342465753:.08692876065491224*Math.log(v+.005494072432257808)+.5300133392291939;
   if(profile!=='Rec.709')throw new Error(`Unsupported input profile: ${profile}`);
   return Math.max(0,v)**(1/2.4);
 }
@@ -53,6 +56,8 @@ const primaries: Record<string, number[][]> = {
   'DaVinci Wide Gamut': [[.8,.313],[.1682,.9877],[.079,-.1155]],
   'S-Gamut': [[.73,.28],[.14,.855],[.1,-.05]],
   'Cinema Gamut': [[.74,.27],[.17,1.14],[.08,-.1]],
+  // Blackmagic Generation 5 Color Science technical reference; the BRAW SDK's own Rec.709 and Rec.2020 conversions match these to 1e-4.
+  'Blackmagic Wide Gamut': [[.7177215,.3171181],[.228041,.861569],[.1005841,-.0820452]],
 };
 function inverse(m: number[][]) {
   const [[a,b,c],[d,e,f],[g,h,i]] = m, det = a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
@@ -78,7 +83,7 @@ export function logView(profile:string,gamut:string){
 }
 export function interpretation(clip: Clip, asset?: MediaAsset) {
   const profile = String(clip.properties.inputProfile ?? asset?.inputProfile ?? 'Rec.709');
-  const gamut = String(clip.properties.inputGamut ?? asset?.inputGamut ?? (profile === 'S-Log3' ? 'S-Gamut3.Cine' : profile==='S-Log'||profile==='S-Log2' ? 'S-Gamut' : profile==='DaVinci Intermediate' ? 'DaVinci Wide Gamut' : profile.startsWith('Canon') ? 'Cinema Gamut' : profile==='Apple Log' ? 'Rec.2020' : 'Rec.709'));
+  const gamut = String(clip.properties.inputGamut ?? asset?.inputGamut ?? (profile === 'S-Log3' ? 'S-Gamut3.Cine' : profile==='S-Log'||profile==='S-Log2' ? 'S-Gamut' : profile==='DaVinci Intermediate' ? 'DaVinci Wide Gamut' : profile.startsWith('Canon') ? 'Cinema Gamut' : profile==='Apple Log' ? 'Rec.2020' : profile==='Blackmagic Film Gen 5' ? 'Blackmagic Wide Gamut' : 'Rec.709'));
   if (!(profiles as readonly string[]).includes(profile) || !(gamuts as readonly string[]).includes(gamut)) throw new Error('Choose a supported input profile and gamut.');
   return { profile, gamut };
 }

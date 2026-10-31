@@ -23,7 +23,7 @@ const expand = (path: string) => resolve(path.replace(/^~(?=$|[\\/])/, homedir()
 
 /** What a folder upload picks up (scripts/import-folder.mjs:38; that script runs when imported, so the list is copied).
  *  A file named directly goes up whatever its extension. */
-export const EXTENSIONS = ['.mp4', '.mov', '.m4v', '.mxf', '.avi', '.mkv', '.webm', '.wav', '.mp3', '.aac', '.aiff', '.aif', '.flac', '.m4a', '.ogg', '.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff', '.heic'];
+export const EXTENSIONS = ['.mp4', '.mov', '.m4v', '.mxf', '.avi', '.braw', '.mkv', '.webm', '.wav', '.mp3', '.aac', '.aiff', '.aif', '.flac', '.m4a', '.ogg', '.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff', '.heic'];
 const MB = (n: number) => n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${(n / 1e6).toFixed(1)} MB`;
 const later = (s: number) => s >= 90 ? `${Math.round(s / 60)}m` : `${Math.round(s)}s`;
 
@@ -271,6 +271,8 @@ export const topics: Record<string, string> = {
     'bins: act moveMedia([@m, …], binId). act createBin("Cam A") prints the new id; move into it in the next act call (upload/link bin: creates it by name). renameBin(id, name). deleteBin(id) sends its media back to broll (video, images) or audio; those two cannot be deleted. Bin edits are not undoable.',
     'remove: act removeMedia(@m). Refused while a clip or snapshot uses it (delete those clips first) or while an export or caption job runs.',
     'retry: act retryMedia(@m) reprocesses from the saved original: failed rows, "Processing was interrupted" after a server restart, or to rebuild previews. A failed or paused upload: run the same upload job again.',
+    'braw: Blackmagic RAW (.braw) develops on the server through Blackmagic\'s RAW SDK (npm run setup:braw there; without it the row fails saying so). The media row shows the camera; get media @m for its Camera Raw (braw.info.asShot = camera values, braw.info.options/ranges = what it accepts, braw.settings = the clip\'s own).',
+    'camera raw: act setCameraRaw(@m, {white_balance_kelvin:5600, white_balance_tint:10, iso:800, exposure:.5}) replaces the clip\'s settings ({} = camera metadata). Other keys: viewing_gamma ("Blackmagic Design Film" log, "Blackmagic Design Extended Video", "DaVinci Intermediate"…), viewing_gamut ("Blackmagic Design"…), viewing_bmdgen 4|5|6, highlight_recovery 0|1, gamut_compression_enable 0|1, post_3dlut_mode Embedded|Disabled, tone_curve_contrast/saturation/midpoint/highlights/shadows/black_level/white_level (with viewing_gamma "Blackmagic Design Custom"), tone_curve_video_black_level 0|1. The clip develops again (braw.developing %) and plays its old look meanwhile; exports wait for it. Film Gen 5 and DaVinci Intermediate are colour managed (initializeColorGrade reads them).',
     'timeline: act addMediaToTimeline(@m | [@m, …], start?, trackId?, insert?) takes ready media only.',
   ].join('\n'),
 };

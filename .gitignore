@@ -30,3 +30,6 @@ desktop/node_modules/
 desktop/stage/
 desktop/release/
 desktop/vendor/
+
+# Blackmagic RAW helper and SDK libraries (npm run setup:braw)
+.braw/

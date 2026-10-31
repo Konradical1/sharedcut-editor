@@ -37,6 +37,7 @@ def decode(v,p):
     if p=='Apple Log':
         x=(v*1023-64)/876  # Apple Log Profile on the video-range scale; mirrored below code 64 as decodeLog
         return np.where(x>=.208555316,2**((x-.69336945)/.08550479)-.00964052,np.sign(x)*np.sqrt(np.abs(x)/47.28711236)-.05641088)
+    if p=='Blackmagic Film Gen 5': return np.where(v<.13388378308667,(v-.09246575342465753)/8.283605932402494,np.exp((v-.5300133392291939)/.08692876065491224)-.005494072432257808)
     raise ValueError('Unsupported gamma: '+p)
 
 def encode(v,p):
@@ -57,6 +58,7 @@ def encode(v,p):
     if p=='Apple Log':
         d=v+.05641088
         return (np.where(v>=.01,.08550479*np.log2(np.maximum(v,.01)+.00964052)+.69336945,47.28711236*d*np.abs(d))*876+64)/1023
+    if p=='Blackmagic Film Gen 5': return np.where(v<.005,8.283605932402494*v+.09246575342465753,.08692876065491224*np.log(np.maximum(v,.005)+.005494072432257808)+.5300133392291939)
     raise ValueError('Unsupported gamma: '+p)
 
 def curve(v,c):

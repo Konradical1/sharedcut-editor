@@ -38,7 +38,7 @@ export const ROUTES: Record<string, string> = {
   '/api/frames': 'frame',
   // Media
   '/api/media': 'job:upload',
-  '/api/media/([a-zA-Z0-9_-]+)(?:/(.*))?': 'job:upload', // upload, replace, original, files; PATCH/retry/DELETE are act renameMedia/retryMedia/removeMedia
+  '/api/media/([a-zA-Z0-9_-]+)(?:/(.*))?': 'job:upload', // upload, replace, original, files; PATCH/retry/DELETE are act renameMedia/retryMedia/removeMedia; raw is act setCameraRaw; raw-frame is the viewer's Camera Raw still
   '/api/media/import-link': 'job:link',
   '/api/media/still': 'job:still',
   '/api/media/move': 'store:moveMedia',

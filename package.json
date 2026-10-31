@@ -58,6 +58,7 @@
     "setup:flow": "node scripts/setup-venv.mjs .venv-flow scripts/optical-flow-requirements.txt scripts/optical-flow.py --check",
     "setup:tracker": "node scripts/setup-venv.mjs .venv-tracker scripts/tracker-requirements.txt scripts/tracker.py --check",
     "test:tracker": "node scripts/venv-run.mjs .venv-tracker scripts/tracker.py --selftest && node --experimental-strip-types --test src/services/motionTracker.test.ts server/motionTracker.test.ts",
+    "setup:braw": "node scripts/setup-braw.mjs",
     "test:tracker:browser": "node --experimental-strip-types scripts/motion-tracker-check.mjs",
     "test:optical-flow:browser": "node --experimental-strip-types scripts/optical-flow-check.mjs",
     "setup:windows": "node scripts/setup-windows.mjs",

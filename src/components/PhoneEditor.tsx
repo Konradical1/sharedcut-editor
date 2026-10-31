@@ -50,7 +50,7 @@ function MediaSheet({ onClose }: { onClose: () => void }) {
   };
   const shown = media.filter(m => kind === 'all' || m.kind === kind).reverse();
   return <Sheet title="Media" onClose={onClose} tall>
-    <input ref={input} type="file" hidden multiple accept="video/*,image/*,audio/*" onChange={e => { upload(e.target.files); e.target.value = ''; }}/>
+    <input ref={input} type="file" hidden multiple accept="video/*,image/*,audio/*,.braw" onChange={e => { upload(e.target.files); e.target.value = ''; }}/>
     <button className="ph-upload" onClick={() => input.current?.click()}><Upload size={18}/>Add from this phone</button>
     <UploadQueue projectId={projectId} media={media} onSelectFiles={() => input.current?.click()}/>
     <div className="ph-filters">{(['all', 'video', 'image', 'audio'] as const).map(k => <button key={k} className={kind === k ? 'active' : ''} onClick={() => setKind(k)}>{k === 'all' ? 'All' : k === 'image' ? 'Photos' : k === 'video' ? 'Videos' : 'Audio'}</button>)}</div>

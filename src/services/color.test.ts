@@ -55,7 +55,7 @@ test('wide-gamut references, reversible transforms, custom curves and complete l
   assert.ok(Math.abs(encodeLog(1,'DaVinci Intermediate')-.513837)<.000001);
   assert.ok(Math.abs(encodeLog(.18,'S-Log2')-.339532524633774)<1e-12);
   assert.ok(Math.abs(encodeLog(.18,'S-Log')-.384970815928670)<1e-12);
-  for(const profile of ['S-Log','S-Log2','S-Log3','Canon Log','Canon Log 2','Canon Log 3','DaVinci Intermediate','Gamma 2.4','Linear','Apple Log'])for(const v of [-.01,0,.002,.18,1,5,20])assert.ok(Math.abs(decodeLog(encodeLog(v,profile),profile)-v)<2e-5,`${profile}: ${v}`);
+  for(const profile of ['S-Log','S-Log2','S-Log3','Canon Log','Canon Log 2','Canon Log 3','DaVinci Intermediate','Gamma 2.4','Linear','Apple Log','Blackmagic Film Gen 5'])for(const v of [-.01,0,.002,.18,1,5,20])assert.ok(Math.abs(decodeLog(encodeLog(v,profile),profile)-v)<2e-5,`${profile}: ${v}`);
   const m=gamutMatrix('DaVinci Wide Gamut','Rec.709');// Published DWG red XYZ column multiplied by the Rec.709 XYZ-to-RGB matrix.
   assert.ok(Math.abs(m[0][0]-(3.2409699419*.70062239-1.5373831776*.27411851-.4986107603*(-.09896291)))<1e-7);
   const input=defaultCST('in'),output=defaultCST('out','DaVinci Intermediate','DaVinci Wide Gamut','S-Log3','S-Gamut3.Cine');
@@ -201,9 +201,9 @@ test('Apple Log: the white paper curve on the video-range scale, grey .18 at P .
 test('the preview shader transfers every profile like decodeLog/encodeLog (Apple Log at index 10)',async()=>{
   const {TRANSFER}=await import('./colorPreview.ts');
   // The two GLSL functions run as JavaScript: the same statements, GLSL's built-ins mapped to Math.
-  const glsl=(name:string)=>new Function('v','profile',`const pow=Math.pow,exp2=x=>2**x,log2=Math.log2,log=Math.log,sign=Math.sign,abs=Math.abs,sqrt=Math.sqrt,max=Math.max;${TRANSFER.split(`float ${name}(float v, int profile) {`)[1].split('\n  }')[0].replace(/\bfloat /g,'let ')}`) as (v:number,profile:number)=>number;
+  const glsl=(name:string)=>new Function('v','profile',`const pow=Math.pow,exp=Math.exp,exp2=x=>2**x,log2=Math.log2,log=Math.log,sign=Math.sign,abs=Math.abs,sqrt=Math.sqrt,max=Math.max;${TRANSFER.split(`float ${name}(float v, int profile) {`)[1].split('\n  }')[0].replace(/\bfloat /g,'let ')}`) as (v:number,profile:number)=>number;
   const [decode,encode]=[glsl('decode'),glsl('encode')],near=(a:number,b:number,m:string)=>assert.ok(Math.abs(a-b)<=1e-9*Math.max(1,Math.abs(b)),`${m}: ${a} vs ${b}`);
-  assert.equal(profiles.indexOf('Apple Log'),10);
+  assert.equal(profiles.indexOf('Apple Log'),10);assert.equal(profiles.indexOf('Blackmagic Film Gen 5'),11);
   profiles.forEach((profile,p)=>{
     for(const v of [-.05,0,.03,.1,.17,.19,.2,.25,.4,.6,.9,1,1.08])near(decode(v,p),decodeLog(v,profile),`${profile} decode ${v}`);
     for(const r of [-.03,0,.001,.0099,.01,.05,.18,1,6,30])near(encode(r,p),encodeLog(r,profile),`${profile} encode ${r}`);
@@ -219,4 +219,12 @@ test('Apple Log decodes like OpenColorIO\'s ACES input transform (P = (code − 
     // OCIO samples the curve through a half-float 1D table, so it agrees to about 1e-5 of the signal.
     ours.forEach((v,c)=>assert.ok(Math.abs(v-ocio[i][c])<=1e-6+2e-5*scale,`P ${P} channel ${c}: ${v} vs OCIO ${ocio[i][c]}`));
   });
+});
+
+test('Blackmagic Film Gen 5 hits the technical reference\'s mapping table, and its gamut is Blackmagic Wide Gamut',async()=>{
+  // Blackmagic Generation 5 Color Science technical reference (2021), "Mapping Values".
+  for(const [x,y] of [[0,.0924657534246575],[.18,.3835616438356165],[1,.5304896249573048],[10,.7302219538415439],[100,.9303398518999735],[222.86,1]])assert.ok(Math.abs(encodeLog(x,'Blackmagic Film Gen 5')-y)<2e-6,`${x} → ${y}`);
+  assert.deepEqual(interpretation({properties:{}} as unknown as Clip,{inputProfile:'Blackmagic Film Gen 5'} as MediaAsset),{profile:'Blackmagic Film Gen 5',gamut:'Blackmagic Wide Gamut'});
+  // The BRAW SDK's own Linear/Rec.709 decode of a Linear/Blackmagic Design one fits this matrix (row 1: 1.5684 −.5228 −.0457).
+  const {gamutMatrix}=await import('./color.ts'),m=gamutMatrix('Blackmagic Wide Gamut','Rec.709');[1.5684,-.5228,-.0457].forEach((v,i)=>assert.ok(Math.abs(m[0][i]-v)<2e-4,`709 red row ${i}`));
 });

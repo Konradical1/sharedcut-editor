@@ -14,7 +14,7 @@ import type { Keyframe, KeyframeValue, BoardItem, BoardItemKind, PlanTab, Script
 import { BOARD_ITEM_KINDS, crowded, HEX_COLOR, nextShotNumber, ordered, orderBetween, PLAN_LIMITS, PLAN_TABS, SCRIPT_BLOCK_KINDS, SCRIPT_FORMATS, sceneNumbers } from '../services/plan.ts';
 import { create } from 'zustand';
 import { useShallow } from 'zustand/react/shallow';
-import type { Bin, Clip, CollaborativeLock, Comment, GradeNode, Marker, MediaAsset, Notification, Operation, OperationType, Presence, Project, ProjectState, RenderJob, Settings, Snapshot, Timeline, Track, User, Workspace } from './models.ts';
+import type { Bin, Clip, CollaborativeLock, Comment, GradeNode, Marker, MediaAsset, Notification, Operation, OperationType, Presence, Project, ProjectState, RawValue, RenderJob, Settings, Snapshot, Timeline, Track, User, Workspace } from './models.ts';
 import { bins as fixedBins, createDemoProject, defaultProperties, projects, users } from './demo.ts';
 import { authenticationService, collaborationService, colorService, createId, LOCK_TTL, lockConflict, mediaService, projectService, renderService } from '../services/index.ts';
 import type { PersistedState } from '../services/index.ts';
@@ -166,7 +166,12 @@ export interface EditorStore extends PersistedState {
   replyComment(id: string, text: string): void; resolveComment(id: string): void;
   enqueueRender(name: string, preset: string, settings: Record<string, string>): void; updateRender(id: string, patch: Partial<RenderJob>): void;
   /** With `place`, the files also go on the timeline at `start` on `trackId` (end to end, one undo) once the server has them ready, so each clip takes its file's real length. `duration` only sizes the ghost meanwhile. */
-  uploadMedia(files: File[], place?: { start: number; trackId: string; duration?: number }): void; renameMedia(id: string, name: string): void; removeMedia(id: string): void; retryMedia(id: string): void; revealMedia(id: string | null): void;
+  uploadMedia(files: File[], place?: { start: number; trackId: string; duration?: number }): void; renameMedia(id: string, name: string): void; removeMedia(id: string): void; retryMedia(id: string): void;
+  /** Blackmagic RAW Camera Raw (Resolve's panel): the clip's own settings by the SDK's .sidecar names (iso, white_balance_kelvin,
+   *  white_balance_tint, exposure, viewing_gamma, viewing_gamut, viewing_bmdgen, tone_curve_*, highlight_recovery,
+   *  gamut_compression_enable, post_3dlut_mode); {} decodes using camera metadata. They replace the clip's previous settings.
+   *  The clip develops again on the server and keeps playing its last look until that is done. */
+  setCameraRaw(id: string, settings: Record<string, RawValue>): void; revealMedia(id: string | null): void;
   /** Upload `file` as the new original of media `id`: same id, so every clip keeps pointing at it. */
   replaceMedia(id: string, file: File): void;
   /** Media picked in the bin: what `,` inserts and `.` overwrites at the playhead. */
@@ -1981,6 +1986,13 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       if (state.boardItems.some(item => item.projectId === state.projectId && item.mediaId === id)) { state.notify('That image is on the mood board', 'info', 'Remove it from the board first.'); return; }
       if (connection.enabled) { void connection.flush().then(() => api(`/media/${encodeURIComponent(id)}`, { method: 'DELETE' })).then(() => connection.refresh()).catch(error => state.notify(error.message,'error')); return; }
       set({ media: state.media.filter(asset => asset.id !== id || asset.projectId !== state.projectId) });
+    },
+    setCameraRaw(id, settings) {
+      const state = get(), asset = state.media.find(item => item.id === id && item.projectId === state.projectId);
+      if (!writable() || !asset?.braw) return;
+      // The server checks them against the camera and saves them; the viewer's Camera Raw stills follow the saved ones.
+      if (connection.enabled) { void connection.flush().then(() => api(`/media/${encodeURIComponent(id)}/raw`, { method: 'POST', body: JSON.stringify({ settings }) })).then(() => connection.refresh()).catch(error => { state.notify(error.message, 'error'); void connection.refresh(); }); return; }
+      set({ media: state.media.map(item => item === asset ? { ...item, braw: { ...item.braw!, settings: { ...settings }, error: undefined } } : item) });
     },
     retryMedia(id) { const state = get(); if (!writable()) return; if (connection.enabled) { void api(`/media/${encodeURIComponent(id)}/retry`, { method: 'POST' }).then(() => connection.refresh()).catch(error => state.notify(error.message, 'error')); return; } set({ media: state.media.map(asset => asset.id === id && asset.projectId === state.projectId ? { ...asset, status: 'proxy', progress: 0 } : asset) }); state.notify('Demo proxy generation queued'); },
     replaceMedia(id, file) {

@@ -87,7 +87,7 @@ content-addressed sample files in `data/motion-trackers/` and travel with projec
 
 `npm run doctor` checks each local worker. Individual installers are
 `setup:captions`, `setup:flow`, `setup:masks`, `setup:depth`, `setup:denoise`, `setup:stabilize`, `setup:tracker`,
-`setup:color`, and `setup:imports`. Each has a FRAME_LINE_*_PYTHON override; optical flow uses
+`setup:color`, and `setup:imports`. Blackmagic RAW is `npm run setup:braw` from a Visual Studio developer prompt, after installing Blackmagic RAW (README, Blackmagic RAW). Each has a FRAME_LINE_*_PYTHON override; optical flow uses
 FRAME_LINE_FLOW_PYTHON. FRAME_LINE_CAPTION_DEVICE accepts auto (default), cpu,
 or cuda (GPU required, useful for tests). The default caption model is large-v3;
 FRAME_LINE_WHISPER_MODEL can select another faster-whisper model.
