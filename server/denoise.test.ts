@@ -131,6 +131,7 @@ test('Denoise all prepares every chunk of each clip in turn, reports per-clip pr
     service.all({ projectId: 'p', timelineId: 't', quality: '1/4', clips: [item('one', [0, 1]), item('two', [2])] });
     await until(() => service.allStatus('p').status === 'done');
     assert.deepEqual(service.allStatus('p').clips, { one: { done: 2, total: 2 }, two: { done: 1, total: 1 } });
+    assert.deepEqual(service.resumable(), [], 'a finished run is not resumed');
     // Its chunks are the viewer's: asking for one again is a cache hit.
     assert.equal((await service.preview({ projectId: 'p', clipId: 'one', input: source, asset, chunk: 1, quality: '1/4', view: 'denoised', settings })).status, 'ready');
     // Stop: the held chunk is cancelled, the clip never finishes, and the run says stopped.
@@ -138,7 +139,10 @@ test('Denoise all prepares every chunk of each clip in turn, reports per-clip pr
     const before = jobsRun(dir).length;
     service.all({ projectId: 'p', timelineId: 't', quality: 'Stream', clips: [item('one', [0, 1])] });
     await until(() => jobsRun(dir).length > before);
+    // A server restarting now (a deploy) finds the run to start again.
+    assert.deepEqual(denoiseService(path.join(dir, 'data')).resumable(), [{ projectId: 'p', timelineId: 't', quality: 'Stream' }]);
     service.stopAll('p');
+    assert.deepEqual(service.resumable(), [], 'a run stopped on request is not resumed');
     rmSync(path.join(dir, 'slow'));
     assert.equal(service.allStatus('p').status, 'stopped');
     assert.deepEqual(service.allStatus('p').clips.one, { done: 0, total: 2 });

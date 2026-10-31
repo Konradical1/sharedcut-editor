@@ -495,6 +495,12 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   const rawFrames = new Map<string, Promise<void>>();
   const sourcePath = (asset: Pick<MediaAsset, 'id' | 'braw'>) => asset.braw?.developed ? join(mediaDir(asset.id), masterName(asset.braw.developed)) : originalPath(asset.id);
   const mediaSource = (id: string) => sourcePath(state.media.find(asset => asset.id === id) ?? { id });
+  /** Denoise all: every clip of the timeline the viewer would denoise, left to right; optical flow previews instead (denoisePreview.ts). */
+  const denoiseAllClips = (projectId: string, timelineId: string) => state.clips.filter(c => c.projectId === projectId && c.timelineId === timelineId && !c.disabled && !c.properties.opticalFlow && denoiseEffect(c) && state.tracks.find(t => t.id === c.trackId)?.kind === 'video').sort((a, b) => a.start - b.start).flatMap(c => {
+    const asset = state.media.find(a => a.id === c.mediaId && a.projectId === projectId);
+    if (asset?.kind !== 'video' || asset.hasAlpha || !(asset.fps > 0) || !existsSync(sourcePath(asset))) return [];
+    return [{ clipId: c.id, input: sourcePath(asset), asset, settings: denoiseSettingsOf(denoiseSettings(c, denoiseEffect(c)!)), chunks: denoiseClipChunks(c, asset) }];
+  });
   const replacedVersion = (id: string) => { try { return readFileSync(join(mediaDir(id), 'replaced'), 'utf8'); } catch { return ''; } };
   // A deleted project, media included, stays restorable for a week before purgeExpiredProjects removes its files.
   const PROJECT_RECOVERY_MS = 7 * 86400_000;
@@ -1993,12 +1999,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (method === 'POST') {
             const body = await jsonBody(req), project = requireProject(textField(body.projectId,160,true),userId,true), timelineId = textField(body.timelineId,160,true);
             const quality = textField(body.quality,20,true); if (!denoiseQualities.includes(quality)) fail(400,'Invalid preview quality.');
-            // Every clip of the timeline the viewer would denoise, left to right; optical flow previews instead (denoisePreview.ts).
-            const clips = state.clips.filter(c => c.projectId === project.id && c.timelineId === timelineId && !c.disabled && !c.properties.opticalFlow && denoiseEffect(c) && state.tracks.find(t => t.id === c.trackId)?.kind === 'video').sort((a, b) => a.start - b.start).flatMap(c => {
-              const asset = state.media.find(a => a.id === c.mediaId && a.projectId === project.id);
-              if (asset?.kind !== 'video' || asset.hasAlpha || !(asset.fps > 0) || !existsSync(sourcePath(asset))) return [];
-              return [{ clipId: c.id, input: sourcePath(asset), asset, settings: denoiseSettingsOf(denoiseSettings(c, denoiseEffect(c)!)), chunks: denoiseClipChunks(c, asset) }];
-            });
+            const clips = denoiseAllClips(project.id, timelineId);
             if (!clips.length) fail(400,'No clip on this timeline has Noise Reduction to denoise.');
             const capabilities = await denoiseCapabilities(); if (!capabilities.available) fail(503, capabilities.reason || 'Noise Reduction is not available on this server.');
             send(res,200,denoise.all({ projectId: project.id, timelineId, quality, clips })); return;
@@ -2245,6 +2246,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   for (const id of again) processAsset(id);
   // A Camera Raw develop the restart cut short starts again, behind the look the clip already plays.
   for (const asset of state.media as Asset[]) if (asset.status === 'ready' && rawPending(asset.braw) && existsSync(originalPath(asset.id))) processAsset(asset.id, true);
+  // A Denoise all the restart cut short goes on from the timeline as it is now; its finished chunks are cache hits. One that can no longer run is forgotten.
+  void denoiseCapabilities().then(capabilities => {
+    for (const run of denoise.resumable()) {
+      const clips = capabilities.available && state.projects.some(p => p.id === run.projectId) ? denoiseAllClips(run.projectId, run.timelineId) : [];
+      if (clips.length && denoiseQualities.includes(run.quality)) denoise.all({ ...run, clips }); else denoise.stopAll(run.projectId);
+    }
+  }).catch(error => console.error('Denoise all could not resume:', error));
   // An upload nobody has sent a chunk to for a day is abandoned: it stops holding a queue slot and its partial file goes.
   // A Final Cut import's files wait a week for its importer's Mac to come back; after that the import stops and they go too.
   const expireUploads = () => {

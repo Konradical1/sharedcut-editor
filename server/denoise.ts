@@ -3,7 +3,7 @@
 // from one-shot jobs; both decode the camera original and never convert its colour.
 import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, statfsSync, utimesSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, statfsSync, utimesSync, writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { cpus } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -174,6 +174,10 @@ export function denoiseService(directory: string, options: { freeGpu?: () => voi
   const chunks = join(directory, 'chunks'), profiles = join(directory, 'profiles');
   for (const folder of [chunks, profiles, join(directory, 'exports')]) { mkdirSync(folder, { recursive: true, mode: 0o700 }); void sweep(folder); }
   const jobs = new Map<string, Job>(), batches = new Map<string, Batch>();
+  // Denoise all runs not yet finished or stopped, so a server restart (a deploy) picks them up again instead of dropping them.
+  const runsFile = join(directory, 'runs.json');
+  const runs = (): Record<string, { timelineId: string; quality: string }> => { try { return JSON.parse(readFileSync(runsFile, 'utf8')); } catch { return {}; } };
+  const keepRun = (projectId: string, run?: { timelineId: string; quality: string }) => { const all = runs(); if (run) all[projectId] = run; else delete all[projectId]; writeFileSync(runsFile, JSON.stringify(all), { mode: 0o600 }); };
   let resident: Resident | undefined, closed = false;
   const stop = (reason: string) => {
     const current = resident; if (!current) return; resident = undefined;
@@ -312,6 +316,7 @@ export function denoiseService(directory: string, options: { freeGpu?: () => voi
       service.stopAll(o.projectId);
       const batch: Batch = { status: 'running', timelineId: o.timelineId, quality: o.quality, controller: new AbortController(), keys: new Set(), clips: Object.fromEntries(o.clips.map(c => [c.clipId, { done: 0, total: c.chunks.length }])) };
       batches.set(o.projectId, batch);
+      keepRun(o.projectId, { timelineId: o.timelineId, quality: o.quality });
       const signal = batch.controller.signal;
       const one = async (item: typeof o.clips[number], chunk: number) => {
         for (let cancelled = 0; ;) {
@@ -335,12 +340,16 @@ export function denoiseService(directory: string, options: { freeGpu?: () => voi
           batch.clips[item.clipId].done++;
         }
         batch.status = 'done';
+        if (batches.get(o.projectId) === batch) keepRun(o.projectId);
       })();
       return service.allStatus(o.projectId);
     },
     allStatus(projectId: string): DenoiseAllStatus { const b = batches.get(projectId); return b ? { status: b.status, timelineId: b.timelineId, quality: b.quality, clips: b.clips } : { status: 'none', clips: {} }; },
+    /** The Denoise all runs a stopped server left unfinished; the server starts each again with `all` (cached chunks are skipped). */
+    resumable() { return Object.entries(runs()).map(([projectId, run]) => ({ projectId, ...run })); },
     /** Stops the run and the chunk it was waiting for; finished chunks stay. */
     stopAll(projectId: string) {
+      keepRun(projectId);
       const b = batches.get(projectId); if (b?.status !== 'running') return;
       b.status = 'stopped'; b.controller.abort();
       const job = jobs.get(b.current ?? ''); if (job?.status === 'preparing') job.controller.abort();
