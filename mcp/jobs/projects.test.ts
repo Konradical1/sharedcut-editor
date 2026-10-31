@@ -10,6 +10,7 @@ process.env.FRAME_LINE_URL = 'http://fake.local';
 process.env.FRAME_LINE_COOKIE = 'frameline_session=test';
 let saved: any = structuredClone(persistentState(store.getState()));
 let revision = 1;
+let recentProjectActivity: Record<string, { userId: string; kind: 'edited' | 'viewed'; timestamp: number }> = {};
 // SharedCut Desktop's /api/remote: signed in to sharedcut.com, one project there not kept yet.
 let remoteLink: { user: { email: string } | null; expired?: string; online: boolean; projects: { id: string; name: string; kept: boolean; status?: string; uploading: number; downloading: number }[] } = { user: { email: 'konrad@example.com' }, online: true, projects: [{ id: 'trip-1', name: 'Konrad Trip', kept: false, uploading: 0, downloading: 0 }] };
 const deleted: any[] = [], calls: { method: string; path: string; body?: any }[] = [];
@@ -22,7 +23,7 @@ globalThis.fetch = (async (input: string, init: RequestInit = {}) => {
   if (path === '/api/auth/me') return json({ user: saved.users.find((u: any) => u.id === saved.currentUserId) });
   if (path === '/api/state' && method === 'GET') return json(url.searchParams.get('since') === String(revision) ? { revision } : { revision, state: saved });
   if (path === '/api/state' && method === 'PATCH') { saved = applyStateDelta(saved, body.delta); return json({ revision: ++revision }); }
-  if (path === '/api/library') return json({ revision: 1, folders: [], locations: {}, directMembers: Object.fromEntries(saved.projects.map((p: any) => [p.id, p.members])) });
+  if (path === '/api/library') return json({ activity: recentProjectActivity, revision: 1, folders: [], locations: {}, directMembers: Object.fromEntries(saved.projects.map((p: any) => [p.id, p.members])) });
   if (path === '/api/projects/deleted') return json({ projects: deleted.map(p => ({ id: p.id, name: p.name, expiresAt: Date.parse('2026-10-12T10:00:00Z') })) });
   if (path === '/api/remote') return json(remoteLink);
   const keep = /^\/api\/remote\/projects\/([\w-]+)$/.exec(path);
@@ -143,4 +144,16 @@ test('keep-offline keeps a sharedcut.com project on this computer, lists what is
   // A session sharedcut.com ended says so, naming the account to sign in with again.
   remoteLink = { ...remoteLink, user: null, expired: 'konrad@example.com' };
   await assert.rejects(run('keep-offline', {}), /session of konrad@example\.com ended/);
+});
+
+
+test('project-activity shows the latest person, action and relative time, and omits old activity', async () => {
+  const s = store.getState(), p = s.projects[0], user = s.users[0];
+  recentProjectActivity = { [p.id]: { userId: user.id, kind: 'viewed', timestamp: Date.now() - 32 * 60_000 } };
+  assert.match(await run('project-activity'), new RegExp(`${user.name} viewed this 32 minutes ago`));
+  recentProjectActivity[p.id] = { userId: user.id, kind: 'edited', timestamp: Date.now() - 2 * 3600_000 };
+  assert.match(await run('project-activity', { project: p.id }), /edited this 2 hours ago/);
+  recentProjectActivity[p.id].timestamp = Date.now() - 86_400_000;
+  assert.equal(await run('project-activity'), 'No activity in the past 24 hours.');
+  recentProjectActivity = {};
 });

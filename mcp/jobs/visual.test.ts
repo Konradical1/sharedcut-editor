@@ -2,6 +2,10 @@
 // a graded clip under a title, a contact sheet, a clip's ungraded source, Stabilize falling back to the source, an
 // old server (no /api/frames) falling back to the thumbnail, and the sound of a clipping clip with a gap.
 import '../env.ts';
+import { GlobalFonts } from '@napi-rs/canvas';
+import { fileURLToPath } from 'node:url';
+// These tests check pixels and exports, not the host's optional system fonts.
+GlobalFonts.registerFromPath(fileURLToPath(new URL('../../public/fonts/TikTokSans.ttf', import.meta.url)), 'Helvetica Neue');
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';

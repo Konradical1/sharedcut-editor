@@ -13,6 +13,7 @@ import { loudnessTargets } from '../../src/services/effects.ts';
 import { transitionNames } from '../../src/services/transitions.ts';
 import { defaultProperties } from '../../src/state/demo.ts';
 import type { Clip, Project, ProjectMember } from '../../src/state/models.ts';
+import { projectActivityLabel } from '../../src/services/library.ts';
 import type { LibraryView } from '../../src/services/library.ts';
 
 const ROLES = ['Editor', 'Commenter', 'Viewer'] as const;
@@ -63,6 +64,18 @@ async function direct<T>(route: string, init: RequestInit & { json?: unknown }) 
 }
 
 export const jobs: Record<string, JobDef> = {
+  'project-activity': {
+    doc: '{project?} latest person who edited or viewed each accessible project in the past 24 hours; optional project name/id',
+    async start(params) {
+      const library = await call<LibraryView>('/library'), s = store.getState();
+      const selected = params.project ? [target(params)] : s.projects;
+      const rows = selected.flatMap(p => {
+        const activity = library.activity?.[p.id], label = projectActivityLabel(activity, s.users);
+        return label ? [`${handle(p.id)} ${quote(p.name)} · ${label}`] : [];
+      });
+      return done(rows.join('\n') || 'No activity in the past 24 hours.');
+    },
+  },
   project: {
     doc: '{project?, name?, description?, status?:In progress|In review|Complete, access?:private|people|class, members?:[[user,role]] (replaces), classRole?:Editor|Viewer} owner only; no fields = show it + people',
     async start(params) {

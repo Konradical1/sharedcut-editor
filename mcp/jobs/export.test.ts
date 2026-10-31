@@ -1,6 +1,10 @@
 // Export jobs against a real SharedCut server on a temporary data folder: Deliver's settings, a render downloaded
 // (and resumed) to disk, cancel/retry, and a Resolve bridge bundle imported with its original uploaded.
 import '../env.ts';
+import { GlobalFonts } from '@napi-rs/canvas';
+import { fileURLToPath } from 'node:url';
+// These tests check pixels and exports, not the host's optional system fonts.
+GlobalFonts.registerFromPath(fileURLToPath(new URL('../../public/fonts/TikTokSans.ttf', import.meta.url)), 'Helvetica Neue');
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFileSync } from 'node:child_process';
@@ -96,6 +100,7 @@ test('an export renders, downloads, resumes a partial download, retries and canc
 });
 
 test('Resolve: bridge script, OTIO refusal on a title, and a bundle imported with its original', async () => {
+  await mkdir(out, { recursive: true });
   assert.match(await job('resolve', { do: 'bridge', path: out }), /resolve-export\.lua\nin Resolve's Lua console: dofile\(".*resolve-export\.lua"\)/);
   assert.match(await readFile(join(out, 'resolve-export.lua'), 'utf8'), /^-- Run in Resolve's Lua console/);
   assert.match((await tool('job', { kind: 'resolve', params: { do: 'otio', path: out } })).text, /export titles as video/);

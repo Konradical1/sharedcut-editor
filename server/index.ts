@@ -1,3 +1,4 @@
+import { projectActivity } from './projectActivity.ts';
 import { createPreviewCache, createStillCache, mediaStill, stillSettings, StillSkipped, PreviewBusyError, PREVIEW_SLOTS, type PreviewAdmission } from './previewCache.ts';
 import { createHostGuard, JOB_COST_BYTES, VICTIM_ORDER, type HostGuard } from './hostGuard.ts';
 import { showcaseFile } from './showcase.ts';
@@ -264,7 +265,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     }
     store.replace(state, revision);
   }
-  const presence = new Map<string, { person: Presence; session: string; active: boolean }>(); const locks = new Map<string, CollaborativeLock>();
+  const recentActivity = projectActivity(db);
+  for (const operation of [...state.operations].sort((a, b) => a.timestamp - b.timestamp)) if (operation.timestamp > Date.now() - 86_400_000 && operation.timestamp <= Date.now()) recentActivity.record(operation.projectId, operation.userId, 'edited', operation.timestamp);
+  const presence = new Map<string, { person: Presence; session: string; active: boolean; visitedAt: number }>(); const locks = new Map<string, CollaborativeLock>();
   // Keep insertion order stable: simultaneous active devices must not trade ownership on every heartbeat.
   const visiblePresence = () => {
     const people = new Map<string, { person: Presence; active: boolean }>();
@@ -964,11 +967,25 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
     const deleted = new Set([...allowed].filter(id => !nextProjectIds.has(id)));
     if (deleted.size) { next.media = state.media.filter(item => !deleted.has(item.projectId)); next.renderJobs = state.renderJobs.filter(item => !deleted.has(item.projectId)); }
     validateRelations(next);
+    const editedProjects = new Set<string>();
+    for (const key of ['projects', 'timelines', 'clips', 'tracks', 'nodes', 'comments', 'snapshots', 'scripts', 'scriptBlocks', 'shots', 'boardItems'] as const) {
+      if (next[key] === state[key]) continue;
+      const before = new Map((state[key] as unknown as Entry[]).map(item => [item.id, item]));
+      const after = new Map((next[key] as unknown as Entry[]).map(item => [item.id, item]));
+      for (const id of new Set([...before.keys(), ...after.keys()])) {
+        const old = before.get(id), item = after.get(id);
+        if (old === item || same(old, item)) continue;
+        if (key === 'projects' && old && item && same({ ...old, modifiedAt: 0 }, { ...item, modifiedAt: 0 })) continue;
+        const value = item ?? old!;
+        const projectId = key === 'projects' ? value.id : key === 'tracks' ? (newTimelines.get(value.timelineId) ?? oldTimelines.get(value.timelineId)) : value.projectId;
+        if (projectId && nextProjectIds.has(projectId)) editedProjects.add(projectId);
+      }
+    }
     // A project deleted by a save is restorable like one deleted through DELETE /api/projects/:id; its files go when the backup expires.
     const backups = [...deleted].map(id => [id, projectBundle(existing.get(id)!)] as const), expiresAt = Date.now() + PROJECT_RECOVERY_MS;
     const previousState = state; const previousRevision = revision; const previousSettings = account.settings;
     const settings = { ...DEFAULT_SETTINGS, ...incoming.settings };
-    try { transaction(() => { if (!same(settings, account.settings)) { account.settings = settings; saveAccount(account); } for (const [id, backup] of backups) backupProject(id, userId, expiresAt, backup); state = next; persist(); }); }
+    try { transaction(() => { if (!same(settings, account.settings)) { account.settings = settings; saveAccount(account); } for (const [id, backup] of backups) backupProject(id, userId, expiresAt, backup); state = next; persist(); for (const id of editedProjects) recentActivity.record(id, userId, 'edited'); }); }
     catch (error) { state = previousState; revision = previousRevision; account.settings = previousSettings; throw error; }
     for (const [id, backup] of backups) { timelinePreviews.cancelProject(id); for (const item of [...backup.media, ...backup.renderJobs]) aborters.get(item.id)?.abort(); }
     return true;
@@ -1097,13 +1114,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             const mediaId = `media-sfx-${createHash('sha256').update(`${project.id}:${id}`).digest('hex').slice(0, 32)}`;
             let asset = state.media.find(a => a.id === mediaId);
             if (!asset) {
-              try { asset = sounds.importAsset(id, project.id, mediaId, mediaDir(mediaId)); state.media = [asset, ...state.media]; persist(); }
+              try { asset = sounds.importAsset(id, project.id, mediaId, mediaDir(mediaId)); state.media = [asset, ...state.media]; persist(); recentActivity.record(project.id, userId, 'edited'); }
               catch (error) { state.media = state.media.filter(a => a.id !== mediaId); rmSync(mediaDir(mediaId), { recursive: true, force: true }); throw error; }
             }
             send(res, 200, { asset, revision }); return;
           }
         }
-        if (path === '/api/library' && method === 'GET') { send(res, 200, library.view(userId)); return; }
+        if (path === '/api/library' && method === 'GET') { send(res, 200, { ...library.view(userId), activity: recentActivity.latest(new Set(state.projects.filter(p => visibleTo(p, userId)).map(p => p.id))) }); return; }
         if (path === '/api/library' && method === 'POST') { const body = await jsonBody(req); send(res, 200, library.change(body, userId)); return; }
         if (path === '/api/fonts' && method === 'GET') { send(res, 200, { fonts: fonts.list() }); return; }
         if (path === '/api/fonts' && method === 'POST') {
@@ -1224,7 +1241,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const note = method === 'PUT' ? textField((await jsonBody(req)).note ?? '', 200).trim() : '';
           const { lock: _, ...open } = project, updated: Project = method === 'PUT' ? { ...open, lock: { userId, at: Date.now(), note } } : open;
           const previous = state.projects; state.projects = state.projects.map(item => item.id === updated.id ? updated : item);
-          try { persist(); } catch (error) { state.projects = previous; throw error; }
+          try { transaction(() => { persist(); recentActivity.record(updated.id, userId, 'edited'); }); } catch (error) { state.projects = previous; throw error; }
           send(res, 200, { project: updated }); return;
         }
         // SharedCut Desktop's link to sharedcut.com (remoteSync.ts); a server started without FRAME_LINE_REMOTE has none.
@@ -1262,7 +1279,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (!['Viewer', 'Editor'].includes(classRole)) fail(400, 'Choose Viewer or Editor for class access.');
           const updated: Project = { ...project, name: textField(body.name ?? project.name, 100, true).trim(), description: textField(body.description ?? project.description, 5000).trim(), status: ['In progress', 'In review', 'Complete'].includes(body.status ?? project.status) ? body.status ?? project.status : fail(400, 'Invalid project status.'), resolution: textField(body.resolution ?? project.resolution, 80, true).trim(), fps: numberField(body.fps ?? project.fps, 1, 240), shared: access === 'class', classRole, members: [{ userId, role: 'Owner' }, ...members], modifiedAt: Date.now() };
           const previous = state.projects; state.projects = state.projects.map(item => item.id === updated.id ? updated : item);
-          try { persist(); } catch (error) { state.projects = previous; throw error; }
+          try { transaction(() => { persist(); recentActivity.record(updated.id, userId, 'edited'); }); } catch (error) { state.projects = previous; throw error; }
           send(res, 200, { project: updated }); return;
         }
         if (projectRoute && method === 'DELETE') {
@@ -1328,7 +1345,9 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
             }
 
             const selectedClipId = typeof body.selectedClipId === 'string' && state.clips.some(clip => clip.id === body.selectedClipId && clip.projectId === project.id) ? body.selectedClipId : undefined;
-            presence.set(key, { session, active: body.active ?? !!cursor, person: { preview, userId, projectId: project.id, planTab: PLAN_TABS.includes(body.planTab) ? body.planTab : undefined, cursor: body.active === false ? null : cursor, playhead: numberField(body.playhead ?? 0, 0, 86400 * 7), selectedClipId, mediaTab: ['Media','SFX','Captions','Effects','Transitions','Titles','Shapes'].includes(body.mediaTab) ? body.mediaTab : undefined, inspectorTab: selectedClipId && ['Video','Audio','Effects','Info','Caption','Text','Shape','Transition'].includes(body.inspectorTab) ? body.inspectorTab : undefined, focusedField: typeof body.focusedField === 'string' ? body.focusedField.slice(0, 100) : undefined, activity: typeof body.activity === 'string' ? body.activity.slice(0, 160) : 'Editing', online: true, updatedAt: Date.now(), ...(body.timelineId && state.timelines.some(timeline => timeline.id === body.timelineId && timeline.projectId === project.id) ? { timelineId: body.timelineId } : {}), presenting: body.presenting === true, playing: body.playing === true } });
+            const previousPresence = presence.get(key), visitedAt = previousPresence?.visitedAt ?? Date.now();
+            presence.set(key, { session, visitedAt, active: body.active ?? !!cursor, person: { preview, userId, projectId: project.id, planTab: PLAN_TABS.includes(body.planTab) ? body.planTab : undefined, cursor: body.active === false ? null : cursor, playhead: numberField(body.playhead ?? 0, 0, 86400 * 7), selectedClipId, mediaTab: ['Media','SFX','Captions','Effects','Transitions','Titles','Shapes'].includes(body.mediaTab) ? body.mediaTab : undefined, inspectorTab: selectedClipId && ['Video','Audio','Effects','Info','Caption','Text','Shape','Transition'].includes(body.inspectorTab) ? body.inspectorTab : undefined, focusedField: typeof body.focusedField === 'string' ? body.focusedField.slice(0, 100) : undefined, activity: typeof body.activity === 'string' ? body.activity.slice(0, 160) : 'Editing', online: true, updatedAt: Date.now(), ...(body.timelineId && state.timelines.some(timeline => timeline.id === body.timelineId && timeline.projectId === project.id) ? { timelineId: body.timelineId } : {}), presenting: body.presenting === true, playing: body.playing === true } });
+            if (body.active !== false || !previousPresence) recentActivity.record(project.id, userId, 'viewed', Date.now(), visitedAt);
             takeReport({ userId, name: account.user.name, clientId, projectId: project.id }, body.health);
           }
           for (const subscriber of subscribers.values()) if (subscriber.session === session && subscriber.clientId === clientId) subscriber.projectId = body.online === false ? undefined : project.id;
@@ -1527,7 +1546,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           const id = `media-${randomUUID()}`, name = `${timeline.name} ${timecode(still.time, project.fps).replaceAll(':', '.')}.png`;
           const asset: Asset = { id, projectId: project.id, name, kind: 'image', binId: 'stills', thumbnail: '', duration: 0, resolution: '', fps: 0, size: '', status: 'processing', progress: 0 };
           mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); copyFileSync(file, originalPath(id));
-          state.media = [asset, ...state.media]; persist();
+          state.media = [asset, ...state.media]; persist(); recentActivity.record(project.id, userId, 'edited');
           processAsset(id); send(res, 202, { asset }); return;
         }
         if (path === '/api/media/import-link' && method === 'POST') {
@@ -1538,7 +1557,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           requireSpace(0);
           const id = `media-${randomUUID()}`, spotify = link!.url.includes('open.spotify.com');
           const asset: Asset = { id, projectId: project.id, name: spotify ? 'Spotify track · matching audio' : 'YouTube · waiting to download', kind: link!.mode === 'audio' ? 'audio' : 'video', binId: link!.mode === 'audio' ? 'audio' : 'broll', thumbnail: youtubeThumbnail(link!.url), duration: 0, resolution: '', fps: 0, size: '', status: 'downloading', progress: 0, importLink: link! };
-          mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media = [asset, ...state.media]; persist();
+          mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media = [asset, ...state.media]; persist(); recentActivity.record(project.id, userId, 'edited');
           processAsset(id); send(res, 202, { asset }); return;
         }
         if (path === '/api/media' && method === 'POST') {
@@ -1550,7 +1569,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           requireSpace(length > 0 ? length : 0);
           const kind = mediaKind(name);
           const asset: Asset = { id, projectId: project.id, name, kind, binId: kind === 'audio' ? 'audio' : 'broll', thumbnail: '', duration: 0, resolution: '', fps: 0, size: '', status: 'uploading', progress: 0 };
-          mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media = [asset, ...state.media]; persist();
+          mkdirSync(mediaDir(id), { recursive: true, mode: 0o700 }); state.media = [asset, ...state.media]; persist(); recentActivity.record(project.id, userId, 'edited');
           if (url.searchParams.get('placeholder') === '1') { send(res, 201, { asset }); return; }
           const temporary = join(mediaDir(id), 'upload.part'); let bytes = 0, lastProgress = 0;
           try {
@@ -1567,12 +1586,13 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (!Array.isArray(body.mediaIds) || !body.mediaIds.length || body.mediaIds.length > 10_000) fail(400, 'Choose media to move.');
           const ids = new Set<string>(body.mediaIds); if (![...ids].every(id => state.media.some(asset => asset.id === id && asset.projectId === project.id))) fail(404, 'Media not found.');
           const previous = state.media; state.media = state.media.map(asset => ids.has(asset.id) && asset.binId !== binId ? { ...asset, binId } : asset);
-          try { persist(); } catch (error) { state.media = previous; throw error; }
+          try { persist(); if (state.media.some((asset, i) => asset !== previous[i])) recentActivity.record(project.id, userId, 'edited'); } catch (error) { state.media = previous; throw error; }
           send(res, 200, { ok: true }); return;
         }
         const mediaRoute = /^\/api\/media\/([a-zA-Z0-9_-]+)(?:\/(.*))?$/.exec(path);
         if (mediaRoute) {
           const id = mediaRoute[1]; const suffix = mediaRoute[2]; const asset = state.media.find(item => item.id === id) ?? fail(404, 'Media not found.'); requireProject(asset.projectId, userId, !['GET', 'HEAD'].includes(method));
+          if (!['GET', 'HEAD'].includes(method)) res.once('finish', () => { if (res.statusCode >= 200 && res.statusCode < 300) recentActivity.record(asset.projectId, userId, 'edited'); });
           if (suffix === 'thumbnail' && method === 'PUT') {
             if (asset.status !== 'uploading' || asset.importLink) fail(409, 'Upload previews are only accepted while uploading a local file.');
             const bytes = await binaryBody(req, 512 * 1024);
