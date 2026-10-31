@@ -64,7 +64,7 @@ const hdrCube = (transfer: string): HdrTable => { const c = makeCube(hdrTransfor
 /** One shot as the worker reads it. Shots of one camera body with the same source settings share a `setup` (white balance and level are pooled per setup). `clean`: measured as the rebuilt grade. */
 function workerShot(clip: Clip, asset: MediaAsset, nodes: GradeNode[], input: string, cube: (transfer: string) => HdrTable, clean: boolean): WorkerShot {
   const { pre, post, sdr } = normalizeStages(clip, asset, nodes, { clean }), { profile, gamut } = interpretation(clip, asset), table = isHdrTransfer(asset.colorTransfer) ? cube(asset.colorTransfer!) : undefined;
-  const body = asset.colorEvidence?.match(/(?:metadata|notes) \(([^)]+)\)/)?.[1] ?? asset.camera ?? '';
+  const body = asset.braw?.info.camera ?? asset.colorEvidence?.match(/(?:metadata|notes) \(([^)]+)\)/)?.[1] ?? asset.camera ?? '';
   return { clipId: clip.id, ...shotSource(clip, asset, pre, table && [asset.colorTransfer, table.hash]), input, preStages: pre, postStages: post, setup: JSON.stringify([body, profile, gamut, asset.colorTransfer ?? '']), sdr, ...(table && { hdrCube: table.cube }), interpretation: { profile, gamut } };
 }
 

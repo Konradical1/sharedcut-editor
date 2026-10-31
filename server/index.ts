@@ -490,6 +490,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
   /** The file decoders read: a Blackmagic RAW clip's developed master (FFmpeg reads no .braw picture), else the original. */
   const rawFrames = new Map<string, Promise<void>>();
   const sourcePath = (asset: Pick<MediaAsset, 'id' | 'braw'>) => asset.braw?.developed ? join(mediaDir(asset.id), masterName(asset.braw.developed)) : originalPath(asset.id);
+  const mediaSource = (id: string) => sourcePath(state.media.find(asset => asset.id === id) ?? { id });
   const replacedVersion = (id: string) => { try { return readFileSync(join(mediaDir(id), 'replaced'), 'utf8'); } catch { return ''; } };
   // A deleted project, media included, stays restorable for a week before purgeExpiredProjects removes its files.
   const PROJECT_RECOVERY_MS = 7 * 86400_000;
@@ -2069,7 +2070,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (file === undefined && jobId && method === 'GET') { send(res, 200, colorAssistant.get(projectId, jobId)); return; }
           if (file === undefined && jobId && method === 'DELETE') { colorAssistant.cancel(projectId, jobId); send(res, 200, { ok: true }); return; }
           if (!jobId && method === 'GET') { send(res, 200, colorAssistant.latest(projectId)); return; }
-          if (!jobId && method === 'POST') { const body = await jsonBody(req); send(res, 202, colorAssistant.start({ projectId, body, clips: state.clips, media: state.media, nodes: state.nodes, source: originalPath })); return; }
+          if (!jobId && method === 'POST') { const body = await jsonBody(req); send(res, 202, colorAssistant.start({ projectId, body, clips: state.clips, media: state.media, nodes: state.nodes, source: mediaSource })); return; }
           fail(405, 'Method not allowed.');
         }
         // Normalize measures and balances shots on this server (SharedCut Desktop: on sharedcut.com); no AI, so no allow-list. Starting and cancelling need an editor role.
@@ -2080,7 +2081,7 @@ export function createFrameLineServer(options: { dataDir?: string; distDir?: str
           if (jobId && method === 'GET') { send(res, 200, colorNormalize.get(projectId, jobId)); return; }
           if (jobId && method === 'DELETE') { colorNormalize.cancel(projectId, jobId); send(res, 200, { ok: true }); return; }
           if (!jobId && method === 'GET') { send(res, 200, colorNormalize.latest(projectId)); return; }
-          if (!jobId && method === 'POST') { const body = await jsonBody(req); send(res, 202, colorNormalize.start({ projectId, body, clips: state.clips, media: state.media, nodes: state.nodes, source: originalPath })); return; }
+          if (!jobId && method === 'POST') { const body = await jsonBody(req); send(res, 202, colorNormalize.start({ projectId, body, clips: state.clips, media: state.media, nodes: state.nodes, source: mediaSource })); return; }
           fail(405, 'Method not allowed.');
         }
         if (path === '/api/stabilize/capabilities' && method === 'GET') { send(res,200,await stabilizeCapabilities()); return; }

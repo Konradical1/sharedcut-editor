@@ -99,7 +99,8 @@ export function shotSource(clip: Clip, asset: MediaAsset, pre: Stage[], hdr?: un
   // Only what changes the picture: ids, names, order, kind and positions label or arrange the graph (and a fresh grade's ids change once applied); they must not throw away cached frames.
   const bare = <T extends { id: string }>({ id: _id, name: _name, ...rest }: T & { name?: string }) => rest;
   const stages = pre.map(({ node, ...stage }) => ({ ...stage, node: { enabled: node.enabled, parameters: node.parameters, curves: node.curves, mask: node.mask, effects: node.effects?.map(bare) }, ...('effect' in stage && { effect: bare(stage.effect) }) }));
-  return { ...shot, key: createHash('sha256').update(JSON.stringify([ENGINE, asset.id, times, stages, shot.matrix, shot.range, WIDTH, ...(hdr === undefined ? [] : [hdr])])).digest('hex') };
+  // A Blackmagic RAW clip is read from its developed master: new Camera Raw settings are a new picture.
+  return { ...shot, key: createHash('sha256').update(JSON.stringify([ENGINE, asset.id, times, stages, shot.matrix, shot.range, WIDTH, ...(hdr === undefined ? [] : [hdr]), ...(asset.braw?.developed ? [asset.braw.developed] : [])])).digest('hex') };
 }
 function prepareShot(clip: Clip, asset: MediaAsset, nodes: GradeNode[], input: string): Shot {
   const stages = stagesFor(clip, asset, nodes), cut = cutAt(stages, findGradeNodes(clip, nodes).balance!);
