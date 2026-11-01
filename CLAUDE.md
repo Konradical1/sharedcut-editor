@@ -16,13 +16,13 @@ object-storage migration unless Konrad explicitly changes this decision. Keep
 projects and media on the Lenovo; the Mac is the fallback. Prioritize the native Windows setup in docs/WINDOWS_NATIVE.md, including
 portable captions, optical flow, Smart Mask setup, and NVIDIA acceleration.
 The existing public-access tunnel does not change where the application or media
-is hosted. See `docs/LENOVO_SETUP.md`.
+is hosted.
 
 ## This server is moving to Windows — write nothing Mac-native
 
 Today the backend runs on an Apple silicon Mac. It is moving to a Windows machine (a Lenovo
-tower with an RTX 5060 Ti) and the Mac becomes a fallback. `docs/WINDOWS_MIGRATION.md` has the
-full plan.
+tower with an RTX 5060 Ti) and the Mac becomes a fallback. `docs/WINDOWS_NATIVE.md` has the
+setup.
 
 **Every feature added from now on must run on both.** This is not a later cleanup — a
 Mac-only feature written today is a feature that breaks on the move. When you are about to

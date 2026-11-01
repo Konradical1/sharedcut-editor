@@ -77,6 +77,6 @@ The GPU regression uses a nonuniform queued picture and an unloaded video elemen
 
 ## Activation
 
-Run the production build and restart the application server through its normal deployment process to enable the preview routes and automatic preparation of missing StreamLow variants. Reload editor tabs for the new decoder and worker. Existing variants stay usable while additional previews prepare. Follow `docs/LENOVO_SETUP.md` when moving the application and private media to Windows.
+Run the production build and restart the application server through its normal deployment process to enable the preview routes and automatic preparation of missing StreamLow variants. Reload editor tabs for the new decoder and worker. Existing variants stay usable while additional previews prepare. See `docs/WINDOWS_NATIVE.md` for running on Windows.
 
 This build was activated on the existing Mac host with a graceful server restart. Local and public health checks returned 200, and both served the current frontend bundle. The host began preparing missing smaller streams automatically. No cloud migration or live project edits were performed; the normal preparation queue adds derivative media and updates its metadata.
