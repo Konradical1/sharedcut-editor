@@ -1,4 +1,4 @@
-.denoise-workspace { height: 100%; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 300px; grid-template-rows: minmax(0, 1.1fr) minmax(0, 1fr); gap: 7px; padding: 7px; overflow: hidden; }
+.denoise-workspace { height: 100%; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 300px; grid-template-rows: minmax(0, 1.1fr) minmax(0, 1fr); gap: 1px; background: var(--seam); overflow: hidden; }
 .denoise-viewer { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .denoise-viewer > .viewer { flex: 1; min-height: 0; }
 .denoise-panel { min-height: 0; display: flex; flex-direction: column; }
@@ -11,5 +11,5 @@
 .denoise-timeline { grid-column: 1 / -1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 .denoise-timeline > .timeline { flex: 1; min-height: 0; }
 @media (max-width: 760px) {
-  .denoise-workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto minmax(0, 1fr); padding: 4px 0; }
+  .denoise-workspace { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto minmax(0, 1fr); }
 }

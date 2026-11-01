@@ -1,9 +1,9 @@
 /* Color page. Top: viewer | nodes over the shot strip. A draggable row, then the grading tools beside the scopes. The right
    panel (Library, Settings, Groups, Assistant) spans both. Sized for a MacBook first: everything fits 1470×760 and 1280×720. */
-.color-workspace.color-overhaul{--panel:#222327;--border:#37393f;--text:#dedee3;--muted:#9699a3;--label:#aeb2bc;--well:#18191d;--track:#3a3d45;--color-accent:#db978a;--color-tools:clamp(214px,37%,340px);display:grid;grid-template-columns:minmax(0,1fr) var(--color-inspector);grid-template-rows:minmax(0,1fr) 7px min(var(--color-tools),calc(100% - 245px)) 20px;gap:0 5px;padding:6px 6px 0;background:#16171a;color:var(--text);overflow:hidden;min-width:0;min-height:0;font-size:12px;position:relative}
+.color-workspace.color-overhaul{--panel:#222327;--border:#37393f;--text:#dedee3;--muted:#9699a3;--label:#aeb2bc;--well:#18191d;--track:#3a3d45;--color-accent:#db978a;--color-tools:clamp(214px,37%,340px);--seam:#121316;display:grid;grid-template-columns:minmax(0,1fr) var(--color-inspector);grid-template-rows:minmax(0,1fr) 1px min(var(--color-tools),calc(100% - 245px)) 20px;gap:0;padding:0;background:#16171a;color:var(--text);overflow:hidden;min-width:0;min-height:0;font-size:12px;position:relative}
 .color-overhaul.inspector-closed{grid-template-columns:minmax(0,1fr)}
 .color-overhaul button,.color-overhaul input,.color-overhaul select{font:inherit}.color-overhaul button{cursor:pointer}.color-overhaul button:disabled{opacity:.35;cursor:default}.color-overhaul button:focus-visible,.color-overhaul [tabindex]:focus-visible,.color-overhaul input:focus-visible,.color-overhaul select:focus-visible{outline:2px solid var(--color-accent);outline-offset:2px}
-.color-overhaul .panel{border:1px solid var(--border);border-radius:3px;background:var(--panel);min-height:0;min-width:0;overflow:hidden}
+.color-overhaul .panel{background:var(--panel);min-height:0;min-width:0;overflow:hidden}
 .color-overhaul .panel-header{display:flex;align-items:center;gap:9px;height:30px;min-height:30px;padding:0 10px;background:#292a2f;border-bottom:1px solid #17181c;font-size:11px}.color-overhaul .panel-header strong{font-weight:550}.color-overhaul small{font-size:10px;color:var(--muted)}
 .color-overhaul .icon-button{width:25px;height:25px;flex-shrink:0;color:#b8bbc5;border:0;background:transparent;border-radius:3px}.color-overhaul .icon-button:hover{background:#3b3d45;color:#fff}
 .color-overhaul .button{font-size:11px;min-height:26px;padding:3px 9px;background:#383a42;border:1px solid #52545f;color:#e0e2e9;border-radius:4px;display:inline-flex;align-items:center;gap:6px;white-space:nowrap}.color-overhaul .button:hover:not(:disabled){background:#42444d}
@@ -15,13 +15,13 @@
 .color-overhaul .transform-overlay{display:none}
 
 /* ---- Top: viewer, nodes, shot strip ---- */
-.color-main{grid-column:1;grid-row:1;display:grid;grid-template-columns:minmax(0,1.42fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr) 64px;gap:5px;min-height:0;min-width:0}
+.color-main{grid-column:1;grid-row:1;display:grid;grid-template-columns:minmax(0,1.42fr) minmax(0,1fr);grid-template-rows:minmax(0,1fr) 64px;gap:1px;background:var(--seam);min-height:0;min-width:0}
 .color-overhaul .color-viewer{grid-column:1;grid-row:1/3;display:flex;flex-direction:column;overflow:hidden;min-width:0;min-height:0;position:relative}
 .color-overhaul .viewer{width:100%;height:0;flex:1;min-height:0}
 .color-overhaul .viewer-stage{background:#0e0f11;min-height:0}
 .color-overhaul .viewer-header,.color-overhaul .viewer-transport{background:#24262b;font-size:10px}
-.color-overhaul .viewer-transport{height:32px}
-.color-scrub{display:flex;align-items:center;gap:10px;min-height:28px;flex-shrink:0;padding:0 10px;background:#202226;border:1px solid var(--border);border-top:0;font-size:9px;color:#aeb3bd}
+.color-overhaul .viewer-transport{height:32px}.color-overhaul .viewer-header{height:30px}
+.color-scrub{display:flex;align-items:center;gap:10px;min-height:28px;flex-shrink:0;padding:0 10px;background:#202226;border-top:1px solid #17181c;font-size:9px;color:#aeb3bd}
 .scrub-clip-name{max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .color-scrub input{flex:1;width:0}
 .color-scrub .mono{font-size:9px}
@@ -70,15 +70,17 @@
 .color-overhaul .shot-card>span{font-size:9px;max-width:100%;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
 
 /* ---- Resizers ---- */
-.color-resizer{width:6px;height:100%;background:#1c1d21;cursor:col-resize;touch-action:none;flex-shrink:0;position:relative}
-.color-resizer:hover,.color-resizer:focus-visible{background:#8c706a}
-.color-row-resizer{grid-column:1;grid-row:2;cursor:row-resize;touch-action:none;position:relative}
-.color-row-resizer:after{content:"";position:absolute;left:calc(50% - 20px);top:2px;width:40px;height:3px;border-radius:2px;background:#33353c;transition:background .12s}
-.color-row-resizer:hover:after,.color-row-resizer:focus-visible:after{background:var(--color-accent)}
+/* 1px seams; the :before widens the grab area past the line. */
+.color-resizer{width:1px;height:100%;background:var(--seam);cursor:col-resize;touch-action:none;flex-shrink:0;position:relative;z-index:6;transition:background .12s}
+.color-resizer:before{content:"";position:absolute;inset:0 -4px}
+.color-resizer:hover,.color-resizer:focus-visible{background:var(--color-accent)}
+.color-row-resizer{grid-column:1;grid-row:2;cursor:row-resize;touch-action:none;position:relative;z-index:6;background:var(--seam);transition:background .12s}
+.color-row-resizer:before{content:"";position:absolute;inset:-4px 0}
+.color-row-resizer:hover,.color-row-resizer:focus-visible{background:var(--color-accent)}
 .color-overhaul .color-row-resizer:focus-visible{outline:0}
 
 /* ---- Bottom: tools beside the scopes ---- */
-.color-overhaul .color-bottom{grid-column:1;grid-row:3;display:grid;grid-template-columns:minmax(0,1fr) 6px min(30%,var(--color-scopes));gap:3px;min-height:0;min-width:0}
+.color-overhaul .color-bottom{grid-column:1;grid-row:3;display:grid;grid-template-columns:minmax(0,1fr) 1px min(30%,var(--color-scopes));gap:0;min-height:0;min-width:0}
 .color-overhaul .grade-controls{display:flex;flex-direction:column;min-height:0}
 .color-tabs{display:flex;align-items:stretch;height:100%;gap:6px}
 .color-tabs button{display:flex;align-items:center;justify-content:center;gap:5px;padding:8px 10px;background:transparent;border:0;border-bottom:2px solid transparent;color:#989eab;white-space:nowrap}
@@ -247,10 +249,9 @@
 .color-overhaul .scope-meta{display:flex;justify-content:space-between;gap:6px;padding:4px 10px 6px;font-size:8px;color:#969da9}
 
 /* ---- Right panel ---- */
-.color-effects-panel{grid-column:2;grid-row:1/4;display:flex;min-width:0;min-height:0;border:1px solid var(--border);border-radius:4px;background:#24262b;overflow:hidden}
+.color-effects-panel{grid-column:2;grid-row:1/4;display:flex;min-width:0;min-height:0;background:#24262b;overflow:hidden}
 .color-effects-content{flex:1;min-width:0;overflow:auto;overscroll-behavior:contain;display:flex;flex-direction:column}
-.inspector-tabs{height:41px;min-height:41px;border-bottom:1px solid #141519;position:sticky;top:0;background:#292b31;z-index:3}
-.color-overhaul .inspector-tabs{padding-inline:6px;gap:2px}
+.color-overhaul .inspector-tabs{height:41px;min-height:41px;border-bottom:1px solid #141519;position:sticky;top:0;background:#292b31;z-index:3;padding-inline:6px;gap:2px}
 .color-overhaul .inspector-tabs button{flex:1;padding-inline:6px;font-size:13px;font-weight:550}
 .color-overhaul .inspector-tabs>.icon-button{align-self:center;flex:0 0 25px;margin-right:5px;padding:0;border:0}
 .effect-inspector,.effects-library{padding:13px;flex:1}
@@ -355,7 +356,7 @@
 
 /* ---- Laptop heights (MacBook Air with browser chrome and Dock): tighter chrome, thinner strip, no hints. ---- */
 @media(max-height:820px){
-.color-workspace.color-overhaul{padding-top:5px;grid-template-rows:minmax(0,1fr) 7px min(var(--color-tools),calc(100% - 225px)) 18px}
+.color-workspace.color-overhaul{grid-template-rows:minmax(0,1fr) 1px min(var(--color-tools),calc(100% - 225px)) 18px}
 .color-overhaul .panel-header{height:28px;min-height:28px}
 .color-main{grid-template-rows:minmax(0,1fr) 54px}
 .color-overhaul .shot-image{height:24px}
@@ -369,21 +370,21 @@
 .color-overhaul .node-footer>small:first-child{display:none}
 .grade-tool-body{padding:7px 10px 6px}
 .color-overhaul .scope-meta{display:none}
-.inspector-tabs{height:34px;min-height:34px}
+.color-overhaul .inspector-tabs{height:34px;min-height:34px}
 .color-overhaul .inspector-tabs button{font-size:12px}
 }
 
 /* ---- Narrow windows: the right panel floats over the page; phones stack the top. ---- */
 @media(max-width:1250px){
 .color-workspace.color-overhaul{grid-template-columns:minmax(0,1fr)}
-.color-effects-panel{position:absolute;right:6px;top:6px;bottom:22px;width:var(--color-inspector);z-index:20;box-shadow:-10px 0 35px #0008}
+.color-effects-panel{position:absolute;right:0;top:0;bottom:20px;width:var(--color-inspector);z-index:20;box-shadow:-10px 0 35px #0008}
 .color-overhaul .node-footer>small:first-child{display:none}
 .color-overhaul .scope-meta{flex-direction:column}
 .color-overhaul .grade-parameter{grid-template-columns:minmax(0,1fr) 44px}
 }
 @media(max-width:760px){
 .color-main{grid-template-columns:minmax(0,1.3fr) minmax(0,1fr)}
-.color-overhaul .color-bottom{grid-template-columns:minmax(0,1fr) 4px minmax(130px,25%)}
+.color-overhaul .color-bottom{grid-template-columns:minmax(0,1fr) 1px minmax(130px,25%)}
 .color-overhaul .node-panel .panel-header{gap:3px;padding:0 4px}
 .node-panel .panel-header>small{display:none}
 .color-overhaul .node-panel .button{font-size:9px;padding:3px}
@@ -393,9 +394,9 @@
 .color-overhaul .scope-live{display:none}
 }
 @media(max-width:520px){
-.color-workspace.color-overhaul{grid-template-rows:minmax(0,1fr) 7px minmax(0,40%) 18px}
+.color-workspace.color-overhaul{grid-template-rows:minmax(0,1fr) 1px minmax(0,40%) 18px}
 .color-main{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1.4fr) minmax(0,1fr) 60px}
-.color-overhaul .color-bottom{overflow:auto;grid-template-columns:minmax(360px,1fr) 4px 200px}
+.color-overhaul .color-bottom{overflow:auto;grid-template-columns:minmax(360px,1fr) 1px 200px}
 .color-overhaul .color-viewer{order:0;grid-column:1;grid-row:1}
 .color-overhaul .node-panel{grid-column:1;grid-row:2}
 .color-overhaul .shot-browser{grid-column:1;grid-row:3}

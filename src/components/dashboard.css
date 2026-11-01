@@ -311,7 +311,7 @@ input.dash-switch[type=checkbox] { appearance: none; padding: 0; cursor: pointer
 .settings-bottom > span { display: flex; align-items: center; gap: 7px; font-size: 9px; color: #879f76; }
 /* Human-readable activity and first-class milestones. */
 .history-panel { background: var(--panel); height: 100%; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
-.history-panel-header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); min-height: 43px; padding: 0 15px; }
+.history-panel-header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #ffffff07; min-height: var(--bar); padding: 0 12px; }
 .history-panel-header > div { display: flex; gap: 8px; align-items: center; color: #bac6b5; }
 .history-panel-header h2 { font-size: 11px; font-weight: 550; margin: 0; }
 .history-saved { display: flex; gap: 5px; align-items: center; color: #8fa882; font-size: 8px; }
